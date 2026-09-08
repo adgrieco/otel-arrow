@@ -1,0 +1,31 @@
+# platform: windows-only
+# Development sample only, not a finalized host counter profile.
+# From rust\otap-dataflow:
+# cargo run --features winperfcounters-receiver --bin df_engine -- -c configs\winperfcounters-console.yaml
+
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          memory:
+            type: receiver:winperfcounters
+            config:
+              counter: '\Memory\Available Bytes'
+              collection_interval: 30s
+          console:
+            type: exporter:console
+            config:
+              format: pretty
+              unicode: false
+              color: false
+        connections:
+          - from: memory
+            to: console

@@ -82,6 +82,7 @@ rdkafka = { workspace = true, features = ["cmake-build", "curl-static"], optiona
 # which is not a valid Win32 executable (os error 193).
 [target.'cfg(target_os = "windows")'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Performance"], optional = true }
 
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 one_collect = { workspace = true, optional = true }
@@ -90,6 +91,7 @@ one_collect = { workspace = true, optional = true }
 tracepoint_decode = { workspace = true, optional = true }
 
 [features]
+winperfcounters-receiver = ["dep:windows-sys", "dep:humantime-serde"]
 etw-receiver = ["dep:one_collect", "dep:humantime-serde"]
 kafka-receiver = [
     "dep:rdkafka",
@@ -111,6 +113,7 @@ aws = [
 ]
 contrib-receivers = [
     "etw-receiver",
+    "winperfcounters-receiver",
     "kafka-receiver",
     "user_events-receiver",
 ]
