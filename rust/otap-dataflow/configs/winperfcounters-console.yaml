@@ -18,7 +18,11 @@ groups:
           memory:
             type: receiver:winperfcounters
             config:
-              counter: '\Memory\Available Bytes'
+              counters:
+                - path: '\Memory\Available Bytes'
+                  name: windows.memory.available
+                  unit: By
+                  description: Physical memory immediately available for allocation.
               collection_interval: 30s
           console:
             type: exporter:console

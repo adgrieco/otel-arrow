@@ -12,26 +12,42 @@
 
 ## Overview
 
-Reads only `\Memory\Available Bytes` through the live Windows PDH API.
-The output is an OpenTelemetry integer gauge named `windows.memory.available`
-with unit `By`, collection timestamp, data-point attribute
-`windows.perf_counter.path`, and resource attribute `os.type=windows`.
-It is built directly as OTAP Arrow records, not via intermediate OTLP protobuf.
-This input is a development sample, not the finalized host counter profile.
+Reads configured exact Windows performance-counter paths through the live PDH
+API. Each entry supplies its OTel metric name, unit, and description. The
+receiver emits integer gauges with collection timestamps, data-point attribute
+`windows.perf_counter.path`, and resource attribute `os.type=windows`. It builds
+OTAP Arrow records directly, without intermediate OTLP protobuf. The included
+memory counter is a development sample, not a hard-coded ALDO-W profile.
 
 ## Configuration
 
 ```yaml
 type: receiver:winperfcounters
 config:
-  counter: '\Memory\Available Bytes'
+  counters:
+    - path: '\Memory\Available Bytes'
+      name: windows.memory.available
+      unit: By
+      description: Physical memory immediately available for allocation.
   collection_interval: 30s
 ```
 
-`counter` is required and accepts exactly the path above. YAML single quotes
-preserve single backslashes. `collection_interval` defaults to `30s` only when
-omitted; its supported range is `1s` through `24h`. Invalid durations, unknown
-fields, null intervals, and all other counter paths are errors.
+`counters` requires 1 through 256 entries. Every entry requires a non-empty
+exact English PDH path, metric name, unit, and description. Paths are
+case-insensitively unique, metric names are exactly unique, and `*` or `?`
+wildcards are rejected. YAML single quotes preserve single backslashes.
+`collection_interval` defaults to `30s` only when omitted; its supported range
+is `1s` through `24h`. Invalid durations and unknown fields are errors.
+
+Milestone 1 supports only native `PERF_COUNTER_RAWCOUNT` and
+`PERF_COUNTER_LARGE_RAWCOUNT` counters. Values are requested with
+`PDH_FMT_LARGE | PDH_FMT_NOSCALE`, preserving the exact integer rather than
+silently applying the native display scale. The configured unit must describe
+that unscaled value. For example, `\Memory\Available Bytes` advertises display
+scale `-6`, but this receiver emits its unscaled byte count with unit `By`.
+Rates, percentages, fractions, timers, averages, deltas, text, and
+hexadecimal-display raw counters are rejected at startup with the path and
+native type in the error. Applying any scale or conversion is unsupported.
 
 The source pipeline must allocate **one core**. Multiple instances within one
 process are rejected to avoid duplicate host-wide collection. Separate engine
@@ -39,7 +55,7 @@ processes are not coordinated; run only one collector for a given host.
 
 ## Examples
 
-From `rust\otap-dataflow` in PowerShell:
+From `C:\Repos\otel-arrow\rust\otap-dataflow` in PowerShell:
 
 ```powershell
 cargo run --features winperfcounters-receiver --bin df_engine -- -c configs\winperfcounters-console.yaml
@@ -54,39 +70,43 @@ The first collection is immediate; press Ctrl+C to stop.
 
 Read these files in order:
 
-1. `../winperfcounters/config.rs`: a Serde enum closes the supported input set.
-2. `../winperfcounters/mod.rs`: the source-neutral, integer `Sample`.
-3. `pdh.rs`: a stack-owned query, English counter registration, collection,
+1. `../winperfcounters/config.rs`: strict reusable counter configuration.
+2. `../winperfcounters/mod.rs`: the source-neutral, ordered integer `Sample`.
+3. `pdh.rs`: the persistent query owner, native-type inspection, collection,
    status checks, integer extraction, and automatic query/counter cleanup.
-4. `../winperfcounters/otap_builder.rs`: one metric, one data point, attributes.
+4. `../winperfcounters/otap_builder.rs`: configured gauges and attributes.
 5. `mod.rs`: factory registration, one-core guard, periodic collection on a
-   blocking worker, downstream backpressure, and shutdown control.
+   dedicated blocking worker, downstream backpressure, and shutdown control.
 
-Every scrape opens and closes its query. This intentionally simple lifecycle
-works for this direct gauge; it must not be reused for two-sample rates.
-No Windows handles move between threads and no unsafe `Send` is needed.
+One dedicated OS thread opens the query and all counters once, services a
+capacity-one command channel, and closes the query on exit. Windows handles
+never leave that thread and no unsafe `Send` is needed.
 
 ## Telemetry
 
-Engine receiver telemetry remains available. This POC adds no metric set.
-PDH failures include the operation, source path and hexadecimal status.
-Query-close failures emit `winperfcounters.close_failed`.
+Engine receiver telemetry remains available. This milestone adds no metric set.
+PDH failures include the operation, source path, and hexadecimal status. A
+failed scrape emits `winperfcounters.scrape_failed`, sends no partial batch or
+zero value, and retries on the next configured interval. Query-close failures
+emit `winperfcounters.close_failed`.
 
 ## Limits
 
-- No arbitrary paths, wildcard instances, rates, BLG, TCA, StatsD or ETW input.
+- No wildcards, rates, scaled values, BLG, TCA, StatsD, or ETW input.
 - No production exporter/authentication or Windows service packaging.
 - No host identity discovery beyond `os.type`; console-only local inspection.
 - One scrape is in flight at a time; missed ticks are skipped, not queued.
   Backpressure delays subsequent scrapes instead of buffering unbounded data.
-- PDH, worker and projection errors fail the receiver; no zero substitutes.
+- PDH collection/status failures are reported and retried at the next interval;
+  no partial batches or zero substitutes are emitted. Worker and projection
+  failures stop the receiver.
 - Shutdown remains responsive during collection and downstream backpressure.
-  An in-flight sample may be discarded on drain. Windows PDH calls cannot be
-  cancelled; an already-running blocking task closes its query when the OS call
-  returns and retains the singleton lease until then. A hung provider can delay
-  runtime teardown; hard cancellation/isolation is outside this POC.
-- Requires an installed, accessible Windows Memory performance counter.
-  English PDH registration avoids dependence on localized display names.
+  An in-flight sample may be discarded on drain. Synchronous PDH calls cannot
+  be cancelled. If one outlives the engine deadline, its worker retains query
+  ownership and the singleton lease, then closes the query when the call
+  returns. Hard cancellation or process isolation is outside this milestone.
+- Configured counters must be installed and accessible. English PDH
+  registration avoids dependence on localized display names.
 
 ## Validation
 
@@ -94,25 +114,49 @@ Query-close failures emit `winperfcounters.close_failed`.
 cargo test -p otel-arrow-dfe-contrib-nodes --features winperfcounters-receiver --lib winperfcounters
 ```
 
-Configuration/projection tests are portable. `pdh::tests::real_memory_gauge`
-also reads the actual local Windows counter three times, without elevation or
-rate warm-up. IRVM validation has not yet been performed.
+Configuration/projection tests are portable. The worker test opens one query,
+reads two installed Memory counters three times, and verifies one cleanup on
+shutdown. Initialization-error coverage verifies partial query cleanup. A
+simulated blocked worker verifies deadline return, later cleanup, and singleton
+lease retention until the worker finishes.
 
-A local two-sample console smoke on 2026-09-08 produced this first data point
+The milestone-1 validation used these exact files:
+
+```text
+Binary: C:\Repos\otel-arrow\rust\otap-dataflow\target\debug\df_engine.exe
+Config: C:\Repos\otel-arrow\rust\otap-dataflow\configs\winperfcounters-console.yaml
+```
+
+The binary was built from `C:\Repos\otel-arrow\rust\otap-dataflow` with:
+
+```powershell
+cargo build --features winperfcounters-receiver --bin df_engine
+```
+
+The bounded console smoke used loopback admin control:
+
+```powershell
+.\target\debug\df_engine.exe --config .\configs\winperfcounters-console.yaml --http-admin-bind 127.0.0.1:18085
+Invoke-WebRequest -UseBasicParsing -Method Post -Uri 'http://127.0.0.1:18085/api/v1/groups/shutdown?wait=true&timeout_secs=10'
+```
+
+On 2026-09-08 it emitted three ASCII data points with the configured identity
 (values vary with host memory pressure):
 
 ```text
 METRIC name=windows.memory.available unit=By
 GAUGE
-DATA_POINT time_unix_nano=1788882733442799500 value_int=101356367872
+DATA_POINT time_unix_nano=1788894834668402300 value_int=98923638784
   windows.perf_counter.path=\Memory\Available Bytes
 ```
 
-The second sample arrived approximately 30 seconds later with value
-`101388521472`. The loopback admin liveness endpoint returned HTTP 200.
-Ctrl+C initiated graceful shutdown and the engine exited with code 0.
-All seven targeted tests, the feature-enabled crate check and clippy, and
-`--validate-and-exit` with the example YAML passed.
+The next timestamps were `1788894864661887000` and `1788894894665995200`,
+giving intervals of 29.993 seconds and 30.004 seconds. `GET /api/v1/readyz`
+returned HTTP 200. The waited admin shutdown returned HTTP 200 with
+`{"status":"completed","durationMs":114}`; the process printed
+`Pipeline run successfully`, exited with code 0, and was no longer running.
+All 11 targeted receiver tests and the feature-enabled contrib-nodes crate
+check passed.
 
 The locally validated executable uses the unoptimized debug profile and targets
 x64 Windows. Its PE imports include `VCRUNTIME140.dll`, Windows Universal CRT

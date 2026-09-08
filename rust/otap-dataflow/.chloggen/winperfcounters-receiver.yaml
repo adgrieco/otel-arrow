@@ -8,7 +8,7 @@ change_type: new_component
 component: pipeline
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: Add an opt-in Windows performance-counter receiver POC for the available-memory gauge and console output.
+note: Add an opt-in Windows receiver for configurable exact performance-counter gauges.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 issues: []
@@ -18,4 +18,4 @@ issues: []
 # Use pipe (|) for multiline entries. Breaking entries must include a `Migration:`
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
-subtext: Enable winperfcounters-receiver on Windows and allocate one source core. Only the Memory Available Bytes counter is supported; collection defaults to 30 seconds.
+subtext: Configure exact paths with metric names, units, and descriptions. Milestone 1 supports unscaled raw integer counters, defaults to 30 seconds, and requires one source core.

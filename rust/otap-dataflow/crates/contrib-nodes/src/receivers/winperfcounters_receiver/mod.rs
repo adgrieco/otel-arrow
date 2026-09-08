@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Windows-only, single-core receiver for the fixed memory-gauge POC.
+//! Windows-only, single-core receiver for exact performance-counter gauges.
 
 otel_arrow_dfe_telemetry::otel_component_scope!(
     urn = WINPERFCOUNTERS_RECEIVER_URN,
@@ -24,6 +24,7 @@ use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
 use otel_arrow_dfe_telemetry::metrics::MetricSetSnapshot;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
 
 /// Factory identity for the Windows performance-counter receiver.
@@ -33,7 +34,10 @@ pub const WINPERFCOUNTERS_RECEIVER_URN: &str = "urn:otel:receiver:winperfcounter
 // process-wide atomic is only used at construction/drop, never in the hot path.
 static COLLECTING: AtomicBool = AtomicBool::new(false);
 
-struct Lease;
+pub(super) struct Lease;
+
+#[cfg(test)]
+static TEST_LEASE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 impl Lease {
     fn acquire() -> Result<Self, otel_arrow_dfe_config::error::Error> {
@@ -56,7 +60,7 @@ impl Drop for Lease {
 
 struct WinPerfCountersReceiver {
     config: Config,
-    lease: Arc<Lease>,
+    worker: pdh::Worker,
 }
 
 #[allow(unsafe_code)]
@@ -73,10 +77,13 @@ pub static WINPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactor
             });
         }
         let config = Config::from_json(&node_config.config)?;
-        let receiver = WinPerfCountersReceiver {
-            config,
-            lease: Arc::new(Lease::acquire()?),
-        };
+        let lease = Arc::new(Lease::acquire()?);
+        let worker = pdh::Worker::start(config.counters.clone(), lease).map_err(|err| {
+            otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                error: err.to_string(),
+            }
+        })?;
+        let receiver = WinPerfCountersReceiver { config, worker };
         Ok(ReceiverWrapper::local(
             receiver,
             node,
@@ -103,18 +110,19 @@ impl WinPerfCountersReceiver {
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             let _ = interval.tick().await;
-            // Blocking PDH calls must not stall the thread-per-core runtime.
-            // The Arc retains exclusivity even if shutdown drops this future
-            // while an uncancellable Windows call is still completing.
-            let lease = Arc::clone(&self.lease);
-            let sample = tokio::task::spawn_blocking(move || {
-                let _lease = lease;
-                pdh::collect()
-            })
-            .await
-            .map_err(|err| failure(format!("PDH worker failed: {err}")))?
-            .map_err(|err| failure(err.to_string()))?;
-            let records = into_otap(sample).map_err(|err| failure(err.to_string()))?;
+            let sample = match self.worker.collect().await {
+                Ok(sample) => sample,
+                Err(err) if err.is_collection_failure() => {
+                    otel_arrow_dfe_telemetry::otel_warn!(
+                        "winperfcounters.scrape_failed",
+                        error = %err
+                    );
+                    continue;
+                }
+                Err(err) => return Err(failure(err.to_string())),
+            };
+            let records =
+                into_otap(&self.config.counters, sample).map_err(|err| failure(err.to_string()))?;
             let pdata = OtapPdata::new(Context::default(), records.into());
             effect_handler
                 .send_message_with_source_node(pdata)
@@ -127,29 +135,68 @@ impl WinPerfCountersReceiver {
 #[async_trait(?Send)]
 impl local::Receiver<OtapPdata> for WinPerfCountersReceiver {
     async fn start(
-        self: Box<Self>,
+        mut self: Box<Self>,
         mut ctrl_msg_recv: local::ControlChannel<OtapPdata>,
         effect_handler: local::EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
-        let collect_and_send = self.collect_and_send(&effect_handler);
-        tokio::pin!(collect_and_send);
-        loop {
-            tokio::select! {
-                biased;
-                msg = ctrl_msg_recv.recv() => match msg {
-                    Ok(NodeControlMsg::DrainIngress { deadline, .. }) => {
-                        effect_handler.notify_receiver_drained().await?;
-                        return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
-                    }
-                    Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
-                        return Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []));
-                    }
-                    Err(err) => return Err(Error::ChannelRecvError(err)),
-                    _ => {}
-                },
-                result = &mut collect_and_send => return result,
+        enum Exit {
+            Control { deadline: Instant, drained: bool },
+            Collection(Result<TerminalState, Error>),
+        }
+
+        let exit = {
+            let collect_and_send = self.collect_and_send(&effect_handler);
+            tokio::pin!(collect_and_send);
+            loop {
+                tokio::select! {
+                    biased;
+                    msg = ctrl_msg_recv.recv() => match msg {
+                        Ok(NodeControlMsg::DrainIngress { deadline, .. }) => {
+                            break Exit::Control { deadline, drained: true };
+                        }
+                        Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
+                            break Exit::Control { deadline, drained: false };
+                        }
+                        Err(err) => {
+                            break Exit::Collection(Err(Error::ChannelRecvError(err)));
+                        }
+                        _ => {}
+                    },
+                    result = &mut collect_and_send => break Exit::Collection(result),
+                }
+            }
+        };
+
+        let (deadline, drained, collection_result) = match exit {
+            Exit::Control { deadline, drained } => (deadline, drained, None),
+            Exit::Collection(result) => {
+                (Instant::now() + Duration::from_secs(5), false, Some(result))
+            }
+        };
+        match self.worker.shutdown(deadline).await {
+            Ok(true) => {}
+            Ok(false) => {
+                otel_arrow_dfe_telemetry::otel_warn!(
+                    "winperfcounters.shutdown_timeout",
+                    "PDH worker still owns its query and will close it when the active call returns"
+                );
+            }
+            Err(err) => {
+                return Err(Error::ReceiverError {
+                    receiver: effect_handler.receiver_id(),
+                    kind: ReceiverErrorKind::Other,
+                    error: err.to_string(),
+                    source_detail: String::new(),
+                });
             }
         }
+        if let Some(result) = collection_result {
+            return result;
+        }
+        if drained {
+            effect_handler.notify_receiver_drained().await?;
+        }
+        Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []))
     }
 }
 
@@ -159,8 +206,9 @@ mod tests {
 
     /// Scenario: A receiver stops while its blocking worker still holds the collection lease.
     /// Guarantees: Duplicate collection stays rejected until the final owner releases the lease.
-    #[test]
-    fn lease_covers_outstanding_worker() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn lease_covers_outstanding_worker() {
+        let _serial = TEST_LEASE_LOCK.lock().await;
         let receiver = Arc::new(Lease::acquire().unwrap());
         let worker = Arc::clone(&receiver);
         assert!(Lease::acquire().is_err());
