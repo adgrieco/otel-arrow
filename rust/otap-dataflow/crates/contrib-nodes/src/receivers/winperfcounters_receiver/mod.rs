@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Windows-only, single-core receiver for exact performance-counter gauges.
+//! Windows-only, single-core receiver for exact and calculated performance gauges.
 
 otel_arrow_dfe_telemetry::otel_component_scope!(
     urn = WINPERFCOUNTERS_RECEIVER_URN,
@@ -121,8 +121,11 @@ impl WinPerfCountersReceiver {
                 }
                 Err(err) => return Err(failure(err.to_string())),
             };
-            let records =
-                into_otap(&self.config.counters, sample).map_err(|err| failure(err.to_string()))?;
+            let Some(records) =
+                into_otap(&self.config.counters, sample).map_err(|err| failure(err.to_string()))?
+            else {
+                continue;
+            };
             let pdata = OtapPdata::new(Context::default(), records.into());
             effect_handler
                 .send_message_with_source_node(pdata)

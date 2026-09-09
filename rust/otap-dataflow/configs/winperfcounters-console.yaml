@@ -23,6 +23,10 @@ groups:
                   name: windows.memory.available
                   unit: By
                   description: Physical memory immediately available for allocation.
+                - path: '\Processor(_Total)\% Processor Time'
+                  name: windows.processor.time
+                  unit: "%"
+                  description: Average processor utilization across all logical processors.
               collection_interval: 30s
           console:
             type: exporter:console

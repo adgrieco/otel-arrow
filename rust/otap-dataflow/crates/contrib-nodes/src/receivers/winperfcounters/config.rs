@@ -7,6 +7,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 const MAX_COUNTERS: usize = 256;
+const MIN_SCALE_POWER10: i32 = -18;
+const MAX_SCALE_POWER10: i32 = 18;
 
 /// One exact Windows performance counter and its OTel metric identity.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -20,6 +22,9 @@ pub struct CounterConfig {
     pub unit: String,
     /// OTel metric description.
     pub description: String,
+    /// Base-10 scaling applied after PDH calculates the native value.
+    #[serde(default)]
+    pub scale_power10: i32,
 }
 
 /// Configuration for Windows performance-counter collection.
@@ -78,6 +83,14 @@ impl Config {
                     error: format!("{} must be an exact path without wildcards", field("path")),
                 });
             }
+            if !(MIN_SCALE_POWER10..=MAX_SCALE_POWER10).contains(&counter.scale_power10) {
+                return Err(Error::InvalidUserConfig {
+                    error: format!(
+                        "{} must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}",
+                        field("scale_power10")
+                    ),
+                });
+            }
             if !paths.insert(counter.path.to_ascii_lowercase()) {
                 return Err(Error::InvalidUserConfig {
                     error: format!("duplicate counter path: {}", counter.path),
@@ -120,6 +133,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.counters.len(), 2);
         assert_eq!(config.counters[0].path, r"\Memory\Available Bytes");
+        assert_eq!(config.counters[0].scale_power10, 0);
         assert_eq!(config.collection_interval, Duration::from_secs(30));
         let config = Config::from_json(&json!({
             "counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
@@ -150,6 +164,13 @@ mod tests {
                    "collection_interval": "bad"}),
             json!({"counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
                    "extra": true}),
+            json!({"counters": [{
+                    "path": r"\Memory\Available Bytes",
+                    "name": "windows.memory.available",
+                    "unit": "By",
+                    "description": "Test counter.",
+                    "scale_power10": 19
+            }]}),
         ] {
             assert!(Config::from_json(&value).is_err(), "{value}");
         }

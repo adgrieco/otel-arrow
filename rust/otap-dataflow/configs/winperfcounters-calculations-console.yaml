@@ -1,0 +1,57 @@
+# platform: windows-only
+# Milestone 2 calculation sample, not a finalized host counter profile.
+# Requires the Memory, Processor, Cache, and PhysicalDisk performance objects,
+# including the PhysicalDisk _Total instance and provider-defined base counters.
+# From rust\otap-dataflow:
+# cargo run --features winperfcounters-receiver --bin df_engine -- -c configs\winperfcounters-calculations-console.yaml
+
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          calculations:
+            type: receiver:winperfcounters
+            config:
+              counters:
+                - path: '\Memory\Available Bytes'
+                  name: windows.memory.available
+                  unit: By
+                  description: Physical memory immediately available for allocation.
+                - path: '\Processor(_Total)\% Processor Time'
+                  name: windows.processor.time
+                  unit: "%"
+                  description: Average processor utilization across all logical processors.
+                - path: '\Memory\% Committed Bytes In Use'
+                  name: windows.memory.committed
+                  unit: "%"
+                  description: Percentage of the memory commit limit currently in use.
+                - path: '\Cache\Data Map Hits %'
+                  name: windows.cache.data_map_hits
+                  unit: "%"
+                  description: Percentage of data-map requests served from the system cache.
+                - path: '\PhysicalDisk(_Total)\Avg. Disk sec/Read'
+                  name: windows.disk.read.time
+                  unit: s
+                  description: Average time to complete a physical-disk read.
+                - path: '\PhysicalDisk(_Total)\Avg. Disk Bytes/Read'
+                  name: windows.disk.read.size
+                  unit: By
+                  description: Average bytes transferred by a physical-disk read.
+              collection_interval: 30s
+          console:
+            type: exporter:console
+            config:
+              format: pretty
+              unicode: false
+              color: false
+        connections:
+          - from: calculations
+            to: console
