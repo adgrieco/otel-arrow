@@ -1,6 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(test)]
+use super::SamplePoint;
 use super::{CounterConfig, Number, Sample, SampleValue};
 use arrow::error::ArrowError;
 use otel_arrow_dfe_pdata::encode::record::attributes::StrKeysAttributesRecordBatchBuilder;
@@ -10,6 +12,7 @@ use otel_arrow_dfe_pdata::encode::record::metrics::{
 use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords};
 use otel_arrow_dfe_pdata::otlp::metrics::MetricType;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+use std::collections::BTreeMap;
 
 /// Project the ready values from one scrape directly into OTAP gauges.
 pub fn into_otap(
@@ -21,37 +24,43 @@ pub fn into_otap(
             "performance-counter sample requires a positive Unix timestamp".to_owned(),
         ));
     }
-    if counters.len() != sample.values.len() {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "configured counter count {} does not match sample value count {}",
-            counters.len(),
-            sample.values.len()
-        )));
-    }
     let mut metrics = MetricsRecordBatchBuilder::new();
     let mut points = NumberDataPointsRecordBatchBuilder::new();
     let mut attrs = StrKeysAttributesRecordBatchBuilder::<u32>::new();
-    let ready = counters
-        .iter()
-        .zip(sample.values)
-        .filter_map(|(counter, value)| match value {
-            SampleValue::Value(value) => Some((counter, value)),
+    let mut metric_ids = BTreeMap::new();
+    let ready = sample
+        .points
+        .into_iter()
+        .filter_map(|point| match point.value {
+            SampleValue::Value(value) => Some((point, value)),
             SampleValue::Warming | SampleValue::NoObservation => None,
         });
-    let mut count = 0;
-    for (index, (counter, value)) in ready.enumerate() {
-        let metric_id = u16::try_from(index).map_err(|_| {
-            ArrowError::InvalidArgumentError("too many configured counters".to_owned())
+    let mut point_count = 0;
+    for (index, (point, value)) in ready.enumerate() {
+        let counter = counters.get(point.counter_index).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!(
+                "sample references missing configured counter {}",
+                point.counter_index
+            ))
         })?;
+        let metric_id = if let Some(metric_id) = metric_ids.get(&point.counter_index) {
+            *metric_id
+        } else {
+            let metric_id = u16::try_from(metric_ids.len()).map_err(|_| {
+                ArrowError::InvalidArgumentError("too many configured metrics".to_owned())
+            })?;
+            metrics.append_id(metric_id);
+            metrics.append_metric_type(MetricType::Gauge as u8);
+            metrics.append_name(counter.name.as_bytes());
+            metrics.append_description(counter.description.as_bytes());
+            metrics.append_unit(counter.unit.as_bytes());
+            metrics.append_aggregation_temporality(None);
+            metrics.append_is_monotonic(None);
+            let _ = metric_ids.insert(point.counter_index, metric_id);
+            metric_id
+        };
         let point_id = u32::try_from(index)
             .map_err(|_| ArrowError::InvalidArgumentError("too many counter values".to_owned()))?;
-        metrics.append_id(metric_id);
-        metrics.append_metric_type(MetricType::Gauge as u8);
-        metrics.append_name(counter.name.as_bytes());
-        metrics.append_description(counter.description.as_bytes());
-        metrics.append_unit(counter.unit.as_bytes());
-        metrics.append_aggregation_temporality(None);
-        metrics.append_is_monotonic(None);
 
         points.append_id(point_id);
         points.append_parent_id(metric_id);
@@ -76,24 +85,52 @@ pub fn into_otap(
 
         attrs.append_parent_id(&point_id);
         attrs.append_key("windows.perf_counter.path");
-        attrs.any_values_builder.append_str(counter.path.as_bytes());
-        count += 1;
+        attrs.any_values_builder.append_str(point.path.as_bytes());
+        if point.path != counter.path {
+            attrs.append_parent_id(&point_id);
+            attrs.append_key("windows.perf_counter.path_template");
+            attrs.any_values_builder.append_str(counter.path.as_bytes());
+        }
+        if let Some(instance) = point.instance {
+            attrs.append_parent_id(&point_id);
+            attrs.append_key("windows.perf_counter.instance");
+            attrs
+                .any_values_builder
+                .append_str(instance.name.as_bytes());
+            if let Some(parent) = instance.parent {
+                attrs.append_parent_id(&point_id);
+                attrs.append_key("windows.perf_counter.parent_instance");
+                attrs.any_values_builder.append_str(parent.as_bytes());
+            }
+            attrs.append_parent_id(&point_id);
+            attrs.append_key("windows.perf_counter.instance_index");
+            attrs
+                .any_values_builder
+                .append_str(instance.index.to_string().as_bytes());
+        }
+        point_count += 1;
     }
-    if count == 0 {
+    if point_count == 0 {
         return Ok(None);
     }
-    metrics.resource.append_id_n(0, count);
-    metrics.resource.append_schema_url_n(None, count);
-    metrics.resource.append_dropped_attributes_count_n(0, count);
-    metrics.scope.append_id_n(0, count);
+    let metric_count = metric_ids.len();
+    metrics.resource.append_id_n(0, metric_count);
+    metrics.resource.append_schema_url_n(None, metric_count);
+    metrics
+        .resource
+        .append_dropped_attributes_count_n(0, metric_count);
+    metrics.scope.append_id_n(0, metric_count);
+    metrics.scope.append_name_n(
+        Some(b"otel-arrow-dfe-contrib-nodes/winperfcounters"),
+        metric_count,
+    );
     metrics
         .scope
-        .append_name_n(Some(b"otel-arrow-dfe-contrib-nodes/winperfcounters"), count);
+        .append_version_n(Some(env!("CARGO_PKG_VERSION").as_bytes()), metric_count);
     metrics
         .scope
-        .append_version_n(Some(env!("CARGO_PKG_VERSION").as_bytes()), count);
-    metrics.scope.append_dropped_attributes_count_n(0, count);
-    metrics.append_scope_schema_url_n(b"", count);
+        .append_dropped_attributes_count_n(0, metric_count);
+    metrics.append_scope_schema_url_n(b"", metric_count);
 
     let mut resource = StrKeysAttributesRecordBatchBuilder::<u16>::new();
     resource.append_parent_id(&0);
@@ -129,6 +166,15 @@ mod tests {
         }
     }
 
+    fn point(counter_index: usize, path: &str, value: SampleValue) -> SamplePoint {
+        SamplePoint {
+            counter_index,
+            path: path.to_owned(),
+            instance: None,
+            value,
+        }
+    }
+
     /// Scenario: Multiple configured readings include an integer beyond f64's exact range.
     /// Guarantees: Gauge order, metadata, paths, timestamps, and exact i64 values are retained.
     #[test]
@@ -143,10 +189,21 @@ mod tests {
             &counters,
             Sample {
                 timestamp_unix_nano: timestamp,
-                values: vec![
-                    SampleValue::Value(Number::Integer(bytes)),
-                    SampleValue::Value(Number::Integer(42)),
+                points: vec![
+                    point(
+                        0,
+                        r"\Memory\Available Bytes",
+                        SampleValue::Value(Number::Integer(bytes)),
+                    ),
+                    point(
+                        1,
+                        r"\Memory\Committed Bytes",
+                        SampleValue::Value(Number::Integer(42)),
+                    ),
                 ],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
             },
         )
         .unwrap()
@@ -225,10 +282,21 @@ mod tests {
             &counters,
             Sample {
                 timestamp_unix_nano: 1,
-                values: vec![
-                    SampleValue::Value(Number::Integer(42)),
-                    SampleValue::Warming,
+                points: vec![
+                    point(
+                        0,
+                        r"\Memory\Available Bytes",
+                        SampleValue::Value(Number::Integer(42)),
+                    ),
+                    point(
+                        1,
+                        r"\Processor(_Total)\% Processor Time",
+                        SampleValue::Warming,
+                    ),
                 ],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
             },
         )
         .unwrap()
@@ -256,7 +324,14 @@ mod tests {
                 &counters,
                 Sample {
                     timestamp_unix_nano: 1,
-                    values: vec![SampleValue::Warming],
+                    points: vec![point(
+                        0,
+                        r"\Processor(_Total)\% Processor Time",
+                        SampleValue::Warming,
+                    )],
+                    failures: Vec::new(),
+                    overflows: Vec::new(),
+                    diagnostics: Default::default(),
                 }
             )
             .unwrap()
@@ -285,11 +360,26 @@ mod tests {
             &counters,
             Sample {
                 timestamp_unix_nano: 1,
-                values: vec![
-                    SampleValue::Value(Number::Integer(42)),
-                    SampleValue::Value(Number::Double(12.5)),
-                    SampleValue::NoObservation,
+                points: vec![
+                    point(
+                        0,
+                        r"\Memory\Available Bytes",
+                        SampleValue::Value(Number::Integer(42)),
+                    ),
+                    point(
+                        1,
+                        r"\Processor(_Total)\% Processor Time",
+                        SampleValue::Value(Number::Double(12.5)),
+                    ),
+                    point(
+                        2,
+                        r"\PhysicalDisk(_Total)\Avg. Disk Bytes/Read",
+                        SampleValue::NoObservation,
+                    ),
                 ],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
             },
         )
         .unwrap()
@@ -302,6 +392,47 @@ mod tests {
         assert!(display.contains("windows.memory.available"));
         assert!(display.contains("windows.processor.time"));
         assert!(!display.contains("windows.disk.read.average"));
+    }
+
+    /// Scenario: A disappeared wildcard instance fails while an exact Memory point remains valid.
+    /// Guarantees: Counter-local failure metadata does not suppress projection of healthy points.
+    #[test]
+    fn projects_healthy_points_when_a_peer_failed() {
+        let counters = [
+            counter(r"\Memory\Available Bytes", "windows.memory.available", "By"),
+            counter(
+                r"\Process(*)\Private Bytes",
+                "windows.process.private",
+                "By",
+            ),
+        ];
+        let records = into_otap(
+            &counters,
+            Sample {
+                timestamp_unix_nano: 1,
+                points: vec![point(
+                    0,
+                    r"\Memory\Available Bytes",
+                    SampleValue::Value(Number::Integer(42)),
+                )],
+                failures: vec![super::super::SampleFailure {
+                    counter_index: 1,
+                    reason: "PdhGetFormattedCounterValue",
+                    error: "PDH_INVALID_DATA".to_owned(),
+                }],
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let metrics = records.get(ArrowPayloadType::UnivariateMetrics).unwrap();
+        let display = arrow::util::pretty::pretty_format_batches(std::slice::from_ref(metrics))
+            .unwrap()
+            .to_string();
+        assert_eq!(metrics.num_rows(), 1);
+        assert!(display.contains("windows.memory.available"));
+        assert!(!display.contains("windows.process.private"));
     }
 
     /// Scenario: A calculated counter produces a finite floating-point value.
@@ -317,7 +448,14 @@ mod tests {
             &counters,
             Sample {
                 timestamp_unix_nano: 1,
-                values: vec![SampleValue::Value(Number::Double(12.5))],
+                points: vec![point(
+                    0,
+                    r"\Processor(_Total)\% Processor Time",
+                    SampleValue::Value(Number::Double(12.5)),
+                )],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
             },
         )
         .unwrap()
@@ -337,8 +475,8 @@ mod tests {
         );
     }
 
-    /// Scenario: A sample has an invalid timestamp or does not match configured counter count.
-    /// Guarantees: Misaligned or untimed values never become plausible output gauges.
+    /// Scenario: A sample has an invalid timestamp or references a missing configured counter.
+    /// Guarantees: Misidentified or untimed values never become plausible output gauges.
     #[test]
     fn rejects_invalid_sample() {
         let counters = [counter(
@@ -351,7 +489,14 @@ mod tests {
                 &counters,
                 Sample {
                     timestamp_unix_nano: 1,
-                    values: vec![]
+                    points: vec![point(
+                        1,
+                        r"\Memory\Available Bytes",
+                        SampleValue::Value(Number::Integer(1)),
+                    )],
+                    failures: Vec::new(),
+                    overflows: Vec::new(),
+                    diagnostics: Default::default(),
                 }
             )
             .is_err()
@@ -361,7 +506,14 @@ mod tests {
                 &counters,
                 Sample {
                     timestamp_unix_nano: 0,
-                    values: vec![SampleValue::Value(Number::Integer(1))]
+                    points: vec![point(
+                        0,
+                        r"\Memory\Available Bytes",
+                        SampleValue::Value(Number::Integer(1)),
+                    )],
+                    failures: Vec::new(),
+                    overflows: Vec::new(),
+                    diagnostics: Default::default(),
                 }
             )
             .is_err()
@@ -371,7 +523,14 @@ mod tests {
                 &counters,
                 Sample {
                     timestamp_unix_nano: 1,
-                    values: vec![SampleValue::Value(Number::Integer(-1))]
+                    points: vec![point(
+                        0,
+                        r"\Memory\Available Bytes",
+                        SampleValue::Value(Number::Integer(-1)),
+                    )],
+                    failures: Vec::new(),
+                    overflows: Vec::new(),
+                    diagnostics: Default::default(),
                 }
             )
             .is_ok()
@@ -381,10 +540,77 @@ mod tests {
                 &counters,
                 Sample {
                     timestamp_unix_nano: 1,
-                    values: vec![SampleValue::Value(Number::Double(f64::INFINITY))]
+                    points: vec![point(
+                        0,
+                        r"\Memory\Available Bytes",
+                        SampleValue::Value(Number::Double(f64::INFINITY)),
+                    )],
+                    failures: Vec::new(),
+                    overflows: Vec::new(),
+                    diagnostics: Default::default(),
                 }
             )
             .is_err()
         );
+    }
+
+    /// Scenario: Two expanded instances map to one configured wildcard metric.
+    /// Guarantees: Concrete paths and parsed duplicate identities are emitted without positional joining.
+    #[test]
+    fn projects_wildcard_instance_identity() {
+        let counters = [counter(
+            r"\Process(*)\Private Bytes",
+            "windows.process.private",
+            "By",
+        )];
+        let records = into_otap(
+            &counters,
+            Sample {
+                timestamp_unix_nano: 1,
+                points: vec![
+                    SamplePoint {
+                        counter_index: 0,
+                        path: r"\Process(worker)\Private Bytes".to_owned(),
+                        instance: Some(super::super::InstanceIdentity {
+                            name: "worker".to_owned(),
+                            parent: None,
+                            index: 0,
+                        }),
+                        value: SampleValue::Value(Number::Integer(10)),
+                    },
+                    SamplePoint {
+                        counter_index: 0,
+                        path: r"\Process(worker#1)\Private Bytes".to_owned(),
+                        instance: Some(super::super::InstanceIdentity {
+                            name: "worker".to_owned(),
+                            parent: Some("service".to_owned()),
+                            index: 1,
+                        }),
+                        value: SampleValue::Value(Number::Integer(20)),
+                    },
+                ],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let metrics = records.get(ArrowPayloadType::UnivariateMetrics).unwrap();
+        assert_eq!(metrics.num_rows(), 1);
+        let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
+        assert_eq!(points.num_rows(), 2);
+        let attrs = records.get(ArrowPayloadType::NumberDpAttrs).unwrap();
+        let display = arrow::util::pretty::pretty_format_batches(std::slice::from_ref(attrs))
+            .unwrap()
+            .to_string();
+        assert!(display.contains(r"\Process(worker)\Private Bytes"));
+        assert!(display.contains(r"\Process(worker#1)\Private Bytes"));
+        assert!(display.contains(r"\Process(*)\Private Bytes"));
+        assert!(display.contains("windows.perf_counter.instance"));
+        assert!(display.contains("windows.perf_counter.instance_index"));
+        assert!(display.contains("windows.perf_counter.parent_instance"));
+        assert!(display.contains("worker"));
+        assert!(display.contains("service"));
     }
 }

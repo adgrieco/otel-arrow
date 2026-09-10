@@ -29,13 +29,100 @@ pub enum SampleValue {
     NoObservation,
 }
 
+/// Identity parsed from one expanded wildcard instance path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceIdentity {
+    /// Instance name without the duplicate index suffix.
+    pub name: String,
+    /// Optional parent instance name.
+    pub parent: Option<String>,
+    /// Duplicate instance index used by PDH to distinguish equal names.
+    pub index: u32,
+}
+
+/// One exact or expanded counter point in a collection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SamplePoint {
+    /// Index of the configured counter that defines metric metadata.
+    pub counter_index: usize,
+    /// Exact configured path or concrete expanded wildcard path.
+    pub path: String,
+    /// Parsed identity for an expanded wildcard instance.
+    pub instance: Option<InstanceIdentity>,
+    /// Ready value or expected omission.
+    pub value: SampleValue,
+}
+
+/// One counter-local failure omitted from an otherwise successful collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleFailure {
+    /// Index of the configured exact or wildcard path.
+    pub counter_index: usize,
+    /// Low-cardinality failure category.
+    pub reason: &'static str,
+    /// Native status or calculation detail without expanded instance identity.
+    pub error: String,
+}
+
+/// One explicit wildcard expansion limit reached during discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpansionOverflow {
+    /// Index of the configured wildcard path.
+    pub counter_index: usize,
+    /// Low-cardinality limit category.
+    pub reason: &'static str,
+    /// Number of concrete paths discovered before this limit was applied.
+    pub discovered: usize,
+    /// Number of concrete paths retained after this limit was applied.
+    pub retained: usize,
+    /// Number of concrete paths omitted by this limit.
+    pub omitted: usize,
+}
+
+/// Bounded operational changes observed while producing one sample.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SampleDiagnostics {
+    /// Number of currently active expanded wildcard counters.
+    pub active_expanded_counters: usize,
+    /// Number of wildcard discovery refreshes attempted.
+    pub discovery_refreshes: u64,
+    /// Number of wildcard discovery attempts that failed.
+    pub discovery_failures: u64,
+    /// Number of newly active expanded instances.
+    pub instances_added: u64,
+    /// Number of expanded instances removed.
+    pub instances_removed: u64,
+    /// Number of expanded instances omitted by configured limits.
+    pub instances_omitted_over_limit: u64,
+    /// Number of counter-add attempts that failed.
+    pub counter_add_failures: u64,
+    /// Number of counter read, status, or projection failures.
+    pub counter_read_failures: u64,
+    /// Number of deferred counter retry attempts.
+    pub retry_attempts: u64,
+    /// Number of deferred counter retries that recovered.
+    pub retry_recoveries: u64,
+    /// Number of worker-owned query rebuilds attempted.
+    pub query_rebuild_attempts: u64,
+    /// Number of worker-owned query rebuilds that recovered.
+    pub query_rebuild_recoveries: u64,
+    /// Number of independently warming points omitted.
+    pub warmup_omissions: u64,
+}
+
 /// A successful point-in-time PDH reading, independent of Windows handles.
 #[derive(Debug, Clone)]
 pub struct Sample {
     /// Collection time as nanoseconds since the Unix epoch.
     pub timestamp_unix_nano: i64,
-    /// Values and expected omissions in configured order.
-    pub values: Vec<SampleValue>,
+    /// Exact and expanded points keyed by configured counter and concrete path.
+    pub points: Vec<SamplePoint>,
+    /// Counter-local failures that did not suppress healthy points.
+    pub failures: Vec<SampleFailure>,
+    /// Explicit per-template and receiver-wide expansion overflows.
+    pub overflows: Vec<ExpansionOverflow>,
+    /// Aggregate bounded diagnostics for this collection.
+    pub diagnostics: SampleDiagnostics,
 }
 
 pub(crate) fn scale_integer(value: i64, power10: i32) -> Result<Number, String> {

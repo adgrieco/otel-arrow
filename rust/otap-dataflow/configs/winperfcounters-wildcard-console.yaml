@@ -1,0 +1,44 @@
+# platform: windows-only
+# Wildcard discovery example using the built-in Process performance object.
+# The exact Memory counter continues emitting when individual process counters
+# appear, disappear, or temporarily fail.
+# From rust\otap-dataflow:
+# cargo run --features winperfcounters-receiver --bin df_engine -- -c configs\winperfcounters-wildcard-console.yaml
+
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation:
+      type: core_count
+      count: 1
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          wildcard:
+            type: receiver:winperfcounters
+            config:
+              counters:
+                - path: '\Memory\Available Bytes'
+                  name: windows.memory.available
+                  unit: By
+                  description: Physical memory immediately available for allocation.
+                - path: '\Process(*)\Private Bytes'
+                  name: windows.process.private
+                  unit: By
+                  description: Private memory allocated by each process instance.
+              collection_interval: 5s
+              wildcard_refresh_interval: 5s
+              max_instances_per_wildcard: 256
+              max_expanded_counters: 512
+          console:
+            type: exporter:console
+            config:
+              format: pretty
+              unicode: false
+              color: false
+        connections:
+          - from: wildcard
+            to: console

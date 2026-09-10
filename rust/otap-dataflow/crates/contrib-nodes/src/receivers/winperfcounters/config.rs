@@ -7,14 +7,34 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 const MAX_COUNTERS: usize = 256;
+const MAX_INSTANCE_LIMIT: usize = 16_384;
+const MAX_COUNTER_PATH_LEN: usize = 2_047;
+const DEFAULT_MAX_INSTANCES_PER_WILDCARD: usize = 256;
+const DEFAULT_MAX_EXPANDED_COUNTERS: usize = 4_096;
 const MIN_SCALE_POWER10: i32 = -18;
 const MAX_SCALE_POWER10: i32 = 18;
 
-/// One exact Windows performance counter and its OTel metric identity.
+fn has_only_instance_wildcards(path: &str) -> bool {
+    let Some(counter_separator) = path.rfind('\\') else {
+        return false;
+    };
+    let object_and_instance = &path[..counter_separator];
+    let Some(instance_start) = object_and_instance.rfind('(') else {
+        return false;
+    };
+    let Some(instance_end) = object_and_instance.rfind(')') else {
+        return false;
+    };
+    instance_start < instance_end
+        && !path[..instance_start].contains('*')
+        && !path[instance_end + 1..].contains('*')
+}
+
+/// One Windows performance counter and its OTel metric identity.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CounterConfig {
-    /// Exact English PDH path. Wildcards are not supported.
+    /// English PDH path, optionally wildcarding only the instance segment.
     pub path: String,
     /// OTel metric name.
     pub name: String,
@@ -31,18 +51,42 @@ pub struct CounterConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Exact counters to collect.
+    /// Exact or instance-wildcard counters to collect.
     pub counters: Vec<CounterConfig>,
     /// Time between collections; defaults to 30 seconds.
     #[serde(default = "default_interval", with = "humantime_serde")]
     pub collection_interval: Duration,
+    /// Time between wildcard discovery refreshes; defaults to the collection interval.
+    #[serde(default, with = "humantime_serde")]
+    pub wildcard_refresh_interval: Option<Duration>,
+    /// Maximum expanded instances retained for one wildcard path.
+    #[serde(default = "default_max_instances_per_wildcard")]
+    pub max_instances_per_wildcard: usize,
+    /// Maximum expanded wildcard counters retained by this receiver.
+    #[serde(default = "default_max_expanded_counters")]
+    pub max_expanded_counters: usize,
 }
 
 fn default_interval() -> Duration {
     Duration::from_secs(30)
 }
 
+fn default_max_instances_per_wildcard() -> usize {
+    DEFAULT_MAX_INSTANCES_PER_WILDCARD
+}
+
+fn default_max_expanded_counters() -> usize {
+    DEFAULT_MAX_EXPANDED_COUNTERS
+}
+
 impl Config {
+    /// Effective wildcard refresh interval.
+    #[must_use]
+    pub fn wildcard_refresh_interval(&self) -> Duration {
+        self.wildcard_refresh_interval
+            .unwrap_or(self.collection_interval)
+    }
+
     /// Parse and validate the portable configuration contract.
     pub fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
         let config: Self =
@@ -56,9 +100,36 @@ impl Config {
                 error: "collection_interval must be between 1s and 24h".to_owned(),
             });
         }
+        if let Some(refresh_interval) = config.wildcard_refresh_interval
+            && (!(Duration::from_secs(1)..=Duration::from_secs(86400)).contains(&refresh_interval)
+                || refresh_interval < config.collection_interval)
+        {
+            return Err(Error::InvalidUserConfig {
+                error: "wildcard_refresh_interval must be between collection_interval and 24h"
+                    .to_owned(),
+            });
+        }
         if !(1..=MAX_COUNTERS).contains(&config.counters.len()) {
             return Err(Error::InvalidUserConfig {
                 error: format!("counters must contain between 1 and {MAX_COUNTERS} entries"),
+            });
+        }
+        if !(1..=MAX_INSTANCE_LIMIT).contains(&config.max_instances_per_wildcard) {
+            return Err(Error::InvalidUserConfig {
+                error: format!(
+                    "max_instances_per_wildcard must be between 1 and {MAX_INSTANCE_LIMIT}"
+                ),
+            });
+        }
+        if !(1..=MAX_INSTANCE_LIMIT).contains(&config.max_expanded_counters) {
+            return Err(Error::InvalidUserConfig {
+                error: format!("max_expanded_counters must be between 1 and {MAX_INSTANCE_LIMIT}"),
+            });
+        }
+        if config.max_instances_per_wildcard > config.max_expanded_counters {
+            return Err(Error::InvalidUserConfig {
+                error: "max_instances_per_wildcard must not exceed max_expanded_counters"
+                    .to_owned(),
             });
         }
 
@@ -78,9 +149,25 @@ impl Config {
                     });
                 }
             }
-            if counter.path.contains(['*', '?']) {
+            if counter.path.contains('?') {
                 return Err(Error::InvalidUserConfig {
-                    error: format!("{} must be an exact path without wildcards", field("path")),
+                    error: format!("{} does not support the '?' wildcard", field("path")),
+                });
+            }
+            if counter.path.encode_utf16().count() > MAX_COUNTER_PATH_LEN {
+                return Err(Error::InvalidUserConfig {
+                    error: format!(
+                        "{} must contain at most {MAX_COUNTER_PATH_LEN} UTF-16 code units",
+                        field("path")
+                    ),
+                });
+            }
+            if counter.path.contains('*') && !has_only_instance_wildcards(&counter.path) {
+                return Err(Error::InvalidUserConfig {
+                    error: format!(
+                        "{} may contain '*' only in the instance segment",
+                        field("path")
+                    ),
                 });
             }
             if !(MIN_SCALE_POWER10..=MAX_SCALE_POWER10).contains(&counter.scale_power10) {
@@ -91,7 +178,7 @@ impl Config {
                     ),
                 });
             }
-            if !paths.insert(counter.path.to_ascii_lowercase()) {
+            if !paths.insert(counter.path.to_lowercase()) {
                 return Err(Error::InvalidUserConfig {
                     error: format!("duplicate counter path: {}", counter.path),
                 });
@@ -135,23 +222,34 @@ mod tests {
         assert_eq!(config.counters[0].path, r"\Memory\Available Bytes");
         assert_eq!(config.counters[0].scale_power10, 0);
         assert_eq!(config.collection_interval, Duration::from_secs(30));
+        assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(30));
+        assert_eq!(config.max_instances_per_wildcard, 256);
+        assert_eq!(config.max_expanded_counters, 4_096);
         let config = Config::from_json(&json!({
             "counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
-            "collection_interval": "2s"
+            "collection_interval": "2s",
+            "wildcard_refresh_interval": "10s",
+            "max_instances_per_wildcard": 10,
+            "max_expanded_counters": 20
         }))
         .unwrap();
         assert_eq!(config.collection_interval, Duration::from_secs(2));
+        assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(10));
+        assert_eq!(config.max_instances_per_wildcard, 10);
+        assert_eq!(config.max_expanded_counters, 20);
     }
 
-    /// Scenario: Empty fields, wildcards, duplicates, unknown options, or invalid limits are used.
+    /// Scenario: Empty fields, invalid wildcards, duplicates, unknown options, or invalid limits are used.
     /// Guarantees: Invalid configuration fails explicitly before any PDH handles are opened.
     #[test]
     fn rejects_invalid_config() {
         for value in [
             json!({}),
             json!({"counters": []}),
-            json!({"counters": [counter(r"\Process(*)\Private Bytes", "process.private")]}),
             json!({"counters": [counter(r"\Process(?)\Private Bytes", "process.private")]}),
+            json!({"counters": [counter(r"\Proc*ess(foo)\Private Bytes", "process.private")]}),
+            json!({"counters": [counter(r"\Process(foo)\Private *", "process.private")]}),
+            json!({"counters": [counter(r"\Memory\Available *", "windows.memory.available")]}),
             json!({"counters": [counter("", "windows.memory.available")]}),
             json!({"counters": [counter(r"\Memory\Available Bytes", "")]}),
             json!({"counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
@@ -160,8 +258,24 @@ mod tests {
                    "collection_interval": "1ms"}),
             json!({"counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
                    "collection_interval": "25h"}),
+            json!({"counters": [counter(r"\Process(*)\Private Bytes", "process.private")],
+                   "collection_interval": "10s",
+                   "wildcard_refresh_interval": "5s"}),
+            json!({"counters": [counter(r"\Process(*)\Private Bytes", "process.private")],
+                   "wildcard_refresh_interval": "25h"}),
+            json!({"counters": [counter(r"\Process(*)\Private Bytes", "process.private")],
+                   "max_instances_per_wildcard": 0}),
+            json!({"counters": [counter(r"\Process(*)\Private Bytes", "process.private")],
+                   "max_expanded_counters": 16385}),
+            json!({"counters": [counter(r"\Process(*)\Private Bytes", "process.private")],
+                   "max_instances_per_wildcard": 10,
+                   "max_expanded_counters": 5}),
             json!({"counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
                    "collection_interval": "bad"}),
+            json!({"counters": [counter(
+                    &format!(r"\Process({})\Private Bytes", "x".repeat(2048)),
+                    "process.private"
+            )]}),
             json!({"counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
                    "extra": true}),
             json!({"counters": [{
@@ -173,6 +287,24 @@ mod tests {
             }]}),
         ] {
             assert!(Config::from_json(&value).is_err(), "{value}");
+        }
+    }
+
+    /// Scenario: A counter uses a full or partial wildcard inside its instance segment.
+    /// Guarantees: Instance discovery patterns are accepted without allowing object or counter wildcards.
+    #[test]
+    fn accepts_instance_wildcards() {
+        for path in [
+            r"\Process(*)\Private Bytes",
+            r"\Process(dotnet*)\Private Bytes",
+            r"\Thread(*)\% Processor Time",
+            r"\\host\Process(parent/*#0)\Private Bytes",
+        ] {
+            let config = Config::from_json(&json!({
+                "counters": [counter(path, "process.private")]
+            }))
+            .unwrap();
+            assert_eq!(config.counters[0].path, path);
         }
     }
 

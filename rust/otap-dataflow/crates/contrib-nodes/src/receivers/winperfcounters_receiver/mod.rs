@@ -8,6 +8,7 @@ otel_arrow_dfe_telemetry::otel_component_scope!(
     target = "otel.receiver.winperfcounters",
 );
 
+mod metrics;
 mod pdh;
 
 use crate::receivers::winperfcounters::{Config, into_otap};
@@ -21,7 +22,9 @@ use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_engine::{MessageSourceLocalEffectHandlerExtension, ReceiverFactory};
 use otel_arrow_dfe_otap::OTAP_RECEIVER_FACTORIES;
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
-use otel_arrow_dfe_telemetry::metrics::MetricSetSnapshot;
+use otel_arrow_dfe_telemetry::metrics::MetricSet;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -61,6 +64,7 @@ impl Drop for Lease {
 struct WinPerfCountersReceiver {
     config: Config,
     worker: pdh::Worker,
+    metrics: Rc<RefCell<MetricSet<metrics::WinPerfCountersMetrics>>>,
 }
 
 #[allow(unsafe_code)]
@@ -77,13 +81,39 @@ pub static WINPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFactor
             });
         }
         let config = Config::from_json(&node_config.config)?;
+        let mut metrics = pipeline.register_metrics::<metrics::WinPerfCountersMetrics>();
+        metrics.configured_exact.set(
+            config
+                .counters
+                .iter()
+                .filter(|counter| !counter.path.contains('*'))
+                .count() as u64,
+        );
+        metrics.configured_wildcard.set(
+            config
+                .counters
+                .iter()
+                .filter(|counter| counter.path.contains('*'))
+                .count() as u64,
+        );
         let lease = Arc::new(Lease::acquire()?);
-        let worker = pdh::Worker::start(config.counters.clone(), lease).map_err(|err| {
-            otel_arrow_dfe_config::error::Error::InvalidUserConfig {
-                error: err.to_string(),
-            }
-        })?;
-        let receiver = WinPerfCountersReceiver { config, worker };
+        let worker = pdh::Worker::start(
+            config.counters.clone(),
+            config.wildcard_refresh_interval(),
+            config.max_instances_per_wildcard,
+            config.max_expanded_counters,
+            lease,
+        )
+        .map_err(
+            |err| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
+                error: format!("PDH runtime initialization failed: {err}"),
+            },
+        )?;
+        let receiver = WinPerfCountersReceiver {
+            config,
+            worker,
+            metrics: Rc::new(RefCell::new(metrics)),
+        };
         Ok(ReceiverWrapper::local(
             receiver,
             node,
@@ -110,9 +140,57 @@ impl WinPerfCountersReceiver {
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             let _ = interval.tick().await;
+            let scrape_start = Instant::now();
             let sample = match self.worker.collect().await {
-                Ok(sample) => sample,
+                Ok(sample) => {
+                    let mut metrics = self.metrics.borrow_mut();
+                    metrics.scrapes.add(1);
+                    metrics
+                        .scrape_duration
+                        .record(scrape_start.elapsed().as_secs_f64());
+                    metrics.apply(&sample.diagnostics);
+                    drop(metrics);
+                    for overflow in &sample.overflows {
+                        let path_template = &self.config.counters[overflow.counter_index].path;
+                        otel_arrow_dfe_telemetry::otel_warn!(
+                            "winperfcounters.instance_limit_exceeded",
+                            path_template = path_template,
+                            reason = overflow.reason,
+                            discovered = overflow.discovered as u64,
+                            retained = overflow.retained as u64,
+                            omitted = overflow.omitted as u64
+                        );
+                    }
+                    if sample.diagnostics.instances_added > 0
+                        || sample.diagnostics.instances_removed > 0
+                    {
+                        otel_arrow_dfe_telemetry::otel_info!(
+                            "winperfcounters.instances_changed",
+                            added = sample.diagnostics.instances_added,
+                            removed = sample.diagnostics.instances_removed,
+                            active = sample.diagnostics.active_expanded_counters as u64
+                        );
+                    }
+                    if sample.diagnostics.retry_attempts > 0
+                        || sample.diagnostics.retry_recoveries > 0
+                        || sample.diagnostics.query_rebuild_attempts > 0
+                    {
+                        otel_arrow_dfe_telemetry::otel_info!(
+                            "winperfcounters.recovery",
+                            retry_attempts = sample.diagnostics.retry_attempts,
+                            retry_recoveries = sample.diagnostics.retry_recoveries,
+                            query_rebuild_attempts = sample.diagnostics.query_rebuild_attempts,
+                            query_rebuild_recoveries = sample.diagnostics.query_rebuild_recoveries
+                        );
+                    }
+                    sample
+                }
                 Err(err) if err.is_collection_failure() => {
+                    let mut metrics = self.metrics.borrow_mut();
+                    metrics.scrape_failures.add(1);
+                    metrics
+                        .scrape_duration
+                        .record(scrape_start.elapsed().as_secs_f64());
                     otel_arrow_dfe_telemetry::otel_warn!(
                         "winperfcounters.scrape_failed",
                         error = %err
@@ -121,6 +199,15 @@ impl WinPerfCountersReceiver {
                 }
                 Err(err) => return Err(failure(err.to_string())),
             };
+            for counter_failure in &sample.failures {
+                let path_template = &self.config.counters[counter_failure.counter_index].path;
+                otel_arrow_dfe_telemetry::otel_warn!(
+                    "winperfcounters.counter_failed",
+                    path_template = path_template,
+                    reason = counter_failure.reason,
+                    error = counter_failure.error
+                );
+            }
             let Some(records) =
                 into_otap(&self.config.counters, sample).map_err(|err| failure(err.to_string()))?
             else {
@@ -159,6 +246,10 @@ impl local::Receiver<OtapPdata> for WinPerfCountersReceiver {
                         }
                         Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
                             break Exit::Control { deadline, drained: false };
+                        }
+                        Ok(NodeControlMsg::CollectTelemetry { mut metrics_reporter }) => {
+                            let mut metrics = self.metrics.borrow_mut();
+                            let _ = metrics_reporter.report(&mut metrics);
                         }
                         Err(err) => {
                             break Exit::Collection(Err(Error::ChannelRecvError(err)));
@@ -199,7 +290,8 @@ impl local::Receiver<OtapPdata> for WinPerfCountersReceiver {
         if drained {
             effect_handler.notify_receiver_drained().await?;
         }
-        Ok(TerminalState::new::<[MetricSetSnapshot; 0]>(deadline, []))
+        let snapshot = self.metrics.borrow().snapshot();
+        Ok(TerminalState::new(deadline, [snapshot]))
     }
 }
 
