@@ -14,7 +14,10 @@ const DEFAULT_MAX_EXPANDED_COUNTERS: usize = 4_096;
 const MIN_SCALE_POWER10: i32 = -18;
 const MAX_SCALE_POWER10: i32 = 18;
 
-fn has_only_instance_wildcards(path: &str) -> bool {
+fn has_valid_wildcard_placement(path: &str) -> bool {
+    if !path.contains('*') {
+        return true;
+    }
     let Some(counter_separator) = path.rfind('\\') else {
         return false;
     };
@@ -162,7 +165,7 @@ impl Config {
                     ),
                 });
             }
-            if counter.path.contains('*') && !has_only_instance_wildcards(&counter.path) {
+            if !has_valid_wildcard_placement(&counter.path) {
                 return Err(Error::InvalidUserConfig {
                     error: format!(
                         "{} may contain '*' only in the instance segment",

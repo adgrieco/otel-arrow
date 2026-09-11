@@ -1,5 +1,5 @@
 # platform: windows-only
-# Development sample only, not a finalized host counter profile.
+# Basic exact-counter example using built-in Windows performance objects.
 # From rust\otap-dataflow:
 # cargo run --features winperfcounters-receiver --bin df_engine -- -c configs\winperfcounters-console.yaml
 

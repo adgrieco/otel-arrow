@@ -1698,6 +1698,7 @@ mod tests {
     /// Scenario: A persistent worker collects two supported counters repeatedly and shuts down.
     /// Guarantees: One query serves every scrape and normal shutdown closes it exactly once.
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
     async fn persistent_worker_reuses_and_closes_query() {
         let _serial = super::super::TEST_LEASE_LOCK.lock().await;
         let before = query_counts();
@@ -1733,6 +1734,7 @@ mod tests {
     /// Scenario: The first post-prime scrape has direct, raw-fraction, and two-sample values.
     /// Guarantees: One-sample values emit immediately while only the two-sample timer is omitted.
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
     async fn first_scrape_emits_one_sample_values_and_warms_two_sample() {
         let _serial = super::super::TEST_LEASE_LOCK.lock().await;
         let counters = vec![
@@ -1769,6 +1771,7 @@ mod tests {
     /// Scenario: The local host exposes one exact gauge and dynamically enumerated process gauges.
     /// Guarantees: Native wildcard expansion returns concrete identity-keyed points without changing the exact point.
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
     async fn collects_exact_and_wildcard_counters() {
         let _serial = super::super::TEST_LEASE_LOCK.lock().await;
         let counters = vec![
@@ -1821,6 +1824,7 @@ mod tests {
     /// Scenario: Initialization adds a valid path followed by an invalid exact path.
     /// Guarantees: Startup reports the failing path and closes the partially built query.
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
     async fn initialization_error_closes_query() {
         let _serial = super::super::TEST_LEASE_LOCK.lock().await;
         let before = query_counts();

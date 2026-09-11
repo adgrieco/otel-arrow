@@ -264,6 +264,38 @@ jobs:
         run: cargo test --locked -p otel-arrow-dfe-contrib-nodes etw_receiver_decodes_tracelogging_events_end_to_end --features etw-receiver -- --ignored
         working-directory: ./rust/otap-dataflow
 
+  winperfcounters_windows_smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - name: Install OpenSSL (Windows)
+        run: |
+          vcpkg install openssl:x64-windows-static-md
+          echo "OPENSSL_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md" >> $env:GITHUB_ENV
+        shell: pwsh
+      - name: Install SymCrypt
+        uses: ./.github/actions/install-symcrypt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ./rust/otap-dataflow
+          cache-bin: false
+          save-if: false
+      - name: Run contrib-node tests with all features
+        run: cargo test --locked -p otel-arrow-dfe-contrib-nodes --all-features
+        working-directory: ./rust/otap-dataflow
+      - name: Run live Windows performance-counter smoke tests
+        run: >
+          cargo test --locked -p otel-arrow-dfe-contrib-nodes
+          winperfcounters_receiver::pdh::tests::
+          --features winperfcounters-receiver
+          -- --ignored --test-threads=1
+        working-directory: ./rust/otap-dataflow
+
   fmt:
     if: github.event_name == 'pull_request'
     strategy:
@@ -1254,6 +1286,7 @@ jobs:
       - host-metrics-semconv
       - user_events_linux_smoke
       - etw_windows_smoke
+      - winperfcounters_windows_smoke
       - license-header-check
     steps:
       - name: Summarize required-build caches
@@ -1331,6 +1364,10 @@ jobs:
           fi
           if [[ "${{ needs.etw_windows_smoke.result }}" != "success" ]]; then
             echo "etw_windows_smoke failed or was cancelled"
+            exit 1
+          fi
+          if [[ "${{ needs.winperfcounters_windows_smoke.result }}" != "success" ]]; then
+            echo "winperfcounters_windows_smoke failed or was cancelled"
             exit 1
           fi
           if [[ "${{ needs.license-header-check.result }}" != "success" ]]; then

@@ -208,7 +208,7 @@ To check the configuration structure without starting collection:
 Provider availability and native types are checked when the receiver starts,
 not by `--validate-and-exit`.
 
-## Operational requirements and limitations
+## Limits
 
 - The source pipeline must allocate one core.
 - Only one receiver instance can collect in an engine process.
@@ -239,7 +239,7 @@ counters, scrape success/failure and duration, discovery refreshes, instance
 adds/removals/overflow, counter failures, retries/recoveries, query rebuilds,
 and warm-up omissions.
 
-## References
+## Related documentation
 
 - [Using the PDH Functions to Consume Counter Data][using-pdh]
 - [`PdhAddEnglishCounterW`][add-counter]

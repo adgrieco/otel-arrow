@@ -63,7 +63,7 @@ pub(super) struct WinPerfCountersMetrics {
     #[metric(unit = "{recovery}")]
     pub query_rebuild_recoveries: Counter<u64>,
     /// Points omitted while independently warming.
-    #[metric(unit = "{point}")]
+    #[metric(unit = "{metric}")]
     pub warmup_omissions: Counter<u64>,
 }
 
