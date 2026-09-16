@@ -202,15 +202,15 @@ not by `--validate-and-exit`.
 ## Limits
 
 - The source pipeline must allocate one core.
-- Only one receiver instance can collect in an engine process.
-- Separate engine processes are not coordinated; avoid duplicate host
-  collection.
+- Multiple receiver nodes may use independent intervals. Each node owns one
+  worker and PDH query; avoid unintentionally configuring duplicate collection.
 - Use narrow wildcard patterns where possible. The configured per-path and
   receiver-wide limits bound active handles and emitted cardinality.
 - One scrape can be in flight. Missed ticks are skipped rather than queued.
 - Downstream backpressure delays later scrapes instead of creating an
   unbounded buffer.
-- Synchronous PDH calls cannot be cancelled. Shutdown remains bounded, but a
+- Synchronous PDH calls cannot be cancelled. The receiver waits at most one
+  second for worker cleanup while preserving time for pipeline completion. A
   blocked provider call may retain its query resources until it returns.
 
 ## Telemetry

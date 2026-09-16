@@ -25,46 +25,30 @@ use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
 use otel_arrow_dfe_telemetry::metrics::MetricSet;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
 
 /// Factory identity for the Windows performance-counter receiver.
 pub const WINDOWSPERFCOUNTERS_RECEIVER_URN: &str = "urn:otel:receiver:windowsperfcounters";
 
-// Host-wide input must not be duplicated by separate nodes/pipelines. This
-// process-wide atomic is only used at construction/drop, never in the hot path.
-static COLLECTING: AtomicBool = AtomicBool::new(false);
-
-pub(super) struct Lease;
+const WORKER_SHUTDOWN_MAX_WAIT: Duration = Duration::from_secs(1);
+const PIPELINE_COMPLETION_RESERVE: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
-static TEST_LEASE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-impl Lease {
-    fn acquire() -> Result<Self, otel_arrow_dfe_config::error::Error> {
-        let _ = COLLECTING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
-                error:
-                    "another windowsperfcounters receiver already collects this host in this process"
-                        .to_owned(),
-            })?;
-        Ok(Self)
-    }
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        COLLECTING.store(false, Ordering::Release);
-    }
-}
+static TEST_PDH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct WindowsPerfCountersReceiver {
     config: Config,
     worker: pdh::Worker,
     metrics: Rc<RefCell<MetricSet<metrics::WindowsPerfCountersMetrics>>>,
+}
+
+fn worker_shutdown_deadline(now: Instant, pipeline_deadline: Instant) -> Instant {
+    let available = pipeline_deadline.saturating_duration_since(now);
+    let worker_budget = available
+        .saturating_sub(PIPELINE_COMPLETION_RESERVE)
+        .min(WORKER_SHUTDOWN_MAX_WAIT);
+    now + worker_budget
 }
 
 #[allow(unsafe_code)]
@@ -97,13 +81,11 @@ pub static WINDOWSPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFa
                 .filter(|counter| counter.path.contains('*'))
                 .count() as u64,
         );
-        let lease = Arc::new(Lease::acquire()?);
         let worker = pdh::Worker::start(
             config.counters.clone(),
             config.wildcard_refresh_interval(),
             config.max_instances_per_wildcard,
             config.max_expanded_counters,
-            lease,
         )
         .map_err(
             |err| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
@@ -268,12 +250,14 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
                 (Instant::now() + Duration::from_secs(5), false, Some(result))
             }
         };
-        match self.worker.shutdown(deadline).await {
+        let worker_deadline = worker_shutdown_deadline(Instant::now(), deadline);
+        match self.worker.shutdown(worker_deadline).await {
             Ok(true) => {}
             Ok(false) => {
                 otel_arrow_dfe_telemetry::otel_warn!(
                     "windowsperfcounters.shutdown_timeout",
-                    "PDH worker still owns its query and will close it when the active call returns"
+                    "PDH worker exceeded the receiver-local shutdown wait and still owns its query; \
+                     it will close the query when the active call returns"
                 );
             }
             Err(err) => {
@@ -295,23 +279,27 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
         Ok(TerminalState::new(deadline, [snapshot]))
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Scenario: A receiver stops while its blocking worker still holds the collection lease.
-    /// Guarantees: Duplicate collection stays rejected until the final owner releases the lease.
-    #[tokio::test(flavor = "current_thread")]
-    async fn lease_covers_outstanding_worker() {
-        let _serial = TEST_LEASE_LOCK.lock().await;
-        let receiver = Arc::new(Lease::acquire().unwrap());
-        let worker = Arc::clone(&receiver);
-        assert!(Lease::acquire().is_err());
-        drop(receiver);
-        assert!(Lease::acquire().is_err());
-        drop(worker);
-        let next_receiver = Lease::acquire().unwrap();
-        drop(next_receiver);
+    /// Scenario: Native worker cleanup competes with receiver and pipeline teardown for one deadline.
+    /// Guarantees: Worker waiting is capped and preserves time for pipeline completion.
+    #[test]
+    fn worker_shutdown_preserves_pipeline_completion_budget() {
+        let now = Instant::now();
+
+        assert_eq!(
+            worker_shutdown_deadline(now, now + Duration::from_secs(15)),
+            now + WORKER_SHUTDOWN_MAX_WAIT
+        );
+        assert_eq!(
+            worker_shutdown_deadline(now, now + Duration::from_millis(750)),
+            now + Duration::from_millis(250)
+        );
+        assert_eq!(
+            worker_shutdown_deadline(now, now + Duration::from_millis(250)),
+            now
+        );
     }
 }

@@ -4,7 +4,6 @@
 //! Persistent synchronous PDH worker. Windows handles never leave its thread.
 #![allow(unsafe_code)]
 
-use super::Lease;
 use crate::receivers::windowsperfcounters::{
     CounterConfig, ExpansionOverflow, InstanceIdentity, Sample, SampleDiagnostics, SampleFailure,
     SamplePoint, SampleValue, scale_double, scale_integer,
@@ -1506,7 +1505,6 @@ impl Worker {
         wildcard_refresh_interval: Duration,
         max_instances_per_wildcard: usize,
         max_expanded_counters: usize,
-        lease: Arc<Lease>,
     ) -> Result<Self, Error> {
         let (tx, rx) = mpsc::sync_channel(1);
         let (init_tx, init_rx) = mpsc::sync_channel(1);
@@ -1657,7 +1655,6 @@ impl Worker {
                         }
                     }
                 }
-                drop(lease);
                 let _ = completion_tx.send(());
             })
             .map_err(|err| Error::WorkerStart(err.to_string()))?;
@@ -1822,10 +1819,7 @@ mod tests {
         }
     }
 
-    fn simulated_blocked_worker(
-        lease: Arc<Lease>,
-        cleanup_complete: Arc<AtomicBool>,
-    ) -> (Worker, mpsc::Sender<()>) {
+    fn simulated_blocked_worker(cleanup_complete: Arc<AtomicBool>) -> (Worker, mpsc::Sender<()>) {
         let (tx, rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -1834,7 +1828,6 @@ mod tests {
             let _commands = rx;
             let _ = release_rx.recv();
             cleanup_complete.store(true, Ordering::Release);
-            drop(lease);
             let _ = completion_tx.send(());
         });
         (
@@ -1853,15 +1846,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
     async fn persistent_worker_reuses_and_closes_query() {
-        let _serial = super::super::TEST_LEASE_LOCK.lock().await;
+        let _serial = super::super::TEST_PDH_LOCK.lock().await;
         let before = query_counts();
         let counters = vec![
             counter(r"\Memory\Available Bytes", "windows.memory.available"),
             counter(r"\Memory\Committed Bytes", "windows.memory.committed"),
         ];
-        let lease = Arc::new(Lease::acquire().unwrap());
-        let mut worker =
-            Worker::start(counters, Duration::from_secs(30), 256, 4_096, lease).unwrap();
+        let mut worker = Worker::start(counters, Duration::from_secs(30), 256, 4_096).unwrap();
         for _ in 0..3 {
             let sample = worker.collect().await.unwrap();
             assert_eq!(sample.points.len(), 2);
@@ -1884,12 +1875,45 @@ mod tests {
         assert_eq!(after.1 - before.1, 1);
     }
 
+    /// Scenario: Two independently configured receiver workers collect in one process.
+    /// Guarantees: Each receiver owns a distinct query and both can collect and shut down cleanly.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+    async fn independent_workers_can_collect_concurrently() {
+        let _serial = super::super::TEST_PDH_LOCK.lock().await;
+        let before = query_counts();
+        let counters = vec![counter(
+            r"\Memory\Available Bytes",
+            "windows.memory.available",
+        )];
+        let mut first =
+            Worker::start(counters.clone(), Duration::from_secs(30), 256, 4_096).unwrap();
+        let mut second = Worker::start(counters, Duration::from_secs(30), 256, 4_096).unwrap();
+        assert!(!first.collect().await.unwrap().points.is_empty());
+        assert!(!second.collect().await.unwrap().points.is_empty());
+        assert!(
+            first
+                .shutdown(Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
+        assert!(
+            second
+                .shutdown(Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
+        let after = query_counts();
+        assert_eq!(after.0 - before.0, 2);
+        assert_eq!(after.1 - before.1, 2);
+    }
+
     /// Scenario: The first post-prime scrape has direct, raw-fraction, and two-sample values.
     /// Guarantees: One-sample values emit immediately while only the two-sample timer is omitted.
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
     async fn first_scrape_emits_one_sample_values_and_warms_two_sample() {
-        let _serial = super::super::TEST_LEASE_LOCK.lock().await;
+        let _serial = super::super::TEST_PDH_LOCK.lock().await;
         let counters = vec![
             counter(r"\Memory\Available Bytes", "windows.memory.available"),
             counter(
@@ -1901,9 +1925,7 @@ mod tests {
                 "windows.processor.time",
             ),
         ];
-        let lease = Arc::new(Lease::acquire().unwrap());
-        let mut worker =
-            Worker::start(counters, Duration::from_secs(30), 256, 4_096, lease).unwrap();
+        let mut worker = Worker::start(counters, Duration::from_secs(30), 256, 4_096).unwrap();
         let sample = worker.collect().await.unwrap();
         assert!(matches!(
             sample.points[0].value,
@@ -1926,14 +1948,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
     async fn collects_exact_and_wildcard_counters() {
-        let _serial = super::super::TEST_LEASE_LOCK.lock().await;
+        let _serial = super::super::TEST_PDH_LOCK.lock().await;
         let counters = vec![
             counter(r"\Memory\Available Bytes", "windows.memory.available"),
             counter(r"\Process(*)\Private Bytes", "windows.process.private"),
         ];
-        let lease = Arc::new(Lease::acquire().unwrap());
-        let mut worker =
-            Worker::start(counters, Duration::from_secs(1), 256, 4_096, lease).unwrap();
+        let mut worker = Worker::start(counters, Duration::from_secs(1), 256, 4_096).unwrap();
         let sample = worker.collect().await.unwrap();
         let exact = sample
             .points
@@ -1979,7 +1999,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
     async fn unavailable_exact_counter_retries_after_startup() {
-        let _serial = super::super::TEST_LEASE_LOCK.lock().await;
+        let _serial = super::super::TEST_PDH_LOCK.lock().await;
         let before = query_counts();
         let counters = vec![
             counter(r"\Memory\Available Bytes", "windows.memory.available"),
@@ -1988,9 +2008,7 @@ mod tests {
                 "windows.missing.counter",
             ),
         ];
-        let lease = Arc::new(Lease::acquire().unwrap());
-        let mut worker =
-            Worker::start(counters, Duration::from_secs(30), 256, 4_096, lease).unwrap();
+        let mut worker = Worker::start(counters, Duration::from_secs(30), 256, 4_096).unwrap();
         let sample = worker.collect().await.unwrap();
         assert!(
             sample
@@ -2018,8 +2036,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
     async fn entirely_unavailable_counter_set_starts_empty() {
-        let _serial = super::super::TEST_LEASE_LOCK.lock().await;
-        let lease = Arc::new(Lease::acquire().unwrap());
+        let _serial = super::super::TEST_PDH_LOCK.lock().await;
         let mut worker = Worker::start(
             vec![counter(
                 r"\Missing Object\Missing Counter",
@@ -2028,7 +2045,6 @@ mod tests {
             Duration::from_secs(30),
             256,
             4_096,
-            lease,
         )
         .unwrap();
         let sample = worker.collect().await.unwrap();
@@ -2668,10 +2684,9 @@ mod tests {
     /// and the singleton lease remains held until that cleanup completes.
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_worker_releases_resources_after_timeout() {
-        let _serial = super::super::TEST_LEASE_LOCK.lock().await;
+        let _serial = super::super::TEST_PDH_LOCK.lock().await;
         let cleanup_complete = Arc::new(AtomicBool::new(false));
-        let lease = Arc::new(Lease::acquire().unwrap());
-        let (mut worker, release) = simulated_blocked_worker(lease, Arc::clone(&cleanup_complete));
+        let (mut worker, release) = simulated_blocked_worker(Arc::clone(&cleanup_complete));
 
         let start = Instant::now();
         assert!(
@@ -2682,8 +2697,6 @@ mod tests {
         );
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(!cleanup_complete.load(Ordering::Acquire));
-        assert!(Lease::acquire().is_err());
-
         release.send(()).unwrap();
         assert!(
             worker
@@ -2692,7 +2705,5 @@ mod tests {
                 .unwrap()
         );
         assert!(cleanup_complete.load(Ordering::Acquire));
-        let next = Lease::acquire().unwrap();
-        drop(next);
     }
 }
