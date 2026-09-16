@@ -42,6 +42,8 @@ pub struct Config {
     pub counters: Vec<CounterConfig>,
     /// Time between collections; defaults to 30 seconds.
     pub collection_interval: Duration,
+    /// Delay before the first collection request; defaults to one second.
+    pub initial_delay: Duration,
     /// Time between wildcard discovery refreshes; defaults to the collection interval.
     pub wildcard_refresh_interval: Option<Duration>,
     /// Maximum expanded instances retained for one wildcard path.
@@ -57,6 +59,8 @@ struct UserConfig {
     perfcounters: Vec<ObjectConfig>,
     #[serde(default = "default_interval", with = "humantime_serde")]
     collection_interval: Duration,
+    #[serde(default = "default_initial_delay", with = "humantime_serde")]
+    initial_delay: Duration,
     #[serde(default, with = "humantime_serde")]
     wildcard_refresh_interval: Option<Duration>,
     #[serde(default = "default_max_instances_per_wildcard")]
@@ -117,6 +121,10 @@ struct CounterMapping {
 
 fn default_interval() -> Duration {
     Duration::from_secs(30)
+}
+
+fn default_initial_delay() -> Duration {
+    Duration::from_secs(1)
 }
 
 fn default_max_instances_per_wildcard() -> usize {
@@ -193,6 +201,9 @@ impl Config {
             .contains(&user.collection_interval)
         {
             return Err(invalid("collection_interval must be between 1s and 24h"));
+        }
+        if user.initial_delay > Duration::from_secs(86400) {
+            return Err(invalid("initial_delay must be between 0s and 24h"));
         }
         if let Some(refresh_interval) = user.wildcard_refresh_interval
             && (!(Duration::from_secs(1)..=Duration::from_secs(86400)).contains(&refresh_interval)
@@ -352,6 +363,7 @@ impl Config {
         Ok(Self {
             counters,
             collection_interval: user.collection_interval,
+            initial_delay: user.initial_delay,
             wildcard_refresh_interval: user.wildcard_refresh_interval,
             max_instances_per_wildcard: user.max_instances_per_wildcard,
             max_expanded_counters: user.max_expanded_counters,
@@ -420,6 +432,7 @@ mod tests {
         assert_eq!(config.counters[2].attributes["state"], "idle");
         assert_eq!(config.counters[1].excluded_aggregation_instance, None);
         assert_eq!(config.collection_interval, Duration::from_secs(30));
+        assert_eq!(config.initial_delay, Duration::from_secs(1));
         assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(30));
     }
 
@@ -560,6 +573,7 @@ mod tests {
         }
         for (key, value) in [
             ("collection_interval", json!("0s")),
+            ("initial_delay", json!("25h")),
             ("wildcard_refresh_interval", json!("25h")),
             ("max_instances_per_wildcard", json!(0)),
             ("max_expanded_counters", json!(16_385)),

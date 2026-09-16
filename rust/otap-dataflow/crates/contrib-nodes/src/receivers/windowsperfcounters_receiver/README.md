@@ -47,6 +47,7 @@ config:
       counters:
         - name: "% Processor Time"
           metric: windows.processor.time
+  initial_delay: 1s
   collection_interval: 30s
   wildcard_refresh_interval: 2m
 ```
@@ -57,6 +58,7 @@ config:
 | --- | --- | --- | --- |
 | `metrics` | Yes | None | Gauge metadata keyed by OTel metric name |
 | `perfcounters` | Yes | None | Performance objects and counter mappings |
+| `initial_delay` | No | `1s` | Delay before the first collection request |
 | `collection_interval` | No | `30s` | Interval from `1s` through `24h` |
 | `wildcard_refresh_interval` | No | See below | Wildcard discovery cadence |
 | `max_instances_per_wildcard` | No | `256` | Per-path expansion limit |
@@ -143,8 +145,9 @@ For example, `\Memory\Available Bytes` remains an exact byte count with unit
 
 ## Collection behavior
 
-The receiver primes the PDH query during startup, then performs its first
-scheduled scrape immediately.
+The receiver primes the PDH query during startup, waits `initial_delay`, then
+performs its first scheduled scrape. This delay does not replace two-sample
+counter warm-up or startup retries.
 
 - Wildcards are expanded at startup and then at
   `wildcard_refresh_interval`. Concrete paths are joined by configured counter

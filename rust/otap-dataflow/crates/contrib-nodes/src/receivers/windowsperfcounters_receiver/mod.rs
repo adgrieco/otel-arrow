@@ -43,6 +43,10 @@ struct WindowsPerfCountersReceiver {
     metrics: Rc<RefCell<MetricSet<metrics::WindowsPerfCountersMetrics>>>,
 }
 
+async fn wait_initial_delay(delay: Duration) {
+    tokio::time::sleep(delay).await;
+}
+
 fn worker_shutdown_deadline(now: Instant, pipeline_deadline: Instant) -> Instant {
     let available = pipeline_deadline.saturating_duration_since(now);
     let worker_budget = available
@@ -119,6 +123,7 @@ impl WindowsPerfCountersReceiver {
             error,
             source_detail: String::new(),
         };
+        wait_initial_delay(self.config.initial_delay).await;
         let mut interval = tokio::time::interval(self.config.collection_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
@@ -279,9 +284,33 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
         Ok(TerminalState::new(deadline, [snapshot]))
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: Collection has a nonzero initial delay before its first request.
+    /// Guarantees: The delay remains pending until the configured duration has fully elapsed.
+    #[tokio::test(start_paused = true)]
+    async fn initial_delay_gates_first_collection() {
+        let delay = Duration::from_secs(10);
+        let wait = wait_initial_delay(delay);
+        tokio::pin!(wait);
+        tokio::select! {
+            biased;
+            () = &mut wait => panic!("initial delay completed before time advanced"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        tokio::time::advance(delay - Duration::from_nanos(1)).await;
+        tokio::select! {
+            biased;
+            () = &mut wait => panic!("initial delay completed before the full duration"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        wait.await;
+    }
 
     /// Scenario: Native worker cleanup competes with receiver and pipeline teardown for one deadline.
     /// Guarantees: Worker waiting is capped and preserves time for pipeline completion.

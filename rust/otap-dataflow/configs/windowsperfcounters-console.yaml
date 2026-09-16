@@ -37,6 +37,7 @@ groups:
                   counters:
                     - name: "% Processor Time"
                       metric: windows.processor.time
+              initial_delay: 1s
               collection_interval: 30s
           console:
             type: exporter:console
