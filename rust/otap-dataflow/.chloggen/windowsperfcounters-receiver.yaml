@@ -18,4 +18,4 @@ issues: []
 # Use pipe (|) for multiline entries. Breaking entries must include a `Migration:`
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
-subtext: Supports exact and instance-wildcard paths, rates, percentages, fractions, averages, scaling, bounded dynamic expansion, isolated failures, recovery diagnostics, and no zero-fill during warm-up or idle intervals.
+subtext: Supports structured object and instance selection, shared metric metadata, custom point attributes, calculations, scaling, bounded dynamic expansion, isolated failures, and recovery diagnostics.

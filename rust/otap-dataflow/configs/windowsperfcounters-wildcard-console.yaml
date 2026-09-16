@@ -20,15 +20,25 @@ groups:
           wildcard:
             type: receiver:windowsperfcounters
             config:
-              counters:
-                - path: '\Memory\Available Bytes'
-                  name: windows.memory.available
+              metrics:
+                windows.memory.available:
                   unit: By
                   description: Physical memory immediately available for allocation.
-                - path: '\Process(*)\Private Bytes'
-                  name: windows.process.private
+                  gauge: {}
+                windows.process.private:
                   unit: By
                   description: Private memory allocated by each process instance.
+                  gauge: {}
+              perfcounters:
+                - object: Memory
+                  counters:
+                    - name: Available Bytes
+                      metric: windows.memory.available
+                - object: Process
+                  instances: ["*"]
+                  counters:
+                    - name: Private Bytes
+                      metric: windows.process.private
               collection_interval: 5s
               wildcard_refresh_interval: 5s
               max_instances_per_wildcard: 256

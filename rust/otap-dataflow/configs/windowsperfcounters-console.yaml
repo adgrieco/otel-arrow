@@ -18,15 +18,25 @@ groups:
           memory:
             type: receiver:windowsperfcounters
             config:
-              counters:
-                - path: '\Memory\Available Bytes'
-                  name: windows.memory.available
+              metrics:
+                windows.memory.available:
                   unit: By
                   description: Physical memory immediately available for allocation.
-                - path: '\Processor(_Total)\% Processor Time'
-                  name: windows.processor.time
+                  gauge: {}
+                windows.processor.time:
                   unit: "%"
                   description: Average processor utilization across all logical processors.
+                  gauge: {}
+              perfcounters:
+                - object: Memory
+                  counters:
+                    - name: Available Bytes
+                      metric: windows.memory.available
+                - object: Processor
+                  instances: ["_Total"]
+                  counters:
+                    - name: "% Processor Time"
+                      metric: windows.processor.time
               collection_interval: 30s
           console:
             type: exporter:console

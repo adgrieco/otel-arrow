@@ -1593,6 +1593,7 @@ mod tests {
             name: name.to_owned(),
             unit: "By".to_owned(),
             description: format!("Description for {name}."),
+            attributes: BTreeMap::new(),
             scale_power10: 0,
         }
     }

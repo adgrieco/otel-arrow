@@ -18,25 +18,35 @@ metric identity and concrete `windows.perf_counter.path` attribute. Wildcard
 points also include their configured path template and instance identity. The
 resource includes `os.type=windows`.
 
-The receiver accepts English paths. It periodically expands `*` in the
-instance segment and keeps exact paths on the existing direct collection path.
-Confirm that every configured object and counter is installed and enabled on
-the target host.
+The receiver constructs PDH paths from configured performance objects,
+instances, and counters, and periodically refreshes wildcard instances.
+Configured objects and counters must be installed and enabled on the target
+host.
 
 ## Configuration
 
 ```yaml
 type: receiver:windowsperfcounters
 config:
-  counters:
-    - path: '\Memory\Available Bytes'
-      name: windows.memory.available
+  metrics:
+    windows.memory.available:
       unit: By
       description: Physical memory immediately available for allocation.
-    - path: '\Processor(_Total)\% Processor Time'
-      name: windows.processor.time
+      gauge: {}
+    windows.processor.time:
       unit: "%"
       description: Average processor utilization across all logical processors.
+      gauge: {}
+  perfcounters:
+    - object: Memory
+      counters:
+        - name: Available Bytes
+          metric: windows.memory.available
+    - object: Processor
+      instances: ["_Total"]
+      counters:
+        - name: "% Processor Time"
+          metric: windows.processor.time
   collection_interval: 30s
   wildcard_refresh_interval: 2m
 ```
@@ -45,90 +55,86 @@ config:
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `counters` | Yes | None | Between 1 and 256 counter entries |
+| `metrics` | Yes | None | Gauge metadata keyed by OTel metric name |
+| `perfcounters` | Yes | None | Performance objects and counter mappings |
 | `collection_interval` | No | `30s` | Interval from `1s` through `24h` |
 | `wildcard_refresh_interval` | No | See below | Wildcard discovery cadence |
 | `max_instances_per_wildcard` | No | `256` | Per-path expansion limit |
 | `max_expanded_counters` | No | `4096` | Receiver-wide expansion limit |
 
 `wildcard_refresh_interval` defaults to `collection_interval` and must be
-between `collection_interval` and `24h`.
-Both expansion limits must be between `1` and `16384`, and the per-wildcard
-limit cannot exceed the receiver-wide limit.
+between `collection_interval` and `24h`. Both expansion limits must be between
+`1` and `16384`, and the per-wildcard limit cannot exceed the receiver-wide
+limit. Normalization produces between 1 and 256 exact or wildcard paths, and
+`initial_delay` accepts `0s` through `24h`.
 
-### Counter options
+### Metric options
+
+Each `metrics` key is an OTel metric name. Its value requires `description`,
+`unit`, and an empty `gauge: {}` object. Multiple counter mappings may
+reference one metric and contribute points distinguished by their configured
+attributes. Only Gauge output is supported.
+
+### Performance object and counter options
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `path` | Yes | None | English PDH path |
-| `name` | Yes | None | OTel metric name |
-| `unit` | Yes | None | Unit of the emitted value after configured scaling |
-| `description` | Yes | None | OTel metric description |
-| `scale_power10` | No | `0` | Base-10 scale from `-18` through `18` |
+| `object` | Yes | None | Windows performance object |
+| `instances` | No | None | One instance, a list, or `"*"` |
+| `counters` | Yes | None | Counter mappings for the object |
 
-Paths are case-insensitively unique, and metric names are exactly unique.
-Unknown fields, empty metadata, duplicate entries, invalid intervals, and
-unsupported scales are configuration errors.
-Configured paths are limited to 2047 UTF-16 code units. Expanded paths that
-reach PDH's 2048-unit native limit are omitted and diagnosed.
+Each counter mapping requires `name` and `metric`. Optional `attributes`
+contains static string key/value pairs added to each emitted point.
+`scale_power10` defaults to zero and accepts values from `-18` through `18`.
+Attribute keys beginning with `windows.perf_counter.` are reserved for
+receiver-generated counter identity.
 
-The `*` wildcard is allowed only in the instance segment. The `?` wildcard
-and wildcards in machine, object, or counter names are rejected. Full and
-partial instance patterns such as `\Process(*)\Private Bytes` and
-`\Process(dotnet*)\Private Bytes` are supported. PDH documents `*` as a
-wildcard but no literal escape contract, so literal `*` instance names cannot
-be configured.
+Omit `instances` for objects without instances. Specify one name or a list for
+exact instances, or specify `"*"` to discover all instances. A wildcard cannot
+be combined with named instances.
+
+Unknown fields, empty metadata, undefined or unused metrics, duplicate
+instances, duplicate normalized paths, invalid intervals, and unsupported
+scales are configuration errors. Object, instance, and counter names cannot
+contain path separators or wildcard path syntax. Configured paths are limited
+to 2047 UTF-16 code units. Expanded paths that reach PDH's 2048-unit native
+limit are omitted and diagnosed.
 
 ## Supported counter families
 
-- Direct values use one sample and emit integer gauges:
-  `PERF_COUNTER_RAWCOUNT`, `PERF_COUNTER_LARGE_RAWCOUNT`,
-  `PERF_COUNTER_RAWCOUNT_HEX`, and `PERF_COUNTER_LARGE_RAWCOUNT_HEX`.
-- Rates use two samples and emit double gauges:
-  `PERF_COUNTER_COUNTER` and `PERF_COUNTER_BULK_COUNT`.
-- Timer percentages use two samples and emit double gauges:
-  `PERF_COUNTER_TIMER`, `PERF_COUNTER_TIMER_INV`, `PERF_100NSEC_TIMER`, and
-  `PERF_100NSEC_TIMER_INV`.
-- Raw fractions use one sample and emit double gauges:
-  `PERF_RAW_FRACTION` and `PERF_LARGE_RAW_FRACTION`.
-- Sample fractions use two samples and emit double gauges:
-  `PERF_SAMPLE_FRACTION`.
-- Averages use two samples and emit double gauges:
-  `PERF_AVERAGE_TIMER` and `PERF_AVERAGE_BULK`.
+| Family | Native types | Samples | Output |
+| --- | --- | --- | --- |
+| Direct values | `PERF_COUNTER_RAWCOUNT`, `PERF_COUNTER_LARGE_RAWCOUNT`, and hexadecimal variants | One | Integer gauge |
+| Rates | `PERF_COUNTER_COUNTER`, `PERF_COUNTER_BULK_COUNT` | Two | Double gauge |
+| Timer percentages | `PERF_COUNTER_TIMER`, inverse variants, and 100-nanosecond variants | Two | Double gauge |
+| Raw fractions | `PERF_RAW_FRACTION`, `PERF_LARGE_RAW_FRACTION` | One | Double gauge |
+| Sample fractions | `PERF_SAMPLE_FRACTION` | Two | Double gauge |
+| Averages | `PERF_AVERAGE_TIMER`, `PERF_AVERAGE_BULK` | Two | Double gauge |
 
 PDH performs rate, timer, fraction, and average calculations and associates
 visible fraction/average numerators with their provider-defined base counters.
 Configure only the visible numerator path. Standalone base counters are not
 metrics and are rejected.
 
-All supported results are gauges. Formatted rates, interval percentages,
-fractions, and averages are not emitted as cumulative OTel sums.
-
-Unsupported exact counter types fail startup. Unsupported expanded instances
-are omitted and diagnosed without suppressing healthy counters. Diagnostics
-include the hexadecimal native type. See the [Windows Performance Counters
-documentation][performance-counters] and the Windows SDK `winperf.h` header
-for native type definitions.
+Unsupported exact counter types fail startup. A missing or inaccessible exact
+counter is omitted and retried, including when no configured counter is
+initially available. Unsupported expanded instances are omitted and diagnosed
+without suppressing healthy counters. Diagnostics include the native type.
 
 ## Scaling
 
-The receiver requests unscaled native values and applies only
-`scale_power10`. It never applies the provider's default display scale. The
-configured unit must describe the value after this explicit scaling.
+The receiver requests unscaled values and applies only `scale_power10`; the
+configured unit must describe the scaled result.
 
 - Zero scale preserves direct values as exact integers.
-- Positive integer scaling remains an integer when multiplication does not
-  overflow.
-- Negative integer scaling always emits a double. Exact decimal division is
-  performed before conversion when possible; otherwise the source integer
-  must be exactly representable as `f64`.
-- Calculated values and scaled doubles must remain finite. Overflow,
-  precision-unsafe integer conversion, and nonzero values underflowing to zero
-  omit that point and report `windowsperfcounters.counter_failed`; other healthy
-  points in the scrape still emit.
+- Positive integer scaling remains integer unless it overflows.
+- Negative integer scaling emits a double and requires a precision-safe
+  conversion.
+- Non-finite, overflowing, precision-unsafe, or nonzero underflowing results
+  are omitted and diagnosed without suppressing healthy points.
 
 For example, `\Memory\Available Bytes` remains an exact byte count with unit
-`By`, regardless of its provider display scale.
+`By` at the default scale.
 
 ## Collection behavior
 
@@ -138,23 +144,18 @@ scheduled scrape immediately.
 - Wildcards are expanded at startup and then at
   `wildcard_refresh_interval`. Concrete paths are joined by configured counter
   and full case-insensitive path, including PDH's `#n` duplicate index.
-- Newly discovered one-sample counters can emit on their first collection.
-  Newly discovered two-sample counters warm independently.
+- One-sample counters can emit immediately. Two-sample counters warm
+  independently and become eligible at the next configured interval.
 - Removed instances stop emitting after the next discovery refresh.
-- One-sample direct values and raw fractions can emit immediately.
-- Two-sample rates, timers, sample fractions, and averages are omitted from the
-  first scrape while warming. Other ready values still emit.
-- A two-sample value becomes eligible at the next configured interval.
 - When a sample-fraction or average base does not advance, no relevant
-  operation occurred during that interval. Only that value is omitted; it is
-  not replaced with zero.
-- A decreasing base is invalid/reset data and omits that point while resetting
-  its baseline for the next collection.
+  operation occurred; that value is omitted rather than replaced with zero. A
+  decreasing base also omits the point and resets its baseline.
 - A counter-local invalid PDH status, non-finite output, or scaling failure
-  omits only that point and reports `windowsperfcounters.counter_failed`. Healthy
-  exact counters and wildcard peers remain in the batch.
+  omits only that point; healthy peers remain in the batch.
 - Counter add/read failures remove only the affected handle and retry with
   exponential backoff capped by `wildcard_refresh_interval`.
+- Counter availability does not fail startup. An empty active set emits no
+  points until a configured counter becomes available.
 - A query-level collection failure emits no batch and retries the existing
   query with bounded exponential backoff so transient failures preserve
   history. Three consecutive collection failures rebuild the worker-owned
@@ -180,12 +181,7 @@ example contains Available Bytes and total Processor utilization.
 
 The
 [`windowsperfcounters-calculations-console.yaml`](../../../../../configs/windowsperfcounters-calculations-console.yaml)
-example also contains:
-
-- `\Memory\% Committed Bytes In Use`
-- `\Cache\Data Map Hits %`
-- `\PhysicalDisk(_Total)\Avg. Disk sec/Read`
-- `\PhysicalDisk(_Total)\Avg. Disk Bytes/Read`
+example demonstrates rates, fractions, and averages.
 
 The focused
 [`windowsperfcounters-wildcard-console.yaml`](../../../../../configs/windowsperfcounters-wildcard-console.yaml)
@@ -193,11 +189,6 @@ example combines an exact Memory counter with
 `\Process(*)\Private Bytes` and refreshes discovery every five seconds. It
 uses only built-in Windows performance counters and demonstrates bounded
 per-process expansion without requiring a separate test executable.
-
-The calculations example requires the Memory, Processor, Cache, and
-PhysicalDisk performance objects, the PhysicalDisk `_Total` instance, and
-their provider-defined base counters. During an idle interval, Cache or disk
-values may be absent when their bases do not advance.
 
 To check the configuration structure without starting collection:
 
@@ -221,9 +212,6 @@ not by `--validate-and-exit`.
   unbounded buffer.
 - Synchronous PDH calls cannot be cancelled. Shutdown remains bounded, but a
   blocked provider call may retain its query resources until it returns.
-- Production exporter configuration, authentication, Windows service
-  packaging, BLG, TCA, StatsD, and ETW input are outside this receiver
-  example.
 
 ## Telemetry
 

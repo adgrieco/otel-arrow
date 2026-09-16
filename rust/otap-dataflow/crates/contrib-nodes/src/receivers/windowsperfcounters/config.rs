@@ -3,7 +3,7 @@
 
 use otel_arrow_dfe_config::error::Error;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 const MAX_COUNTERS: usize = 256;
@@ -13,31 +13,12 @@ const DEFAULT_MAX_INSTANCES_PER_WILDCARD: usize = 256;
 const DEFAULT_MAX_EXPANDED_COUNTERS: usize = 4_096;
 const MIN_SCALE_POWER10: i32 = -18;
 const MAX_SCALE_POWER10: i32 = 18;
+const RECEIVER_ATTRIBUTE_PREFIX: &str = "windows.perf_counter.";
 
-fn has_valid_wildcard_placement(path: &str) -> bool {
-    if !path.contains('*') {
-        return true;
-    }
-    let Some(counter_separator) = path.rfind('\\') else {
-        return false;
-    };
-    let object_and_instance = &path[..counter_separator];
-    let Some(instance_start) = object_and_instance.rfind('(') else {
-        return false;
-    };
-    let Some(instance_end) = object_and_instance.rfind(')') else {
-        return false;
-    };
-    instance_start < instance_end
-        && !path[..instance_start].contains('*')
-        && !path[instance_end + 1..].contains('*')
-}
-
-/// One Windows performance counter and its OTel metric identity.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+/// One normalized counter consumed by the existing PDH worker and OTAP builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CounterConfig {
-    /// English PDH path, optionally wildcarding only the instance segment.
+    /// PDH path, optionally wildcarding only the instance segment.
     pub path: String,
     /// OTel metric name.
     pub name: String,
@@ -45,29 +26,88 @@ pub struct CounterConfig {
     pub unit: String,
     /// OTel metric description.
     pub description: String,
+    /// Static attributes added to every point from this counter.
+    pub attributes: BTreeMap<String, String>,
     /// Base-10 scaling applied after PDH calculates the native value.
-    #[serde(default)]
     pub scale_power10: i32,
 }
 
-/// Configuration for Windows performance-counter collection.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Configuration normalized for Windows performance-counter collection.
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Exact or instance-wildcard counters to collect.
     pub counters: Vec<CounterConfig>,
     /// Time between collections; defaults to 30 seconds.
-    #[serde(default = "default_interval", with = "humantime_serde")]
     pub collection_interval: Duration,
     /// Time between wildcard discovery refreshes; defaults to the collection interval.
-    #[serde(default, with = "humantime_serde")]
     pub wildcard_refresh_interval: Option<Duration>,
     /// Maximum expanded instances retained for one wildcard path.
-    #[serde(default = "default_max_instances_per_wildcard")]
     pub max_instances_per_wildcard: usize,
     /// Maximum expanded wildcard counters retained by this receiver.
-    #[serde(default = "default_max_expanded_counters")]
     pub max_expanded_counters: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserConfig {
+    metrics: BTreeMap<String, MetricConfig>,
+    perfcounters: Vec<ObjectConfig>,
+    #[serde(default = "default_interval", with = "humantime_serde")]
+    collection_interval: Duration,
+    #[serde(default, with = "humantime_serde")]
+    wildcard_refresh_interval: Option<Duration>,
+    #[serde(default = "default_max_instances_per_wildcard")]
+    max_instances_per_wildcard: usize,
+    #[serde(default = "default_max_expanded_counters")]
+    max_expanded_counters: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricConfig {
+    description: String,
+    unit: String,
+    gauge: GaugeConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GaugeConfig {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObjectConfig {
+    object: String,
+    #[serde(default)]
+    instances: Option<OneOrMany>,
+    counters: Vec<CounterMapping>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CounterMapping {
+    name: String,
+    metric: String,
+    #[serde(default)]
+    attributes: BTreeMap<String, String>,
+    #[serde(default)]
+    scale_power10: i32,
 }
 
 fn default_interval() -> Duration {
@@ -82,6 +122,56 @@ fn default_max_expanded_counters() -> usize {
     DEFAULT_MAX_EXPANDED_COUNTERS
 }
 
+fn invalid(error: impl Into<String>) -> Error {
+    Error::InvalidUserConfig {
+        error: error.into(),
+    }
+}
+
+fn require_name(field: &str, value: &str) -> Result<(), Error> {
+    if value.trim().is_empty() {
+        return Err(invalid(format!("{field} must not be empty")));
+    }
+    Ok(())
+}
+
+fn validate_path_element(field: &str, value: &str, allow_star: bool) -> Result<(), Error> {
+    require_name(field, value)?;
+    if value.contains('\\')
+        || value.contains('(')
+        || value.contains(')')
+        || value.contains('?')
+        || (!allow_star && value.contains('*'))
+    {
+        return Err(invalid(format!(
+            "{field} contains a reserved performance-counter path character"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_counter(counter: &CounterConfig, index: usize) -> Result<(), Error> {
+    if counter.path.encode_utf16().count() > MAX_COUNTER_PATH_LEN {
+        return Err(invalid(format!(
+            "normalized counter {index} path must contain at most {MAX_COUNTER_PATH_LEN} UTF-16 code units"
+        )));
+    }
+    if !(MIN_SCALE_POWER10..=MAX_SCALE_POWER10).contains(&counter.scale_power10) {
+        return Err(invalid(format!(
+            "normalized counter {index} scale_power10 must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}"
+        )));
+    }
+    for key in counter.attributes.keys() {
+        require_name(&format!("normalized counter {index} attribute key"), key)?;
+        if key.starts_with(RECEIVER_ATTRIBUTE_PREFIX) {
+            return Err(invalid(format!(
+                "attribute {key:?} conflicts with receiver-generated attributes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     /// Effective wildcard refresh interval.
     #[must_use]
@@ -90,109 +180,155 @@ impl Config {
             .unwrap_or(self.collection_interval)
     }
 
-    /// Parse and validate the portable configuration contract.
+    /// Parse, validate, and normalize the public configuration contract.
     pub fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
-        let config: Self =
-            serde_json::from_value(value.clone()).map_err(|err| Error::InvalidUserConfig {
-                error: err.to_string(),
-            })?;
+        let user: UserConfig =
+            serde_json::from_value(value.clone()).map_err(|err| invalid(err.to_string()))?;
         if !(Duration::from_secs(1)..=Duration::from_secs(86400))
-            .contains(&config.collection_interval)
+            .contains(&user.collection_interval)
         {
-            return Err(Error::InvalidUserConfig {
-                error: "collection_interval must be between 1s and 24h".to_owned(),
-            });
+            return Err(invalid("collection_interval must be between 1s and 24h"));
         }
-        if let Some(refresh_interval) = config.wildcard_refresh_interval
+        if let Some(refresh_interval) = user.wildcard_refresh_interval
             && (!(Duration::from_secs(1)..=Duration::from_secs(86400)).contains(&refresh_interval)
-                || refresh_interval < config.collection_interval)
+                || refresh_interval < user.collection_interval)
         {
-            return Err(Error::InvalidUserConfig {
-                error: "wildcard_refresh_interval must be between collection_interval and 24h"
-                    .to_owned(),
-            });
+            return Err(invalid(
+                "wildcard_refresh_interval must be between collection_interval and 24h",
+            ));
         }
-        if !(1..=MAX_COUNTERS).contains(&config.counters.len()) {
-            return Err(Error::InvalidUserConfig {
-                error: format!("counters must contain between 1 and {MAX_COUNTERS} entries"),
-            });
+        if user.metrics.is_empty() {
+            return Err(invalid("metrics must contain at least one entry"));
         }
-        if !(1..=MAX_INSTANCE_LIMIT).contains(&config.max_instances_per_wildcard) {
-            return Err(Error::InvalidUserConfig {
-                error: format!(
-                    "max_instances_per_wildcard must be between 1 and {MAX_INSTANCE_LIMIT}"
-                ),
-            });
+        if user.perfcounters.is_empty() {
+            return Err(invalid("perfcounters must contain at least one entry"));
         }
-        if !(1..=MAX_INSTANCE_LIMIT).contains(&config.max_expanded_counters) {
-            return Err(Error::InvalidUserConfig {
-                error: format!("max_expanded_counters must be between 1 and {MAX_INSTANCE_LIMIT}"),
-            });
+        if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_instances_per_wildcard) {
+            return Err(invalid(format!(
+                "max_instances_per_wildcard must be between 1 and {MAX_INSTANCE_LIMIT}"
+            )));
         }
-        if config.max_instances_per_wildcard > config.max_expanded_counters {
-            return Err(Error::InvalidUserConfig {
-                error: "max_instances_per_wildcard must not exceed max_expanded_counters"
-                    .to_owned(),
-            });
+        if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_expanded_counters) {
+            return Err(invalid(format!(
+                "max_expanded_counters must be between 1 and {MAX_INSTANCE_LIMIT}"
+            )));
+        }
+        if user.max_instances_per_wildcard > user.max_expanded_counters {
+            return Err(invalid(
+                "max_instances_per_wildcard must not exceed max_expanded_counters",
+            ));
         }
 
-        let mut paths = HashSet::with_capacity(config.counters.len());
-        let mut names = HashSet::with_capacity(config.counters.len());
-        for (index, counter) in config.counters.iter().enumerate() {
-            let field = |name| format!("counters[{index}].{name}");
-            for (name, value) in [
-                ("path", counter.path.as_str()),
-                ("name", counter.name.as_str()),
-                ("unit", counter.unit.as_str()),
-                ("description", counter.description.as_str()),
-            ] {
-                if value.trim().is_empty() {
-                    return Err(Error::InvalidUserConfig {
-                        error: format!("{} must not be empty", field(name)),
+        for (name, metric) in &user.metrics {
+            require_name("metric name", name)?;
+            require_name(&format!("metrics.{name}.description"), &metric.description)?;
+            require_name(&format!("metrics.{name}.unit"), &metric.unit)?;
+            let _ = &metric.gauge;
+        }
+
+        let mut counters = Vec::new();
+        let mut referenced_metrics = HashSet::new();
+        for (object_index, object) in user.perfcounters.into_iter().enumerate() {
+            let object_field = format!("perfcounters[{object_index}]");
+            validate_path_element(&format!("{object_field}.object"), &object.object, false)?;
+            if object.counters.is_empty() {
+                return Err(invalid(format!(
+                    "{object_field}.counters must contain at least one entry"
+                )));
+            }
+            let instances = object.instances.map(OneOrMany::into_vec);
+            if instances.as_ref().is_some_and(Vec::is_empty) {
+                return Err(invalid(format!(
+                    "{object_field}.instances must not be empty"
+                )));
+            }
+            if let Some(instances) = &instances {
+                let mut unique = HashSet::new();
+                for instance in instances {
+                    validate_path_element(
+                        &format!("{object_field}.instances"),
+                        instance,
+                        instance == "*",
+                    )?;
+                    if !unique.insert(instance.to_lowercase()) {
+                        return Err(invalid(format!(
+                            "{object_field}.instances contains duplicate {instance:?}"
+                        )));
+                    }
+                }
+                if instances.iter().any(|instance| instance == "*") && instances.len() != 1 {
+                    return Err(invalid(format!(
+                        "{object_field}.instances cannot combine \"*\" with named instances"
+                    )));
+                }
+            }
+
+            for (counter_index, mapping) in object.counters.into_iter().enumerate() {
+                let counter_field = format!("{object_field}.counters[{counter_index}]");
+                validate_path_element(&format!("{counter_field}.name"), &mapping.name, false)?;
+                let metric = user.metrics.get(&mapping.metric).ok_or_else(|| {
+                    invalid(format!(
+                        "{counter_field}.metric references undefined metric {:?}",
+                        mapping.metric
+                    ))
+                })?;
+                let _ = referenced_metrics.insert(mapping.metric.clone());
+                let paths = match &instances {
+                    None => vec![format!(r"\{}\{}", object.object, mapping.name)],
+                    Some(instances) if instances.iter().any(|instance| instance == "*") => {
+                        vec![format!(r"\{}(*)\{}", object.object, mapping.name)]
+                    }
+                    Some(instances) => instances
+                        .iter()
+                        .map(|instance| {
+                            format!(r"\{}({})\{}", object.object, instance, mapping.name)
+                        })
+                        .collect(),
+                };
+                for path in paths {
+                    counters.push(CounterConfig {
+                        path,
+                        name: mapping.metric.clone(),
+                        unit: metric.unit.clone(),
+                        description: metric.description.clone(),
+                        attributes: mapping.attributes.clone(),
+                        scale_power10: mapping.scale_power10,
                     });
                 }
             }
-            if counter.path.contains('?') {
-                return Err(Error::InvalidUserConfig {
-                    error: format!("{} does not support the '?' wildcard", field("path")),
-                });
-            }
-            if counter.path.encode_utf16().count() > MAX_COUNTER_PATH_LEN {
-                return Err(Error::InvalidUserConfig {
-                    error: format!(
-                        "{} must contain at most {MAX_COUNTER_PATH_LEN} UTF-16 code units",
-                        field("path")
-                    ),
-                });
-            }
-            if !has_valid_wildcard_placement(&counter.path) {
-                return Err(Error::InvalidUserConfig {
-                    error: format!(
-                        "{} may contain '*' only in the instance segment",
-                        field("path")
-                    ),
-                });
-            }
-            if !(MIN_SCALE_POWER10..=MAX_SCALE_POWER10).contains(&counter.scale_power10) {
-                return Err(Error::InvalidUserConfig {
-                    error: format!(
-                        "{} must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}",
-                        field("scale_power10")
-                    ),
-                });
-            }
+        }
+        if !(1..=MAX_COUNTERS).contains(&counters.len()) {
+            return Err(invalid(format!(
+                "normalized counters must contain between 1 and {MAX_COUNTERS} entries"
+            )));
+        }
+        let unused = user
+            .metrics
+            .keys()
+            .filter(|name| !referenced_metrics.contains(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unused.is_empty() {
+            return Err(invalid(format!(
+                "metrics are not referenced by any counter: {}",
+                unused.join(", ")
+            )));
+        }
+        let mut paths = HashSet::with_capacity(counters.len());
+        for (index, counter) in counters.iter().enumerate() {
+            validate_counter(counter, index)?;
             if !paths.insert(counter.path.to_lowercase()) {
-                return Err(Error::InvalidUserConfig {
-                    error: format!("duplicate counter path: {}", counter.path),
-                });
-            }
-            if !names.insert(counter.name.as_str()) {
-                return Err(Error::InvalidUserConfig {
-                    error: format!("duplicate metric name: {}", counter.name),
-                });
+                return Err(invalid(format!("duplicate counter path: {}", counter.path)));
             }
         }
-        Ok(config)
+
+        Ok(Self {
+            counters,
+            collection_interval: user.collection_interval,
+            wildcard_refresh_interval: user.wildcard_refresh_interval,
+            max_instances_per_wildcard: user.max_instances_per_wildcard,
+            max_expanded_counters: user.max_expanded_counters,
+        })
     }
 }
 
@@ -201,131 +337,175 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn counter(path: &str, name: &str) -> serde_json::Value {
+    fn metric() -> serde_json::Value {
         json!({
-            "path": path,
-            "name": name,
+            "description": "Test counter.",
             "unit": "By",
-            "description": "Test counter."
+            "gauge": {}
         })
     }
 
-    /// Scenario: Multiple exact counters are configured with an omitted or explicit interval.
-    /// Guarantees: Metadata and order are preserved, and only interval omission defaults to 30s.
+    /// Scenario: Objects with no instances, named instances, and wildcards share metric metadata.
+    /// Guarantees: Public configuration normalizes to exact and wildcard paths without changing metadata.
     #[test]
-    fn valid_config() {
+    fn normalizes_structured_configuration() {
         let config = Config::from_json(&json!({
-            "counters": [
-                counter(r"\Memory\Available Bytes", "windows.memory.available"),
-                counter(r"\Memory\Committed Bytes", "windows.memory.committed")
+            "metrics": {
+                "windows.memory.available": metric(),
+                "windows.process.time": {
+                    "description": "Process time.",
+                    "unit": "%",
+                    "gauge": {}
+                }
+            },
+            "perfcounters": [
+                {
+                    "object": "Memory",
+                    "counters": [{
+                        "name": "Available Bytes",
+                        "metric": "windows.memory.available"
+                    }]
+                },
+                {
+                    "object": "Process",
+                    "instances": "*",
+                    "counters": [
+                        {
+                            "name": "% Processor Time",
+                            "metric": "windows.process.time",
+                            "attributes": {"state": "active"}
+                        },
+                        {
+                            "name": "% Idle Time",
+                            "metric": "windows.process.time",
+                            "attributes": {"state": "idle"}
+                        }
+                    ]
+                }
             ]
         }))
         .unwrap();
-        assert_eq!(config.counters.len(), 2);
+        assert_eq!(config.counters.len(), 3);
         assert_eq!(config.counters[0].path, r"\Memory\Available Bytes");
-        assert_eq!(config.counters[0].scale_power10, 0);
+        assert_eq!(config.counters[1].path, r"\Process(*)\% Processor Time");
+        assert_eq!(config.counters[1].name, "windows.process.time");
+        assert_eq!(config.counters[1].attributes["state"], "active");
+        assert_eq!(config.counters[2].attributes["state"], "idle");
         assert_eq!(config.collection_interval, Duration::from_secs(30));
         assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(30));
-        assert_eq!(config.max_instances_per_wildcard, 256);
-        assert_eq!(config.max_expanded_counters, 4_096);
+    }
+
+    /// Scenario: Multiple named instances are selected without a wildcard.
+    /// Guarantees: Each instance becomes one exact path while retaining shared metric identity.
+    #[test]
+    fn normalizes_named_instances() {
         let config = Config::from_json(&json!({
-            "counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
-            "collection_interval": "2s",
-            "wildcard_refresh_interval": "10s",
-            "max_instances_per_wildcard": 10,
-            "max_expanded_counters": 20
+            "metrics": {"test": metric()},
+            "perfcounters": [{
+                "object": "Processor",
+                "instances": ["0", "1"],
+                "counters": [{"name": "% Processor Time", "metric": "test"}]
+            }]
         }))
         .unwrap();
-        assert_eq!(config.collection_interval, Duration::from_secs(2));
-        assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(10));
-        assert_eq!(config.max_instances_per_wildcard, 10);
-        assert_eq!(config.max_expanded_counters, 20);
+        assert_eq!(
+            config
+                .counters
+                .iter()
+                .map(|counter| counter.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                r"\Processor(0)\% Processor Time",
+                r"\Processor(1)\% Processor Time"
+            ]
+        );
+        assert!(config.counters.iter().all(|counter| counter.name == "test"));
     }
 
-    /// Scenario: Empty fields, invalid wildcards, duplicates, unknown options, or invalid limits are used.
-    /// Guarantees: Invalid configuration fails explicitly before any PDH handles are opened.
+    /// Scenario: Invalid metadata, references, path elements, attributes, limits, or metric types are used.
+    /// Guarantees: Invalid configuration fails before any PDH handles are opened.
     #[test]
-    fn rejects_invalid_config() {
+    fn rejects_invalid_configuration() {
+        let valid = json!({
+            "metrics": {"test": metric()},
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{"name": "Available Bytes", "metric": "test"}]
+            }]
+        });
         for value in [
             json!({}),
-            json!({"counters": []}),
-            json!({"counters": [counter(r"\Process(?)\Private Bytes", "process.private")]}),
-            json!({"counters": [counter(r"\Proc*ess(foo)\Private Bytes", "process.private")]}),
-            json!({"counters": [counter(r"\Process(foo)\Private *", "process.private")]}),
-            json!({"counters": [counter(r"\Memory\Available *", "windows.memory.available")]}),
-            json!({"counters": [counter("", "windows.memory.available")]}),
-            json!({"counters": [counter(r"\Memory\Available Bytes", "")]}),
-            json!({"counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
-                   "collection_interval": "0s"}),
-            json!({"counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
-                   "collection_interval": "1ms"}),
-            json!({"counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
-                   "collection_interval": "25h"}),
-            json!({"counters": [counter(r"\Process(*)\Private Bytes", "process.private")],
-                   "collection_interval": "10s",
-                   "wildcard_refresh_interval": "5s"}),
-            json!({"counters": [counter(r"\Process(*)\Private Bytes", "process.private")],
-                   "wildcard_refresh_interval": "25h"}),
-            json!({"counters": [counter(r"\Process(*)\Private Bytes", "process.private")],
-                   "max_instances_per_wildcard": 0}),
-            json!({"counters": [counter(r"\Process(*)\Private Bytes", "process.private")],
-                   "max_expanded_counters": 16385}),
-            json!({"counters": [counter(r"\Process(*)\Private Bytes", "process.private")],
-                   "max_instances_per_wildcard": 10,
-                   "max_expanded_counters": 5}),
-            json!({"counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
-                   "collection_interval": "bad"}),
-            json!({"counters": [counter(
-                    &format!(r"\Process({})\Private Bytes", "x".repeat(2048)),
-                    "process.private"
-            )]}),
-            json!({"counters": [counter(r"\Memory\Available Bytes", "windows.memory.available")],
-                   "extra": true}),
-            json!({"counters": [{
-                    "path": r"\Memory\Available Bytes",
-                    "name": "windows.memory.available",
-                    "unit": "By",
-                    "description": "Test counter.",
-                    "scale_power10": 19
-            }]}),
+            json!({"metrics": {}, "perfcounters": []}),
+            json!({
+                "metrics": {"test": metric()},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "missing"}]
+                }]
+            }),
+            json!({
+                "metrics": {"test": {"description": "x", "unit": "1", "sum": {}}},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }]
+            }),
+            json!({
+                "metrics": {"test": metric()},
+                "perfcounters": [{
+                    "object": "Process",
+                    "instances": ["*", "_Total"],
+                    "counters": [{"name": "Private Bytes", "metric": "test"}]
+                }]
+            }),
+            json!({
+                "metrics": {"test": metric()},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{
+                        "name": "Available Bytes",
+                        "metric": "test",
+                        "attributes": {"windows.perf_counter.path": "override"}
+                    }]
+                }]
+            }),
+            json!({
+                "metrics": {"test": metric()},
+                "perfcounters": [{
+                    "object": "Mem\\ory",
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }]
+            }),
+            json!({
+                "metrics": {"test": metric()},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{
+                        "name": "Available Bytes",
+                        "metric": "test",
+                        "scale_power10": 19
+                    }]
+                }]
+            }),
+            json!({
+                "metrics": {"unused": metric(), "test": metric()},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }]
+            }),
         ] {
             assert!(Config::from_json(&value).is_err(), "{value}");
         }
-    }
-
-    /// Scenario: A counter uses a full or partial wildcard inside its instance segment.
-    /// Guarantees: Instance discovery patterns are accepted without allowing object or counter wildcards.
-    #[test]
-    fn accepts_instance_wildcards() {
-        for path in [
-            r"\Process(*)\Private Bytes",
-            r"\Process(dotnet*)\Private Bytes",
-            r"\Thread(*)\% Processor Time",
-            r"\\host\Process(parent/*#0)\Private Bytes",
+        for (key, value) in [
+            ("collection_interval", json!("0s")),
+            ("wildcard_refresh_interval", json!("25h")),
+            ("max_instances_per_wildcard", json!(0)),
+            ("max_expanded_counters", json!(16_385)),
         ] {
-            let config = Config::from_json(&json!({
-                "counters": [counter(path, "process.private")]
-            }))
-            .unwrap();
-            assert_eq!(config.counters[0].path, path);
-        }
-    }
-
-    /// Scenario: Paths differ only by case or metric names are repeated exactly.
-    /// Guarantees: One PDH path is never sampled twice and metric identities never compete.
-    #[test]
-    fn rejects_duplicate_paths_and_names() {
-        for value in [
-            json!({"counters": [
-                counter(r"\Memory\Available Bytes", "windows.memory.available"),
-                counter(r"\memory\available bytes", "windows.memory.other")
-            ]}),
-            json!({"counters": [
-                counter(r"\Memory\Available Bytes", "windows.memory.available"),
-                counter(r"\Memory\Committed Bytes", "windows.memory.available")
-            ]}),
-        ] {
-            assert!(Config::from_json(&value).is_err(), "{value}");
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            assert!(Config::from_json(&invalid).is_err(), "{invalid}");
         }
     }
 }

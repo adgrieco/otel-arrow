@@ -20,31 +20,54 @@ groups:
           calculations:
             type: receiver:windowsperfcounters
             config:
-              counters:
-                - path: '\Memory\Available Bytes'
-                  name: windows.memory.available
+              metrics:
+                windows.memory.available:
                   unit: By
                   description: Physical memory immediately available for allocation.
-                - path: '\Processor(_Total)\% Processor Time'
-                  name: windows.processor.time
+                  gauge: {}
+                windows.processor.time:
                   unit: "%"
                   description: Average processor utilization across all logical processors.
-                - path: '\Memory\% Committed Bytes In Use'
-                  name: windows.memory.committed
+                  gauge: {}
+                windows.memory.committed:
                   unit: "%"
                   description: Percentage of the memory commit limit currently in use.
-                - path: '\Cache\Data Map Hits %'
-                  name: windows.cache.data_map_hits
+                  gauge: {}
+                windows.cache.data_map_hits:
                   unit: "%"
                   description: Percentage of data-map requests served from the system cache.
-                - path: '\PhysicalDisk(_Total)\Avg. Disk sec/Read'
-                  name: windows.disk.read.time
+                  gauge: {}
+                windows.disk.read.time:
                   unit: s
                   description: Average time to complete a physical-disk read.
-                - path: '\PhysicalDisk(_Total)\Avg. Disk Bytes/Read'
-                  name: windows.disk.read.size
+                  gauge: {}
+                windows.disk.read.size:
                   unit: By
                   description: Average bytes transferred by a physical-disk read.
+                  gauge: {}
+              perfcounters:
+                - object: Memory
+                  counters:
+                    - name: Available Bytes
+                      metric: windows.memory.available
+                    - name: "% Committed Bytes In Use"
+                      metric: windows.memory.committed
+                - object: Processor
+                  instances: ["_Total"]
+                  counters:
+                    - name: "% Processor Time"
+                      metric: windows.processor.time
+                - object: Cache
+                  counters:
+                    - name: Data Map Hits %
+                      metric: windows.cache.data_map_hits
+                - object: PhysicalDisk
+                  instances: ["_Total"]
+                  counters:
+                    - name: Avg. Disk sec/Read
+                      metric: windows.disk.read.time
+                    - name: Avg. Disk Bytes/Read
+                      metric: windows.disk.read.size
               collection_interval: 30s
           console:
             type: exporter:console

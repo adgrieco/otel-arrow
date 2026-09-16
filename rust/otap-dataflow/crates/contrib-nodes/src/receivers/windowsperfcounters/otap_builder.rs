@@ -43,7 +43,7 @@ pub fn into_otap(
                 point.counter_index
             ))
         })?;
-        let metric_id = if let Some(metric_id) = metric_ids.get(&point.counter_index) {
+        let metric_id = if let Some(metric_id) = metric_ids.get(&counter.name) {
             *metric_id
         } else {
             let metric_id = u16::try_from(metric_ids.len()).map_err(|_| {
@@ -56,7 +56,7 @@ pub fn into_otap(
             metrics.append_unit(counter.unit.as_bytes());
             metrics.append_aggregation_temporality(None);
             metrics.append_is_monotonic(None);
-            let _ = metric_ids.insert(point.counter_index, metric_id);
+            let _ = metric_ids.insert(counter.name.clone(), metric_id);
             metric_id
         };
         let point_id = u32::try_from(index)
@@ -83,6 +83,11 @@ pub fn into_otap(
         }
         points.append_flags(0);
 
+        for (key, value) in &counter.attributes {
+            attrs.append_parent_id(&point_id);
+            attrs.append_key(key);
+            attrs.any_values_builder.append_str(value.as_bytes());
+        }
         attrs.append_parent_id(&point_id);
         attrs.append_key("windows.perf_counter.path");
         attrs.any_values_builder.append_str(point.path.as_bytes());
@@ -162,6 +167,7 @@ mod tests {
             name: name.to_owned(),
             unit: unit.to_owned(),
             description: format!("Description for {name}."),
+            attributes: BTreeMap::new(),
             scale_power10: 0,
         }
     }
@@ -612,5 +618,64 @@ mod tests {
         assert!(display.contains("windows.perf_counter.parent_instance"));
         assert!(display.contains("worker"));
         assert!(display.contains("service"));
+    }
+
+    /// Scenario: Two counters map to one metric and use custom attributes to distinguish their points.
+    /// Guarantees: OTAP emits one metric row and preserves both attribute-qualified gauge points.
+    #[test]
+    fn projects_shared_metric_with_custom_attributes() {
+        let mut active = counter(
+            r"\Processor(_Total)\% Processor Time",
+            "windows.processor.time",
+            "%",
+        );
+        let _ = active
+            .attributes
+            .insert("state".to_owned(), "active".to_owned());
+        let mut idle = counter(
+            r"\Processor(_Total)\% Idle Time",
+            "windows.processor.time",
+            "%",
+        );
+        let _ = idle
+            .attributes
+            .insert("state".to_owned(), "idle".to_owned());
+        let records = into_otap(
+            &[active, idle],
+            Sample {
+                timestamp_unix_nano: 1,
+                points: vec![
+                    point(
+                        0,
+                        r"\Processor(_Total)\% Processor Time",
+                        SampleValue::Value(Number::Double(60.0)),
+                    ),
+                    point(
+                        1,
+                        r"\Processor(_Total)\% Idle Time",
+                        SampleValue::Value(Number::Double(40.0)),
+                    ),
+                ],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            records
+                .get(ArrowPayloadType::UnivariateMetrics)
+                .unwrap()
+                .num_rows(),
+            1
+        );
+        let attrs = records.get(ArrowPayloadType::NumberDpAttrs).unwrap();
+        let display = arrow::util::pretty::pretty_format_batches(std::slice::from_ref(attrs))
+            .unwrap()
+            .to_string();
+        assert!(display.contains("state"));
+        assert!(display.contains("active"));
+        assert!(display.contains("idle"));
     }
 }
