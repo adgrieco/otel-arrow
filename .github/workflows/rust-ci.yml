@@ -264,7 +264,7 @@ jobs:
         run: cargo test --locked -p otel-arrow-dfe-contrib-nodes etw_receiver_decodes_tracelogging_events_end_to_end --features etw-receiver -- --ignored
         working-directory: ./rust/otap-dataflow
 
-  winperfcounters_windows_smoke:
+  windowsperfcounters_windows_smoke:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -291,8 +291,8 @@ jobs:
       - name: Run live Windows performance-counter smoke tests
         run: >
           cargo test --locked -p otel-arrow-dfe-contrib-nodes
-          winperfcounters_receiver::pdh::tests::
-          --features winperfcounters-receiver
+          windowsperfcounters_receiver::pdh::tests::
+          --features windowsperfcounters-receiver
           -- --ignored --test-threads=1
         working-directory: ./rust/otap-dataflow
 
@@ -1286,7 +1286,7 @@ jobs:
       - host-metrics-semconv
       - user_events_linux_smoke
       - etw_windows_smoke
-      - winperfcounters_windows_smoke
+      - windowsperfcounters_windows_smoke
       - license-header-check
     steps:
       - name: Summarize required-build caches
@@ -1366,8 +1366,8 @@ jobs:
             echo "etw_windows_smoke failed or was cancelled"
             exit 1
           fi
-          if [[ "${{ needs.winperfcounters_windows_smoke.result }}" != "success" ]]; then
-            echo "winperfcounters_windows_smoke failed or was cancelled"
+          if [[ "${{ needs.windowsperfcounters_windows_smoke.result }}" != "success" ]]; then
+            echo "windowsperfcounters_windows_smoke failed or was cancelled"
             exit 1
           fi
           if [[ "${{ needs.license-header-check.result }}" != "success" ]]; then

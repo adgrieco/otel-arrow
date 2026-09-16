@@ -121,7 +121,7 @@ pub fn into_otap(
         .append_dropped_attributes_count_n(0, metric_count);
     metrics.scope.append_id_n(0, metric_count);
     metrics.scope.append_name_n(
-        Some(b"otel-arrow-dfe-contrib-nodes/winperfcounters"),
+        Some(b"otel-arrow-dfe-contrib-nodes/windowsperfcounters"),
         metric_count,
     );
     metrics

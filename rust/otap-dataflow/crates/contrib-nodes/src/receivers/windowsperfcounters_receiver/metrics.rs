@@ -3,14 +3,14 @@
 
 //! Bounded operational metrics for the Windows performance-counter receiver.
 
-use crate::receivers::winperfcounters::SampleDiagnostics;
+use crate::receivers::windowsperfcounters::SampleDiagnostics;
 use otel_arrow_dfe_telemetry::instrument::{Counter, Gauge, HistogramNormal};
 use otel_arrow_dfe_telemetry_macros::metric_set;
 
 /// Lifecycle, recovery, and collection metrics.
-#[metric_set(name = "receiver.winperfcounters")]
+#[metric_set(name = "receiver.windowsperfcounters")]
 #[derive(Debug, Default, Clone)]
-pub(super) struct WinPerfCountersMetrics {
+pub(super) struct WindowsPerfCountersMetrics {
     /// Configured exact counter paths.
     #[metric(unit = "{counter}")]
     pub configured_exact: Gauge<u64>,
@@ -67,7 +67,7 @@ pub(super) struct WinPerfCountersMetrics {
     pub warmup_omissions: Counter<u64>,
 }
 
-impl WinPerfCountersMetrics {
+impl WindowsPerfCountersMetrics {
     pub(super) fn apply(&mut self, diagnostics: &SampleDiagnostics) {
         self.active_expanded
             .set(diagnostics.active_expanded_counters as u64);

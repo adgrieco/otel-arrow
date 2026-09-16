@@ -1,7 +1,7 @@
 # platform: windows-only
 # Basic exact-counter example using built-in Windows performance objects.
 # From rust\otap-dataflow:
-# cargo run --features winperfcounters-receiver --bin df_engine -- -c configs\winperfcounters-console.yaml
+# cargo run --features windowsperfcounters-receiver --bin df_engine -- -c configs\windowsperfcounters-console.yaml
 
 version: otel_dataflow/v1
 engine: {}
@@ -16,7 +16,7 @@ groups:
       main:
         nodes:
           memory:
-            type: receiver:winperfcounters
+            type: receiver:windowsperfcounters
             config:
               counters:
                 - path: '\Memory\Available Bytes'

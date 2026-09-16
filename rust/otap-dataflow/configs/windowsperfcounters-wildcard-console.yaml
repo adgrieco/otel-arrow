@@ -3,7 +3,7 @@
 # The exact Memory counter continues emitting when individual process counters
 # appear, disappear, or temporarily fail.
 # From rust\otap-dataflow:
-# cargo run --features winperfcounters-receiver --bin df_engine -- -c configs\winperfcounters-wildcard-console.yaml
+# cargo run --features windowsperfcounters-receiver --bin df_engine -- -c configs\windowsperfcounters-wildcard-console.yaml
 
 version: otel_dataflow/v1
 engine: {}
@@ -18,7 +18,7 @@ groups:
       main:
         nodes:
           wildcard:
-            type: receiver:winperfcounters
+            type: receiver:windowsperfcounters
             config:
               counters:
                 - path: '\Memory\Available Bytes'

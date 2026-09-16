@@ -4,9 +4,9 @@
 
 | Field | Value |
 | --- | --- |
-| Type | `receiver:winperfcounters` |
-| URN | `urn:otel:receiver:winperfcounters` |
-| Feature | `winperfcounters-receiver` |
+| Type | `receiver:windowsperfcounters` |
+| URN | `urn:otel:receiver:windowsperfcounters` |
+| Feature | `windowsperfcounters-receiver` |
 | Platform | Windows only |
 | Stability | Experimental |
 
@@ -26,7 +26,7 @@ the target host.
 ## Configuration
 
 ```yaml
-type: receiver:winperfcounters
+type: receiver:windowsperfcounters
 config:
   counters:
     - path: '\Memory\Available Bytes'
@@ -124,7 +124,7 @@ configured unit must describe the value after this explicit scaling.
   must be exactly representable as `f64`.
 - Calculated values and scaled doubles must remain finite. Overflow,
   precision-unsafe integer conversion, and nonzero values underflowing to zero
-  omit that point and report `winperfcounters.counter_failed`; other healthy
+  omit that point and report `windowsperfcounters.counter_failed`; other healthy
   points in the scrape still emit.
 
 For example, `\Memory\Available Bytes` remains an exact byte count with unit
@@ -151,7 +151,7 @@ scheduled scrape immediately.
 - A decreasing base is invalid/reset data and omits that point while resetting
   its baseline for the next collection.
 - A counter-local invalid PDH status, non-finite output, or scaling failure
-  omits only that point and reports `winperfcounters.counter_failed`. Healthy
+  omits only that point and reports `windowsperfcounters.counter_failed`. Healthy
   exact counters and wildcard peers remain in the batch.
 - Counter add/read failures remove only the affected handle and retry with
   exponential backoff capped by `wildcard_refresh_interval`.
@@ -171,15 +171,15 @@ time.
 From `rust\otap-dataflow`:
 
 ```powershell
-cargo run --features winperfcounters-receiver --bin df_engine -- -c configs\winperfcounters-console.yaml
+cargo run --features windowsperfcounters-receiver --bin df_engine -- -c configs\windowsperfcounters-console.yaml
 ```
 
 The basic
-[`winperfcounters-console.yaml`](../../../../../configs/winperfcounters-console.yaml)
+[`windowsperfcounters-console.yaml`](../../../../../configs/windowsperfcounters-console.yaml)
 example contains Available Bytes and total Processor utilization.
 
 The
-[`winperfcounters-calculations-console.yaml`](../../../../../configs/winperfcounters-calculations-console.yaml)
+[`windowsperfcounters-calculations-console.yaml`](../../../../../configs/windowsperfcounters-calculations-console.yaml)
 example also contains:
 
 - `\Memory\% Committed Bytes In Use`
@@ -188,7 +188,7 @@ example also contains:
 - `\PhysicalDisk(_Total)\Avg. Disk Bytes/Read`
 
 The focused
-[`winperfcounters-wildcard-console.yaml`](../../../../../configs/winperfcounters-wildcard-console.yaml)
+[`windowsperfcounters-wildcard-console.yaml`](../../../../../configs/windowsperfcounters-wildcard-console.yaml)
 example combines an exact Memory counter with
 `\Process(*)\Private Bytes` and refreshes discovery every five seconds. It
 uses only built-in Windows performance counters and demonstrates bounded
@@ -202,7 +202,7 @@ values may be absent when their bases do not advance.
 To check the configuration structure without starting collection:
 
 ```powershell
-.\df_engine.exe --validate-and-exit -c .\winperfcounters-calculations-console.yaml
+.\df_engine.exe --validate-and-exit -c .\windowsperfcounters-calculations-console.yaml
 ```
 
 Provider availability and native types are checked when the receiver starts,
@@ -227,14 +227,14 @@ not by `--validate-and-exit`.
 
 ## Telemetry
 
-Counter-local failures emit `winperfcounters.counter_failed` with a configured
+Counter-local failures emit `windowsperfcounters.counter_failed` with a configured
 path template and low-cardinality reason. Expansion overflow emits
-`winperfcounters.instance_limit_exceeded`; lifecycle and retry recovery emit
+`windowsperfcounters.instance_limit_exceeded`; lifecycle and retry recovery emit
 aggregate events. Query-level collection failures emit
-`winperfcounters.scrape_failed`, and query-close failures emit
-`winperfcounters.close_failed`.
+`windowsperfcounters.scrape_failed`, and query-close failures emit
+`windowsperfcounters.close_failed`.
 
-The `receiver.winperfcounters` metric set records configured and active
+The `receiver.windowsperfcounters` metric set records configured and active
 counters, scrape success/failure and duration, discovery refreshes, instance
 adds/removals/overflow, counter failures, retries/recoveries, query rebuilds,
 and warm-up omissions.

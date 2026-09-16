@@ -5,7 +5,7 @@
 #![allow(unsafe_code)]
 
 use super::Lease;
-use crate::receivers::winperfcounters::{
+use crate::receivers::windowsperfcounters::{
     CounterConfig, ExpansionOverflow, InstanceIdentity, Sample, SampleDiagnostics, SampleFailure,
     SamplePoint, SampleValue, scale_double, scale_integer,
 };
@@ -1333,7 +1333,7 @@ impl Drop for Query {
         let _ = QUERY_CLOSES.fetch_add(1, Ordering::Relaxed);
         if status != 0 {
             otel_arrow_dfe_telemetry::otel_warn!(
-                "winperfcounters.close_failed",
+                "windowsperfcounters.close_failed",
                 status = status as u64
             );
         }
@@ -1392,7 +1392,7 @@ impl Worker {
             max_expanded_counters,
         };
         let join = std::thread::Builder::new()
-            .name("winperfcounters-pdh".to_owned())
+            .name("windowsperfcounters-pdh".to_owned())
             .spawn(move || {
                 {
                     let query = match settings.open() {
@@ -1581,7 +1581,7 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::receivers::winperfcounters::Number;
+    use crate::receivers::windowsperfcounters::Number;
     use windows_sys::Win32::System::Performance::{
         PDH_CSTATUS_INVALID_DATA, PDH_CSTATUS_NEW_DATA, PDH_FMT_COUNTERVALUE, PDH_RAW_COUNTER,
         PdhFormatFromRawValue,

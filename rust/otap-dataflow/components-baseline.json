@@ -282,7 +282,7 @@
     "attributes": {}
   },
   {
-    "id": "urn:otel:receiver:winperfcounters",
+    "id": "urn:otel:receiver:windowsperfcounters",
     "category": "Receiver",
     "description": null,
     "attributes": {}
