@@ -81,6 +81,7 @@ attributes. Only Gauge output is supported.
 | --- | --- | --- | --- |
 | `object` | Yes | None | Windows performance object |
 | `instances` | No | None | One instance, a list, or `"*"` |
+| `aggregation_name` | No | `_Total` | Provider aggregation instance |
 | `counters` | Yes | None | Counter mappings for the object |
 
 Each counter mapping requires `name` and `metric`. Optional `attributes`
@@ -90,8 +91,12 @@ Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
 
 Omit `instances` for objects without instances. Specify one name or a list for
-exact instances, or specify `"*"` to discover all instances. A wildcard cannot
-be combined with named instances.
+exact instances. Specify `"*"` to discover all concrete instances while
+omitting the configured aggregation instance. Specify `["*", "_Total"]` to
+retain `_Total`, or select `"_Total"` alone to collect only that exact
+instance. Set `aggregation_name` when a provider uses another name such as
+`_Global_`. Filtering occurs before expansion limits, and explicit wildcard
+inclusion does not create a duplicate aggregate query.
 
 Unknown fields, empty metadata, undefined or unused metrics, duplicate
 instances, duplicate normalized paths, invalid intervals, and unsupported

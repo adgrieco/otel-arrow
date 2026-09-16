@@ -168,6 +168,7 @@ mod tests {
             unit: unit.to_owned(),
             description: format!("Description for {name}."),
             attributes: BTreeMap::new(),
+            excluded_aggregation_instance: None,
             scale_power10: 0,
         }
     }

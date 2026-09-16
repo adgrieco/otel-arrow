@@ -11,6 +11,7 @@ const MAX_INSTANCE_LIMIT: usize = 16_384;
 const MAX_COUNTER_PATH_LEN: usize = 2_047;
 const DEFAULT_MAX_INSTANCES_PER_WILDCARD: usize = 256;
 const DEFAULT_MAX_EXPANDED_COUNTERS: usize = 4_096;
+const DEFAULT_AGGREGATION_NAME: &str = "_Total";
 const MIN_SCALE_POWER10: i32 = -18;
 const MAX_SCALE_POWER10: i32 = 18;
 const RECEIVER_ATTRIBUTE_PREFIX: &str = "windows.perf_counter.";
@@ -28,6 +29,8 @@ pub struct CounterConfig {
     pub description: String,
     /// Static attributes added to every point from this counter.
     pub attributes: BTreeMap<String, String>,
+    /// Provider aggregation instance omitted from this wildcard, when any.
+    pub excluded_aggregation_instance: Option<String>,
     /// Base-10 scaling applied after PDH calculates the native value.
     pub scale_power10: i32,
 }
@@ -80,6 +83,8 @@ struct ObjectConfig {
     object: String,
     #[serde(default)]
     instances: Option<OneOrMany>,
+    #[serde(default)]
+    aggregation_name: Option<String>,
     counters: Vec<CounterMapping>,
 }
 
@@ -236,6 +241,14 @@ impl Config {
                     "{object_field}.counters must contain at least one entry"
                 )));
             }
+            let aggregation_name = object
+                .aggregation_name
+                .unwrap_or_else(|| DEFAULT_AGGREGATION_NAME.to_owned());
+            validate_path_element(
+                &format!("{object_field}.aggregation_name"),
+                &aggregation_name,
+                false,
+            )?;
             let instances = object.instances.map(OneOrMany::into_vec);
             if instances.as_ref().is_some_and(Vec::is_empty) {
                 return Err(invalid(format!(
@@ -256,9 +269,13 @@ impl Config {
                         )));
                     }
                 }
-                if instances.iter().any(|instance| instance == "*") && instances.len() != 1 {
+                if instances.iter().any(|instance| instance == "*")
+                    && instances.iter().any(|instance| {
+                        instance != "*" && !instance.eq_ignore_ascii_case(&aggregation_name)
+                    })
+                {
                     return Err(invalid(format!(
-                        "{object_field}.instances cannot combine \"*\" with named instances"
+                        "{object_field}.instances may combine \"*\" only with aggregation_name"
                     )));
                 }
             }
@@ -274,24 +291,34 @@ impl Config {
                 })?;
                 let _ = referenced_metrics.insert(mapping.metric.clone());
                 let paths = match &instances {
-                    None => vec![format!(r"\{}\{}", object.object, mapping.name)],
+                    None => vec![(format!(r"\{}\{}", object.object, mapping.name), None)],
                     Some(instances) if instances.iter().any(|instance| instance == "*") => {
-                        vec![format!(r"\{}(*)\{}", object.object, mapping.name)]
+                        let include_aggregation = instances
+                            .iter()
+                            .any(|instance| instance.eq_ignore_ascii_case(&aggregation_name));
+                        vec![(
+                            format!(r"\{}(*)\{}", object.object, mapping.name),
+                            (!include_aggregation).then(|| aggregation_name.clone()),
+                        )]
                     }
                     Some(instances) => instances
                         .iter()
                         .map(|instance| {
-                            format!(r"\{}({})\{}", object.object, instance, mapping.name)
+                            (
+                                format!(r"\{}({})\{}", object.object, instance, mapping.name),
+                                None,
+                            )
                         })
                         .collect(),
                 };
-                for path in paths {
+                for (path, excluded_aggregation_instance) in paths {
                     counters.push(CounterConfig {
                         path,
                         name: mapping.metric.clone(),
                         unit: metric.unit.clone(),
                         description: metric.description.clone(),
                         attributes: mapping.attributes.clone(),
+                        excluded_aggregation_instance,
                         scale_power10: mapping.scale_power10,
                     });
                 }
@@ -368,7 +395,7 @@ mod tests {
                 },
                 {
                     "object": "Process",
-                    "instances": "*",
+                    "instances": ["*", "_Total"],
                     "counters": [
                         {
                             "name": "% Processor Time",
@@ -391,8 +418,42 @@ mod tests {
         assert_eq!(config.counters[1].name, "windows.process.time");
         assert_eq!(config.counters[1].attributes["state"], "active");
         assert_eq!(config.counters[2].attributes["state"], "idle");
+        assert_eq!(config.counters[1].excluded_aggregation_instance, None);
         assert_eq!(config.collection_interval, Duration::from_secs(30));
         assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(30));
+    }
+
+    /// Scenario: A wildcard omits the default or custom aggregation instance unless selected.
+    /// Guarantees: Normalization records filtering only when the aggregate was not explicitly included.
+    #[test]
+    fn normalizes_aggregation_selection() {
+        let excluded = Config::from_json(&json!({
+            "metrics": {"test": metric()},
+            "perfcounters": [{
+                "object": "Custom Object",
+                "instances": "*",
+                "aggregation_name": "_Global_",
+                "counters": [{"name": "Counter", "metric": "test"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            excluded.counters[0]
+                .excluded_aggregation_instance
+                .as_deref(),
+            Some("_Global_")
+        );
+        let included = Config::from_json(&json!({
+            "metrics": {"test": metric()},
+            "perfcounters": [{
+                "object": "Custom Object",
+                "instances": ["*", "_Global_"],
+                "aggregation_name": "_Global_",
+                "counters": [{"name": "Counter", "metric": "test"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(included.counters[0].excluded_aggregation_instance, None);
     }
 
     /// Scenario: Multiple named instances are selected without a wildcard.
@@ -454,7 +515,7 @@ mod tests {
                 "metrics": {"test": metric()},
                 "perfcounters": [{
                     "object": "Process",
-                    "instances": ["*", "_Total"],
+                    "instances": ["*", "worker"],
                     "counters": [{"name": "Private Bytes", "metric": "test"}]
                 }]
             }),

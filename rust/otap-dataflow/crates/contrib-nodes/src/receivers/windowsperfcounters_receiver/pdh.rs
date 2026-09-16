@@ -593,6 +593,16 @@ fn unix_timestamp_nanos() -> Result<i64, Error> {
     i64::try_from(timestamp).map_err(|_| Error::InvalidSample("timestamp exceeds i64 nanoseconds"))
 }
 
+fn is_aggregation_instance(path: &str, aggregation_name: &str) -> bool {
+    parse_instance(path).is_ok_and(|instance| instance.name.eq_ignore_ascii_case(aggregation_name))
+}
+
+fn remove_aggregation_instances(paths: &mut Vec<String>, aggregation_name: Option<&str>) {
+    if let Some(aggregation_name) = aggregation_name {
+        paths.retain(|path| !is_aggregation_instance(path, aggregation_name));
+    }
+}
+
 fn merge_diagnostics(target: &mut SampleDiagnostics, delta: SampleDiagnostics) {
     target.discovery_refreshes += delta.discovery_refreshes;
     target.discovery_failures += delta.discovery_failures;
@@ -1020,6 +1030,12 @@ impl Query {
             let Ok(mut paths) = discovery else {
                 continue;
             };
+            remove_aggregation_instances(
+                &mut paths,
+                self.configs[config_index]
+                    .excluded_aggregation_instance
+                    .as_deref(),
+            );
             let oversized = paths
                 .iter()
                 .filter(|path| path.encode_utf16().count() >= PDH_MAX_COUNTER_PATH as usize)
@@ -1743,6 +1759,7 @@ mod tests {
             unit: "By".to_owned(),
             description: format!("Description for {name}."),
             attributes: BTreeMap::new(),
+            excluded_aggregation_instance: None,
             scale_power10: 0,
         }
     }
@@ -2679,9 +2696,41 @@ mod tests {
         assert!(parse_multi_sz(&[b'a' as u16]).is_err());
     }
 
+    /// Scenario: A wildcard expansion contains aggregate and concrete provider instances.
+    /// Guarantees: Aggregate matching is case-insensitive and does not confuse concrete instances.
+    #[test]
+    fn identifies_provider_aggregation_instances() {
+        assert!(is_aggregation_instance(
+            r"\Process(_Total)\Private Bytes",
+            "_Total"
+        ));
+        assert!(is_aggregation_instance(
+            r"\Custom(_GLOBAL_)\Counter",
+            "_Global_"
+        ));
+        assert!(!is_aggregation_instance(
+            r"\Process(worker)\Private Bytes",
+            "_Total"
+        ));
+    }
+
+    /// Scenario: A wildcard aggregate sorts before concrete instances under a one-instance limit.
+    /// Guarantees: Aggregate filtering happens before limits so capacity is available to real instances.
+    #[test]
+    fn filters_aggregation_before_expansion_limits() {
+        let mut paths = vec![
+            r"\Process(_Total)\Private Bytes".to_owned(),
+            r"\Process(worker)\Private Bytes".to_owned(),
+        ];
+        remove_aggregation_instances(&mut paths, Some("_Total"));
+        let omitted = limit_expanded_paths(&mut paths, 1, 1);
+        assert_eq!(omitted, (0, 0));
+        assert_eq!(paths, [r"\Process(worker)\Private Bytes"]);
+    }
+
     /// Scenario: A simulated PDH call remains blocked past the shutdown deadline.
     /// Guarantees: Shutdown returns at the deadline, cleanup occurs later on the worker,
-    /// and the singleton lease remains held until that cleanup completes.
+    /// and worker-owned resources remain alive until that cleanup completes.
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_worker_releases_resources_after_timeout() {
         let _serial = super::super::TEST_PDH_LOCK.lock().await;
