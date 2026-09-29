@@ -1,9 +1,10 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use super::config::{CounterConfig, MetricKind};
 #[cfg(test)]
-use super::SamplePoint;
-use super::{CounterConfig, Number, Sample, SampleValue};
+use super::model::SamplePoint;
+use super::model::{Number, Sample, SampleValue};
 use arrow::error::ArrowError;
 use otel_arrow_dfe_pdata::encode::record::attributes::StrKeysAttributesRecordBatchBuilder;
 use otel_arrow_dfe_pdata::encode::record::metrics::{
@@ -14,8 +15,10 @@ use otel_arrow_dfe_pdata::otlp::metrics::MetricType;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use std::collections::BTreeMap;
 
-/// Project the ready values from one scrape directly into OTAP gauges.
-pub fn into_otap(
+const AGGREGATION_TEMPORALITY_CUMULATIVE: i32 = 2;
+
+/// Project the ready values from one scrape directly into OTAP metric streams.
+pub(super) fn into_otap(
     counters: &[CounterConfig],
     sample: Sample,
 ) -> Result<Option<OtapArrowRecords>, ArrowError> {
@@ -43,6 +46,15 @@ pub fn into_otap(
                 point.counter_index
             ))
         })?;
+        if counter.metric_kind == MetricKind::UpDownCounter
+            && (sample.start_time_unix_nano <= 0
+                || sample.start_time_unix_nano > sample.timestamp_unix_nano)
+        {
+            return Err(ArrowError::InvalidArgumentError(
+                "performance-counter UpDownCounter requires a positive start time no later than its timestamp"
+                    .to_owned(),
+            ));
+        }
         let metric_id = if let Some(metric_id) = metric_ids.get(&counter.name) {
             *metric_id
         } else {
@@ -50,12 +62,25 @@ pub fn into_otap(
                 ArrowError::InvalidArgumentError("too many configured metrics".to_owned())
             })?;
             metrics.append_id(metric_id);
-            metrics.append_metric_type(MetricType::Gauge as u8);
+            let metric_type = match counter.metric_kind {
+                MetricKind::Gauge => MetricType::Gauge,
+                MetricKind::UpDownCounter => MetricType::Sum,
+            };
+            metrics.append_metric_type(metric_type as u8);
             metrics.append_name(counter.name.as_bytes());
             metrics.append_description(counter.description.as_bytes());
             metrics.append_unit(counter.unit.as_bytes());
-            metrics.append_aggregation_temporality(None);
-            metrics.append_is_monotonic(None);
+            match counter.metric_kind {
+                MetricKind::Gauge => {
+                    metrics.append_aggregation_temporality(None);
+                    metrics.append_is_monotonic(None);
+                }
+                MetricKind::UpDownCounter => {
+                    metrics
+                        .append_aggregation_temporality(Some(AGGREGATION_TEMPORALITY_CUMULATIVE));
+                    metrics.append_is_monotonic(Some(false));
+                }
+            }
             let _ = metric_ids.insert(counter.name.clone(), metric_id);
             metric_id
         };
@@ -64,7 +89,10 @@ pub fn into_otap(
 
         points.append_id(point_id);
         points.append_parent_id(metric_id);
-        points.append_start_time_unix_nano(None);
+        points.append_start_time_unix_nano(match counter.metric_kind {
+            MetricKind::Gauge => None,
+            MetricKind::UpDownCounter => Some(sample.start_time_unix_nano),
+        });
         points.append_time_unix_nano(sample.timestamp_unix_nano);
         match value {
             Number::Integer(value) => {
@@ -158,8 +186,10 @@ pub fn into_otap(
 
 #[cfg(test)]
 mod tests {
+    use super::super::model::{InstanceIdentity, SampleFailure};
     use super::*;
     use arrow::array::{Array, Int64Array, UInt8Array};
+    use arrow::util::display::array_value_to_string;
 
     fn counter(path: &str, name: &str, unit: &str) -> CounterConfig {
         CounterConfig {
@@ -167,9 +197,17 @@ mod tests {
             name: name.to_owned(),
             unit: unit.to_owned(),
             description: format!("Description for {name}."),
+            metric_kind: MetricKind::Gauge,
             attributes: BTreeMap::new(),
             excluded_aggregation_instance: None,
             scale_power10: 0,
+        }
+    }
+
+    fn up_down_counter(path: &str, name: &str, unit: &str) -> CounterConfig {
+        CounterConfig {
+            metric_kind: MetricKind::UpDownCounter,
+            ..counter(path, name, unit)
         }
     }
 
@@ -195,6 +233,7 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
+                start_time_unix_nano: 1,
                 timestamp_unix_nano: timestamp,
                 points: vec![
                     point(
@@ -273,6 +312,104 @@ mod tests {
         assert_eq!(time.value(0), timestamp);
     }
 
+    /// Scenario: Process memory is configured as an UpDownCounter with a current integer value.
+    /// Guarantees: OTAP emits a cumulative non-monotonic Sum and preserves the query start time.
+    #[test]
+    fn projects_integer_up_down_counter() {
+        let mut counter = up_down_counter(
+            r"\Process(*)\Private Bytes",
+            "windows.process.private",
+            "By",
+        );
+        counter.description = "Committed private memory for each process instance.".to_owned();
+        let counters = [counter];
+        let records = into_otap(
+            &counters,
+            Sample {
+                start_time_unix_nano: 5,
+                timestamp_unix_nano: 10,
+                points: vec![point(
+                    0,
+                    r"\Process(worker)\Private Bytes",
+                    SampleValue::Value(Number::Integer(42)),
+                )],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let metrics = records.get(ArrowPayloadType::UnivariateMetrics).unwrap();
+        assert_eq!(
+            metrics
+                .column_by_name("metric_type")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .value(0),
+            MetricType::Sum as u8
+        );
+        assert_eq!(
+            array_value_to_string(
+                metrics
+                    .column_by_name("aggregation_temporality")
+                    .unwrap()
+                    .as_ref(),
+                0
+            )
+            .unwrap(),
+            AGGREGATION_TEMPORALITY_CUMULATIVE.to_string()
+        );
+        assert!(metrics.column_by_name("is_monotonic").is_none());
+        let display = arrow::util::pretty::pretty_format_batches(std::slice::from_ref(metrics))
+            .unwrap()
+            .to_string();
+        assert!(display.contains("Committed private memory for each process instance."));
+        let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
+        assert_eq!(
+            points
+                .column_by_name("start_time_unix_nano")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                .unwrap()
+                .value(0),
+            5
+        );
+    }
+
+    /// Scenario: A Gauge sample carries an unused start timestamp later than its collection timestamp.
+    /// Guarantees: Gauge projection ignores cumulative start-time state and preserves existing output.
+    #[test]
+    fn gauge_ignores_irrelevant_start_time() {
+        let counters = [counter(
+            r"\Memory\Available Bytes",
+            "windows.memory.available",
+            "By",
+        )];
+        assert!(
+            into_otap(
+                &counters,
+                Sample {
+                    start_time_unix_nano: 2,
+                    timestamp_unix_nano: 1,
+                    points: vec![point(
+                        0,
+                        r"\Memory\Available Bytes",
+                        SampleValue::Value(Number::Integer(42)),
+                    )],
+                    failures: Vec::new(),
+                    overflows: Vec::new(),
+                    diagnostics: Default::default(),
+                }
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
     /// Scenario: The immediate first scrape has a ready direct gauge and a warming calculated gauge.
     /// Guarantees: The first batch contains only the direct gauge, without delaying or zero-filling it.
     #[test]
@@ -288,6 +425,7 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
+                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![
                     point(
@@ -330,6 +468,7 @@ mod tests {
             into_otap(
                 &counters,
                 Sample {
+                    start_time_unix_nano: 1,
                     timestamp_unix_nano: 1,
                     points: vec![point(
                         0,
@@ -366,6 +505,7 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
+                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![
                     point(
@@ -416,13 +556,14 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
+                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![point(
                     0,
                     r"\Memory\Available Bytes",
                     SampleValue::Value(Number::Integer(42)),
                 )],
-                failures: vec![super::super::SampleFailure {
+                failures: vec![SampleFailure {
                     counter_index: 1,
                     reason: "PdhGetFormattedCounterValue",
                     error: "PDH_INVALID_DATA".to_owned(),
@@ -454,6 +595,7 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
+                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![point(
                     0,
@@ -495,6 +637,7 @@ mod tests {
             into_otap(
                 &counters,
                 Sample {
+                    start_time_unix_nano: 1,
                     timestamp_unix_nano: 1,
                     points: vec![point(
                         1,
@@ -512,6 +655,7 @@ mod tests {
             into_otap(
                 &counters,
                 Sample {
+                    start_time_unix_nano: 1,
                     timestamp_unix_nano: 0,
                     points: vec![point(
                         0,
@@ -529,6 +673,7 @@ mod tests {
             into_otap(
                 &counters,
                 Sample {
+                    start_time_unix_nano: 1,
                     timestamp_unix_nano: 1,
                     points: vec![point(
                         0,
@@ -546,6 +691,7 @@ mod tests {
             into_otap(
                 &counters,
                 Sample {
+                    start_time_unix_nano: 1,
                     timestamp_unix_nano: 1,
                     points: vec![point(
                         0,
@@ -573,12 +719,13 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
+                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![
                     SamplePoint {
                         counter_index: 0,
                         path: r"\Process(worker)\Private Bytes".to_owned(),
-                        instance: Some(super::super::InstanceIdentity {
+                        instance: Some(InstanceIdentity {
                             name: "worker".to_owned(),
                             parent: None,
                             index: 0,
@@ -588,7 +735,7 @@ mod tests {
                     SamplePoint {
                         counter_index: 0,
                         path: r"\Process(worker#1)\Private Bytes".to_owned(),
-                        instance: Some(super::super::InstanceIdentity {
+                        instance: Some(InstanceIdentity {
                             name: "worker".to_owned(),
                             parent: Some("service".to_owned()),
                             index: 1,
@@ -644,6 +791,7 @@ mod tests {
         let records = into_otap(
             &[active, idle],
             Sample {
+                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![
                     point(

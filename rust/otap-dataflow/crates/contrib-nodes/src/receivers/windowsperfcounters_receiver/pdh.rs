@@ -4,9 +4,10 @@
 //! Persistent synchronous PDH worker. Windows handles never leave its thread.
 #![allow(unsafe_code)]
 
-use crate::receivers::windowsperfcounters::{
-    CounterConfig, ExpansionOverflow, InstanceIdentity, Sample, SampleDiagnostics, SampleFailure,
-    SamplePoint, SampleValue, scale_double, scale_integer,
+use super::config::CounterConfig;
+use super::model::{
+    ExpansionOverflow, InstanceIdentity, Sample, SampleDiagnostics, SampleFailure, SamplePoint,
+    SampleValue, scale_double, scale_integer,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::{size_of, size_of_val};
@@ -593,6 +594,18 @@ fn unix_timestamp_nanos() -> Result<i64, Error> {
     i64::try_from(timestamp).map_err(|_| Error::InvalidSample("timestamp exceeds i64 nanoseconds"))
 }
 
+fn cumulative_start_time(
+    start_time_unix_nano: &mut i64,
+    previous_timestamp_unix_nano: &mut i64,
+    timestamp_unix_nano: i64,
+) -> i64 {
+    if timestamp_unix_nano < *previous_timestamp_unix_nano {
+        *start_time_unix_nano = timestamp_unix_nano;
+    }
+    *previous_timestamp_unix_nano = timestamp_unix_nano;
+    *start_time_unix_nano
+}
+
 fn is_aggregation_instance(path: &str, aggregation_name: &str) -> bool {
     parse_instance(path).is_ok_and(|instance| instance.name.eq_ignore_ascii_case(aggregation_name))
 }
@@ -644,6 +657,40 @@ fn merge_sample_metadata(
         } else {
             target_overflows.push(overflow);
         }
+    }
+}
+
+#[derive(Default)]
+struct PendingMetadata {
+    diagnostics: SampleDiagnostics,
+    failures: Vec<SampleFailure>,
+    overflows: Vec<ExpansionOverflow>,
+}
+
+impl PendingMetadata {
+    fn merge(
+        &mut self,
+        diagnostics: SampleDiagnostics,
+        failures: Vec<SampleFailure>,
+        overflows: Vec<ExpansionOverflow>,
+    ) {
+        merge_sample_metadata(
+            &mut self.diagnostics,
+            &mut self.failures,
+            &mut self.overflows,
+            diagnostics,
+            failures,
+            overflows,
+        );
+    }
+
+    fn merge_into_sample(&mut self, sample: &mut Sample) {
+        let mut pending = std::mem::take(self);
+        merge_diagnostics(&mut sample.diagnostics, pending.diagnostics);
+        pending.failures.append(&mut sample.failures);
+        sample.failures = pending.failures;
+        pending.overflows.append(&mut sample.overflows);
+        sample.overflows = pending.overflows;
     }
 }
 
@@ -740,12 +787,12 @@ struct CounterHandle {
 /// The query owns every added counter; closing it releases all handles.
 struct Query {
     handle: PDH_HQUERY,
+    start_time_unix_nano: i64,
+    previous_timestamp_unix_nano: i64,
     configs: Vec<CounterConfig>,
     counters: BTreeMap<CounterKey, CounterHandle>,
     retry_states: BTreeMap<CounterKey, RetryState>,
-    pending_diagnostics: SampleDiagnostics,
-    pending_failures: Vec<SampleFailure>,
-    pending_overflows: Vec<ExpansionOverflow>,
+    pending: PendingMetadata,
     pending_prime_failure: Option<Error>,
     wildcard_refresh_interval: Duration,
     max_instances_per_wildcard: usize,
@@ -760,6 +807,7 @@ impl Query {
         max_instances_per_wildcard: usize,
         max_expanded_counters: usize,
     ) -> Result<Self, Error> {
+        let start_time_unix_nano = unix_timestamp_nanos()?;
         let mut handle = null_mut();
         // SAFETY: Null selects the live local data source; handle is writable.
         check("PdhOpenQueryW", "<query>", unsafe {
@@ -767,12 +815,12 @@ impl Query {
         })?;
         let mut query = Self {
             handle,
+            start_time_unix_nano,
+            previous_timestamp_unix_nano: start_time_unix_nano,
             configs,
             counters: BTreeMap::new(),
             retry_states: BTreeMap::new(),
-            pending_diagnostics: SampleDiagnostics::default(),
-            pending_failures: Vec::new(),
-            pending_overflows: Vec::new(),
+            pending: PendingMetadata::default(),
             pending_prime_failure: None,
             wildcard_refresh_interval,
             max_instances_per_wildcard,
@@ -801,9 +849,10 @@ impl Query {
                     Ok(()) => {}
                     Err(error @ Error::UnsupportedType { .. }) => return Err(error),
                     Err(error) => {
-                        query.pending_diagnostics.counter_add_failures += 1;
+                        query.pending.diagnostics.counter_add_failures += 1;
                         query
-                            .pending_failures
+                            .pending
+                            .failures
                             .push(sample_failure(config_index, &error));
                         query.schedule_retry(key, target, Instant::now());
                     }
@@ -814,9 +863,7 @@ impl Query {
         let mut failures = Vec::new();
         let mut overflows = Vec::new();
         query.refresh_wildcards(&mut diagnostics, &mut failures, &mut overflows)?;
-        merge_diagnostics(&mut query.pending_diagnostics, diagnostics);
-        query.pending_failures.extend(failures);
-        query.pending_overflows = overflows;
+        query.pending.merge(diagnostics, failures, overflows);
         if !query.counters.is_empty()
             && let Err(error) = query.prime()
         {
@@ -1194,14 +1241,7 @@ impl Query {
         failures: Vec<SampleFailure>,
         overflows: Vec<ExpansionOverflow>,
     ) {
-        merge_sample_metadata(
-            &mut self.pending_diagnostics,
-            &mut self.pending_failures,
-            &mut self.pending_overflows,
-            diagnostics,
-            failures,
-            overflows,
-        );
+        self.pending.merge(diagnostics, failures, overflows);
     }
 
     fn move_pending_metadata_to(
@@ -1210,13 +1250,14 @@ impl Query {
         failures: &mut Vec<SampleFailure>,
         overflows: &mut Vec<ExpansionOverflow>,
     ) {
+        let pending = std::mem::take(&mut self.pending);
         merge_sample_metadata(
             diagnostics,
             failures,
             overflows,
-            std::mem::take(&mut self.pending_diagnostics),
-            std::mem::take(&mut self.pending_failures),
-            std::mem::take(&mut self.pending_overflows),
+            pending.diagnostics,
+            pending.failures,
+            pending.overflows,
         );
     }
 
@@ -1224,9 +1265,10 @@ impl Query {
         if let Some(error) = self.pending_prime_failure.take() {
             return Err(error);
         }
-        let mut diagnostics = std::mem::take(&mut self.pending_diagnostics);
-        let mut failures = std::mem::take(&mut self.pending_failures);
-        let mut overflows = std::mem::take(&mut self.pending_overflows);
+        let pending = std::mem::take(&mut self.pending);
+        let mut diagnostics = pending.diagnostics;
+        let mut failures = pending.failures;
+        let mut overflows = pending.overflows;
         if self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval {
             if let Err(error) =
                 self.refresh_wildcards(&mut diagnostics, &mut failures, &mut overflows)
@@ -1244,7 +1286,13 @@ impl Query {
                     return Err(error);
                 }
             };
+            let start_time_unix_nano = cumulative_start_time(
+                &mut self.start_time_unix_nano,
+                &mut self.previous_timestamp_unix_nano,
+                timestamp_unix_nano,
+            );
             return Ok(Sample {
+                start_time_unix_nano,
                 timestamp_unix_nano,
                 points: Vec::new(),
                 failures,
@@ -1266,6 +1314,11 @@ impl Query {
                 return Err(error);
             }
         };
+        let start_time_unix_nano = cumulative_start_time(
+            &mut self.start_time_unix_nano,
+            &mut self.previous_timestamp_unix_nano,
+            timestamp_unix_nano,
+        );
 
         // PDH advances the entire query at once. Refresh every valid receiver-side
         // base before formatting so one counter failure cannot leave later base
@@ -1458,6 +1511,7 @@ impl Query {
             .filter(|counter| counter.wildcard)
             .count();
         Ok(Sample {
+            start_time_unix_nano,
             timestamp_unix_nano,
             points,
             failures,
@@ -1552,9 +1606,7 @@ impl Worker {
                     let mut next_query_retry = Instant::now();
                     let mut rebuild_attempts = 0_u32;
                     let mut next_rebuild = Instant::now();
-                    let mut pending_diagnostics = SampleDiagnostics::default();
-                    let mut pending_failures = Vec::new();
-                    let mut pending_overflows = Vec::new();
+                    let mut pending = PendingMetadata::default();
                     while !worker_shutdown.load(Ordering::Acquire) {
                         match rx.recv() {
                             Ok(Command::Collect(response)) => {
@@ -1563,7 +1615,7 @@ impl Worker {
                                     && query_failure_attempts > 0
                                     && now >= next_query_retry;
                                 if was_query_retry {
-                                    pending_diagnostics.retry_attempts += 1;
+                                    pending.diagnostics.retry_attempts += 1;
                                 }
                                 let mut result = if let Some(active_query) = query.as_mut() {
                                     if now < next_query_retry {
@@ -1582,10 +1634,10 @@ impl Worker {
                                             .as_millis(),
                                     })
                                 } else {
-                                    pending_diagnostics.query_rebuild_attempts += 1;
+                                    pending.diagnostics.query_rebuild_attempts += 1;
                                     match settings.open() {
                                         Ok(rebuilt) => {
-                                            pending_diagnostics.query_rebuild_recoveries += 1;
+                                            pending.diagnostics.query_rebuild_recoveries += 1;
                                             rebuild_attempts = 0;
                                             query_failure_attempts = 0;
                                             next_query_retry = now;
@@ -1620,9 +1672,9 @@ impl Worker {
                                     if should_rebuild_query(query_failure_attempts) {
                                         if let Some(active_query) = query.as_mut() {
                                             active_query.move_pending_metadata_to(
-                                                &mut pending_diagnostics,
-                                                &mut pending_failures,
-                                                &mut pending_overflows,
+                                                &mut pending.diagnostics,
+                                                &mut pending.failures,
+                                                &mut pending.overflows,
                                             );
                                         }
                                         query = None;
@@ -1635,9 +1687,9 @@ impl Worker {
                                 {
                                     if let Some(active_query) = query.as_mut() {
                                         active_query.move_pending_metadata_to(
-                                            &mut pending_diagnostics,
-                                            &mut pending_failures,
-                                            &mut pending_overflows,
+                                            &mut pending.diagnostics,
+                                            &mut pending.failures,
+                                            &mut pending.overflows,
                                         );
                                     }
                                     query = None;
@@ -1646,24 +1698,13 @@ impl Worker {
                                         now + retry_delay(1, settings.wildcard_refresh_interval);
                                 } else if result.is_ok() {
                                     if was_query_retry {
-                                        pending_diagnostics.retry_recoveries += 1;
+                                        pending.diagnostics.retry_recoveries += 1;
                                     }
                                     query_failure_attempts = 0;
                                     next_query_retry = now;
                                 }
                                 if let Ok(sample) = &mut result {
-                                    let mut accumulated_failures =
-                                        std::mem::take(&mut pending_failures);
-                                    accumulated_failures.append(&mut sample.failures);
-                                    sample.failures = accumulated_failures;
-                                    let mut accumulated_overflows =
-                                        std::mem::take(&mut pending_overflows);
-                                    accumulated_overflows.append(&mut sample.overflows);
-                                    sample.overflows = accumulated_overflows;
-                                    merge_diagnostics(
-                                        &mut sample.diagnostics,
-                                        std::mem::take(&mut pending_diagnostics),
-                                    );
+                                    pending.merge_into_sample(sample);
                                 }
                                 let _ = response.send(result);
                             }
@@ -1745,8 +1786,9 @@ impl Drop for Worker {
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::MetricKind;
+    use super::super::model::Number;
     use super::*;
-    use crate::receivers::windowsperfcounters::Number;
     use windows_sys::Win32::System::Performance::{
         PDH_CSTATUS_INVALID_DATA, PDH_CSTATUS_NEW_DATA, PDH_FMT_COUNTERVALUE, PDH_RAW_COUNTER,
         PdhFormatFromRawValue,
@@ -1758,6 +1800,7 @@ mod tests {
             name: name.to_owned(),
             unit: "By".to_owned(),
             description: format!("Description for {name}."),
+            metric_kind: MetricKind::Gauge,
             attributes: BTreeMap::new(),
             excluded_aggregation_instance: None,
             scale_power10: 0,
@@ -2368,6 +2411,17 @@ mod tests {
         assert_eq!(current.discovery_refreshes, 1);
     }
 
+    /// Scenario: The wall clock moves backward while a cumulative metric query remains open.
+    /// Guarantees: The next point begins a new cumulative sequence that later scrapes retain.
+    #[test]
+    fn cumulative_start_time_resets_after_clock_rollback() {
+        let mut start = 10;
+        let mut previous = 10;
+        assert_eq!(cumulative_start_time(&mut start, &mut previous, 20), 10);
+        assert_eq!(cumulative_start_time(&mut start, &mut previous, 15), 15);
+        assert_eq!(cumulative_start_time(&mut start, &mut previous, 16), 15);
+    }
+
     /// Scenario: Query metadata survives a failed collection and is merged with later recovery evidence.
     /// Guarantees: Diagnostic counts, counter failures, and expansion overflows remain ordered and observable.
     #[test]
@@ -2443,6 +2497,62 @@ mod tests {
         assert_eq!(failures[0].error, "latest failure");
         assert_eq!(overflows.len(), 2);
         assert_eq!(overflows[0].discovered, 5);
+    }
+
+    /// Scenario: Worker recovery metadata precedes metadata from the successful scrape that releases it.
+    /// Guarantees: Bundling pending state preserves failure and overflow order while adding diagnostics.
+    #[test]
+    fn pending_metadata_bundle_preserves_worker_merge_order() {
+        let mut pending = PendingMetadata {
+            diagnostics: SampleDiagnostics {
+                retry_attempts: 1,
+                ..Default::default()
+            },
+            failures: vec![SampleFailure {
+                counter_index: 0,
+                reason: "pending",
+                error: "pending failure".to_owned(),
+            }],
+            overflows: vec![ExpansionOverflow {
+                counter_index: 0,
+                reason: "per_wildcard",
+                discovered: 3,
+                retained: 2,
+                omitted: 1,
+            }],
+        };
+        let mut sample = Sample {
+            start_time_unix_nano: 1,
+            timestamp_unix_nano: 2,
+            points: Vec::new(),
+            failures: vec![SampleFailure {
+                counter_index: 1,
+                reason: "current",
+                error: "current failure".to_owned(),
+            }],
+            overflows: vec![ExpansionOverflow {
+                counter_index: 1,
+                reason: "receiver_total",
+                discovered: 4,
+                retained: 3,
+                omitted: 1,
+            }],
+            diagnostics: SampleDiagnostics {
+                retry_recoveries: 1,
+                ..Default::default()
+            },
+        };
+
+        pending.merge_into_sample(&mut sample);
+
+        assert_eq!(sample.diagnostics.retry_attempts, 1);
+        assert_eq!(sample.diagnostics.retry_recoveries, 1);
+        assert_eq!(sample.failures[0].reason, "pending");
+        assert_eq!(sample.failures[1].reason, "current");
+        assert_eq!(sample.overflows[0].reason, "per_wildcard");
+        assert_eq!(sample.overflows[1].reason, "receiver_total");
+        assert_eq!(pending.failures.len(), 0);
+        assert_eq!(pending.overflows.len(), 0);
     }
 
     /// Scenario: A counter repeatedly fails while the refresh cadence caps recovery delay.

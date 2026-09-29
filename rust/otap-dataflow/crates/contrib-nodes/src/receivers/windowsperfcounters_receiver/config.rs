@@ -18,38 +18,49 @@ const RECEIVER_ATTRIBUTE_PREFIX: &str = "windows.perf_counter.";
 
 /// One normalized counter consumed by the existing PDH worker and OTAP builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CounterConfig {
+pub(super) struct CounterConfig {
     /// PDH path, optionally wildcarding only the instance segment.
-    pub path: String,
+    pub(super) path: String,
     /// OTel metric name.
-    pub name: String,
+    pub(super) name: String,
     /// OTel metric unit.
-    pub unit: String,
+    pub(super) unit: String,
     /// OTel metric description.
-    pub description: String,
+    pub(super) description: String,
+    /// OTel metric stream kind.
+    pub(super) metric_kind: MetricKind,
     /// Static attributes added to every point from this counter.
-    pub attributes: BTreeMap<String, String>,
+    pub(super) attributes: BTreeMap<String, String>,
     /// Provider aggregation instance omitted from this wildcard, when any.
-    pub excluded_aggregation_instance: Option<String>,
+    pub(super) excluded_aggregation_instance: Option<String>,
     /// Base-10 scaling applied after PDH calculates the native value.
-    pub scale_power10: i32,
+    pub(super) scale_power10: i32,
+}
+
+/// Supported OTel metric stream kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetricKind {
+    /// A point-in-time Gauge.
+    Gauge,
+    /// A cumulative non-monotonic Sum produced by an UpDownCounter.
+    UpDownCounter,
 }
 
 /// Configuration normalized for Windows performance-counter collection.
 #[derive(Debug, Clone)]
-pub struct Config {
+pub(super) struct Config {
     /// Exact or instance-wildcard counters to collect.
-    pub counters: Vec<CounterConfig>,
+    pub(super) counters: Vec<CounterConfig>,
     /// Time between collections; defaults to 30 seconds.
-    pub collection_interval: Duration,
+    pub(super) collection_interval: Duration,
     /// Delay before the first collection request; defaults to one second.
-    pub initial_delay: Duration,
+    pub(super) initial_delay: Duration,
     /// Time between wildcard discovery refreshes; defaults to the collection interval.
-    pub wildcard_refresh_interval: Option<Duration>,
+    pub(super) wildcard_refresh_interval: Option<Duration>,
     /// Maximum expanded instances retained for one wildcard path.
-    pub max_instances_per_wildcard: usize,
+    pub(super) max_instances_per_wildcard: usize,
     /// Maximum expanded wildcard counters retained by this receiver.
-    pub max_expanded_counters: usize,
+    pub(super) max_expanded_counters: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,12 +85,34 @@ struct UserConfig {
 struct MetricConfig {
     description: String,
     unit: String,
-    gauge: GaugeConfig,
+    #[serde(default)]
+    gauge: Option<GaugeConfig>,
+    #[serde(default)]
+    up_down_counter: Option<UpDownCounterConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GaugeConfig {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpDownCounterConfig {}
+
+impl MetricConfig {
+    fn kind(&self, name: &str) -> Result<MetricKind, Error> {
+        match (&self.gauge, &self.up_down_counter) {
+            (Some(_), None) => Ok(MetricKind::Gauge),
+            (None, Some(_)) => Ok(MetricKind::UpDownCounter),
+            (None, None) => Err(invalid(format!(
+                "metrics.{name} must configure gauge or up_down_counter"
+            ))),
+            (Some(_), Some(_)) => Err(invalid(format!(
+                "metrics.{name} must configure exactly one of gauge or up_down_counter"
+            ))),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -188,13 +221,13 @@ fn validate_counter(counter: &CounterConfig, index: usize) -> Result<(), Error> 
 impl Config {
     /// Effective wildcard refresh interval.
     #[must_use]
-    pub fn wildcard_refresh_interval(&self) -> Duration {
+    pub(super) fn wildcard_refresh_interval(&self) -> Duration {
         self.wildcard_refresh_interval
             .unwrap_or(self.collection_interval)
     }
 
     /// Parse, validate, and normalize the public configuration contract.
-    pub fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
+    pub(super) fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
         let user: UserConfig =
             serde_json::from_value(value.clone()).map_err(|err| invalid(err.to_string()))?;
         if !(Duration::from_secs(1)..=Duration::from_secs(86400))
@@ -239,7 +272,7 @@ impl Config {
             require_name("metric name", name)?;
             require_name(&format!("metrics.{name}.description"), &metric.description)?;
             require_name(&format!("metrics.{name}.unit"), &metric.unit)?;
-            let _ = &metric.gauge;
+            let _ = metric.kind(name)?;
         }
 
         let mut counters = Vec::new();
@@ -328,6 +361,7 @@ impl Config {
                         name: mapping.metric.clone(),
                         unit: metric.unit.clone(),
                         description: metric.description.clone(),
+                        metric_kind: metric.kind(&mapping.metric)?,
                         attributes: mapping.attributes.clone(),
                         excluded_aggregation_instance,
                         scale_power10: mapping.scale_power10,
@@ -384,6 +418,14 @@ mod tests {
         })
     }
 
+    fn up_down_counter_metric() -> serde_json::Value {
+        json!({
+            "description": "Committed private memory for each process instance.",
+            "unit": "By",
+            "up_down_counter": {}
+        })
+    }
+
     /// Scenario: Objects with no instances, named instances, and wildcards share metric metadata.
     /// Guarantees: Public configuration normalizes to exact and wildcard paths without changing metadata.
     #[test]
@@ -428,12 +470,37 @@ mod tests {
         assert_eq!(config.counters[0].path, r"\Memory\Available Bytes");
         assert_eq!(config.counters[1].path, r"\Process(*)\% Processor Time");
         assert_eq!(config.counters[1].name, "windows.process.time");
+        assert_eq!(config.counters[1].metric_kind, MetricKind::Gauge);
         assert_eq!(config.counters[1].attributes["state"], "active");
         assert_eq!(config.counters[2].attributes["state"], "idle");
         assert_eq!(config.counters[1].excluded_aggregation_instance, None);
         assert_eq!(config.collection_interval, Duration::from_secs(30));
         assert_eq!(config.initial_delay, Duration::from_secs(1));
         assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(30));
+    }
+
+    /// Scenario: A current additive value is configured as an UpDownCounter.
+    /// Guarantees: Configuration preserves the requested non-monotonic Sum kind on every normalized path.
+    #[test]
+    fn normalizes_up_down_counter_configuration() {
+        let config = Config::from_json(&json!({
+            "metrics": {"windows.process.private": up_down_counter_metric()},
+            "perfcounters": [{
+                "object": "Process",
+                "instances": "*",
+                "counters": [{
+                    "name": "Private Bytes",
+                    "metric": "windows.process.private"
+                }]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(config.counters[0].name, "windows.process.private");
+        assert_eq!(
+            config.counters[0].description,
+            "Committed private memory for each process instance."
+        );
+        assert_eq!(config.counters[0].metric_kind, MetricKind::UpDownCounter);
     }
 
     /// Scenario: A wildcard omits the default or custom aggregation instance unless selected.
@@ -519,6 +586,27 @@ mod tests {
             }),
             json!({
                 "metrics": {"test": {"description": "x", "unit": "1", "sum": {}}},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }]
+            }),
+            json!({
+                "metrics": {"test": {"description": "x", "unit": "1"}},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }]
+            }),
+            json!({
+                "metrics": {
+                    "test": {
+                        "description": "x",
+                        "unit": "1",
+                        "gauge": {},
+                        "up_down_counter": {}
+                    }
+                },
                 "perfcounters": [{
                     "object": "Memory",
                     "counters": [{"name": "Available Bytes", "metric": "test"}]

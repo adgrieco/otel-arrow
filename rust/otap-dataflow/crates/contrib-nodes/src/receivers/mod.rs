@@ -5,12 +5,8 @@
 #[cfg(all(feature = "etw-receiver", target_os = "windows"))]
 pub mod etw_receiver;
 
-/// Portable configuration and projection for Windows performance counters.
-#[cfg(feature = "windowsperfcounters-receiver")]
-pub mod windowsperfcounters;
-
 /// Windows performance-counter receiver.
-#[cfg(all(feature = "windowsperfcounters-receiver", target_os = "windows"))]
+#[cfg(feature = "windowsperfcounters-receiver")]
 pub mod windowsperfcounters_receiver;
 
 /// Kafka receiver.

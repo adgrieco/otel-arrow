@@ -3,7 +3,7 @@
 
 //! Bounded operational metrics for the Windows performance-counter receiver.
 
-use crate::receivers::windowsperfcounters::SampleDiagnostics;
+use super::model::SampleDiagnostics;
 use otel_arrow_dfe_telemetry::instrument::{Counter, Gauge, HistogramNormal};
 use otel_arrow_dfe_telemetry_macros::metric_set;
 

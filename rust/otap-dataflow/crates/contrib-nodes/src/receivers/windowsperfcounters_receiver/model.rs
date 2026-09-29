@@ -1,17 +1,11 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Portable performance-counter configuration and OTAP gauge projection.
-
-mod config;
-mod otap_builder;
-
-pub use config::{Config, CounterConfig};
-pub use otap_builder::into_otap;
+//! Portable values shared by configuration, PDH collection, and OTAP projection.
 
 /// A numeric performance-counter value.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Number {
+pub(super) enum Number {
     /// An exact signed integer.
     Integer(i64),
     /// A finite calculated or fractionally scaled value.
@@ -20,7 +14,7 @@ pub enum Number {
 
 /// One configured counter's state for a collection.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SampleValue {
+pub(super) enum SampleValue {
     /// A ready numeric value.
     Value(Number),
     /// A two-sample counter is in its bounded first-scrape warm-up.
@@ -31,101 +25,103 @@ pub enum SampleValue {
 
 /// Identity parsed from one expanded wildcard instance path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstanceIdentity {
+pub(super) struct InstanceIdentity {
     /// Instance name without the duplicate index suffix.
-    pub name: String,
+    pub(super) name: String,
     /// Optional parent instance name.
-    pub parent: Option<String>,
+    pub(super) parent: Option<String>,
     /// Duplicate instance index used by PDH to distinguish equal names.
-    pub index: u32,
+    pub(super) index: u32,
 }
 
 /// One exact or expanded counter point in a collection.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SamplePoint {
+pub(super) struct SamplePoint {
     /// Index of the configured counter that defines metric metadata.
-    pub counter_index: usize,
+    pub(super) counter_index: usize,
     /// Exact configured path or concrete expanded wildcard path.
-    pub path: String,
+    pub(super) path: String,
     /// Parsed identity for an expanded wildcard instance.
-    pub instance: Option<InstanceIdentity>,
+    pub(super) instance: Option<InstanceIdentity>,
     /// Ready value or expected omission.
-    pub value: SampleValue,
+    pub(super) value: SampleValue,
 }
 
 /// One counter-local failure omitted from an otherwise successful collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SampleFailure {
+pub(super) struct SampleFailure {
     /// Index of the configured exact or wildcard path.
-    pub counter_index: usize,
+    pub(super) counter_index: usize,
     /// Low-cardinality failure category.
-    pub reason: &'static str,
+    pub(super) reason: &'static str,
     /// Native status or calculation detail without expanded instance identity.
-    pub error: String,
+    pub(super) error: String,
 }
 
 /// One explicit wildcard expansion limit reached during discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExpansionOverflow {
+pub(super) struct ExpansionOverflow {
     /// Index of the configured wildcard path.
-    pub counter_index: usize,
+    pub(super) counter_index: usize,
     /// Low-cardinality limit category.
-    pub reason: &'static str,
+    pub(super) reason: &'static str,
     /// Number of concrete paths discovered before this limit was applied.
-    pub discovered: usize,
+    pub(super) discovered: usize,
     /// Number of concrete paths retained after this limit was applied.
-    pub retained: usize,
+    pub(super) retained: usize,
     /// Number of concrete paths omitted by this limit.
-    pub omitted: usize,
+    pub(super) omitted: usize,
 }
 
 /// Bounded operational changes observed while producing one sample.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SampleDiagnostics {
+pub(super) struct SampleDiagnostics {
     /// Number of currently active expanded wildcard counters.
-    pub active_expanded_counters: usize,
+    pub(super) active_expanded_counters: usize,
     /// Number of wildcard discovery refreshes attempted.
-    pub discovery_refreshes: u64,
+    pub(super) discovery_refreshes: u64,
     /// Number of wildcard discovery attempts that failed.
-    pub discovery_failures: u64,
+    pub(super) discovery_failures: u64,
     /// Number of newly active expanded instances.
-    pub instances_added: u64,
+    pub(super) instances_added: u64,
     /// Number of expanded instances removed.
-    pub instances_removed: u64,
+    pub(super) instances_removed: u64,
     /// Number of expanded instances omitted by configured limits.
-    pub instances_omitted_over_limit: u64,
+    pub(super) instances_omitted_over_limit: u64,
     /// Number of counter-add attempts that failed.
-    pub counter_add_failures: u64,
+    pub(super) counter_add_failures: u64,
     /// Number of counter read, status, or projection failures.
-    pub counter_read_failures: u64,
+    pub(super) counter_read_failures: u64,
     /// Number of deferred counter retry attempts.
-    pub retry_attempts: u64,
+    pub(super) retry_attempts: u64,
     /// Number of deferred counter retries that recovered.
-    pub retry_recoveries: u64,
+    pub(super) retry_recoveries: u64,
     /// Number of worker-owned query rebuilds attempted.
-    pub query_rebuild_attempts: u64,
+    pub(super) query_rebuild_attempts: u64,
     /// Number of worker-owned query rebuilds that recovered.
-    pub query_rebuild_recoveries: u64,
+    pub(super) query_rebuild_recoveries: u64,
     /// Number of independently warming points omitted.
-    pub warmup_omissions: u64,
+    pub(super) warmup_omissions: u64,
 }
 
 /// A successful point-in-time PDH reading, independent of Windows handles.
 #[derive(Debug, Clone)]
-pub struct Sample {
+pub(super) struct Sample {
+    /// Start of the current PDH query as nanoseconds since the Unix epoch.
+    pub(super) start_time_unix_nano: i64,
     /// Collection time as nanoseconds since the Unix epoch.
-    pub timestamp_unix_nano: i64,
+    pub(super) timestamp_unix_nano: i64,
     /// Exact and expanded points keyed by configured counter and concrete path.
-    pub points: Vec<SamplePoint>,
+    pub(super) points: Vec<SamplePoint>,
     /// Counter-local failures that did not suppress healthy points.
-    pub failures: Vec<SampleFailure>,
+    pub(super) failures: Vec<SampleFailure>,
     /// Explicit per-template and receiver-wide expansion overflows.
-    pub overflows: Vec<ExpansionOverflow>,
+    pub(super) overflows: Vec<ExpansionOverflow>,
     /// Aggregate bounded diagnostics for this collection.
-    pub diagnostics: SampleDiagnostics,
+    pub(super) diagnostics: SampleDiagnostics,
 }
 
-pub(crate) fn scale_integer(value: i64, power10: i32) -> Result<Number, String> {
+pub(super) fn scale_integer(value: i64, power10: i32) -> Result<Number, String> {
     match power10.cmp(&0) {
         std::cmp::Ordering::Equal => Ok(Number::Integer(value)),
         std::cmp::Ordering::Greater => {
@@ -162,7 +158,7 @@ pub(crate) fn scale_integer(value: i64, power10: i32) -> Result<Number, String> 
     }
 }
 
-pub(crate) fn scale_double(value: f64, power10: i32) -> Result<Number, String> {
+pub(super) fn scale_double(value: f64, power10: i32) -> Result<Number, String> {
     let scaled = value * 10_f64.powi(power10);
     if !scaled.is_finite() {
         return Err(format!("{value} * 10^{power10} is not finite"));

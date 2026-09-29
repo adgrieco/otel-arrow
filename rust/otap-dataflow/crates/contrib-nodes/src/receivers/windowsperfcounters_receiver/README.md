@@ -13,10 +13,10 @@
 ## Overview
 
 Reads configured exact or instance-wildcard Windows performance-counter paths
-through PDH and emits OTel gauges. Each data point includes the configured
-metric identity and concrete `windows.perf_counter.path` attribute. Wildcard
-points also include their configured path template and instance identity. The
-resource includes `os.type=windows`.
+through PDH and emits OTel Gauges or UpDownCounters. Each data point includes
+the configured metric identity and concrete `windows.perf_counter.path`
+attribute. Wildcard points also include their configured path template and
+instance identity. The resource includes `os.type=windows`.
 
 The receiver constructs PDH paths from configured performance objects,
 instances, and counters, and periodically refreshes wildcard instances.
@@ -37,6 +37,10 @@ config:
       unit: "%"
       description: Average processor utilization across all logical processors.
       gauge: {}
+    windows.process.private:
+      unit: By
+      description: Committed private memory for each process instance.
+      up_down_counter: {}
   perfcounters:
     - object: Memory
       counters:
@@ -47,6 +51,11 @@ config:
       counters:
         - name: "% Processor Time"
           metric: windows.processor.time
+    - object: Process
+      instances: ["*"]
+      counters:
+        - name: Private Bytes
+          metric: windows.process.private
   initial_delay: 1s
   collection_interval: 30s
   wildcard_refresh_interval: 2m
@@ -56,7 +65,7 @@ config:
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `metrics` | Yes | None | Gauge metadata keyed by OTel metric name |
+| `metrics` | Yes | None | Metric metadata keyed by OTel metric name |
 | `perfcounters` | Yes | None | Performance objects and counter mappings |
 | `initial_delay` | No | `1s` | Delay before the first collection request |
 | `collection_interval` | No | `30s` | Interval from `1s` through `24h` |
@@ -73,9 +82,11 @@ limit. Normalization produces between 1 and 256 exact or wildcard paths, and
 ### Metric options
 
 Each `metrics` key is an OTel metric name. Its value requires `description`,
-`unit`, and an empty `gauge: {}` object. Multiple counter mappings may
-reference one metric and contribute points distinguished by their configured
-attributes. Only Gauge output is supported.
+`unit`, and exactly one empty `gauge: {}` or `up_down_counter: {}` object.
+Multiple counter mappings may reference one metric and contribute points
+distinguished by their configured attributes. Gauges have point-in-time
+semantics and no start timestamp. UpDownCounters are cumulative non-monotonic
+Sums whose start timestamp is the opening time of the current PDH query.
 
 ### Performance object and counter options
 
@@ -91,6 +102,12 @@ contains static string key/value pairs added to each emitted point.
 `scale_power10` defaults to zero and accepts values from `-18` through `18`.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
+
+Configure performance object and counter names in English. Exact paths are
+added through PDH's language-neutral English API. Before wildcard expansion,
+the receiver asks PDH to translate the English template to its localized full
+path, expands that localized template, and adds the resulting concrete paths
+through the localized API.
 
 Omit `instances` for objects without instances. Specify one name or a list for
 exact instances. Specify `"*"` to discover all concrete instances while
@@ -111,17 +128,28 @@ limit are omitted and diagnosed.
 
 | Family | Native types | Samples | Output |
 | --- | --- | --- | --- |
-| Direct values | `PERF_COUNTER_RAWCOUNT`, `PERF_COUNTER_LARGE_RAWCOUNT`, and hexadecimal variants | One | Integer gauge |
-| Rates | `PERF_COUNTER_COUNTER`, `PERF_COUNTER_BULK_COUNT` | Two | Double gauge |
-| Timer percentages | `PERF_COUNTER_TIMER`, inverse variants, and 100-nanosecond variants | Two | Double gauge |
-| Raw fractions | `PERF_RAW_FRACTION`, `PERF_LARGE_RAW_FRACTION` | One | Double gauge |
-| Sample fractions | `PERF_SAMPLE_FRACTION` | Two | Double gauge |
-| Averages | `PERF_AVERAGE_TIMER`, `PERF_AVERAGE_BULK` | Two | Double gauge |
+| Direct values | `PERF_COUNTER_RAWCOUNT`, `PERF_COUNTER_LARGE_RAWCOUNT`, and hexadecimal variants | One | Integer |
+| Rates | `PERF_COUNTER_COUNTER`, `PERF_COUNTER_BULK_COUNT` | Two | Double |
+| Timer percentages | `PERF_COUNTER_TIMER`, inverse variants, and 100-nanosecond variants | Two | Double |
+| Raw fractions | `PERF_RAW_FRACTION`, `PERF_LARGE_RAW_FRACTION` | One | Double |
+| Sample fractions | `PERF_SAMPLE_FRACTION` | Two | Double |
+| Averages | `PERF_AVERAGE_TIMER`, `PERF_AVERAGE_BULK` | Two | Double |
+
+The configured metric kind is independent of PDH's numeric formatting. Use a
+Gauge for non-additive current values such as utilization and an UpDownCounter
+for additive current values such as committed private memory. Metric names and
+descriptions must preserve the source counter's semantics; Windows Private
+Bytes includes committed memory that may reside in RAM or the page file and
+must not be labeled as the physical-memory metric `process.memory.usage`.
 
 PDH performs rate, timer, fraction, and average calculations and associates
 visible fraction/average numerators with their provider-defined base counters.
 Configure only the visible numerator path. Standalone base counters are not
 metrics and are rejected.
+
+The receiver requests regular PDH formatted counter values and emits them as
+OTel metrics. Geneva-specific Full or Factored event formats are transport and
+schema choices outside this receiver's OTAP metric contract.
 
 Unsupported exact counter types fail startup. A missing or inaccessible exact
 counter is omitted and retried, including when no configured counter is
@@ -172,8 +200,10 @@ counter warm-up or startup retries.
   instances are omitted, reported explicitly, and reconsidered at the next
   discovery refresh; they are never presented as a complete expansion.
 
-Each emitted point uses the collection timestamp and has no cumulative start
-time.
+Each emitted point uses the collection timestamp. UpDownCounter points use the
+current PDH query's opening time as their cumulative start time; a query rebuild
+or backward wall-clock adjustment starts a new cumulative sequence. Gauge
+points do not use or validate cumulative start time.
 
 ## Examples
 

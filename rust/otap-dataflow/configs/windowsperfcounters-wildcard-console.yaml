@@ -27,8 +27,8 @@ groups:
                   gauge: {}
                 windows.process.private:
                   unit: By
-                  description: Private memory allocated by each process instance.
-                  gauge: {}
+                  description: Committed private memory for each process instance.
+                  up_down_counter: {}
               perfcounters:
                 - object: Memory
                   counters:
