@@ -1,0 +1,6 @@
+type: windowsperfcounters
+status:
+  class: receiver
+  codeowners:
+    active:
+      - adgrieco

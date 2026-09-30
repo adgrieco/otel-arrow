@@ -7407,6 +7407,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "windows-sys 0.61.2",
  "wiremock",
  "xxhash-rust",
 ]

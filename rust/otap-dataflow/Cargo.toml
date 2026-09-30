@@ -95,6 +95,7 @@ arrow-array = { version = "58.3" }
 arrow-cast = { version = "58.3" }
 arrow-select = { version = "58.3" }
 wasmtime = { version = "48.0", default-features = false, features = ["runtime", "component-model", "cranelift", "std"] }
+windows-sys = "0.61.2"
 async-stream = "0.3.6"
 async-trait = "0.1.88"
 async-unsync = "0.3.0"
@@ -344,6 +345,7 @@ kafka = ["otel-arrow-dfe-contrib-nodes/kafka"]
 # Contrib receivers.
 etw = ["otel-arrow-dfe-contrib-nodes/etw"]
 user-events = ["otel-arrow-dfe-contrib-nodes/user-events"]
+windowsperfcounters = ["otel-arrow-dfe-contrib-nodes/windowsperfcounters"]
 
 # Contrib processors.
 condense-attributes = ["otel-arrow-dfe-contrib-nodes/condense-attributes"]

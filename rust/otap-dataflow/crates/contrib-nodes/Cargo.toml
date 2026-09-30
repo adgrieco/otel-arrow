@@ -40,6 +40,7 @@ tokio.workspace = true
 tracing.workspace = true
 base64 = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
+humantime = { workspace = true, optional = true }
 humantime-serde = { workspace = true, optional = true }
 itoa = { workspace = true, optional = true }
 geneva-uploader = { workspace = true, optional = true }
@@ -86,6 +87,7 @@ rdkafka = { workspace = true, features = ["cmake-build", "curl-static"], optiona
 # which is not a valid Win32 executable (os error 193).
 [target.'cfg(target_os = "windows")'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
+windows-sys = { workspace = true, features = ["Win32_System_Performance"], optional = true }
 
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 one_collect = { workspace = true, optional = true }
@@ -101,6 +103,7 @@ contrib-receivers = [
     "etw",
     "kafka",
     "user-events",
+    "windowsperfcounters",
 ]
 contrib-processors = [
     "condense-attributes",
@@ -139,6 +142,7 @@ user-events = [
     "dep:one_collect",
     "dep:tracepoint_decode",
 ]
+windowsperfcounters = ["dep:humantime", "dep:humantime-serde", "dep:windows-sys"]
 
 # Processors.
 condense-attributes = []

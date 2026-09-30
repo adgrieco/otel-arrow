@@ -59,6 +59,7 @@ Receivers ingest data into a pipeline.
 | `receiver:etw` | `etw` | Experimental | Ingests Event Tracing for Windows events as logs. |
 | [`receiver:kafka`](src/receivers/kafka_receiver/README.md) | `kafka` | Experimental | Consumes traces, metrics, and logs from Kafka. |
 | [`receiver:user_events`](src/receivers/user_events_receiver/README.md) | `user-events` | Experimental | Ingests Linux `user_events` tracepoints as logs. |
+| [`receiver:windowsperfcounters`](src/receivers/windowsperfcounters_receiver/README.md) | `windowsperfcounters` | Experimental | Collects exact Windows performance counters as metrics. |
 
 ## Processors
 

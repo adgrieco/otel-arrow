@@ -277,6 +277,25 @@ jobs:
         run: cargo test --locked -p otel-arrow-dfe-contrib-nodes etw_receiver_decodes_tracelogging_events_end_to_end --features etw -- --ignored
         working-directory: ./rust/otap-dataflow
 
+  windowsperfcounters_windows_smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ./rust/otap-dataflow
+          cache-bin: false
+          save-if: false
+      - name: Run Windows performance-counter smoke tests
+        run: "cargo test --locked -p otel-arrow-dfe-contrib-nodes windowsperfcounters_receiver:: --features windowsperfcounters -- --ignored"
+        working-directory: ./rust/otap-dataflow
+
   fmt:
     if: github.event_name == 'pull_request'
     strategy:
@@ -627,7 +646,7 @@ jobs:
         # The complete component inventory is validated by the Linux all-feature
         # build; including its dev-dependencies here would pull Kafka and OpenSSL
         # into this reduced-feature SymCrypt build.
-        run: cargo nextest archive --locked --no-default-features --features=crypto-symcrypt,mimalloc,azure,aws,azure-monitor,geneva,contrib-processors,unsafe-optimizations --workspace --exclude otel-arrow-dfe-component-inventory --archive-file nextest-archive.tar.zst
+        run: cargo nextest archive --locked --no-default-features --features=crypto-symcrypt,mimalloc,azure,aws,azure-monitor,geneva,contrib-processors,windowsperfcounters,unsafe-optimizations --workspace --exclude otel-arrow-dfe-component-inventory --archive-file nextest-archive.tar.zst
         working-directory: ./rust/otap-dataflow
       - name: Upload nextest archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1297,6 +1316,7 @@ jobs:
       - host-metrics-semconv
       - user_events_linux_smoke
       - etw_windows_smoke
+      - windowsperfcounters_windows_smoke
       - license-header-check
     steps:
       - name: Summarize required-build caches
@@ -1374,6 +1394,10 @@ jobs:
           fi
           if [[ "${{ needs.etw_windows_smoke.result }}" != "success" ]]; then
             echo "etw_windows_smoke failed or was cancelled"
+            exit 1
+          fi
+          if [[ "${{ needs.windowsperfcounters_windows_smoke.result }}" != "success" ]]; then
+            echo "windowsperfcounters_windows_smoke failed or was cancelled"
             exit 1
           fi
           if [[ "${{ needs.license-header-check.result }}" != "success" ]]; then
