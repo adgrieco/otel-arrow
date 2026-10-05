@@ -3,6 +3,11 @@
 
 //! Windows performance-counter receiver.
 
+otel_arrow_dfe_telemetry::otel_component_scope!(
+    urn = runtime::WINDOWSPERFCOUNTERS_RECEIVER_URN,
+    target = "otel.receiver.windowsperfcounters",
+);
+
 mod config;
 mod metrics;
 mod model;

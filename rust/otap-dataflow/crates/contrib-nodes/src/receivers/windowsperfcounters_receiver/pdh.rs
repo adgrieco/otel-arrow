@@ -35,7 +35,10 @@ const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
 const PERF_TYPE_COUNTER: u32 = 0x0000_0400;
 const PERF_COUNTER_RATE: u32 = 0x0001_0000;
 const PERF_COUNTER_FRACTION: u32 = 0x0002_0000;
+const PERF_COUNTER_QUEUELEN: u32 = 0x0005_0000;
+const PERF_COUNTER_PRECISION: u32 = 0x0007_0000;
 const PERF_TIMER_100NS: u32 = 0x0010_0000;
+const PERF_OBJECT_TIMER: u32 = 0x0020_0000;
 const PERF_DELTA_COUNTER: u32 = 0x0040_0000;
 const PERF_DELTA_BASE: u32 = 0x0080_0000;
 const PERF_INVERSE_COUNTER: u32 = 0x0100_0000;
@@ -61,6 +64,20 @@ const PERF_COUNTER_BULK_COUNT: u32 = PERF_SIZE_LARGE
     | PERF_COUNTER_RATE
     | PERF_DELTA_COUNTER
     | PERF_DISPLAY_PER_SEC;
+const PERF_COUNTER_QUEUELEN_TYPE: u32 =
+    PERF_SIZE_DWORD | PERF_TYPE_COUNTER | PERF_COUNTER_QUEUELEN | PERF_DELTA_COUNTER;
+const PERF_COUNTER_LARGE_QUEUELEN_TYPE: u32 =
+    PERF_SIZE_LARGE | PERF_TYPE_COUNTER | PERF_COUNTER_QUEUELEN | PERF_DELTA_COUNTER;
+const PERF_COUNTER_100NS_QUEUELEN_TYPE: u32 = PERF_SIZE_LARGE
+    | PERF_TYPE_COUNTER
+    | PERF_COUNTER_QUEUELEN
+    | PERF_TIMER_100NS
+    | PERF_DELTA_COUNTER;
+const PERF_COUNTER_OBJ_TIME_QUEUELEN_TYPE: u32 = PERF_SIZE_LARGE
+    | PERF_TYPE_COUNTER
+    | PERF_COUNTER_QUEUELEN
+    | PERF_OBJECT_TIMER
+    | PERF_DELTA_COUNTER;
 const PERF_COUNTER_TIMER: u32 = PERF_SIZE_LARGE
     | PERF_TYPE_COUNTER
     | PERF_COUNTER_RATE
@@ -69,6 +86,23 @@ const PERF_COUNTER_TIMER: u32 = PERF_SIZE_LARGE
 const PERF_COUNTER_TIMER_INV: u32 = PERF_COUNTER_TIMER | PERF_INVERSE_COUNTER;
 const PERF_100NSEC_TIMER: u32 = PERF_COUNTER_TIMER | PERF_TIMER_100NS;
 const PERF_100NSEC_TIMER_INV: u32 = PERF_100NSEC_TIMER | PERF_INVERSE_COUNTER;
+const PERF_OBJ_TIME_TIMER: u32 = PERF_COUNTER_TIMER | PERF_OBJECT_TIMER;
+const PERF_PRECISION_SYSTEM_TIMER: u32 = PERF_SIZE_LARGE
+    | PERF_TYPE_COUNTER
+    | PERF_COUNTER_PRECISION
+    | PERF_DELTA_COUNTER
+    | PERF_DISPLAY_PERCENT;
+const PERF_PRECISION_100NS_TIMER: u32 = PERF_PRECISION_SYSTEM_TIMER | PERF_TIMER_100NS;
+const PERF_PRECISION_OBJECT_TIMER: u32 = PERF_PRECISION_SYSTEM_TIMER | PERF_OBJECT_TIMER;
+const PERF_COUNTER_DELTA: u32 =
+    PERF_SIZE_DWORD | PERF_TYPE_COUNTER | PERF_DELTA_COUNTER | PERF_DISPLAY_NO_SUFFIX;
+const PERF_COUNTER_LARGE_DELTA: u32 =
+    PERF_SIZE_LARGE | PERF_TYPE_COUNTER | PERF_DELTA_COUNTER | PERF_DISPLAY_NO_SUFFIX;
+const PERF_SAMPLE_COUNTER: u32 = PERF_SIZE_DWORD
+    | PERF_TYPE_COUNTER
+    | PERF_COUNTER_RATE
+    | PERF_DELTA_COUNTER
+    | PERF_DISPLAY_NO_SUFFIX;
 const PERF_RAW_FRACTION: u32 =
     PERF_SIZE_DWORD | PERF_TYPE_COUNTER | PERF_COUNTER_FRACTION | PERF_DISPLAY_PERCENT;
 const PERF_LARGE_RAW_FRACTION: u32 =
@@ -99,7 +133,8 @@ pub(super) enum Error {
     },
     #[error(
         "unsupported native counter type 0x{native_type:08X} for {path}; \
-         supported types are direct raw counts, rates, timers, fractions, and averages"
+         supported types are direct raw counts, rates, deltas, queue lengths, timers, \
+         fractions, and averages"
     )]
     UnsupportedType { path: String, native_type: u32 },
     #[error("invalid performance-counter sample: {0}")]
@@ -129,8 +164,13 @@ impl Error {
             Self::Pdh { .. }
                 | Self::InvalidSample(_)
                 | Self::Calculation { .. }
+                | Self::WorkerBusy
                 | Self::QueryRecoveryPending { .. }
         )
+    }
+
+    pub(super) fn is_overrun(&self) -> bool {
+        matches!(self, Self::WorkerBusy)
     }
 
     fn is_query_collection_failure(&self) -> bool {
@@ -208,10 +248,21 @@ fn classify_native_type(path: &str, native_type: u32, scale: i32) -> Result<Coun
         | PERF_COUNTER_LARGE_RAWCOUNT_HEX => CounterKind::Direct,
         PERF_COUNTER_COUNTER
         | PERF_COUNTER_BULK_COUNT
+        | PERF_COUNTER_QUEUELEN_TYPE
+        | PERF_COUNTER_LARGE_QUEUELEN_TYPE
+        | PERF_COUNTER_100NS_QUEUELEN_TYPE
+        | PERF_COUNTER_OBJ_TIME_QUEUELEN_TYPE
         | PERF_COUNTER_TIMER
         | PERF_COUNTER_TIMER_INV
         | PERF_100NSEC_TIMER
-        | PERF_100NSEC_TIMER_INV => CounterKind::CalculatedTwoSample,
+        | PERF_100NSEC_TIMER_INV
+        | PERF_OBJ_TIME_TIMER
+        | PERF_PRECISION_SYSTEM_TIMER
+        | PERF_PRECISION_100NS_TIMER
+        | PERF_PRECISION_OBJECT_TIMER
+        | PERF_COUNTER_DELTA
+        | PERF_COUNTER_LARGE_DELTA
+        | PERF_SAMPLE_COUNTER => CounterKind::CalculatedTwoSample,
         PERF_SAMPLE_FRACTION | PERF_AVERAGE_TIMER | PERF_AVERAGE_BULK => {
             CounterKind::CalculatedTwoSampleWithBase
         }
@@ -787,6 +838,7 @@ struct CounterHandle {
 /// The query owns every added counter; closing it releases all handles.
 struct Query {
     handle: PDH_HQUERY,
+    node: String,
     start_time_unix_nano: i64,
     previous_timestamp_unix_nano: i64,
     configs: Vec<CounterConfig>,
@@ -806,6 +858,7 @@ impl Query {
         wildcard_refresh_interval: Duration,
         max_instances_per_wildcard: usize,
         max_expanded_counters: usize,
+        node: String,
     ) -> Result<Self, Error> {
         let start_time_unix_nano = unix_timestamp_nanos()?;
         let mut handle = null_mut();
@@ -815,6 +868,7 @@ impl Query {
         })?;
         let mut query = Self {
             handle,
+            node,
             start_time_unix_nano,
             previous_timestamp_unix_nano: start_time_unix_nano,
             configs,
@@ -1530,7 +1584,8 @@ impl Drop for Query {
         let _ = QUERY_CLOSES.fetch_add(1, Ordering::Relaxed);
         if status != 0 {
             otel_arrow_dfe_telemetry::otel_warn!(
-                "windowsperfcounters.close_failed",
+                "otelcol.node.windowsperfcounters.close.fail",
+                node = self.node.as_str(),
                 status = status as u64
             );
         }
@@ -1542,12 +1597,29 @@ enum Command {
     Shutdown,
 }
 
+struct AcceptedCollectGuard {
+    accepted: Arc<AtomicBool>,
+}
+
+impl AcceptedCollectGuard {
+    fn new(accepted: Arc<AtomicBool>) -> Self {
+        Self { accepted }
+    }
+}
+
+impl Drop for AcceptedCollectGuard {
+    fn drop(&mut self) {
+        self.accepted.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Clone)]
 struct QuerySettings {
     counters: Vec<CounterConfig>,
     wildcard_refresh_interval: Duration,
     max_instances_per_wildcard: usize,
     max_expanded_counters: usize,
+    node: String,
 }
 
 impl QuerySettings {
@@ -1557,6 +1629,7 @@ impl QuerySettings {
             self.wildcard_refresh_interval,
             self.max_instances_per_wildcard,
             self.max_expanded_counters,
+            self.node.clone(),
         )
     }
 }
@@ -1564,21 +1637,25 @@ impl QuerySettings {
 /// Capacity-one command client for the thread that owns the persistent query.
 pub(super) struct Worker {
     tx: mpsc::SyncSender<Command>,
+    accepted: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     completion: Option<oneshot::Receiver<()>>,
 }
 
 impl Worker {
-    pub(super) fn start(
+    pub(super) async fn start(
         counters: Vec<CounterConfig>,
         wildcard_refresh_interval: Duration,
         max_instances_per_wildcard: usize,
         max_expanded_counters: usize,
+        node: String,
     ) -> Result<Self, Error> {
         let (tx, rx) = mpsc::sync_channel(1);
-        let (init_tx, init_rx) = mpsc::sync_channel(1);
+        let (init_tx, init_rx) = oneshot::channel();
         let (completion_tx, completion_rx) = oneshot::channel();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let worker_accepted = Arc::clone(&accepted);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown_requested);
         let settings = QuerySettings {
@@ -1586,6 +1663,7 @@ impl Worker {
             wildcard_refresh_interval,
             max_instances_per_wildcard,
             max_expanded_counters,
+            node,
         };
         let join = std::thread::Builder::new()
             .name("windowsperfcounters-pdh".to_owned())
@@ -1610,6 +1688,8 @@ impl Worker {
                     while !worker_shutdown.load(Ordering::Acquire) {
                         match rx.recv() {
                             Ok(Command::Collect(response)) => {
+                                let _accepted =
+                                    AcceptedCollectGuard::new(Arc::clone(&worker_accepted));
                                 let now = Instant::now();
                                 let was_query_retry = query.is_some()
                                     && query_failure_attempts > 0
@@ -1716,23 +1796,24 @@ impl Worker {
             })
             .map_err(|err| Error::WorkerStart(err.to_string()))?;
 
-        match init_rx.recv_timeout(INIT_TIMEOUT) {
-            Ok(Ok(())) => Ok(Self {
+        match tokio::time::timeout(INIT_TIMEOUT, init_rx).await {
+            Ok(Ok(Ok(()))) => Ok(Self {
                 tx,
+                accepted,
                 shutdown_requested,
                 join: Some(join),
                 completion: Some(completion_rx),
             }),
-            Ok(Err(error)) => {
+            Ok(Ok(Err(error))) => {
                 let _ = join.join();
                 Err(error)
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(_) => {
                 shutdown_requested.store(true, Ordering::Release);
                 drop(join);
                 Err(Error::WorkerInitTimeout)
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(Err(_)) => {
                 let _ = join.join();
                 Err(Error::WorkerInitStopped)
             }
@@ -1740,11 +1821,24 @@ impl Worker {
     }
 
     pub(super) async fn collect(&self) -> Result<Sample, Error> {
+        if self
+            .accepted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(Error::WorkerBusy);
+        }
         let (response_tx, response_rx) = oneshot::channel();
         match self.tx.try_send(Command::Collect(response_tx)) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => return Err(Error::WorkerBusy),
-            Err(mpsc::TrySendError::Disconnected(_)) => return Err(Error::WorkerStopped),
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.accepted.store(false, Ordering::Release);
+                return Err(Error::WorkerBusy);
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.accepted.store(false, Ordering::Release);
+                return Err(Error::WorkerStopped);
+            }
         }
         response_rx.await.map_err(|_| Error::WorkerStopped)?
     }
@@ -1799,9 +1893,9 @@ mod tests {
             path: path.to_owned(),
             name: name.to_owned(),
             unit: "By".to_owned(),
-            description: format!("Description for {name}."),
+            description: Arc::from(format!("Description for {name}.")),
             metric_kind: MetricKind::Gauge,
-            attributes: BTreeMap::new(),
+            attributes: Arc::new(BTreeMap::new()),
             excluded_aggregation_instance: None,
             scale_power10: 0,
         }
@@ -1893,12 +1987,101 @@ mod tests {
         (
             Worker {
                 tx,
+                accepted: Arc::new(AtomicBool::new(false)),
                 shutdown_requested,
                 join: Some(join),
                 completion: Some(completion_rx),
             },
             release_tx,
         )
+    }
+
+    fn empty_sample() -> Sample {
+        Sample {
+            start_time_unix_nano: 1,
+            timestamp_unix_nano: 2,
+            points: Vec::new(),
+            failures: Vec::new(),
+            overflows: Vec::new(),
+            diagnostics: SampleDiagnostics::default(),
+        }
+    }
+
+    fn controlled_worker() -> (
+        Worker,
+        oneshot::Receiver<()>,
+        oneshot::Sender<()>,
+        oneshot::Receiver<()>,
+    ) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let accepted = Arc::new(AtomicBool::new(false));
+        let worker_accepted = Arc::clone(&accepted);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown_requested);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (released_tx, released_rx) = oneshot::channel();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let join = std::thread::spawn(move || {
+            let mut first = Some((started_tx, release_rx, released_tx));
+            while !worker_shutdown.load(Ordering::Acquire) {
+                match rx.recv() {
+                    Ok(Command::Collect(response)) => {
+                        let _accepted = AcceptedCollectGuard::new(Arc::clone(&worker_accepted));
+                        if let Some((started, release, released)) = first.take() {
+                            let _ = started.send(());
+                            let _ = release.blocking_recv();
+                            let _ = response.send(Ok(empty_sample()));
+                            let _ = released.send(());
+                        } else {
+                            let _ = response.send(Ok(empty_sample()));
+                        }
+                    }
+                    Ok(Command::Shutdown) | Err(_) => break,
+                }
+            }
+            let _ = completion_tx.send(());
+        });
+        (
+            Worker {
+                tx,
+                accepted,
+                shutdown_requested,
+                join: Some(join),
+                completion: Some(completion_rx),
+            },
+            started_rx,
+            release_tx,
+            released_rx,
+        )
+    }
+
+    /// Scenario: A collection future times out while the worker remains inside a native call.
+    /// Guarantees: Later requests fail fast as busy and collection resumes after the call returns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounds_timed_out_collection_and_recovers() {
+        let (mut worker, started, release, released) = controlled_worker();
+        {
+            let first = tokio::time::timeout(Duration::from_millis(20), worker.collect());
+            tokio::pin!(first);
+            tokio::select! {
+                result = &mut first => panic!("collection resolved before release: {result:?}"),
+                result = started => result.expect("worker should start the first collection"),
+            }
+            assert!(first.await.is_err());
+        }
+        assert!(matches!(worker.collect().await, Err(Error::WorkerBusy)));
+        release.send(()).expect("release worker collection");
+        released
+            .await
+            .expect("worker should finish blocked collection");
+        assert!(worker.collect().await.is_ok());
+        assert!(
+            worker
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await
+                .expect("worker shutdown")
+        );
     }
 
     /// Scenario: A persistent worker collects two supported counters repeatedly and shuts down.
@@ -1912,7 +2095,15 @@ mod tests {
             counter(r"\Memory\Available Bytes", "windows.memory.available"),
             counter(r"\Memory\Committed Bytes", "windows.memory.committed"),
         ];
-        let mut worker = Worker::start(counters, Duration::from_secs(30), 256, 4_096).unwrap();
+        let mut worker = Worker::start(
+            counters,
+            Duration::from_secs(30),
+            256,
+            4_096,
+            "test".to_owned(),
+        )
+        .await
+        .unwrap();
         for _ in 0..3 {
             let sample = worker.collect().await.unwrap();
             assert_eq!(sample.points.len(), 2);
@@ -1946,9 +2137,24 @@ mod tests {
             r"\Memory\Available Bytes",
             "windows.memory.available",
         )];
-        let mut first =
-            Worker::start(counters.clone(), Duration::from_secs(30), 256, 4_096).unwrap();
-        let mut second = Worker::start(counters, Duration::from_secs(30), 256, 4_096).unwrap();
+        let mut first = Worker::start(
+            counters.clone(),
+            Duration::from_secs(30),
+            256,
+            4_096,
+            "first".to_owned(),
+        )
+        .await
+        .unwrap();
+        let mut second = Worker::start(
+            counters,
+            Duration::from_secs(30),
+            256,
+            4_096,
+            "second".to_owned(),
+        )
+        .await
+        .unwrap();
         assert!(!first.collect().await.unwrap().points.is_empty());
         assert!(!second.collect().await.unwrap().points.is_empty());
         assert!(
@@ -1985,7 +2191,15 @@ mod tests {
                 "windows.processor.time",
             ),
         ];
-        let mut worker = Worker::start(counters, Duration::from_secs(30), 256, 4_096).unwrap();
+        let mut worker = Worker::start(
+            counters,
+            Duration::from_secs(30),
+            256,
+            4_096,
+            "test".to_owned(),
+        )
+        .await
+        .unwrap();
         let sample = worker.collect().await.unwrap();
         assert!(matches!(
             sample.points[0].value,
@@ -2013,7 +2227,15 @@ mod tests {
             counter(r"\Memory\Available Bytes", "windows.memory.available"),
             counter(r"\Process(*)\Private Bytes", "windows.process.private"),
         ];
-        let mut worker = Worker::start(counters, Duration::from_secs(1), 256, 4_096).unwrap();
+        let mut worker = Worker::start(
+            counters,
+            Duration::from_secs(1),
+            256,
+            4_096,
+            "test".to_owned(),
+        )
+        .await
+        .unwrap();
         let sample = worker.collect().await.unwrap();
         let exact = sample
             .points
@@ -2054,6 +2276,46 @@ mod tests {
         );
     }
 
+    /// Scenario: Live Windows PDH formats common disk queue-length and precision-timer counters.
+    /// Guarantees: Both additional two-sample families produce finite values from one query.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+    async fn collects_common_calculated_disk_counters() {
+        let _serial = super::super::TEST_PDH_LOCK.lock().await;
+        let counters = vec![
+            counter(
+                r"\PhysicalDisk(_Total)\Avg. Disk Queue Length",
+                "windows.disk.queue_length",
+            ),
+            counter(r"\PhysicalDisk(_Total)\% Disk Time", "windows.disk.time"),
+        ];
+        let mut worker = Worker::start(
+            counters,
+            Duration::from_secs(30),
+            256,
+            4_096,
+            "test".to_owned(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let sample = worker.collect().await.unwrap();
+        assert!(sample.failures.is_empty(), "{:?}", sample.failures);
+        assert_eq!(sample.points.len(), 2);
+        assert!(sample.points.iter().all(|point| {
+            matches!(
+                point.value,
+                SampleValue::Value(Number::Double(value)) if value.is_finite()
+            )
+        }));
+        assert!(
+            worker
+                .shutdown(Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
+    }
+
     /// Scenario: Startup adds a healthy exact counter while another configured counter is absent.
     /// Guarantees: The worker starts, emits the healthy point, and retains a visible retry failure.
     #[tokio::test(flavor = "current_thread")]
@@ -2068,7 +2330,15 @@ mod tests {
                 "windows.missing.counter",
             ),
         ];
-        let mut worker = Worker::start(counters, Duration::from_secs(30), 256, 4_096).unwrap();
+        let mut worker = Worker::start(
+            counters,
+            Duration::from_secs(30),
+            256,
+            4_096,
+            "test".to_owned(),
+        )
+        .await
+        .unwrap();
         let sample = worker.collect().await.unwrap();
         assert!(
             sample
@@ -2105,7 +2375,9 @@ mod tests {
             Duration::from_secs(30),
             256,
             4_096,
+            "test".to_owned(),
         )
+        .await
         .unwrap();
         let sample = worker.collect().await.unwrap();
         assert!(sample.points.is_empty());
@@ -2147,10 +2419,21 @@ mod tests {
         for native_type in [
             PERF_COUNTER_COUNTER,
             PERF_COUNTER_BULK_COUNT,
+            PERF_COUNTER_QUEUELEN_TYPE,
+            PERF_COUNTER_LARGE_QUEUELEN_TYPE,
+            PERF_COUNTER_100NS_QUEUELEN_TYPE,
+            PERF_COUNTER_OBJ_TIME_QUEUELEN_TYPE,
             PERF_COUNTER_TIMER,
             PERF_COUNTER_TIMER_INV,
             PERF_100NSEC_TIMER,
             PERF_100NSEC_TIMER_INV,
+            PERF_OBJ_TIME_TIMER,
+            PERF_PRECISION_SYSTEM_TIMER,
+            PERF_PRECISION_100NS_TIMER,
+            PERF_PRECISION_OBJECT_TIMER,
+            PERF_COUNTER_DELTA,
+            PERF_COUNTER_LARGE_DELTA,
+            PERF_SAMPLE_COUNTER,
         ] {
             assert_eq!(
                 classify_native_type("calculated", native_type, 0).unwrap(),

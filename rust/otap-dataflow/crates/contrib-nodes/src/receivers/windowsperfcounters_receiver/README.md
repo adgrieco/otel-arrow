@@ -6,7 +6,7 @@
 | --- | --- |
 | Type | `receiver:windowsperfcounters` |
 | URN | `urn:otel:receiver:windowsperfcounters` |
-| Feature | `windowsperfcounters-receiver` |
+| Feature | `windowsperfcounters` |
 | Platform | Windows only |
 | Stability | Experimental |
 
@@ -83,6 +83,9 @@ limit. Normalization produces between 1 and 256 exact or wildcard paths, and
 
 Each `metrics` key is an OTel metric name. Its value requires `description`,
 `unit`, and exactly one empty `gauge: {}` or `up_down_counter: {}` object.
+The kind key may also use YAML shorthand such as `gauge:`. Metric names follow
+the OTel instrument-name syntax and are limited to 255 characters. Units must
+be printable ASCII and at most 63 characters.
 Multiple counter mappings may reference one metric and contribute points
 distinguished by their configured attributes. Gauges have point-in-time
 semantics and no start timestamp. UpDownCounters are cumulative non-monotonic
@@ -102,6 +105,9 @@ contains static string key/value pairs added to each emitted point.
 `scale_power10` defaults to zero and accepts values from `-18` through `18`.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
+Counter names may contain parentheses, as required by counters such as
+`Avg. Disk sec/Read (Base)`, but cannot contain path separators or wildcard
+path syntax.
 
 Configure performance object and counter names in English. Exact paths are
 added through PDH's language-neutral English API. Before wildcard expansion,
@@ -119,10 +125,14 @@ inclusion does not create a duplicate aggregate query.
 
 Unknown fields, empty metadata, undefined or unused metrics, duplicate
 instances, duplicate normalized paths, invalid intervals, and unsupported
-scales are configuration errors. Object, instance, and counter names cannot
-contain path separators or wildcard path syntax. Configured paths are limited
-to 2047 UTF-16 code units. Expanded paths that reach PDH's 2048-unit native
-limit are omitted and diagnosed.
+scales are configuration errors. Surrounding whitespace is removed from metric
+identities, metadata, path segments, references, and attribute keys before
+duplicate detection. Embedded NUL characters are rejected. At most 256 metric
+definitions and 256 normalized exact or wildcard counter paths are accepted;
+the path total is checked before materialization. Repeated metric descriptions
+and mapping attributes are shared across explicit instance expansions.
+Configured paths are limited to 2047 UTF-16 code units. Expanded paths that
+reach PDH's 2048-unit native limit are omitted and diagnosed.
 
 ## Supported counter families
 
@@ -130,7 +140,9 @@ limit are omitted and diagnosed.
 | --- | --- | --- | --- |
 | Direct values | `PERF_COUNTER_RAWCOUNT`, `PERF_COUNTER_LARGE_RAWCOUNT`, and hexadecimal variants | One | Integer |
 | Rates | `PERF_COUNTER_COUNTER`, `PERF_COUNTER_BULK_COUNT` | Two | Double |
-| Timer percentages | `PERF_COUNTER_TIMER`, inverse variants, and 100-nanosecond variants | Two | Double |
+| Deltas and samples | `PERF_COUNTER_DELTA`, `PERF_COUNTER_LARGE_DELTA`, `PERF_SAMPLE_COUNTER` | Two | Double |
+| Queue lengths | DWORD, large, 100-nanosecond, and object-time queue variants | Two | Double |
+| Timer percentages | System, 100-nanosecond, object-time, inverse, and precision timer variants | Two | Double |
 | Raw fractions | `PERF_RAW_FRACTION`, `PERF_LARGE_RAW_FRACTION` | One | Double |
 | Sample fractions | `PERF_SAMPLE_FRACTION` | Two | Double |
 | Averages | `PERF_AVERAGE_TIMER`, `PERF_AVERAGE_BULK` | Two | Double |
@@ -146,6 +158,9 @@ PDH performs rate, timer, fraction, and average calculations and associates
 visible fraction/average numerators with their provider-defined base counters.
 Configure only the visible numerator path. Standalone base counters are not
 metrics and are rejected.
+
+Elapsed-time and multi-timer counter families remain unsupported because they
+require output semantics beyond the existing regular PDH formatting path.
 
 The receiver requests regular PDH formatted counter values and emits them as
 OTel metrics. Geneva-specific Full or Factored event formats are transport and
@@ -196,6 +211,9 @@ counter warm-up or startup retries.
   query with bounded exponential backoff so transient failures preserve
   history. Three consecutive collection failures rebuild the worker-owned
   query and all counters.
+- Each scrape is bounded by `collection_interval`. If a native collection call
+  remains blocked after that timeout, later ticks fail fast while the worker is
+  busy; no additional collection request is queued.
 - Wildcard expansion is sorted before applying the configured limits. Excess
   instances are omitted, reported explicitly, and reconsidered at the next
   discovery refresh; they are never presented as a complete expansion.
@@ -210,7 +228,7 @@ points do not use or validate cumulative start time.
 From `rust\otap-dataflow`:
 
 ```powershell
-cargo run --features windowsperfcounters-receiver --bin df_engine -- -c configs\windowsperfcounters-console.yaml
+cargo run --features windowsperfcounters --bin df_engine -- -c configs\windowsperfcounters-console.yaml
 ```
 
 The basic
@@ -253,17 +271,20 @@ not by `--validate-and-exit`.
 
 ## Telemetry
 
-Counter-local failures emit `windowsperfcounters.counter_failed` with a configured
-path template and low-cardinality reason. Expansion overflow emits
-`windowsperfcounters.instance_limit_exceeded`; lifecycle and retry recovery emit
-aggregate events. Query-level collection failures emit
-`windowsperfcounters.scrape_failed`, and query-close failures emit
-`windowsperfcounters.close_failed`.
+Counter-local failures emit
+`otelcol.node.windowsperfcounters.counter.fail` with a configured path template
+and low-cardinality reason. Expansion overflow, instance changes, recovery,
+query-level failures, scrape timeouts, shutdown timeouts, and query-close
+failures use the same `otelcol.node.windowsperfcounters.*` event namespace.
+Repeated scrape and counter warnings are suppressed until the affected
+condition recovers.
 
-The `receiver.windowsperfcounters` metric set records configured and active
-counters, scrape success/failure and duration, discovery refreshes, instance
-adds/removals/overflow, counter failures, retries/recoveries, query rebuilds,
-and warm-up omissions.
+The `receiver.windowsperfcounters.scrapes` measurement metric set attributes
+collection attempts by outcome. The `receiver.windowsperfcounters` health
+metric set records configured and active counters, scrape success/failure,
+overruns and duration, discovery refreshes, instance
+adds/removals/overflow, failed counter values, retries/recoveries, query
+rebuilds, and warm-up omissions.
 
 ## Related documentation
 

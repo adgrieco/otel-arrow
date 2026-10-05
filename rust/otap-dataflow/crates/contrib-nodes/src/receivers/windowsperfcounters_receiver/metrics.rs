@@ -4,8 +4,25 @@
 //! Bounded operational metrics for the Windows performance-counter receiver.
 
 use super::model::SampleDiagnostics;
+use otel_arrow_dfe_engine::context::PipelineContext;
+use otel_arrow_dfe_telemetry::common_attributes::{Outcome, OutcomeAttributes};
+use otel_arrow_dfe_telemetry::error::Error;
 use otel_arrow_dfe_telemetry::instrument::{Counter, Gauge, HistogramNormal};
+use otel_arrow_dfe_telemetry::metrics::{MeasurementMetricSet, MetricSet, MetricSetSnapshot};
+use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
 use otel_arrow_dfe_telemetry_macros::metric_set;
+
+/// PDH scrape outcomes for one Windows performance-counter receiver node.
+#[metric_set(
+    name = "receiver.windowsperfcounters.scrapes",
+    measurement_attributes = OutcomeAttributes
+)]
+#[derive(Debug, Default, Clone)]
+pub(super) struct WindowsPerfCountersScrapeMetrics {
+    /// Number of PDH collection attempts by terminal outcome.
+    #[metric(unit = "{scrape}")]
+    pub attempts: Counter<u64>,
+}
 
 /// Lifecycle, recovery, and collection metrics.
 #[metric_set(name = "receiver.windowsperfcounters")]
@@ -26,6 +43,9 @@ pub(super) struct WindowsPerfCountersMetrics {
     /// Query-level collection failures.
     #[metric(unit = "{scrape}")]
     pub scrape_failures: Counter<u64>,
+    /// Scrapes that timed out or were skipped while the worker remained busy.
+    #[metric(unit = "{scrape}")]
+    pub scrape_overruns: Counter<u64>,
     /// Collection duration.
     #[metric(unit = "s")]
     pub scrape_duration: HistogramNormal,
@@ -50,6 +70,9 @@ pub(super) struct WindowsPerfCountersMetrics {
     /// Counter reads, statuses, or projections that failed.
     #[metric(unit = "{failure}")]
     pub counter_read_failures: Counter<u64>,
+    /// Configured counter values omitted because their read or calculation failed.
+    #[metric(unit = "{metric}")]
+    pub failed_counter_values: Counter<u64>,
     /// Deferred counter retry attempts.
     #[metric(unit = "{attempt}")]
     pub retry_attempts: Counter<u64>,
@@ -89,5 +112,38 @@ impl WindowsPerfCountersMetrics {
         self.query_rebuild_recoveries
             .add(diagnostics.query_rebuild_recoveries);
         self.warmup_omissions.add(diagnostics.warmup_omissions);
+    }
+}
+
+/// Receiver metric sets with bounded-cardinality scrape outcomes.
+pub(super) struct WindowsPerfCountersReceiverMetrics {
+    scrapes: MeasurementMetricSet<WindowsPerfCountersScrapeMetrics>,
+    pub(super) health: MetricSet<WindowsPerfCountersMetrics>,
+}
+
+impl WindowsPerfCountersReceiverMetrics {
+    pub(super) fn register(pipeline: &PipelineContext) -> Self {
+        Self {
+            scrapes: WindowsPerfCountersScrapeMetrics::register(pipeline),
+            health: WindowsPerfCountersMetrics::register(pipeline),
+        }
+    }
+
+    pub(super) fn record_scrape(&mut self, outcome: Outcome) {
+        self.scrapes
+            .with(OutcomeAttributes { outcome })
+            .attempts
+            .inc();
+    }
+
+    pub(super) fn report(&mut self, reporter: &mut MetricsReporter) -> Result<(), Error> {
+        reporter.report_measurement(&mut self.scrapes)?;
+        reporter.report(&mut self.health)
+    }
+
+    pub(super) fn terminal_snapshots(&mut self) -> Vec<MetricSetSnapshot> {
+        let mut snapshots = self.scrapes.terminal_snapshots();
+        snapshots.extend(self.health.terminal_snapshots());
+        snapshots
     }
 }

@@ -14,6 +14,8 @@ use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords};
 use otel_arrow_dfe_pdata::otlp::metrics::MetricType;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::sync::Arc;
 
 const AGGREGATION_TEMPORALITY_CUMULATIVE: i32 = 2;
 
@@ -111,7 +113,7 @@ pub(super) fn into_otap(
         }
         points.append_flags(0);
 
-        for (key, value) in &counter.attributes {
+        for (key, value) in counter.attributes.iter() {
             attrs.append_parent_id(&point_id);
             attrs.append_key(key);
             attrs.any_values_builder.append_str(value.as_bytes());
@@ -196,9 +198,9 @@ mod tests {
             path: path.to_owned(),
             name: name.to_owned(),
             unit: unit.to_owned(),
-            description: format!("Description for {name}."),
+            description: Arc::from(format!("Description for {name}.")),
             metric_kind: MetricKind::Gauge,
-            attributes: BTreeMap::new(),
+            attributes: Arc::new(BTreeMap::new()),
             excluded_aggregation_instance: None,
             scale_power10: 0,
         }
@@ -321,7 +323,7 @@ mod tests {
             "windows.process.private",
             "By",
         );
-        counter.description = "Committed private memory for each process instance.".to_owned();
+        counter.description = Arc::from("Committed private memory for each process instance.");
         let counters = [counter];
         let records = into_otap(
             &counters,
@@ -777,17 +779,13 @@ mod tests {
             "windows.processor.time",
             "%",
         );
-        let _ = active
-            .attributes
-            .insert("state".to_owned(), "active".to_owned());
+        active.attributes = Arc::new(BTreeMap::from([("state".to_owned(), "active".to_owned())]));
         let mut idle = counter(
             r"\Processor(_Total)\% Idle Time",
             "windows.processor.time",
             "%",
         );
-        let _ = idle
-            .attributes
-            .insert("state".to_owned(), "idle".to_owned());
+        idle.attributes = Arc::new(BTreeMap::from([("state".to_owned(), "idle".to_owned())]));
         let records = into_otap(
             &[active, idle],
             Sample {

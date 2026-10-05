@@ -3,13 +3,8 @@
 
 //! Windows-only, single-core receiver for exact and calculated performance metrics.
 
-otel_arrow_dfe_telemetry::otel_component_scope!(
-    urn = WINDOWSPERFCOUNTERS_RECEIVER_URN,
-    target = "otel.receiver.windowsperfcounters",
-);
-
 use super::config::Config;
-use super::metrics;
+use super::metrics::WindowsPerfCountersReceiverMetrics;
 use super::otap_builder::into_otap;
 use super::pdh;
 use async_trait::async_trait;
@@ -22,11 +17,12 @@ use otel_arrow_dfe_engine::terminal_state::TerminalState;
 use otel_arrow_dfe_engine::{MessageSourceLocalEffectHandlerExtension, ReceiverFactory};
 use otel_arrow_dfe_otap::OTAP_RECEIVER_FACTORIES;
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
-use otel_arrow_dfe_telemetry::metrics::MetricSet;
+use otel_arrow_dfe_telemetry::common_attributes::Outcome;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use tokio::time::MissedTickBehavior;
+use tokio::time::{MissedTickBehavior, timeout};
 
 /// Factory identity for the Windows performance-counter receiver.
 pub const WINDOWSPERFCOUNTERS_RECEIVER_URN: &str = "urn:otel:receiver:windowsperfcounters";
@@ -36,8 +32,8 @@ const PIPELINE_COMPLETION_RESERVE: Duration = Duration::from_millis(500);
 
 struct WindowsPerfCountersReceiver {
     config: Config,
-    worker: pdh::Worker,
-    metrics: Rc<RefCell<MetricSet<metrics::WindowsPerfCountersMetrics>>>,
+    node: String,
+    metrics: Rc<RefCell<WindowsPerfCountersReceiverMetrics>>,
 }
 
 async fn wait_initial_delay(delay: Duration) {
@@ -67,35 +63,24 @@ pub static WINDOWSPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFa
             });
         }
         let config = Config::from_json(&node_config.config)?;
-        let mut metrics = pipeline.register_metrics::<metrics::WindowsPerfCountersMetrics>();
-        metrics.configured_exact.set(
+        let mut metrics = WindowsPerfCountersReceiverMetrics::register(&pipeline);
+        metrics.health.configured_exact.set(
             config
                 .counters
                 .iter()
                 .filter(|counter| !counter.path.contains('*'))
                 .count() as u64,
         );
-        metrics.configured_wildcard.set(
+        metrics.health.configured_wildcard.set(
             config
                 .counters
                 .iter()
                 .filter(|counter| counter.path.contains('*'))
                 .count() as u64,
         );
-        let worker = pdh::Worker::start(
-            config.counters.clone(),
-            config.wildcard_refresh_interval(),
-            config.max_instances_per_wildcard,
-            config.max_expanded_counters,
-        )
-        .map_err(
-            |err| otel_arrow_dfe_config::error::Error::InvalidUserConfig {
-                error: format!("PDH runtime initialization failed: {err}"),
-            },
-        )?;
         let receiver = WindowsPerfCountersReceiver {
             config,
-            worker,
+            node: node.name.to_string(),
             metrics: Rc::new(RefCell::new(metrics)),
         };
         Ok(ReceiverWrapper::local(
@@ -112,6 +97,7 @@ pub static WINDOWSPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFa
 impl WindowsPerfCountersReceiver {
     async fn collect_and_send(
         &self,
+        worker: &pdh::Worker,
         effect_handler: &local::EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
         let failure = |error: String| Error::ReceiverError {
@@ -123,22 +109,32 @@ impl WindowsPerfCountersReceiver {
         wait_initial_delay(self.config.initial_delay).await;
         let mut interval = tokio::time::interval(self.config.collection_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut scrape_failed = false;
+        let mut active_counter_failures = BTreeSet::new();
         loop {
             let _ = interval.tick().await;
             let scrape_start = Instant::now();
-            let sample = match self.worker.collect().await {
-                Ok(sample) => {
+            let sample = match timeout(self.config.collection_interval, worker.collect()).await {
+                Ok(Ok(sample)) => {
                     let mut metrics = self.metrics.borrow_mut();
-                    metrics.scrapes.add(1);
+                    metrics.record_scrape(Outcome::Success);
+                    metrics.health.scrapes.add(1);
                     metrics
+                        .health
                         .scrape_duration
                         .record(scrape_start.elapsed().as_secs_f64());
-                    metrics.apply(&sample.diagnostics);
+                    metrics.health.apply(&sample.diagnostics);
+                    metrics
+                        .health
+                        .failed_counter_values
+                        .add(sample.failures.len() as u64);
                     drop(metrics);
+                    scrape_failed = false;
                     for overflow in &sample.overflows {
                         let path_template = &self.config.counters[overflow.counter_index].path;
                         otel_arrow_dfe_telemetry::otel_warn!(
-                            "windowsperfcounters.instance_limit_exceeded",
+                            "otelcol.node.windowsperfcounters.instance_limit.exceeded",
+                            node = self.node.as_str(),
                             path_template = path_template,
                             reason = overflow.reason,
                             discovered = overflow.discovered as u64,
@@ -150,7 +146,8 @@ impl WindowsPerfCountersReceiver {
                         || sample.diagnostics.instances_removed > 0
                     {
                         otel_arrow_dfe_telemetry::otel_info!(
-                            "windowsperfcounters.instances_changed",
+                            "otelcol.node.windowsperfcounters.instances.change",
+                            node = self.node.as_str(),
                             added = sample.diagnostics.instances_added,
                             removed = sample.diagnostics.instances_removed,
                             active = sample.diagnostics.active_expanded_counters as u64
@@ -161,7 +158,8 @@ impl WindowsPerfCountersReceiver {
                         || sample.diagnostics.query_rebuild_attempts > 0
                     {
                         otel_arrow_dfe_telemetry::otel_info!(
-                            "windowsperfcounters.recovery",
+                            "otelcol.node.windowsperfcounters.recovery",
+                            node = self.node.as_str(),
                             retry_attempts = sample.diagnostics.retry_attempts,
                             retry_recoveries = sample.diagnostics.retry_recoveries,
                             query_rebuild_attempts = sample.diagnostics.query_rebuild_attempts,
@@ -170,29 +168,74 @@ impl WindowsPerfCountersReceiver {
                     }
                     sample
                 }
-                Err(err) if err.is_collection_failure() => {
+                Ok(Err(err)) if err.is_collection_failure() => {
                     let mut metrics = self.metrics.borrow_mut();
-                    metrics.scrape_failures.add(1);
+                    metrics.record_scrape(Outcome::Failure);
+                    metrics.health.scrape_failures.add(1);
                     metrics
+                        .health
                         .scrape_duration
                         .record(scrape_start.elapsed().as_secs_f64());
-                    otel_arrow_dfe_telemetry::otel_warn!(
-                        "windowsperfcounters.scrape_failed",
-                        error = %err
-                    );
+                    if err.is_overrun() {
+                        metrics.health.scrape_overruns.inc();
+                    }
+                    drop(metrics);
+                    if !scrape_failed {
+                        otel_arrow_dfe_telemetry::otel_warn!(
+                            "otelcol.node.windowsperfcounters.scrape.fail",
+                            node = self.node.as_str(),
+                            error = %err
+                        );
+                        scrape_failed = true;
+                    }
                     continue;
                 }
-                Err(err) => return Err(failure(err.to_string())),
+                Ok(Err(err)) => {
+                    self.metrics.borrow_mut().record_scrape(Outcome::Failure);
+                    return Err(failure(err.to_string()));
+                }
+                Err(_) => {
+                    let mut metrics = self.metrics.borrow_mut();
+                    metrics.record_scrape(Outcome::Failure);
+                    metrics.health.scrape_failures.inc();
+                    metrics.health.scrape_overruns.inc();
+                    metrics
+                        .health
+                        .scrape_duration
+                        .record(scrape_start.elapsed().as_secs_f64());
+                    drop(metrics);
+                    if !scrape_failed {
+                        otel_arrow_dfe_telemetry::otel_warn!(
+                            "otelcol.node.windowsperfcounters.scrape.timeout",
+                            node = self.node.as_str(),
+                            timeout_seconds = self.config.collection_interval.as_secs_f64()
+                        );
+                        scrape_failed = true;
+                    }
+                    continue;
+                }
             };
+            let mut current_counter_failures = BTreeSet::new();
             for counter_failure in &sample.failures {
-                let path_template = &self.config.counters[counter_failure.counter_index].path;
-                otel_arrow_dfe_telemetry::otel_warn!(
-                    "windowsperfcounters.counter_failed",
-                    path_template = path_template,
-                    reason = counter_failure.reason,
-                    error = counter_failure.error
-                );
+                let Some(counter) = self.config.counters.get(counter_failure.counter_index) else {
+                    return Err(failure(format!(
+                        "sample failure references missing configured counter {}",
+                        counter_failure.counter_index
+                    )));
+                };
+                let key = (counter_failure.counter_index, counter_failure.reason);
+                if !active_counter_failures.contains(&key) {
+                    otel_arrow_dfe_telemetry::otel_warn!(
+                        "otelcol.node.windowsperfcounters.counter.fail",
+                        node = self.node.as_str(),
+                        path_template = counter.path.as_str(),
+                        reason = counter_failure.reason,
+                        error = counter_failure.error.as_str()
+                    );
+                }
+                let _ = current_counter_failures.insert(key);
             }
+            active_counter_failures = current_counter_failures;
             let Some(records) =
                 into_otap(&self.config.counters, sample).map_err(|err| failure(err.to_string()))?
             else {
@@ -219,8 +262,44 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
             Collection(Result<TerminalState, Error>),
         }
 
+        let worker_start = pdh::Worker::start(
+            self.config.counters.clone(),
+            self.config.wildcard_refresh_interval(),
+            self.config.max_instances_per_wildcard,
+            self.config.max_expanded_counters,
+            self.node.clone(),
+        );
+        tokio::pin!(worker_start);
+        let mut worker = loop {
+            tokio::select! {
+                biased;
+                msg = ctrl_msg_recv.recv() => match msg {
+                    Ok(NodeControlMsg::CollectTelemetry { mut metrics_reporter }) => {
+                        let mut metrics = self.metrics.borrow_mut();
+                        let _ = metrics.report(&mut metrics_reporter);
+                    }
+                    Ok(NodeControlMsg::DrainIngress { deadline, .. }) => {
+                        effect_handler.notify_receiver_drained().await?;
+                        let snapshots = self.metrics.borrow_mut().terminal_snapshots();
+                        return Ok(TerminalState::new(deadline, snapshots));
+                    }
+                    Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
+                        let snapshots = self.metrics.borrow_mut().terminal_snapshots();
+                        return Ok(TerminalState::new(deadline, snapshots));
+                    }
+                    Err(err) => return Err(Error::ChannelRecvError(err)),
+                    _ => {}
+                },
+                result = &mut worker_start => break result.map_err(|err| Error::ReceiverError {
+                    receiver: effect_handler.receiver_id(),
+                    kind: ReceiverErrorKind::Other,
+                    error: "failed to initialize the Windows PDH query".to_owned(),
+                    source_detail: err.to_string(),
+                })?,
+            }
+        };
         let exit = {
-            let collect_and_send = self.collect_and_send(&effect_handler);
+            let collect_and_send = self.collect_and_send(&worker, &effect_handler);
             tokio::pin!(collect_and_send);
             loop {
                 tokio::select! {
@@ -234,7 +313,7 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
                         }
                         Ok(NodeControlMsg::CollectTelemetry { mut metrics_reporter }) => {
                             let mut metrics = self.metrics.borrow_mut();
-                            let _ = metrics_reporter.report(&mut metrics);
+                            let _ = metrics.report(&mut metrics_reporter);
                         }
                         Err(err) => {
                             break Exit::Collection(Err(Error::ChannelRecvError(err)));
@@ -253,13 +332,12 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
             }
         };
         let worker_deadline = worker_shutdown_deadline(Instant::now(), deadline);
-        match self.worker.shutdown(worker_deadline).await {
+        match worker.shutdown(worker_deadline).await {
             Ok(true) => {}
             Ok(false) => {
                 otel_arrow_dfe_telemetry::otel_warn!(
-                    "windowsperfcounters.shutdown_timeout",
-                    "PDH worker exceeded the receiver-local shutdown wait and still owns its query; \
-                     it will close the query when the active call returns"
+                    "otelcol.node.windowsperfcounters.shutdown.timeout",
+                    node = self.node.as_str()
                 );
             }
             Err(err) => {
@@ -277,14 +355,20 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
         if drained {
             effect_handler.notify_receiver_drained().await?;
         }
-        let snapshot = self.metrics.borrow().snapshot();
-        Ok(TerminalState::new(deadline, [snapshot]))
+        let snapshots = self.metrics.borrow_mut().terminal_snapshots();
+        Ok(TerminalState::new(deadline, snapshots))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::receivers::windowsperfcounters_receiver::config::{CounterConfig, MetricKind};
+    use otel_arrow_dfe_config::node::NodeUserConfig;
+    use otel_arrow_dfe_engine::testing::receiver::TestRuntime;
+    use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_ctx};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     /// Scenario: Collection has a nonzero initial delay before its first request.
     /// Guarantees: The delay remains pending until the configured duration has fully elapsed.
@@ -327,5 +411,68 @@ mod tests {
             worker_shutdown_deadline(now, now + Duration::from_millis(250)),
             now
         );
+    }
+
+    fn run_live_lifecycle(drain: bool) {
+        let test_runtime = TestRuntime::<OtapPdata>::new();
+        let (pipeline, _) = test_pipeline_ctx();
+        let receiver = WindowsPerfCountersReceiver {
+            config: Config {
+                counters: vec![CounterConfig {
+                    path: r"\Memory\Available Bytes".to_owned(),
+                    name: "windows.memory.available".to_owned(),
+                    unit: "By".to_owned(),
+                    description: Arc::from("Available physical memory."),
+                    metric_kind: MetricKind::Gauge,
+                    attributes: Arc::new(BTreeMap::new()),
+                    excluded_aggregation_instance: None,
+                    scale_power10: 0,
+                }],
+                collection_interval: Duration::from_secs(1),
+                initial_delay: Duration::ZERO,
+                wildcard_refresh_interval: None,
+                max_instances_per_wildcard: 256,
+                max_expanded_counters: 4_096,
+            },
+            node: "windowsperfcounters".to_owned(),
+            metrics: Rc::new(RefCell::new(WindowsPerfCountersReceiverMetrics::register(
+                &pipeline,
+            ))),
+        };
+        let receiver = ReceiverWrapper::local(
+            receiver,
+            test_node("windowsperfcounters"),
+            Arc::new(NodeUserConfig::new_receiver_config(
+                WINDOWSPERFCOUNTERS_RECEIVER_URN,
+            )),
+            test_runtime.config(),
+        );
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(move |ctx| async move {
+                ctx.sleep(Duration::from_secs(1)).await;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                if drain {
+                    ctx.send_control_msg(NodeControlMsg::DrainIngress {
+                        deadline,
+                        reason: "test drain".to_owned(),
+                    })
+                    .await
+                    .unwrap();
+                } else {
+                    ctx.send_shutdown(deadline, "test shutdown").await.unwrap();
+                }
+            })
+            .run_validation(|_| async {});
+    }
+
+    /// Scenario: The engine requests ingress drain and shutdown from a live receiver.
+    /// Guarantees: Both lifecycle paths stop the PDH worker and complete before their deadlines.
+    #[test]
+    #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+    fn completes_drain_and_shutdown_through_engine_harness() {
+        run_live_lifecycle(true);
+        run_live_lifecycle(false);
     }
 }

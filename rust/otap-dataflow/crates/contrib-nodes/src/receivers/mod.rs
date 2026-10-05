@@ -6,7 +6,7 @@
 pub mod etw_receiver;
 
 /// Windows performance-counter receiver.
-#[cfg(feature = "windowsperfcounters-receiver")]
+#[cfg(feature = "windowsperfcounters")]
 pub mod windowsperfcounters_receiver;
 
 /// Kafka receiver.

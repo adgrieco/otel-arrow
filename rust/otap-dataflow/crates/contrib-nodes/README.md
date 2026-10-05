@@ -55,7 +55,7 @@ Receivers ingest data into a pipeline.
 | --- | --- | --- | --- |
 | [`receiver:kafka`](src/receivers/kafka_receiver/README.md) | `kafka-receiver` | Experimental | Consumes traces, metrics, and logs from Kafka. |
 | [`receiver:user_events`](src/receivers/user_events_receiver/README.md) | `user_events-receiver` | Experimental | Ingests Linux `user_events` tracepoints as logs. |
-| [`receiver:windowsperfcounters`](src/receivers/windowsperfcounters_receiver/README.md) | `windowsperfcounters-receiver` | Experimental | Reads configured Windows performance-counter gauges through PDH. |
+| [`receiver:windowsperfcounters`](src/receivers/windowsperfcounters_receiver/README.md) | `windowsperfcounters` | Experimental | Collects configured Windows performance counters as metrics. |
 
 ## Processors
 

@@ -92,6 +92,7 @@ arrow-schema = { version = "58.3" }
 arrow-array = { version = "58.3" }
 arrow-cast = { version = "58.3" }
 arrow-select = { version = "58.3" }
+windows-sys = "0.61.2"
 wasmtime = { version = "47.0", default-features = false, features = ["runtime", "component-model", "cranelift", "std"] }
 async-stream = "0.3.6"
 async-trait = "0.1.88"
@@ -371,7 +372,7 @@ recordset-kql-processor = ["otel-arrow-dfe-contrib-nodes/recordset-kql-processor
 resource-validator-processor = ["otel-arrow-dfe-contrib-nodes/resource-validator-processor"]
 # Contrib receivers (opt-in) - Windows-only
 etw-receiver = ["otel-arrow-dfe-contrib-nodes/etw-receiver"]
-windowsperfcounters-receiver = ["otel-arrow-dfe-contrib-nodes/windowsperfcounters-receiver"]
+windowsperfcounters = ["otel-arrow-dfe-contrib-nodes/windowsperfcounters"]
 
 # Experimental WASM host-kernel processor plugin runtime (opt-in). Off by
 # default; enabling this pulls in wasmtime and registers the

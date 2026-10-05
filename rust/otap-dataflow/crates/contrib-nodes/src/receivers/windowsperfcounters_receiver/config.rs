@@ -4,9 +4,12 @@
 use otel_arrow_dfe_config::error::Error;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 const MAX_COUNTERS: usize = 256;
+const MAX_METRIC_NAME_LEN: usize = 255;
+const MAX_METRIC_UNIT_LEN: usize = 63;
 const MAX_INSTANCE_LIMIT: usize = 16_384;
 const MAX_COUNTER_PATH_LEN: usize = 2_047;
 const DEFAULT_MAX_INSTANCES_PER_WILDCARD: usize = 256;
@@ -25,12 +28,12 @@ pub(super) struct CounterConfig {
     pub(super) name: String,
     /// OTel metric unit.
     pub(super) unit: String,
-    /// OTel metric description.
-    pub(super) description: String,
+    /// OTel metric description, shared by every counter mapped to this metric.
+    pub(super) description: Arc<str>,
     /// OTel metric stream kind.
     pub(super) metric_kind: MetricKind,
-    /// Static attributes added to every point from this counter.
-    pub(super) attributes: BTreeMap<String, String>,
+    /// Static attributes shared by paths expanded from one counter mapping.
+    pub(super) attributes: Arc<BTreeMap<String, String>>,
     /// Provider aggregation instance omitted from this wildcard, when any.
     pub(super) excluded_aggregation_instance: Option<String>,
     /// Base-10 scaling applied after PDH calculates the native value.
@@ -85,19 +88,24 @@ struct UserConfig {
 struct MetricConfig {
     description: String,
     unit: String,
-    #[serde(default)]
-    gauge: Option<GaugeConfig>,
-    #[serde(default)]
-    up_down_counter: Option<UpDownCounterConfig>,
+    #[serde(default, deserialize_with = "present_marker")]
+    gauge: Option<EmptyConfig>,
+    #[serde(default, deserialize_with = "present_marker")]
+    up_down_counter: Option<EmptyConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GaugeConfig {}
+struct EmptyConfig {}
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UpDownCounterConfig {}
+fn present_marker<'de, D>(deserializer: D) -> Result<Option<EmptyConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(
+        Option::<EmptyConfig>::deserialize(deserializer)?.unwrap_or_default(),
+    ))
+}
 
 impl MetricConfig {
     fn kind(&self, name: &str) -> Result<MetricKind, Error> {
@@ -133,6 +141,13 @@ enum OneOrMany {
 }
 
 impl OneOrMany {
+    fn as_slice(&self) -> &[String] {
+        match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Many(values) => values,
+        }
+    }
+
     fn into_vec(self) -> Vec<String> {
         match self {
             Self::One(value) => vec![value],
@@ -181,19 +196,124 @@ fn require_name(field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_path_element(field: &str, value: &str, allow_star: bool) -> Result<(), Error> {
+fn validate_path_element<'a>(
+    field: &str,
+    value: &'a str,
+    allow_star: bool,
+) -> Result<&'a str, Error> {
+    let value = value.trim();
     require_name(field, value)?;
     if value.contains('\\')
         || value.contains('(')
         || value.contains(')')
         || value.contains('?')
+        || value.contains('\0')
         || (!allow_star && value.contains('*'))
     {
         return Err(invalid(format!(
             "{field} contains a reserved performance-counter path character"
         )));
     }
-    Ok(())
+    Ok(value)
+}
+
+fn validate_counter_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
+    let value = value.trim();
+    require_name(field, value)?;
+    if value.contains(['\\', '*', '?', '\0']) {
+        return Err(invalid(format!(
+            "{field} contains a reserved performance-counter path character"
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_metric_name(name: &str) -> Result<&str, Error> {
+    let name = name.trim();
+    require_name("metric name", name)?;
+    let mut chars = name.chars();
+    let valid = name.len() <= MAX_METRIC_NAME_LEN
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '/'));
+    if !valid {
+        return Err(invalid(format!(
+            "metric name {name:?} must start with an ASCII letter, contain only ASCII \
+             letters, digits, '_', '.', '-', or '/', and be at most {MAX_METRIC_NAME_LEN} characters"
+        )));
+    }
+    Ok(name)
+}
+
+fn validate_metric_unit<'a>(name: &str, unit: &'a str) -> Result<&'a str, Error> {
+    let unit = unit.trim();
+    let field = format!("metrics.{name}.unit");
+    require_name(&field, unit)?;
+    if unit.len() > MAX_METRIC_UNIT_LEN || !unit.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+    {
+        return Err(invalid(format!(
+            "{field} must be printable ASCII and at most {MAX_METRIC_UNIT_LEN} characters"
+        )));
+    }
+    Ok(unit)
+}
+
+fn normalize_attributes(
+    field: &str,
+    attributes: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, Error> {
+    let mut normalized = BTreeMap::new();
+    for (key, value) in attributes {
+        let key = key.trim();
+        require_name(&format!("{field} attribute key"), key)?;
+        if key.starts_with(RECEIVER_ATTRIBUTE_PREFIX) {
+            return Err(invalid(format!(
+                "{field} attribute {key:?} conflicts with receiver-generated attributes"
+            )));
+        }
+        if normalized.insert(key.to_owned(), value.clone()).is_some() {
+            return Err(invalid(format!(
+                "{field} contains duplicate attribute key {key:?}"
+            )));
+        }
+    }
+    Ok(normalized)
+}
+
+fn expanded_counter_count(objects: &[ObjectConfig]) -> Result<usize, Error> {
+    let too_many = || {
+        invalid(format!(
+            "perfcounters must normalize to at most {MAX_COUNTERS} counter paths"
+        ))
+    };
+    let mut total = 0usize;
+    for object in objects {
+        let paths_per_counter = match &object.instances {
+            None => 1,
+            Some(instances)
+                if instances
+                    .as_slice()
+                    .iter()
+                    .any(|instance| instance.trim() == "*") =>
+            {
+                1
+            }
+            Some(instances) => instances.as_slice().len(),
+        };
+        let paths = paths_per_counter
+            .checked_mul(object.counters.len())
+            .ok_or_else(too_many)?;
+        total = total.checked_add(paths).ok_or_else(too_many)?;
+        if total > MAX_COUNTERS {
+            return Err(too_many());
+        }
+    }
+    Ok(total)
+}
+
+struct NormalizedMetric {
+    description: Arc<str>,
+    unit: String,
+    kind: MetricKind,
 }
 
 fn validate_counter(counter: &CounterConfig, index: usize) -> Result<(), Error> {
@@ -206,14 +326,6 @@ fn validate_counter(counter: &CounterConfig, index: usize) -> Result<(), Error> 
         return Err(invalid(format!(
             "normalized counter {index} scale_power10 must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}"
         )));
-    }
-    for key in counter.attributes.keys() {
-        require_name(&format!("normalized counter {index} attribute key"), key)?;
-        if key.starts_with(RECEIVER_ATTRIBUTE_PREFIX) {
-            return Err(invalid(format!(
-                "attribute {key:?} conflicts with receiver-generated attributes"
-            )));
-        }
     }
     Ok(())
 }
@@ -249,6 +361,11 @@ impl Config {
         if user.metrics.is_empty() {
             return Err(invalid("metrics must contain at least one entry"));
         }
+        if user.metrics.len() > MAX_COUNTERS {
+            return Err(invalid(format!(
+                "metrics must contain at most {MAX_COUNTERS} entries"
+            )));
+        }
         if user.perfcounters.is_empty() {
             return Err(invalid("perfcounters must contain at least one entry"));
         }
@@ -268,18 +385,33 @@ impl Config {
             ));
         }
 
+        let mut metrics = BTreeMap::new();
+        let mut metric_identities = HashSet::new();
         for (name, metric) in &user.metrics {
-            require_name("metric name", name)?;
-            require_name(&format!("metrics.{name}.description"), &metric.description)?;
-            require_name(&format!("metrics.{name}.unit"), &metric.unit)?;
-            let _ = metric.kind(name)?;
+            let name = validate_metric_name(name)?;
+            if !metric_identities.insert(name.to_ascii_lowercase()) {
+                return Err(invalid(format!("metrics contains duplicate {name:?}")));
+            }
+            let description = metric.description.trim();
+            require_name(&format!("metrics.{name}.description"), description)?;
+            let unit = validate_metric_unit(name, &metric.unit)?;
+            let _ = metrics.insert(
+                name.to_owned(),
+                NormalizedMetric {
+                    description: Arc::from(description),
+                    unit: unit.to_owned(),
+                    kind: metric.kind(name)?,
+                },
+            );
         }
 
-        let mut counters = Vec::new();
+        let expanded_count = expanded_counter_count(&user.perfcounters)?;
+        let mut counters = Vec::with_capacity(expanded_count);
         let mut referenced_metrics = HashSet::new();
         for (object_index, object) in user.perfcounters.into_iter().enumerate() {
             let object_field = format!("perfcounters[{object_index}]");
-            validate_path_element(&format!("{object_field}.object"), &object.object, false)?;
+            let object_name =
+                validate_path_element(&format!("{object_field}.object"), &object.object, false)?;
             if object.counters.is_empty() {
                 return Err(invalid(format!(
                     "{object_field}.counters must contain at least one entry"
@@ -288,7 +420,7 @@ impl Config {
             let aggregation_name = object
                 .aggregation_name
                 .unwrap_or_else(|| DEFAULT_AGGREGATION_NAME.to_owned());
-            validate_path_element(
+            let aggregation_name = validate_path_element(
                 &format!("{object_field}.aggregation_name"),
                 &aggregation_name,
                 false,
@@ -302,10 +434,10 @@ impl Config {
             if let Some(instances) = &instances {
                 let mut unique = HashSet::new();
                 for instance in instances {
-                    validate_path_element(
+                    let instance = validate_path_element(
                         &format!("{object_field}.instances"),
                         instance,
-                        instance == "*",
+                        instance.trim() == "*",
                     )?;
                     if !unique.insert(instance.to_lowercase()) {
                         return Err(invalid(format!(
@@ -313,9 +445,10 @@ impl Config {
                         )));
                     }
                 }
-                if instances.iter().any(|instance| instance == "*")
+                if instances.iter().any(|instance| instance.trim() == "*")
                     && instances.iter().any(|instance| {
-                        instance != "*" && !instance.eq_ignore_ascii_case(&aggregation_name)
+                        instance.trim() != "*"
+                            && !instance.trim().eq_ignore_ascii_case(aggregation_name)
                     })
                 {
                     return Err(invalid(format!(
@@ -326,56 +459,52 @@ impl Config {
 
             for (counter_index, mapping) in object.counters.into_iter().enumerate() {
                 let counter_field = format!("{object_field}.counters[{counter_index}]");
-                validate_path_element(&format!("{counter_field}.name"), &mapping.name, false)?;
-                let metric = user.metrics.get(&mapping.metric).ok_or_else(|| {
+                let counter_name =
+                    validate_counter_name(&format!("{counter_field}.name"), &mapping.name)?;
+                let metric_name = mapping.metric.trim();
+                let metric = metrics.get(metric_name).ok_or_else(|| {
                     invalid(format!(
                         "{counter_field}.metric references undefined metric {:?}",
-                        mapping.metric
+                        metric_name
                     ))
                 })?;
-                let _ = referenced_metrics.insert(mapping.metric.clone());
+                let _ = referenced_metrics.insert(metric_name.to_owned());
+                let attributes =
+                    Arc::new(normalize_attributes(&counter_field, &mapping.attributes)?);
                 let paths = match &instances {
-                    None => vec![(format!(r"\{}\{}", object.object, mapping.name), None)],
-                    Some(instances) if instances.iter().any(|instance| instance == "*") => {
+                    None => vec![(format!(r"\{object_name}\{counter_name}"), None)],
+                    Some(instances) if instances.iter().any(|instance| instance.trim() == "*") => {
                         let include_aggregation = instances
                             .iter()
-                            .any(|instance| instance.eq_ignore_ascii_case(&aggregation_name));
+                            .any(|instance| instance.trim().eq_ignore_ascii_case(aggregation_name));
                         vec![(
-                            format!(r"\{}(*)\{}", object.object, mapping.name),
-                            (!include_aggregation).then(|| aggregation_name.clone()),
+                            format!(r"\{object_name}(*)\{counter_name}"),
+                            (!include_aggregation).then(|| aggregation_name.to_owned()),
                         )]
                     }
                     Some(instances) => instances
                         .iter()
                         .map(|instance| {
-                            (
-                                format!(r"\{}({})\{}", object.object, instance, mapping.name),
-                                None,
-                            )
+                            let instance = instance.trim();
+                            (format!(r"\{object_name}({instance})\{counter_name}"), None)
                         })
                         .collect(),
                 };
                 for (path, excluded_aggregation_instance) in paths {
                     counters.push(CounterConfig {
                         path,
-                        name: mapping.metric.clone(),
+                        name: metric_name.to_owned(),
                         unit: metric.unit.clone(),
-                        description: metric.description.clone(),
-                        metric_kind: metric.kind(&mapping.metric)?,
-                        attributes: mapping.attributes.clone(),
+                        description: Arc::clone(&metric.description),
+                        metric_kind: metric.kind,
+                        attributes: Arc::clone(&attributes),
                         excluded_aggregation_instance,
                         scale_power10: mapping.scale_power10,
                     });
                 }
             }
         }
-        if !(1..=MAX_COUNTERS).contains(&counters.len()) {
-            return Err(invalid(format!(
-                "normalized counters must contain between 1 and {MAX_COUNTERS} entries"
-            )));
-        }
-        let unused = user
-            .metrics
+        let unused = metrics
             .keys()
             .filter(|name| !referenced_metrics.contains(*name))
             .cloned()
@@ -424,6 +553,14 @@ mod tests {
             "unit": "By",
             "up_down_counter": {}
         })
+    }
+
+    fn assert_config_error(value: serde_json::Value, expected: &str) {
+        let error = Config::from_json(&value).unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "expected {error:?} to contain {expected:?}"
+        );
     }
 
     /// Scenario: Objects with no instances, named instances, and wildcards share metric metadata.
@@ -497,7 +634,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.counters[0].name, "windows.process.private");
         assert_eq!(
-            config.counters[0].description,
+            &*config.counters[0].description,
             "Committed private memory for each process instance."
         );
         assert_eq!(config.counters[0].metric_kind, MetricKind::UpDownCounter);
@@ -561,6 +698,272 @@ mod tests {
             ]
         );
         assert!(config.counters.iter().all(|counter| counter.name == "test"));
+    }
+
+    /// Scenario: A canonical Windows counter name contains parentheses.
+    /// Guarantees: Counter-name punctuation remains valid while path separators and wildcards are rejected.
+    #[test]
+    fn accepts_parentheses_in_counter_names() {
+        let config = Config::from_json(&json!({
+            "metrics": {"test": metric()},
+            "perfcounters": [{
+                "object": "Object",
+                "counters": [{"name": "Counter (value)", "metric": "test"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(config.counters[0].path, r"\Object\Counter (value)");
+    }
+
+    /// Scenario: Metric definitions and path segments contain surrounding whitespace.
+    /// Guarantees: Normalization trims identities consistently while preserving attribute values.
+    #[test]
+    fn trims_metric_metadata_attributes_and_paths() {
+        let config = Config::from_json(&json!({
+            "metrics": {" windows.memory.available ": {
+                "description": " Available memory. ",
+                "unit": " By ",
+                "gauge": {}
+            }},
+            "perfcounters": [{
+                "object": " Memory ",
+                "counters": [{
+                    "name": " Available Bytes ",
+                    "metric": "windows.memory.available ",
+                    "attributes": {" state ": " free "}
+                }]
+            }]
+        }))
+        .unwrap();
+        let counter = &config.counters[0];
+        assert_eq!(counter.path, r"\Memory\Available Bytes");
+        assert_eq!(counter.name, "windows.memory.available");
+        assert_eq!(&*counter.description, "Available memory.");
+        assert_eq!(counter.unit, "By");
+        assert_eq!(
+            *counter.attributes,
+            BTreeMap::from([("state".to_owned(), " free ".to_owned())])
+        );
+    }
+
+    /// Scenario: OTel metric names or units violate their public syntax constraints.
+    /// Guarantees: Invalid identities are rejected before constructing PDH paths.
+    #[test]
+    fn validates_metric_names_and_units() {
+        let config = |name: &str, unit: &str| {
+            json!({
+                "metrics": {name: {"description": "Value.", "unit": unit, "gauge": {}}},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": name}]
+                }]
+            })
+        };
+        let long_name = format!("a{}", "b".repeat(MAX_METRIC_NAME_LEN));
+        for name in ["1value", "value space", "é", long_name.as_str()] {
+            assert_config_error(config(name, "By"), "must start with an ASCII letter");
+        }
+        let long_unit = "a".repeat(MAX_METRIC_UNIT_LEN + 1);
+        for unit in ["µs", "B\ty", long_unit.as_str()] {
+            assert_config_error(config("value", unit), "must be printable ASCII");
+        }
+        assert!(Config::from_json(&config("system.memory_usage-1/s", "{item}/s")).is_ok());
+    }
+
+    /// Scenario: More metric definitions are configured than normalized counters can reference.
+    /// Guarantees: The bounded metric count fails before producing a large unused-metric error.
+    #[test]
+    fn bounds_metric_definitions() {
+        let metrics = (0..=MAX_COUNTERS)
+            .map(|index| (format!("m{index}"), metric()))
+            .collect::<serde_json::Map<_, _>>();
+        assert_config_error(
+            json!({
+                "metrics": metrics,
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "m0"}]
+                }]
+            }),
+            "metrics must contain at most 256 entries",
+        );
+    }
+
+    /// Scenario: Normalized metric names or attribute keys collide.
+    /// Guarantees: Case-folded and post-trim duplicates fail instead of silently merging.
+    #[test]
+    fn rejects_normalized_identity_collisions() {
+        let definition = json!({"description": "Value.", "unit": "By", "gauge": {}});
+        assert_config_error(
+            json!({
+                "metrics": {"cpu": definition.clone(), " CPU": definition},
+                "perfcounters": [{
+                    "object": "Processor",
+                    "counters": [{"name": "% Processor Time", "metric": "cpu"}]
+                }]
+            }),
+            "metrics contains duplicate",
+        );
+        assert_config_error(
+            json!({
+                "metrics": {"test": metric()},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{
+                        "name": "Available Bytes",
+                        "metric": "test",
+                        "attributes": {"state": "a", " state": "b"}
+                    }]
+                }]
+            }),
+            "contains duplicate attribute key",
+        );
+    }
+
+    /// Scenario: A path segment contains an embedded NUL character.
+    /// Guarantees: Native string truncation cannot change the validated PDH path.
+    #[test]
+    fn rejects_nul_in_path_segments() {
+        for (field, value) in [
+            ("object", "Mem\0ory"),
+            ("instance", "app\0worker"),
+            ("counter", "Available\0Bytes"),
+        ] {
+            let object = match field {
+                "object" => json!({
+                    "object": value,
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }),
+                "instance" => json!({
+                    "object": "Process",
+                    "instances": value,
+                    "counters": [{"name": "Private Bytes", "metric": "test"}]
+                }),
+                _ => json!({
+                    "object": "Memory",
+                    "counters": [{"name": value, "metric": "test"}]
+                }),
+            };
+            assert_config_error(
+                json!({"metrics": {"test": metric()}, "perfcounters": [object]}),
+                "contains a reserved performance-counter path character",
+            );
+        }
+    }
+
+    /// Scenario: Instance and counter lists multiply beyond the normalized path cap.
+    /// Guarantees: The total is rejected before allocating the expanded path vector.
+    #[test]
+    fn bounds_expanded_counter_paths_before_materialization() {
+        let object = |instances: usize, counters: usize| {
+            json!({
+                "object": "Process",
+                "instances": (0..instances).map(|i| format!("i{i}")).collect::<Vec<_>>(),
+                "counters": (0..counters)
+                    .map(|i| json!({"name": format!("C{i}"), "metric": "test"}))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let config =
+            |perfcounters| json!({"metrics": {"test": metric()}, "perfcounters": perfcounters});
+        assert_eq!(
+            Config::from_json(&config(json!([object(16, 16)])))
+                .unwrap()
+                .counters
+                .len(),
+            MAX_COUNTERS
+        );
+        assert_config_error(
+            config(json!([object(17, 16)])),
+            "must normalize to at most 256 counter paths",
+        );
+        assert_config_error(
+            config(json!([object(1, 129), object(1, 128)])),
+            "must normalize to at most 256 counter paths",
+        );
+    }
+
+    /// Scenario: One counter mapping expands across multiple explicit instances.
+    /// Guarantees: Repeated description and attribute metadata is shared across paths.
+    #[test]
+    fn shares_expanded_counter_metadata() {
+        let config = Config::from_json(&json!({
+            "metrics": {"test": metric()},
+            "perfcounters": [{
+                "object": "Process",
+                "instances": ["a", "b"],
+                "counters": [{
+                    "name": "Private Bytes",
+                    "metric": "test",
+                    "attributes": {"state": "used"}
+                }]
+            }]
+        }))
+        .unwrap();
+        let [first, second] = config.counters.as_slice() else {
+            panic!("expected two expanded counters");
+        };
+        assert!(Arc::ptr_eq(&first.description, &second.description));
+        assert!(Arc::ptr_eq(&first.attributes, &second.attributes));
+    }
+
+    /// Scenario: Trimmed path segments create duplicate instance or counter paths.
+    /// Guarantees: Duplicate detection operates on normalized, case-insensitive paths.
+    #[test]
+    fn rejects_duplicates_after_path_normalization() {
+        assert_config_error(
+            json!({
+                "metrics": {"test": metric()},
+                "perfcounters": [{
+                    "object": "Process",
+                    "instances": ["app", " APP "],
+                    "counters": [{"name": "Private Bytes", "metric": "test"}]
+                }]
+            }),
+            "instances contains duplicate",
+        );
+        assert_config_error(
+            json!({
+                "metrics": {"test": metric()},
+                "perfcounters": [
+                    {
+                        "object": "Memory",
+                        "counters": [{"name": "Available Bytes", "metric": "test"}]
+                    },
+                    {
+                        "object": " memory ",
+                        "counters": [{"name": " available bytes ", "metric": "test"}]
+                    }
+                ]
+            }),
+            "duplicate counter path",
+        );
+    }
+
+    /// Scenario: YAML shorthand selects a metric kind with a null value.
+    /// Guarantees: A present `gauge:` or `up_down_counter:` key remains selected.
+    #[test]
+    fn accepts_null_metric_kind_shorthand() {
+        for kind in ["gauge", "up_down_counter"] {
+            let mut definition = json!({"description": "Value.", "unit": "1"});
+            definition[kind] = serde_json::Value::Null;
+            let config = Config::from_json(&json!({
+                "metrics": {"test": definition},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }]
+            }))
+            .unwrap();
+            assert_eq!(
+                config.counters[0].metric_kind,
+                if kind == "gauge" {
+                    MetricKind::Gauge
+                } else {
+                    MetricKind::UpDownCounter
+                }
+            );
+        }
     }
 
     /// Scenario: Invalid metadata, references, path elements, attributes, limits, or metric types are used.

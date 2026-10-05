@@ -3,7 +3,7 @@
 # Requires the Memory, Processor, Cache, and PhysicalDisk performance objects,
 # including the PhysicalDisk _Total instance and provider-defined base counters.
 # From rust\otap-dataflow:
-# cargo run --features windowsperfcounters-receiver --bin df_engine -- -c configs\windowsperfcounters-calculations-console.yaml
+# cargo run --features windowsperfcounters --bin df_engine -- -c configs\windowsperfcounters-calculations-console.yaml
 
 version: otel_dataflow/v1
 engine: {}
