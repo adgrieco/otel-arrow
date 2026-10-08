@@ -6,7 +6,7 @@
 | --- | --- |
 | Type | `receiver:windowsperfcounters` |
 | URN | `urn:otel:receiver:windowsperfcounters` |
-| Feature | `windowsperfcounters` |
+| Feature | `windows-perf-counters` |
 | Platform | Windows only |
 | Stability | Experimental |
 
@@ -123,6 +123,10 @@ instance. Set `aggregation_name` when a provider uses another name such as
 `_Global_`. Filtering occurs before expansion limits, and explicit wildcard
 inclusion does not create a duplicate aggregate query.
 
+Explicit PDH duplicate-instance indexes are canonicalized before path and
+duplicate checks: the first occurrence omits `#0`, and leading zeroes are
+removed from later indexes.
+
 Unknown fields, empty metadata, undefined or unused metrics, duplicate
 instances, duplicate normalized paths, invalid intervals, and unsupported
 scales are configuration errors. Surrounding whitespace is removed from metric
@@ -228,7 +232,7 @@ points do not use or validate cumulative start time.
 From `rust\otap-dataflow`:
 
 ```powershell
-cargo run --features windowsperfcounters --bin df_engine -- -c configs\windowsperfcounters-console.yaml
+cargo run --features windows-perf-counters --bin df_engine -- -c configs\windowsperfcounters-console.yaml
 ```
 
 The basic

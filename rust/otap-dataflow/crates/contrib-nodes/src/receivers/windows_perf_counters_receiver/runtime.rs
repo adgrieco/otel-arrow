@@ -363,7 +363,7 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::receivers::windowsperfcounters_receiver::config::{CounterConfig, MetricKind};
+    use crate::receivers::windows_perf_counters_receiver::config::{CounterConfig, MetricKind};
     use otel_arrow_dfe_config::node::NodeUserConfig;
     use otel_arrow_dfe_engine::testing::receiver::TestRuntime;
     use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_ctx};

@@ -291,8 +291,8 @@ jobs:
       - name: Run live Windows performance-counter smoke tests
         run: >
           cargo test --locked -p otel-arrow-dfe-contrib-nodes
-          windowsperfcounters_receiver::pdh::tests::
-          --features windowsperfcounters
+          windows_perf_counters_receiver::pdh::tests::
+          --features windows-perf-counters
           -- --ignored --test-threads=1
         working-directory: ./rust/otap-dataflow
 
@@ -633,7 +633,7 @@ jobs:
       - name: Build and archive tests
         # Keep this feature set synchronized with the Windows post-merge cache
         # warmer so PR and merge-queue builds can reuse its target artifacts.
-        run: cargo nextest archive --locked --no-default-features --features=crypto-symcrypt,mimalloc,azure,aws,azure-monitor-exporter,geneva-exporter,contrib-processors,windowsperfcounters,unsafe-optimizations --workspace --archive-file nextest-archive.tar.zst
+        run: cargo nextest archive --locked --no-default-features --features=crypto-symcrypt,mimalloc,azure,aws,azure-monitor-exporter,geneva-exporter,contrib-processors,windows-perf-counters,unsafe-optimizations --workspace --archive-file nextest-archive.tar.zst
         working-directory: ./rust/otap-dataflow
       - name: Upload nextest archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -217,6 +217,28 @@ fn validate_path_element<'a>(
     Ok(value)
 }
 
+/// Canonicalizes PDH's decimal instance index, where the first occurrence omits `#0`.
+fn normalize_instance(field: &str, value: &str) -> Result<String, Error> {
+    let value = validate_path_element(field, value, false)?;
+    let Some((name, index)) = value.rsplit_once('#') else {
+        return Ok(value.to_owned());
+    };
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(value.to_owned());
+    }
+    if name.is_empty() {
+        return Err(invalid(format!(
+            "{field} must include an instance name before its index"
+        )));
+    }
+    let index = index.trim_start_matches('0');
+    if index.is_empty() {
+        Ok(name.to_owned())
+    } else {
+        Ok(format!("{name}#{index}"))
+    }
+}
+
 fn validate_counter_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
     let value = value.trim();
     require_name(field, value)?;
@@ -420,42 +442,46 @@ impl Config {
             let aggregation_name = object
                 .aggregation_name
                 .unwrap_or_else(|| DEFAULT_AGGREGATION_NAME.to_owned());
-            let aggregation_name = validate_path_element(
+            let aggregation_name = normalize_instance(
                 &format!("{object_field}.aggregation_name"),
                 &aggregation_name,
-                false,
             )?;
-            let instances = object.instances.map(OneOrMany::into_vec);
-            if instances.as_ref().is_some_and(Vec::is_empty) {
-                return Err(invalid(format!(
-                    "{object_field}.instances must not be empty"
-                )));
-            }
-            if let Some(instances) = &instances {
-                let mut unique = HashSet::new();
-                for instance in instances {
-                    let instance = validate_path_element(
-                        &format!("{object_field}.instances"),
-                        instance,
-                        instance.trim() == "*",
-                    )?;
-                    if !unique.insert(instance.to_lowercase()) {
-                        return Err(invalid(format!(
-                            "{object_field}.instances contains duplicate {instance:?}"
-                        )));
-                    }
-                }
-                if instances.iter().any(|instance| instance.trim() == "*")
-                    && instances.iter().any(|instance| {
-                        instance.trim() != "*"
-                            && !instance.trim().eq_ignore_ascii_case(aggregation_name)
-                    })
-                {
+            let instances = match object.instances.map(OneOrMany::into_vec) {
+                None => None,
+                Some(instances) if instances.is_empty() => {
                     return Err(invalid(format!(
-                        "{object_field}.instances may combine \"*\" only with aggregation_name"
+                        "{object_field}.instances must not be empty"
                     )));
                 }
-            }
+                Some(instances) => {
+                    let field = format!("{object_field}.instances");
+                    let mut unique = HashSet::new();
+                    let mut normalized = Vec::with_capacity(instances.len());
+                    for instance in instances {
+                        let instance = if instance.trim() == "*" {
+                            validate_path_element(&field, &instance, true)?.to_owned()
+                        } else {
+                            normalize_instance(&field, &instance)?
+                        };
+                        if !unique.insert(instance.to_lowercase()) {
+                            return Err(invalid(format!(
+                                "{object_field}.instances contains duplicate {instance:?}"
+                            )));
+                        }
+                        normalized.push(instance);
+                    }
+                    if normalized.iter().any(|instance| instance == "*")
+                        && normalized.iter().any(|instance| {
+                            instance != "*" && !instance.eq_ignore_ascii_case(&aggregation_name)
+                        })
+                    {
+                        return Err(invalid(format!(
+                            "{object_field}.instances may combine \"*\" only with aggregation_name"
+                        )));
+                    }
+                    Some(normalized)
+                }
+            };
 
             for (counter_index, mapping) in object.counters.into_iter().enumerate() {
                 let counter_field = format!("{object_field}.counters[{counter_index}]");
@@ -473,19 +499,18 @@ impl Config {
                     Arc::new(normalize_attributes(&counter_field, &mapping.attributes)?);
                 let paths = match &instances {
                     None => vec![(format!(r"\{object_name}\{counter_name}"), None)],
-                    Some(instances) if instances.iter().any(|instance| instance.trim() == "*") => {
+                    Some(instances) if instances.iter().any(|instance| instance == "*") => {
                         let include_aggregation = instances
                             .iter()
-                            .any(|instance| instance.trim().eq_ignore_ascii_case(aggregation_name));
+                            .any(|instance| instance.eq_ignore_ascii_case(&aggregation_name));
                         vec![(
                             format!(r"\{object_name}(*)\{counter_name}"),
-                            (!include_aggregation).then(|| aggregation_name.to_owned()),
+                            (!include_aggregation).then(|| aggregation_name.clone()),
                         )]
                     }
                     Some(instances) => instances
                         .iter()
                         .map(|instance| {
-                            let instance = instance.trim();
                             (format!(r"\{object_name}({instance})\{counter_name}"), None)
                         })
                         .collect(),
@@ -760,11 +785,11 @@ mod tests {
             })
         };
         let long_name = format!("a{}", "b".repeat(MAX_METRIC_NAME_LEN));
-        for name in ["1value", "value space", "é", long_name.as_str()] {
+        for name in ["1value", "value space", "\u{e9}", long_name.as_str()] {
             assert_config_error(config(name, "By"), "must start with an ASCII letter");
         }
         let long_unit = "a".repeat(MAX_METRIC_UNIT_LEN + 1);
-        for unit in ["µs", "B\ty", long_unit.as_str()] {
+        for unit in ["\u{b5}s", "B\ty", long_unit.as_str()] {
             assert_config_error(config("value", unit), "must be printable ASCII");
         }
         assert!(Config::from_json(&config("system.memory_usage-1/s", "{item}/s")).is_ok());
@@ -938,6 +963,50 @@ mod tests {
             }),
             "duplicate counter path",
         );
+    }
+
+    /// Scenario: Explicit instance indexes use omitted, zero, or leading-zero spellings.
+    /// Guarantees: Equivalent PDH indexes normalize before duplicate and path checks.
+    #[test]
+    fn canonicalizes_explicit_instance_indexes() {
+        for instances in [["app", "app#0"], ["app#1", "app#01"]] {
+            assert_config_error(
+                json!({
+                    "metrics": {"test": metric()},
+                    "perfcounters": [{
+                        "object": "Process",
+                        "instances": instances,
+                        "counters": [{"name": "Private Bytes", "metric": "test"}]
+                    }]
+                }),
+                "instances contains duplicate",
+            );
+        }
+
+        let config = Config::from_json(&json!({
+            "metrics": {"test": metric()},
+            "perfcounters": [{
+                "object": "Process",
+                "instances": "app#001",
+                "counters": [{"name": "Private Bytes", "metric": "test"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(config.counters[0].path, r"\Process(app#1)\Private Bytes");
+
+        for instance in ["#0", "#1"] {
+            assert_config_error(
+                json!({
+                    "metrics": {"test": metric()},
+                    "perfcounters": [{
+                        "object": "Process",
+                        "instances": instance,
+                        "counters": [{"name": "Private Bytes", "metric": "test"}]
+                    }]
+                }),
+                "must include an instance name before its index",
+            );
+        }
     }
 
     /// Scenario: YAML shorthand selects a metric kind with a null value.

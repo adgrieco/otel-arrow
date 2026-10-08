@@ -372,7 +372,7 @@ recordset-kql-processor = ["otel-arrow-dfe-contrib-nodes/recordset-kql-processor
 resource-validator-processor = ["otel-arrow-dfe-contrib-nodes/resource-validator-processor"]
 # Contrib receivers (opt-in) - Windows-only
 etw-receiver = ["otel-arrow-dfe-contrib-nodes/etw-receiver"]
-windowsperfcounters = ["otel-arrow-dfe-contrib-nodes/windowsperfcounters"]
+windows-perf-counters = ["otel-arrow-dfe-contrib-nodes/windows-perf-counters"]
 
 # Experimental WASM host-kernel processor plugin runtime (opt-in). Off by
 # default; enabling this pulls in wasmtime and registers the

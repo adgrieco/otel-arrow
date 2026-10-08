@@ -1,7 +1,7 @@
 # platform: windows-only
 # Basic exact-counter example using built-in Windows performance objects.
 # From rust\otap-dataflow:
-# cargo run --features windowsperfcounters --bin df_engine -- -c configs\windowsperfcounters-console.yaml
+# cargo run --features windows-perf-counters --bin df_engine -- -c configs\windowsperfcounters-console.yaml
 
 version: otel_dataflow/v1
 engine: {}
