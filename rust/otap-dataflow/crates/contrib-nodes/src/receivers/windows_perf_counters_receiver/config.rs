@@ -7,6 +7,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub(super) const MIN_SCALE_POWER10: i32 = -18;
+pub(super) const MAX_SCALE_POWER10: i32 = 18;
+
 const MAX_COUNTERS: usize = 256;
 const MAX_METRIC_NAME_LEN: usize = 255;
 const MAX_METRIC_UNIT_LEN: usize = 63;
@@ -15,8 +18,6 @@ const MAX_COUNTER_PATH_LEN: usize = 2_047;
 const DEFAULT_MAX_INSTANCES_PER_WILDCARD: usize = 256;
 const DEFAULT_MAX_EXPANDED_COUNTERS: usize = 4_096;
 const DEFAULT_AGGREGATION_NAME: &str = "_Total";
-const MIN_SCALE_POWER10: i32 = -18;
-const MAX_SCALE_POWER10: i32 = 18;
 const RECEIVER_ATTRIBUTE_PREFIX: &str = "windows.perf_counter.";
 
 /// One normalized counter consumed by the existing PDH worker and OTAP builder.

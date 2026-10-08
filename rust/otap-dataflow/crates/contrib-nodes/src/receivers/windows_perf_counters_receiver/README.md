@@ -181,11 +181,10 @@ The receiver requests unscaled values and applies only `scale_power10`; the
 configured unit must describe the scaled result.
 
 - Zero scale preserves direct values as exact integers.
-- Positive integer scaling remains integer unless it overflows.
-- Negative integer scaling emits a double and requires a precision-safe
-  conversion.
-- Non-finite, overflowing, precision-unsafe, or nonzero underflowing results
-  are omitted and diagnosed without suppressing healthy points.
+- Any nonzero integer scale emits a double using standard `f64` rounding.
+- Calculated and scaled values preserve finite subnormal values and signed zero.
+- Non-finite inputs or results are omitted and diagnosed without suppressing
+  healthy points.
 
 For example, `\Memory\Available Bytes` remains an exact byte count with unit
 `By` at the default scale.

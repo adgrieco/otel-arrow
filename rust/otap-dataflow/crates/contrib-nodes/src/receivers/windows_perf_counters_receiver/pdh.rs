@@ -1519,10 +1519,10 @@ impl Query {
             };
             let scaled = match scaled_result {
                 Ok(scaled) => scaled,
-                Err(message) => {
+                Err(error) => {
                     let error = Error::Calculation {
                         path: counter.path.clone(),
-                        message,
+                        message: error.to_string(),
                     };
                     failures.push(sample_failure(counter.config_index, &error));
                     diagnostics.counter_read_failures += 1;
