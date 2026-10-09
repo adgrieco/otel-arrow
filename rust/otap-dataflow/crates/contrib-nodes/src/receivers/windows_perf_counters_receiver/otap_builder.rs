@@ -25,9 +25,10 @@ pub(super) fn into_otap(
     sample: Sample,
 ) -> Result<Option<OtapArrowRecords>, ArrowError> {
     if sample.timestamp_unix_nano <= 0 {
-        return Err(ArrowError::InvalidArgumentError(
-            "performance-counter sample requires a positive Unix timestamp".to_owned(),
-        ));
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "sample has non-positive timestamp {}",
+            sample.timestamp_unix_nano
+        )));
     }
     let mut metrics = MetricsRecordBatchBuilder::new();
     let mut points = NumberDataPointsRecordBatchBuilder::new();
@@ -52,10 +53,10 @@ pub(super) fn into_otap(
             && (sample.start_time_unix_nano <= 0
                 || sample.start_time_unix_nano > sample.timestamp_unix_nano)
         {
-            return Err(ArrowError::InvalidArgumentError(
-                "performance-counter UpDownCounter requires a positive start time no later than its timestamp"
-                    .to_owned(),
-            ));
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "UpDownCounter {} ({}) has invalid start time {} for timestamp {}",
+                counter.name, counter.path, sample.start_time_unix_nano, sample.timestamp_unix_nano
+            )));
         }
         let metric_id = if let Some(metric_id) = metric_ids.get(&counter.name) {
             *metric_id
@@ -105,10 +106,11 @@ pub(super) fn into_otap(
                 points.append_int_value(None);
                 points.append_double_value(Some(value));
             }
-            Number::Double(_) => {
-                return Err(ArrowError::InvalidArgumentError(
-                    "performance-counter double value must be finite".to_owned(),
-                ));
+            Number::Double(value) => {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "counter {} has non-finite double value {value}",
+                    point.path
+                )));
             }
         }
         points.append_flags(0);
@@ -156,7 +158,7 @@ pub(super) fn into_otap(
         .append_dropped_attributes_count_n(0, metric_count);
     metrics.scope.append_id_n(0, metric_count);
     metrics.scope.append_name_n(
-        Some(b"otel-arrow-dfe-contrib-nodes/windowsperfcounters"),
+        Some(b"otel-arrow-dfe-contrib-nodes/windows_perf_counters"),
         metric_count,
     );
     metrics
@@ -380,6 +382,62 @@ mod tests {
                 .value(0),
             5
         );
+    }
+
+    /// Scenario: An emitted UpDownCounter carries an invalid or boundary cumulative start time.
+    /// Guarantees: Only 0 < start <= observation time is accepted and errors identify the counter and both times.
+    #[test]
+    fn validates_up_down_counter_start_time() {
+        let counters = [up_down_counter(
+            r"\Process(*)\Private Bytes",
+            "windows.process.private",
+            "By",
+        )];
+        for start in [i64::MIN, -1, 0, 11, i64::MAX] {
+            assert!(matches!(
+                into_otap(
+                    &counters,
+                    Sample {
+                        start_time_unix_nano: start,
+                        timestamp_unix_nano: 10,
+                        points: vec![point(
+                            0,
+                            r"\Process(worker)\Private Bytes",
+                            SampleValue::Value(Number::Integer(42)),
+                        )],
+                        failures: Vec::new(),
+                        overflows: Vec::new(),
+                        diagnostics: Default::default(),
+                    },
+                ),
+                Err(ArrowError::InvalidArgumentError(message))
+                    if message == format!(
+                        "UpDownCounter windows.process.private (\\Process(*)\\Private Bytes) \
+                         has invalid start time {start} for timestamp 10"
+                    )
+            ));
+        }
+        for start in [1, 10] {
+            assert!(
+                into_otap(
+                    &counters,
+                    Sample {
+                        start_time_unix_nano: start,
+                        timestamp_unix_nano: 10,
+                        points: vec![point(
+                            0,
+                            r"\Process(worker)\Private Bytes",
+                            SampleValue::Value(Number::Integer(42)),
+                        )],
+                        failures: Vec::new(),
+                        overflows: Vec::new(),
+                        diagnostics: Default::default(),
+                    },
+                )
+                .unwrap()
+                .is_some()
+            );
+        }
     }
 
     /// Scenario: A Gauge sample carries an unused start timestamp later than its collection timestamp.
@@ -626,8 +684,8 @@ mod tests {
         );
     }
 
-    /// Scenario: A sample has an invalid timestamp or references a missing configured counter.
-    /// Guarantees: Misidentified or untimed values never become plausible output gauges.
+    /// Scenario: A sample has an invalid timestamp, counter reference, or numeric value.
+    /// Guarantees: Invalid observations are rejected with the timestamp, path, or value needed for diagnosis.
     #[test]
     fn rejects_invalid_sample() {
         let counters = [counter(
@@ -653,24 +711,27 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            into_otap(
-                &counters,
-                Sample {
-                    start_time_unix_nano: 1,
-                    timestamp_unix_nano: 0,
-                    points: vec![point(
-                        0,
-                        r"\Memory\Available Bytes",
-                        SampleValue::Value(Number::Integer(1)),
-                    )],
-                    failures: Vec::new(),
-                    overflows: Vec::new(),
-                    diagnostics: Default::default(),
-                }
-            )
-            .is_err()
-        );
+        for timestamp in [i64::MIN, -1, 0] {
+            assert!(matches!(
+                into_otap(
+                    &counters,
+                    Sample {
+                        start_time_unix_nano: 1,
+                        timestamp_unix_nano: timestamp,
+                        points: vec![point(
+                            0,
+                            r"\Memory\Available Bytes",
+                            SampleValue::Value(Number::Integer(1)),
+                        )],
+                        failures: Vec::new(),
+                        overflows: Vec::new(),
+                        diagnostics: Default::default(),
+                    }
+                ),
+                Err(ArrowError::InvalidArgumentError(message))
+                    if message == format!("sample has non-positive timestamp {timestamp}")
+            ));
+        }
         assert!(
             into_otap(
                 &counters,
@@ -689,24 +750,29 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(
-            into_otap(
-                &counters,
-                Sample {
-                    start_time_unix_nano: 1,
-                    timestamp_unix_nano: 1,
-                    points: vec![point(
-                        0,
-                        r"\Memory\Available Bytes",
-                        SampleValue::Value(Number::Double(f64::INFINITY)),
-                    )],
-                    failures: Vec::new(),
-                    overflows: Vec::new(),
-                    diagnostics: Default::default(),
-                }
-            )
-            .is_err()
-        );
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                into_otap(
+                    &counters,
+                    Sample {
+                        start_time_unix_nano: 1,
+                        timestamp_unix_nano: 1,
+                        points: vec![point(
+                            0,
+                            r"\Memory\Available Bytes",
+                            SampleValue::Value(Number::Double(value)),
+                        )],
+                        failures: Vec::new(),
+                        overflows: Vec::new(),
+                        diagnostics: Default::default(),
+                    }
+                ),
+                Err(ArrowError::InvalidArgumentError(message))
+                    if message == format!(
+                        "counter \\Memory\\Available Bytes has non-finite double value {value}"
+                    )
+            ));
+        }
     }
 
     /// Scenario: Two expanded instances map to one configured wildcard metric.
