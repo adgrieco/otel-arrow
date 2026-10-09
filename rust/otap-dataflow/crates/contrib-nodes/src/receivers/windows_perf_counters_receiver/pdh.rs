@@ -9,6 +9,7 @@ use super::model::{
     ExpansionOverflow, InstanceIdentity, Sample, SampleDiagnostics, SampleFailure, SamplePoint,
     SampleValue, scale_double, scale_integer,
 };
+use super::native_type::{CounterKind, UnsupportedNativeType, classify_native_type};
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::{size_of, size_of_val};
 use std::ptr::{null, null_mut};
@@ -21,102 +22,16 @@ use windows_sys::Win32::System::Performance::{
     PDH_COUNTER_INFO_W, PDH_COUNTER_PATH_ELEMENTS_W, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA,
     PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY,
     PDH_INVALID_ARGUMENT, PDH_MAX_COUNTER_PATH, PDH_MORE_DATA, PDH_RAW_COUNTER,
-    PDH_REFRESHCOUNTERS, PERF_DISPLAY_NO_SUFFIX, PERF_NUMBER_DECIMAL, PERF_NUMBER_HEX,
-    PERF_SIZE_DWORD, PERF_SIZE_LARGE, PERF_TYPE_NUMBER, PdhAddCounterW, PdhAddEnglishCounterW,
-    PdhCloseQuery, PdhCollectQueryData, PdhExpandWildCardPathW, PdhGetCounterInfoW,
-    PdhGetFormattedCounterValue, PdhGetRawCounterValue, PdhOpenQueryW, PdhParseCounterPathW,
-    PdhRemoveCounter,
+    PDH_REFRESHCOUNTERS, PdhAddCounterW, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
+    PdhExpandWildCardPathW, PdhGetCounterInfoW, PdhGetFormattedCounterValue, PdhGetRawCounterValue,
+    PdhOpenQueryW, PdhParseCounterPathW, PdhRemoveCounter,
 };
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 const QUERY_REBUILD_AFTER_FAILURES: u32 = 3;
+// These format flags are not exposed by windows-sys 0.61.2.
 const PDH_FMT_NOSCALE: u32 = 0x0000_1000;
 const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
-const PERF_TYPE_COUNTER: u32 = 0x0000_0400;
-const PERF_COUNTER_RATE: u32 = 0x0001_0000;
-const PERF_COUNTER_FRACTION: u32 = 0x0002_0000;
-const PERF_COUNTER_QUEUELEN: u32 = 0x0005_0000;
-const PERF_COUNTER_PRECISION: u32 = 0x0007_0000;
-const PERF_TIMER_100NS: u32 = 0x0010_0000;
-const PERF_OBJECT_TIMER: u32 = 0x0020_0000;
-const PERF_DELTA_COUNTER: u32 = 0x0040_0000;
-const PERF_DELTA_BASE: u32 = 0x0080_0000;
-const PERF_INVERSE_COUNTER: u32 = 0x0100_0000;
-const PERF_DISPLAY_PER_SEC: u32 = 0x1000_0000;
-const PERF_DISPLAY_PERCENT: u32 = 0x2000_0000;
-const PERF_DISPLAY_SECONDS: u32 = 0x3000_0000;
-const PERF_DISPLAY_NOSHOW: u32 = 0x4000_0000;
-const PERF_COUNTER_RAWCOUNT: u32 =
-    PERF_SIZE_DWORD | PERF_TYPE_NUMBER | PERF_NUMBER_DECIMAL | PERF_DISPLAY_NO_SUFFIX;
-const PERF_COUNTER_LARGE_RAWCOUNT: u32 =
-    PERF_SIZE_LARGE | PERF_TYPE_NUMBER | PERF_NUMBER_DECIMAL | PERF_DISPLAY_NO_SUFFIX;
-const PERF_COUNTER_RAWCOUNT_HEX: u32 =
-    PERF_SIZE_DWORD | PERF_TYPE_NUMBER | PERF_NUMBER_HEX | PERF_DISPLAY_NO_SUFFIX;
-const PERF_COUNTER_LARGE_RAWCOUNT_HEX: u32 =
-    PERF_SIZE_LARGE | PERF_TYPE_NUMBER | PERF_NUMBER_HEX | PERF_DISPLAY_NO_SUFFIX;
-const PERF_COUNTER_COUNTER: u32 = PERF_SIZE_DWORD
-    | PERF_TYPE_COUNTER
-    | PERF_COUNTER_RATE
-    | PERF_DELTA_COUNTER
-    | PERF_DISPLAY_PER_SEC;
-const PERF_COUNTER_BULK_COUNT: u32 = PERF_SIZE_LARGE
-    | PERF_TYPE_COUNTER
-    | PERF_COUNTER_RATE
-    | PERF_DELTA_COUNTER
-    | PERF_DISPLAY_PER_SEC;
-const PERF_COUNTER_QUEUELEN_TYPE: u32 =
-    PERF_SIZE_DWORD | PERF_TYPE_COUNTER | PERF_COUNTER_QUEUELEN | PERF_DELTA_COUNTER;
-const PERF_COUNTER_LARGE_QUEUELEN_TYPE: u32 =
-    PERF_SIZE_LARGE | PERF_TYPE_COUNTER | PERF_COUNTER_QUEUELEN | PERF_DELTA_COUNTER;
-const PERF_COUNTER_100NS_QUEUELEN_TYPE: u32 = PERF_SIZE_LARGE
-    | PERF_TYPE_COUNTER
-    | PERF_COUNTER_QUEUELEN
-    | PERF_TIMER_100NS
-    | PERF_DELTA_COUNTER;
-const PERF_COUNTER_OBJ_TIME_QUEUELEN_TYPE: u32 = PERF_SIZE_LARGE
-    | PERF_TYPE_COUNTER
-    | PERF_COUNTER_QUEUELEN
-    | PERF_OBJECT_TIMER
-    | PERF_DELTA_COUNTER;
-const PERF_COUNTER_TIMER: u32 = PERF_SIZE_LARGE
-    | PERF_TYPE_COUNTER
-    | PERF_COUNTER_RATE
-    | PERF_DELTA_COUNTER
-    | PERF_DISPLAY_PERCENT;
-const PERF_COUNTER_TIMER_INV: u32 = PERF_COUNTER_TIMER | PERF_INVERSE_COUNTER;
-const PERF_100NSEC_TIMER: u32 = PERF_COUNTER_TIMER | PERF_TIMER_100NS;
-const PERF_100NSEC_TIMER_INV: u32 = PERF_100NSEC_TIMER | PERF_INVERSE_COUNTER;
-const PERF_OBJ_TIME_TIMER: u32 = PERF_COUNTER_TIMER | PERF_OBJECT_TIMER;
-const PERF_PRECISION_SYSTEM_TIMER: u32 = PERF_SIZE_LARGE
-    | PERF_TYPE_COUNTER
-    | PERF_COUNTER_PRECISION
-    | PERF_DELTA_COUNTER
-    | PERF_DISPLAY_PERCENT;
-const PERF_PRECISION_100NS_TIMER: u32 = PERF_PRECISION_SYSTEM_TIMER | PERF_TIMER_100NS;
-const PERF_PRECISION_OBJECT_TIMER: u32 = PERF_PRECISION_SYSTEM_TIMER | PERF_OBJECT_TIMER;
-const PERF_COUNTER_DELTA: u32 =
-    PERF_SIZE_DWORD | PERF_TYPE_COUNTER | PERF_DELTA_COUNTER | PERF_DISPLAY_NO_SUFFIX;
-const PERF_COUNTER_LARGE_DELTA: u32 =
-    PERF_SIZE_LARGE | PERF_TYPE_COUNTER | PERF_DELTA_COUNTER | PERF_DISPLAY_NO_SUFFIX;
-const PERF_SAMPLE_COUNTER: u32 = PERF_SIZE_DWORD
-    | PERF_TYPE_COUNTER
-    | PERF_COUNTER_RATE
-    | PERF_DELTA_COUNTER
-    | PERF_DISPLAY_NO_SUFFIX;
-const PERF_RAW_FRACTION: u32 =
-    PERF_SIZE_DWORD | PERF_TYPE_COUNTER | PERF_COUNTER_FRACTION | PERF_DISPLAY_PERCENT;
-const PERF_LARGE_RAW_FRACTION: u32 =
-    PERF_SIZE_LARGE | PERF_TYPE_COUNTER | PERF_COUNTER_FRACTION | PERF_DISPLAY_PERCENT;
-const PERF_SAMPLE_FRACTION: u32 = PERF_SIZE_DWORD
-    | PERF_TYPE_COUNTER
-    | PERF_COUNTER_FRACTION
-    | PERF_DELTA_COUNTER
-    | PERF_DELTA_BASE
-    | PERF_DISPLAY_PERCENT;
-const PERF_AVERAGE_TIMER: u32 =
-    PERF_SIZE_DWORD | PERF_TYPE_COUNTER | PERF_COUNTER_FRACTION | PERF_DISPLAY_SECONDS;
-const PERF_AVERAGE_BULK: u32 =
-    PERF_SIZE_LARGE | PERF_TYPE_COUNTER | PERF_COUNTER_FRACTION | PERF_DISPLAY_NOSHOW;
 
 #[cfg(test)]
 static QUERY_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -131,12 +46,8 @@ pub(super) enum Error {
         path: String,
         status: u32,
     },
-    #[error(
-        "unsupported native counter type 0x{native_type:08X} for {path}; \
-         supported types are direct raw counts, rates, deltas, queue lengths, timers, \
-         fractions, and averages"
-    )]
-    UnsupportedType { path: String, native_type: u32 },
+    #[error(transparent)]
+    UnsupportedType(#[from] UnsupportedNativeType),
     #[error("invalid performance-counter sample: {0}")]
     InvalidSample(&'static str),
     #[error("counter calculation for {path} failed: {message}")]
@@ -194,7 +105,7 @@ impl Error {
     fn reason(&self) -> &'static str {
         match self {
             Self::Pdh { operation, .. } => operation,
-            Self::UnsupportedType { .. } => "unsupported_type",
+            Self::UnsupportedType(_) => "unsupported_type",
             Self::InvalidSample(_) => "invalid_sample",
             Self::Calculation { .. } => "calculation",
             Self::WorkerStart(_) => "worker_start",
@@ -210,8 +121,8 @@ impl Error {
     fn bounded_detail(&self) -> String {
         match self {
             Self::Pdh { status, .. } => format!("PDH status 0x{status:08X}"),
-            Self::UnsupportedType { native_type, .. } => {
-                format!("unsupported native type 0x{native_type:08X}")
+            Self::UnsupportedType(error) => {
+                format!("unsupported native type 0x{:08X}", error.native_type)
             }
             Self::InvalidSample(message) => (*message).to_owned(),
             Self::Calculation { message, .. } => message.clone(),
@@ -230,54 +141,6 @@ fn check(operation: &'static str, path: &str, status: u32) -> Result<(), Error> 
             status,
         })
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CounterKind {
-    Direct,
-    RawFraction,
-    CalculatedTwoSample,
-    CalculatedTwoSampleWithBase,
-}
-
-fn classify_native_type(path: &str, native_type: u32, scale: i32) -> Result<CounterKind, Error> {
-    let kind = match native_type {
-        PERF_COUNTER_RAWCOUNT
-        | PERF_COUNTER_LARGE_RAWCOUNT
-        | PERF_COUNTER_RAWCOUNT_HEX
-        | PERF_COUNTER_LARGE_RAWCOUNT_HEX => CounterKind::Direct,
-        PERF_COUNTER_COUNTER
-        | PERF_COUNTER_BULK_COUNT
-        | PERF_COUNTER_QUEUELEN_TYPE
-        | PERF_COUNTER_LARGE_QUEUELEN_TYPE
-        | PERF_COUNTER_100NS_QUEUELEN_TYPE
-        | PERF_COUNTER_OBJ_TIME_QUEUELEN_TYPE
-        | PERF_COUNTER_TIMER
-        | PERF_COUNTER_TIMER_INV
-        | PERF_100NSEC_TIMER
-        | PERF_100NSEC_TIMER_INV
-        | PERF_OBJ_TIME_TIMER
-        | PERF_PRECISION_SYSTEM_TIMER
-        | PERF_PRECISION_100NS_TIMER
-        | PERF_PRECISION_OBJECT_TIMER
-        | PERF_COUNTER_DELTA
-        | PERF_COUNTER_LARGE_DELTA
-        | PERF_SAMPLE_COUNTER => CounterKind::CalculatedTwoSample,
-        PERF_SAMPLE_FRACTION | PERF_AVERAGE_TIMER | PERF_AVERAGE_BULK => {
-            CounterKind::CalculatedTwoSampleWithBase
-        }
-        PERF_RAW_FRACTION | PERF_LARGE_RAW_FRACTION => CounterKind::RawFraction,
-        _ => {
-            return Err(Error::UnsupportedType {
-                path: path.to_owned(),
-                native_type,
-            });
-        }
-    };
-    // The default scale is a display hint. The receiver always requests
-    // PDH_FMT_NOSCALE and applies only the configured scale.
-    let _ = scale;
-    Ok(kind)
 }
 
 fn required_base(path: &str, base: Option<i64>) -> Result<i64, Error> {
@@ -345,7 +208,10 @@ fn inspect_counter(path: &str, counter: PDH_HCOUNTER) -> Result<CounterKind, Err
     let info = buffer.as_ptr().cast::<PDH_COUNTER_INFO_W>();
     // SAFETY: The successful metadata call initialized the fixed fields used here.
     let (native_type, scale) = unsafe { ((*info).dwType, (*info).lDefaultScale) };
-    classify_native_type(path, native_type, scale)
+    // The default scale is a display hint. The receiver always requests
+    // PDH_FMT_NOSCALE and applies only the configured scale.
+    let _ = scale;
+    classify_native_type(path, native_type).map_err(Error::from)
 }
 
 fn counter_info(path: &str, counter: PDH_HCOUNTER) -> Result<Vec<usize>, Error> {
@@ -901,7 +767,7 @@ impl Query {
                     None,
                 ) {
                     Ok(()) => {}
-                    Err(error @ Error::UnsupportedType { .. }) => return Err(error),
+                    Err(error @ Error::UnsupportedType(_)) => return Err(error),
                     Err(error) => {
                         query.pending.diagnostics.counter_add_failures += 1;
                         query
@@ -1923,12 +1789,12 @@ mod tests {
         previous: Option<&PDH_RAW_COUNTER>,
         time_base: i64,
     ) -> Result<f64, String> {
-        match native_type {
-            PERF_RAW_FRACTION | PERF_LARGE_RAW_FRACTION => {
+        match classify_native_type("fixture", native_type).map_err(|error| error.to_string())? {
+            CounterKind::RawFraction => {
                 validate_positive_base("fixture", current.SecondValue)
                     .map_err(|error| error.to_string())?;
             }
-            PERF_SAMPLE_FRACTION | PERF_AVERAGE_TIMER | PERF_AVERAGE_BULK => {
+            CounterKind::CalculatedTwoSampleWithBase => {
                 let previous = previous.ok_or_else(|| "previous fixture is required".to_owned())?;
                 match classify_base_delta("fixture", previous.SecondValue, current.SecondValue)
                     .map_err(|error| error.to_string())?
@@ -1939,7 +1805,7 @@ mod tests {
                     }
                 }
             }
-            _ => {}
+            CounterKind::Direct | CounterKind::CalculatedTwoSample => {}
         }
         let mut formatted = PDH_FMT_COUNTERVALUE::default();
         // SAFETY: All pointers reference initialized fixture values for this call.
@@ -2391,116 +2257,28 @@ mod tests {
         );
     }
 
-    /// Scenario: Native metadata describes every Part A direct, rate, and timer family.
-    /// Guarantees: Each verified SDK type selects its required one- or two-sample format.
-    #[test]
-    fn classifies_part_a_native_types() {
-        assert_eq!(PERF_COUNTER_RAWCOUNT, 0x0001_0000);
-        assert_eq!(PERF_COUNTER_LARGE_RAWCOUNT, 0x0001_0100);
-        assert_eq!(PERF_COUNTER_RAWCOUNT_HEX, 0x0000_0000);
-        assert_eq!(PERF_COUNTER_LARGE_RAWCOUNT_HEX, 0x0000_0100);
-        assert_eq!(PERF_COUNTER_COUNTER, 0x1041_0400);
-        assert_eq!(PERF_COUNTER_BULK_COUNT, 0x1041_0500);
-        assert_eq!(PERF_COUNTER_TIMER, 0x2041_0500);
-        assert_eq!(PERF_COUNTER_TIMER_INV, 0x2141_0500);
-        assert_eq!(PERF_100NSEC_TIMER, 0x2051_0500);
-        assert_eq!(PERF_100NSEC_TIMER_INV, 0x2151_0500);
-        for native_type in [
-            PERF_COUNTER_RAWCOUNT,
-            PERF_COUNTER_LARGE_RAWCOUNT,
-            PERF_COUNTER_RAWCOUNT_HEX,
-            PERF_COUNTER_LARGE_RAWCOUNT_HEX,
-        ] {
-            assert_eq!(
-                classify_native_type("direct", native_type, -6).unwrap(),
-                CounterKind::Direct
-            );
-        }
-        for native_type in [
-            PERF_COUNTER_COUNTER,
-            PERF_COUNTER_BULK_COUNT,
-            PERF_COUNTER_QUEUELEN_TYPE,
-            PERF_COUNTER_LARGE_QUEUELEN_TYPE,
-            PERF_COUNTER_100NS_QUEUELEN_TYPE,
-            PERF_COUNTER_OBJ_TIME_QUEUELEN_TYPE,
-            PERF_COUNTER_TIMER,
-            PERF_COUNTER_TIMER_INV,
-            PERF_100NSEC_TIMER,
-            PERF_100NSEC_TIMER_INV,
-            PERF_OBJ_TIME_TIMER,
-            PERF_PRECISION_SYSTEM_TIMER,
-            PERF_PRECISION_100NS_TIMER,
-            PERF_PRECISION_OBJECT_TIMER,
-            PERF_COUNTER_DELTA,
-            PERF_COUNTER_LARGE_DELTA,
-            PERF_SAMPLE_COUNTER,
-        ] {
-            assert_eq!(
-                classify_native_type("calculated", native_type, 0).unwrap(),
-                CounterKind::CalculatedTwoSample
-            );
-        }
-    }
-
-    /// Scenario: Native metadata describes every supported fraction and average numerator.
-    /// Guarantees: Raw fractions are one-sample values and delta/base formulas warm for one scrape.
-    #[test]
-    fn classifies_part_b_native_types() {
-        assert_eq!(PERF_RAW_FRACTION, 0x2002_0400);
-        assert_eq!(PERF_LARGE_RAW_FRACTION, 0x2002_0500);
-        assert_eq!(PERF_SAMPLE_FRACTION, 0x20C2_0400);
-        assert_eq!(PERF_AVERAGE_TIMER, 0x3002_0400);
-        assert_eq!(PERF_AVERAGE_BULK, 0x4002_0500);
-        for native_type in [PERF_RAW_FRACTION, PERF_LARGE_RAW_FRACTION] {
-            assert_eq!(
-                classify_native_type("raw fraction", native_type, 0).unwrap(),
-                CounterKind::RawFraction
-            );
-        }
-        for native_type in [PERF_SAMPLE_FRACTION, PERF_AVERAGE_TIMER, PERF_AVERAGE_BULK] {
-            assert_eq!(
-                classify_native_type("delta/base", native_type, 0).unwrap(),
-                CounterKind::CalculatedTwoSampleWithBase
-            );
-        }
-    }
-
-    /// Scenario: Provider base metadata is configured as a visible counter path.
-    /// Guarantees: Non-printing base types remain rejected instead of becoming zero-like gauges.
-    #[test]
-    fn rejects_standalone_base_types() {
-        for native_type in [0x4003_0401, 0x4003_0402, 0x4003_0403, 0x4003_0500] {
-            let error = classify_native_type(r"\Object\Counter Base", native_type, 0)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(r"\Object\Counter Base"));
-            assert!(error.contains(&format!("0x{native_type:08X}")));
-        }
-    }
-
     /// Scenario: PDH formats deterministic raw fraction, sample fraction, and average fixtures.
     /// Guarantees: Every advertised Part B formula produces the documented finite value.
     #[test]
     fn formats_part_b_raw_fixtures() {
-        for native_type in [PERF_RAW_FRACTION, PERF_LARGE_RAW_FRACTION] {
+        for native_type in [0x2002_0400, 0x2002_0500] {
             let value = format_raw_fixture(native_type, &raw_value(25, 100), None, 1).unwrap();
             assert!((value - 25.0).abs() < f64::EPSILON);
         }
 
         let previous = raw_value(100, 200);
         let current = raw_value(130, 250);
-        let value = format_raw_fixture(PERF_SAMPLE_FRACTION, &current, Some(&previous), 1).unwrap();
+        let value = format_raw_fixture(0x20C2_0400, &current, Some(&previous), 1).unwrap();
         assert!((value - 60.0).abs() < f64::EPSILON);
 
         let previous = raw_value(1_000, 10);
         let current = raw_value(3_000, 20);
-        let value =
-            format_raw_fixture(PERF_AVERAGE_TIMER, &current, Some(&previous), 1_000).unwrap();
+        let value = format_raw_fixture(0x3002_0400, &current, Some(&previous), 1_000).unwrap();
         assert!((value - 0.2).abs() < 1e-12);
 
         let previous = raw_value(1_000, 10);
         let current = raw_value(4_000, 20);
-        let value = format_raw_fixture(PERF_AVERAGE_BULK, &current, Some(&previous), 1).unwrap();
+        let value = format_raw_fixture(0x4002_0500, &current, Some(&previous), 1).unwrap();
         assert!((value - 300.0).abs() < f64::EPSILON);
     }
 
@@ -2508,10 +2286,10 @@ mod tests {
     /// Guarantees: Invalid base data is rejected and no zero-filled formatted value is accepted.
     #[test]
     fn rejects_invalid_part_b_denominators() {
-        assert!(format_raw_fixture(PERF_RAW_FRACTION, &raw_value(25, 0), None, 1).is_err());
+        assert!(format_raw_fixture(0x2002_0400, &raw_value(25, 0), None, 1).is_err());
         assert!(
             format_raw_fixture(
-                PERF_SAMPLE_FRACTION,
+                0x20C2_0400,
                 &raw_value(130, 150),
                 Some(&raw_value(100, 200)),
                 1,
@@ -2520,7 +2298,7 @@ mod tests {
         );
         assert!(
             format_raw_fixture(
-                PERF_AVERAGE_TIMER,
+                0x3002_0400,
                 &raw_value(3_000, 5),
                 Some(&raw_value(1_000, 10)),
                 1_000,
@@ -2529,7 +2307,7 @@ mod tests {
         );
         assert!(
             format_raw_fixture(
-                PERF_AVERAGE_BULK,
+                0x4002_0500,
                 &raw_value(4_000, 5),
                 Some(&raw_value(1_000, 10)),
                 1,
@@ -2539,7 +2317,7 @@ mod tests {
 
         let mut invalid = raw_value(25, 100);
         invalid.CStatus = PDH_CSTATUS_INVALID_DATA;
-        assert!(format_raw_fixture(PERF_RAW_FRACTION, &invalid, None, 1).is_err());
+        assert!(format_raw_fixture(0x2002_0400, &invalid, None, 1).is_err());
     }
 
     /// Scenario: A sample fraction or average base is unchanged between valid samples.
