@@ -11,7 +11,6 @@ otel_arrow_dfe_telemetry::otel_component_scope!(
 mod config;
 mod metrics;
 mod model;
-mod native_type;
 mod otap_builder;
 #[cfg(target_os = "windows")]
 mod pdh;

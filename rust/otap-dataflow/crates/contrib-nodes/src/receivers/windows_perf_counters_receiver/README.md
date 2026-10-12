@@ -212,9 +212,9 @@ For example, `\Memory\Available Bytes` remains an exact byte count with unit
 
 ## Collection behavior
 
-The receiver primes the PDH query during startup, waits `initial_delay`, then
-performs its first scheduled scrape. This delay does not replace two-sample
-counter warm-up or startup retries.
+The receiver opens the PDH query during startup without collecting, waits
+`initial_delay`, then performs its first scheduled scrape. Two-sample counters
+therefore warm on scheduled collections; startup retries remain independent.
 
 - Wildcards are expanded at startup and then at
   `wildcard_refresh_interval`. Concrete paths are joined by configured counter
@@ -232,8 +232,9 @@ counter warm-up or startup retries.
   not compared with stale PDH samples. Other counter-local invalid statuses,
   non-finite output, or scaling failures omit only that point; healthy peers
   remain in the batch.
-- Counter add/read failures remove only the affected handle and retry with
-  exponential backoff capped by `wildcard_refresh_interval`.
+- Counter add failures retry with exponential backoff capped by
+  `wildcard_refresh_interval`. Counter read failures omit only the affected
+  point and retain the existing handle for the next scheduled collection.
 - Counter availability does not fail startup. An empty active set emits no
   points until a configured counter becomes available.
 - Query-level `PDH_NO_DATA` and the other transient no-observation statuses
