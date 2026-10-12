@@ -46,8 +46,8 @@ pub(super) struct CounterConfig {
 pub(super) enum MetricKind {
     /// A point-in-time Gauge.
     Gauge,
-    /// A cumulative non-monotonic Sum produced by an UpDownCounter.
-    UpDownCounter,
+    /// A Sum. This receiver always emits cumulative aggregation temporality.
+    Sum { monotonic: bool },
 }
 
 /// Configuration normalized for Windows performance-counter collection.
@@ -91,13 +91,28 @@ struct MetricConfig {
     unit: String,
     #[serde(default, deserialize_with = "present_marker")]
     gauge: Option<EmptyConfig>,
-    #[serde(default, deserialize_with = "present_marker")]
-    up_down_counter: Option<EmptyConfig>,
+    #[serde(default, deserialize_with = "present_sum")]
+    sum: Option<SumConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyConfig {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SumConfig {
+    aggregation: String,
+    #[serde(default)]
+    monotonic: bool,
+}
+
+fn present_sum<'de, D>(deserializer: D) -> Result<Option<SumConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(SumConfig::deserialize(deserializer)?))
+}
 
 fn present_marker<'de, D>(deserializer: D) -> Result<Option<EmptyConfig>, D::Error>
 where
@@ -110,15 +125,23 @@ where
 
 impl MetricConfig {
     fn kind(&self, name: &str) -> Result<MetricKind, Error> {
-        match (&self.gauge, &self.up_down_counter) {
-            (Some(_), None) => Ok(MetricKind::Gauge),
-            (None, Some(_)) => Ok(MetricKind::UpDownCounter),
-            (None, None) => Err(invalid(format!(
-                "metrics.{name} must configure gauge or up_down_counter"
-            ))),
-            (Some(_), Some(_)) => Err(invalid(format!(
-                "metrics.{name} must configure exactly one of gauge or up_down_counter"
-            ))),
+        if self.gauge.is_some() && self.sum.is_some() {
+            return Err(invalid(format!(
+                "metrics.{name} must configure at most one of gauge or sum"
+            )));
+        }
+        if let Some(sum) = &self.sum {
+            if sum.aggregation != "cumulative" {
+                return Err(invalid(format!(
+                    "metrics.{name}.sum.aggregation must be cumulative because this receiver \
+                     emits cumulative Sums; apply downstream conversion if delta temporality is required"
+                )));
+            }
+            Ok(MetricKind::Sum {
+                monotonic: sum.monotonic,
+            })
+        } else {
+            Ok(MetricKind::Gauge)
         }
     }
 }
@@ -573,11 +596,24 @@ mod tests {
         })
     }
 
-    fn up_down_counter_metric() -> serde_json::Value {
+    fn non_monotonic_sum_metric() -> serde_json::Value {
         json!({
             "description": "Committed private memory for each process instance.",
             "unit": "By",
-            "up_down_counter": {}
+            "sum": {
+                "aggregation": "cumulative"
+            }
+        })
+    }
+
+    fn monotonic_sum_metric() -> serde_json::Value {
+        json!({
+            "description": "Cumulative operations since the provider sequence began.",
+            "unit": "{operation}",
+            "sum": {
+                "aggregation": "cumulative",
+                "monotonic": true
+            }
         })
     }
 
@@ -642,12 +678,12 @@ mod tests {
         assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(30));
     }
 
-    /// Scenario: A current additive value is configured as an UpDownCounter.
-    /// Guarantees: Configuration preserves the requested non-monotonic Sum kind on every normalized path.
+    /// Scenario: A cumulative Sum omits its optional monotonic setting.
+    /// Guarantees: Configuration defaults the Sum to non-monotonic on every normalized path.
     #[test]
-    fn normalizes_up_down_counter_configuration() {
+    fn defaults_sum_to_non_monotonic() {
         let config = Config::from_json(&json!({
-            "metrics": {"windows.process.private": up_down_counter_metric()},
+            "metrics": {"windows.process.private": non_monotonic_sum_metric()},
             "perfcounters": [{
                 "object": "Process",
                 "instances": "*",
@@ -663,7 +699,55 @@ mod tests {
             &*config.counters[0].description,
             "Committed private memory for each process instance."
         );
-        assert_eq!(config.counters[0].metric_kind, MetricKind::UpDownCounter);
+        assert_eq!(
+            config.counters[0].metric_kind,
+            MetricKind::Sum { monotonic: false }
+        );
+    }
+
+    /// Scenario: A cumulative additive value is configured as a monotonic Sum.
+    /// Guarantees: Configuration preserves the requested cumulative monotonic Sum kind.
+    #[test]
+    fn normalizes_monotonic_sum_configuration() {
+        let config = Config::from_json(&json!({
+            "metrics": {"windows.operations": monotonic_sum_metric()},
+            "perfcounters": [{
+                "object": "Custom Provider",
+                "counters": [{
+                    "name": "Operations",
+                    "metric": "windows.operations"
+                }]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(config.counters[0].name, "windows.operations");
+        assert_eq!(
+            config.counters[0].metric_kind,
+            MetricKind::Sum { monotonic: true }
+        );
+    }
+
+    /// Scenario: A metric omits both `gauge` and `sum`.
+    /// Guarantees: Configuration defaults the metric to Gauge.
+    #[test]
+    fn defaults_missing_kind_to_gauge() {
+        let config = Config::from_json(&json!({
+            "metrics": {
+                "windows.memory.available": {
+                    "description": "Available memory.",
+                    "unit": "By"
+                }
+            },
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{
+                    "name": "Available Bytes",
+                    "metric": "windows.memory.available"
+                }]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(config.counters[0].metric_kind, MetricKind::Gauge);
     }
 
     /// Scenario: A wildcard omits the default or custom aggregation instance unless selected.
@@ -1010,28 +1094,51 @@ mod tests {
         }
     }
 
-    /// Scenario: YAML shorthand selects a metric kind with a null value.
-    /// Guarantees: A present `gauge:` or `up_down_counter:` key remains selected.
+    /// Scenario: YAML shorthand selects an empty Gauge with a null value.
+    /// Guarantees: A present `gauge:` key remains selected.
     #[test]
     fn accepts_null_metric_kind_shorthand() {
-        for kind in ["gauge", "up_down_counter"] {
-            let mut definition = json!({"description": "Value.", "unit": "1"});
-            definition[kind] = serde_json::Value::Null;
-            let config = Config::from_json(&json!({
-                "metrics": {"test": definition},
-                "perfcounters": [{
-                    "object": "Memory",
-                    "counters": [{"name": "Available Bytes", "metric": "test"}]
-                }]
-            }))
-            .unwrap();
-            assert_eq!(
-                config.counters[0].metric_kind,
-                if kind == "gauge" {
-                    MetricKind::Gauge
-                } else {
-                    MetricKind::UpDownCounter
-                }
+        let config = Config::from_json(&json!({
+            "metrics": {
+                "test": {"description": "Value.", "unit": "1", "gauge": null}
+            },
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{"name": "Available Bytes", "metric": "test"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(config.counters[0].metric_kind, MetricKind::Gauge);
+    }
+
+    /// Scenario: Sum configuration is null, empty, delta, or combined with Gauge.
+    /// Guarantees: Invalid Sum shapes and conflicting metric kinds fail during configuration.
+    #[test]
+    fn rejects_invalid_sum_configuration() {
+        for definition in [
+            json!({"description": "Value.", "unit": "1", "sum": null}),
+            json!({"description": "Value.", "unit": "1", "sum": {}}),
+            json!({
+                "description": "Value.",
+                "unit": "1",
+                "sum": {"aggregation": "delta"}
+            }),
+            json!({
+                "description": "Value.",
+                "unit": "1",
+                "gauge": {},
+                "sum": {"aggregation": "cumulative"}
+            }),
+        ] {
+            assert!(
+                Config::from_json(&json!({
+                    "metrics": {"test": definition},
+                    "perfcounters": [{
+                        "object": "Memory",
+                        "counters": [{"name": "Available Bytes", "metric": "test"}]
+                    }]
+                }))
+                .is_err()
             );
         }
     }
@@ -1065,7 +1172,33 @@ mod tests {
                 }]
             }),
             json!({
-                "metrics": {"test": {"description": "x", "unit": "1"}},
+                "metrics": {
+                    "test": {
+                        "description": "x",
+                        "unit": "1",
+                        "sum": {"aggregation": "delta", "monotonic": true}
+                    }
+                },
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }]
+            }),
+            json!({
+                "metrics": {"test": {"description": "x", "unit": "1", "sum": null}},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }]
+            }),
+            json!({
+                "metrics": {
+                    "test": {
+                        "description": "x",
+                        "unit": "1",
+                        "up_down_counter": {}
+                    }
+                },
                 "perfcounters": [{
                     "object": "Memory",
                     "counters": [{"name": "Available Bytes", "metric": "test"}]
@@ -1077,7 +1210,10 @@ mod tests {
                         "description": "x",
                         "unit": "1",
                         "gauge": {},
-                        "up_down_counter": {}
+                        "sum": {
+                            "aggregation": "cumulative",
+                            "monotonic": true
+                        }
                     }
                 },
                 "perfcounters": [{

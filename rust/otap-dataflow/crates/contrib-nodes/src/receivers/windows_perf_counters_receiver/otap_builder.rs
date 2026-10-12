@@ -49,13 +49,31 @@ pub(super) fn into_otap(
                 point.counter_index
             ))
         })?;
-        if counter.metric_kind == MetricKind::UpDownCounter
-            && (sample.start_time_unix_nano <= 0
-                || sample.start_time_unix_nano > sample.timestamp_unix_nano)
+        let point_start_time = match counter.metric_kind {
+            MetricKind::Gauge => None,
+            MetricKind::Sum { monotonic: true } => {
+                Some(point.start_time_unix_nano.ok_or_else(|| {
+                    ArrowError::InvalidArgumentError(format!(
+                        "monotonic Sum {} ({}) is missing its cumulative start time",
+                        counter.name, point.path
+                    ))
+                })?)
+            }
+            MetricKind::Sum { monotonic: false } => Some(sample.start_time_unix_nano),
+        };
+        if let Some(start_time) = point_start_time
+            && (start_time <= 0 || start_time > sample.timestamp_unix_nano)
         {
+            let (kind, path) = match counter.metric_kind {
+                MetricKind::Sum { monotonic: true } => ("monotonic Sum", point.path.as_str()),
+                MetricKind::Sum { monotonic: false } => {
+                    ("non-monotonic Sum", counter.path.as_str())
+                }
+                MetricKind::Gauge => unreachable!("Gauge points do not have start times"),
+            };
             return Err(ArrowError::InvalidArgumentError(format!(
-                "UpDownCounter {} ({}) has invalid start time {} for timestamp {}",
-                counter.name, counter.path, sample.start_time_unix_nano, sample.timestamp_unix_nano
+                "{kind} {} ({}) has invalid start time {} for timestamp {}",
+                counter.name, path, start_time, sample.timestamp_unix_nano
             )));
         }
         let metric_id = if let Some(metric_id) = metric_ids.get(&counter.name) {
@@ -67,7 +85,7 @@ pub(super) fn into_otap(
             metrics.append_id(metric_id);
             let metric_type = match counter.metric_kind {
                 MetricKind::Gauge => MetricType::Gauge,
-                MetricKind::UpDownCounter => MetricType::Sum,
+                MetricKind::Sum { .. } => MetricType::Sum,
             };
             metrics.append_metric_type(metric_type as u8);
             metrics.append_name(counter.name.as_bytes());
@@ -78,7 +96,12 @@ pub(super) fn into_otap(
                     metrics.append_aggregation_temporality(None);
                     metrics.append_is_monotonic(None);
                 }
-                MetricKind::UpDownCounter => {
+                MetricKind::Sum { monotonic: true } => {
+                    metrics
+                        .append_aggregation_temporality(Some(AGGREGATION_TEMPORALITY_CUMULATIVE));
+                    metrics.append_is_monotonic(Some(true));
+                }
+                MetricKind::Sum { monotonic: false } => {
                     metrics
                         .append_aggregation_temporality(Some(AGGREGATION_TEMPORALITY_CUMULATIVE));
                     metrics.append_is_monotonic(Some(false));
@@ -92,10 +115,7 @@ pub(super) fn into_otap(
 
         points.append_id(point_id);
         points.append_parent_id(metric_id);
-        points.append_start_time_unix_nano(match counter.metric_kind {
-            MetricKind::Gauge => None,
-            MetricKind::UpDownCounter => Some(sample.start_time_unix_nano),
-        });
+        points.append_start_time_unix_nano(point_start_time);
         points.append_time_unix_nano(sample.timestamp_unix_nano);
         match value {
             Number::Integer(value) => {
@@ -208,9 +228,16 @@ mod tests {
         }
     }
 
-    fn up_down_counter(path: &str, name: &str, unit: &str) -> CounterConfig {
+    fn non_monotonic_sum(path: &str, name: &str, unit: &str) -> CounterConfig {
         CounterConfig {
-            metric_kind: MetricKind::UpDownCounter,
+            metric_kind: MetricKind::Sum { monotonic: false },
+            ..counter(path, name, unit)
+        }
+    }
+
+    fn monotonic_sum(path: &str, name: &str, unit: &str) -> CounterConfig {
+        CounterConfig {
+            metric_kind: MetricKind::Sum { monotonic: true },
             ..counter(path, name, unit)
         }
     }
@@ -220,7 +247,20 @@ mod tests {
             counter_index,
             path: path.to_owned(),
             instance: None,
+            start_time_unix_nano: None,
             value,
+        }
+    }
+
+    fn monotonic_sum_point(
+        counter_index: usize,
+        path: &str,
+        start_time_unix_nano: i64,
+        value: Number,
+    ) -> SamplePoint {
+        SamplePoint {
+            start_time_unix_nano: Some(start_time_unix_nano),
+            ..point(counter_index, path, SampleValue::Value(value))
         }
     }
 
@@ -316,11 +356,11 @@ mod tests {
         assert_eq!(time.value(0), timestamp);
     }
 
-    /// Scenario: Process memory is configured as an UpDownCounter with a current integer value.
+    /// Scenario: Process memory is configured as a non-monotonic Sum with a current integer value.
     /// Guarantees: OTAP emits a cumulative non-monotonic Sum and preserves the query start time.
     #[test]
-    fn projects_integer_up_down_counter() {
-        let mut counter = up_down_counter(
+    fn projects_integer_non_monotonic_sum() {
+        let mut counter = non_monotonic_sum(
             r"\Process(*)\Private Bytes",
             "windows.process.private",
             "By",
@@ -384,11 +424,134 @@ mod tests {
         );
     }
 
-    /// Scenario: An emitted UpDownCounter carries an invalid or boundary cumulative start time.
-    /// Guarantees: Only 0 < start <= observation time is accepted and errors identify the counter and both times.
+    /// Scenario: The first running-count observation is configured as a monotonic Sum.
+    /// Guarantees: OTAP emits cumulative monotonic metadata with start time equal to point time.
     #[test]
-    fn validates_up_down_counter_start_time() {
-        let counters = [up_down_counter(
+    fn projects_integer_monotonic_sum() {
+        let counters = [monotonic_sum(
+            r"\Custom Provider\Operations",
+            "windows.operations",
+            "{operation}",
+        )];
+        let records = into_otap(
+            &counters,
+            Sample {
+                start_time_unix_nano: 1,
+                timestamp_unix_nano: 10,
+                points: vec![monotonic_sum_point(
+                    0,
+                    r"\Custom Provider\Operations",
+                    10,
+                    Number::Integer(42),
+                )],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let metrics = records.get(ArrowPayloadType::UnivariateMetrics).unwrap();
+        assert_eq!(
+            metrics
+                .column_by_name("metric_type")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .value(0),
+            MetricType::Sum as u8
+        );
+        assert_eq!(
+            array_value_to_string(
+                metrics
+                    .column_by_name("aggregation_temporality")
+                    .unwrap()
+                    .as_ref(),
+                0
+            )
+            .unwrap(),
+            AGGREGATION_TEMPORALITY_CUMULATIVE.to_string()
+        );
+        assert_eq!(
+            array_value_to_string(metrics.column_by_name("is_monotonic").unwrap().as_ref(), 0)
+                .unwrap(),
+            "true"
+        );
+        let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
+        assert_eq!(
+            points
+                .column_by_name("start_time_unix_nano")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                .unwrap()
+                .value(0),
+            10
+        );
+    }
+
+    /// Scenario: A monotonic Sum point omits its sequence start or has an invalid start timestamp.
+    /// Guarantees: Projection rejects the point with its metric and concrete PDH counter identity.
+    #[test]
+    fn validates_monotonic_sum_start_time() {
+        let counters = [monotonic_sum(
+            r"\Custom Provider\Operations",
+            "windows.operations",
+            "{operation}",
+        )];
+        let missing = into_otap(
+            &counters,
+            Sample {
+                start_time_unix_nano: 1,
+                timestamp_unix_nano: 10,
+                points: vec![point(
+                    0,
+                    r"\Custom Provider\Operations",
+                    SampleValue::Value(Number::Integer(42)),
+                )],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        );
+        assert!(matches!(
+            missing,
+            Err(ArrowError::InvalidArgumentError(message))
+                if message == "monotonic Sum windows.operations (\\Custom Provider\\Operations) is missing its cumulative start time"
+        ));
+        for start in [i64::MIN, -1, 0, 11, i64::MAX] {
+            assert!(matches!(
+                into_otap(
+                    &counters,
+                    Sample {
+                        start_time_unix_nano: 1,
+                        timestamp_unix_nano: 10,
+                        points: vec![monotonic_sum_point(
+                            0,
+                            r"\Custom Provider\Operations",
+                            start,
+                            Number::Integer(42),
+                        )],
+                        failures: Vec::new(),
+                        overflows: Vec::new(),
+                        diagnostics: Default::default(),
+                    },
+                ),
+                Err(ArrowError::InvalidArgumentError(message))
+                    if message == format!(
+                        "monotonic Sum windows.operations (\\Custom Provider\\Operations) \
+                         has invalid start time {start} for timestamp 10"
+                    )
+            ));
+        }
+    }
+
+    /// Scenario: An emitted non-monotonic Sum has an invalid or boundary cumulative start time.
+    /// Guarantees: Only 0 < start <= observation time is accepted and errors identify the PDH counter and both times.
+    #[test]
+    fn validates_non_monotonic_sum_start_time() {
+        let counters = [non_monotonic_sum(
             r"\Process(*)\Private Bytes",
             "windows.process.private",
             "By",
@@ -412,7 +575,7 @@ mod tests {
                 ),
                 Err(ArrowError::InvalidArgumentError(message))
                     if message == format!(
-                        "UpDownCounter windows.process.private (\\Process(*)\\Private Bytes) \
+                        "non-monotonic Sum windows.process.private (\\Process(*)\\Private Bytes) \
                          has invalid start time {start} for timestamp 10"
                     )
             ));
@@ -798,6 +961,7 @@ mod tests {
                             parent: None,
                             index: 0,
                         }),
+                        start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(10)),
                     },
                     SamplePoint {
@@ -808,6 +972,7 @@ mod tests {
                             parent: Some("service".to_owned()),
                             index: 1,
                         }),
+                        start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(20)),
                     },
                 ],

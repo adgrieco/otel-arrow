@@ -13,7 +13,7 @@
 ## Overview
 
 Reads configured exact or instance-wildcard Windows performance-counter paths
-through PDH and emits OTel Gauges or UpDownCounters. Each data point includes
+through PDH and emits OTel Gauges or cumulative Sums. Each data point includes
 the configured metric identity and concrete `windows.perf_counter.path`
 attribute. Wildcard points also include their configured path template and
 instance identity. The resource includes `os.type=windows`.
@@ -40,7 +40,9 @@ config:
     windows.process.private:
       unit: By
       description: Committed private memory for each process instance.
-      up_down_counter: {}
+      sum:
+        aggregation: cumulative
+        monotonic: false
   perfcounters:
     - object: Memory
       counters:
@@ -82,14 +84,28 @@ limit. Normalization produces between 1 and 256 exact or wildcard paths, and
 ### Metric options
 
 Each `metrics` key is an OTel metric name. Its value requires `description`,
-`unit`, and exactly one empty `gauge: {}` or `up_down_counter: {}` object.
-The kind key may also use YAML shorthand such as `gauge:`. Metric names follow
+`unit`, and optionally one `gauge: {}` or `sum:` object. Omitting both defaults
+to Gauge. A Sum requires `aggregation: cumulative`; `monotonic` defaults to
+`false`. Delta, empty, and null Sum configurations are rejected because the
+receiver emits cumulative Sums; apply downstream conversion when delta
+temporality is required. Metrics that configure both Gauge and Sum are also
+rejected. Gauge may use YAML shorthand such as `gauge:`. Metric names follow
 the OTel instrument-name syntax and are limited to 255 characters. Units must
 be printable ASCII and at most 63 characters.
 Multiple counter mappings may reference one metric and contribute points
 distinguished by their configured attributes. Gauges have point-in-time
-semantics and no start timestamp. UpDownCounters are cumulative non-monotonic
-Sums whose start timestamp is the opening time of the current PDH query.
+semantics and no start timestamp. Monotonic Sums are cumulative and limited to
+non-negative direct raw counts. Non-monotonic Sums are cumulative, and their
+start timestamp is the opening time of the current PDH query.
+
+```yaml
+windows.operations:
+  description: Operations completed since the provider sequence began.
+  unit: "{operation}"
+  sum:
+    aggregation: cumulative
+    monotonic: true
+```
 
 ### Performance object and counter options
 
@@ -151,12 +167,15 @@ reach PDH's 2048-unit native limit are omitted and diagnosed.
 | Sample fractions | `PERF_SAMPLE_FRACTION` | Two | Double |
 | Averages | `PERF_AVERAGE_TIMER`, `PERF_AVERAGE_BULK` | Two | Double |
 
-The configured metric kind is independent of PDH's numeric formatting. Use a
-Gauge for non-additive current values such as utilization and an UpDownCounter
-for additive current values such as committed private memory. Metric names and
-descriptions must preserve the source counter's semantics; Windows Private
-Bytes includes committed memory that may reside in RAM or the page file and
-must not be labeled as the physical-memory metric `process.memory.usage`.
+Use a Gauge for rates, ratios, utilization, and other non-additive current
+values. A monotonic Sum asserts that the selected PDH counter is a running
+count; it is accepted only for `PERF_COUNTER_RAWCOUNT`,
+`PERF_COUNTER_LARGE_RAWCOUNT`, and their hexadecimal variants. A
+non-monotonic Sum remains available for every supported native type, including
+additive current values such as committed private memory. Metric names, units,
+and descriptions must preserve the emitted semantics; Windows Private Bytes
+includes committed memory that may reside in RAM or the page file and must not
+be labeled as the physical-memory metric `process.memory.usage`.
 
 PDH performs rate, timer, fraction, and average calculations and associates
 visible fraction/average numerators with their provider-defined base counters.
@@ -166,14 +185,16 @@ metrics and are rejected.
 Elapsed-time and multi-timer counter families remain unsupported because they
 require output semantics beyond the existing regular PDH formatting path.
 
-The receiver requests regular PDH formatted counter values and emits them as
-OTel metrics. Geneva-specific Full or Factored event formats are transport and
-schema choices outside this receiver's OTAP metric contract.
+All mappings emit regular PDH formatted values. Raw reads are used only to
+validate provider-defined bases for fractions and averages. Geneva-specific
+Full or Factored event formats are transport and schema choices outside this
+receiver's OTAP metric contract.
 
-Unsupported exact counter types fail startup. A missing or inaccessible exact
-counter is omitted and retried, including when no configured counter is
-initially available. Unsupported expanded instances are omitted and diagnosed
-without suppressing healthy counters. Diagnostics include the native type.
+Unsupported exact or expanded counter types are omitted and diagnosed without
+suppressing healthy counters. They are not retried because their native type
+cannot change while the handle exists. A missing or inaccessible exact counter
+is omitted and retried, including when no configured counter is initially
+available. Diagnostics include the native type.
 
 ## Scaling
 
@@ -204,16 +225,25 @@ counter warm-up or startup retries.
 - When a sample-fraction or average base does not advance, no relevant
   operation occurred; that value is omitted rather than replaced with zero. A
   decreasing base also omits the point and resets its baseline.
-- A counter-local invalid PDH status, non-finite output, or scaling failure
-  omits only that point; healthy peers remain in the batch.
+- `PDH_INVALID_DATA`, `PDH_NO_DATA`, and `PDH_CALC_NEGATIVE_*` statuses mean
+  no observation. They emit no point, do not count as failures, and preserve
+  the counter handle and monotonic Sum sequence. Saved PDH base history is
+  cleared, and affected two-sample counters restart warm-up so later values are
+  not compared with stale PDH samples. Other counter-local invalid statuses,
+  non-finite output, or scaling failures omit only that point; healthy peers
+  remain in the batch.
 - Counter add/read failures remove only the affected handle and retry with
   exponential backoff capped by `wildcard_refresh_interval`.
 - Counter availability does not fail startup. An empty active set emits no
   points until a configured counter becomes available.
-- A query-level collection failure emits no batch and retries the existing
-  query with bounded exponential backoff so transient failures preserve
-  history. Three consecutive collection failures rebuild the worker-owned
-  query and all counters.
+- Query-level `PDH_NO_DATA` and the other transient no-observation statuses
+  emit an empty batch without counting as failures, clear saved PDH base
+  history, and restart two-sample warm-up while preserving monotonic Sum
+  sequences. Other query-level collection failures and post-collection
+  timestamp failures also clear PDH base history and restart warm-up before
+  returning an error. Query collection failures retry the existing query with
+  bounded exponential backoff. Three consecutive failures rebuild the
+  worker-owned query and all counters.
 - Each scrape is bounded by `collection_interval`. If a native collection call
   remains blocked after that timeout, later ticks fail fast while the worker is
   busy; no additional collection request is queued.
@@ -221,10 +251,18 @@ counter warm-up or startup retries.
   instances are omitted, reported explicitly, and reconsidered at the next
   discovery refresh; they are never presented as a complete expansion.
 
-Each emitted point uses the collection timestamp. UpDownCounter points use the
-current PDH query's opening time as their cumulative start time; a query rebuild
-or backward wall-clock adjustment starts a new cumulative sequence. Gauge
-points do not use or validate cumulative start time.
+Each emitted point uses the collection timestamp. Non-monotonic Sum points use
+the current PDH query's opening time as their cumulative start time; a query
+rebuild or backward wall-clock adjustment starts a new cumulative sequence.
+Monotonic Sum points track sequence start independently for each exact or
+expanded handle. A decrease, handle recreation, newly discovered instance, or
+backward wall-clock adjustment relative to that series' previous observation
+starts a new sequence for only that point. Query-level clock rollback clears
+all monotonic Sum sequences; an omitted series starts fresh at its next valid
+observation. Equal timestamps do not reset a sequence. A value wrap is treated
+as a decrease; the receiver does not compensate for it. Negative monotonic Sum
+values are omitted as invalid. Gauge points do not use or validate cumulative
+start time.
 
 ## Examples
 

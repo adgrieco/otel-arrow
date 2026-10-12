@@ -4,7 +4,7 @@
 //! Persistent synchronous PDH worker. Windows handles never leave its thread.
 #![allow(unsafe_code)]
 
-use super::config::CounterConfig;
+use super::config::{CounterConfig, MetricKind};
 use super::model::{
     ExpansionOverflow, InstanceIdentity, Sample, SampleDiagnostics, SampleFailure, SamplePoint,
     SampleValue, scale_double, scale_integer,
@@ -19,12 +19,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use windows_sys::Win32::System::Performance::{
+    PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
     PDH_COUNTER_INFO_W, PDH_COUNTER_PATH_ELEMENTS_W, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA,
     PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY,
-    PDH_INVALID_ARGUMENT, PDH_MAX_COUNTER_PATH, PDH_MORE_DATA, PDH_RAW_COUNTER,
-    PDH_REFRESHCOUNTERS, PdhAddCounterW, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-    PdhExpandWildCardPathW, PdhGetCounterInfoW, PdhGetFormattedCounterValue, PdhGetRawCounterValue,
-    PdhOpenQueryW, PdhParseCounterPathW, PdhRemoveCounter,
+    PDH_INVALID_ARGUMENT, PDH_INVALID_DATA, PDH_MAX_COUNTER_PATH, PDH_MORE_DATA, PDH_NO_DATA,
+    PDH_RAW_COUNTER, PDH_REFRESHCOUNTERS, PdhAddCounterW, PdhAddEnglishCounterW, PdhCloseQuery,
+    PdhCollectQueryData, PdhExpandWildCardPathW, PdhGetCounterInfoW, PdhGetFormattedCounterValue,
+    PdhGetRawCounterValue, PdhOpenQueryW, PdhParseCounterPathW, PdhRemoveCounter,
 };
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -48,6 +49,8 @@ pub(super) enum Error {
     },
     #[error(transparent)]
     UnsupportedType(#[from] UnsupportedNativeType),
+    #[error("invalid metric mapping for {path}: {message}")]
+    InvalidMetricMapping { path: String, message: String },
     #[error("invalid performance-counter sample: {0}")]
     InvalidSample(&'static str),
     #[error("counter calculation for {path} failed: {message}")]
@@ -106,6 +109,7 @@ impl Error {
         match self {
             Self::Pdh { operation, .. } => operation,
             Self::UnsupportedType(_) => "unsupported_type",
+            Self::InvalidMetricMapping { .. } => "invalid_metric_mapping",
             Self::InvalidSample(_) => "invalid_sample",
             Self::Calculation { .. } => "calculation",
             Self::WorkerStart(_) => "worker_start",
@@ -124,10 +128,18 @@ impl Error {
             Self::UnsupportedType(error) => {
                 format!("unsupported native type 0x{:08X}", error.native_type)
             }
+            Self::InvalidMetricMapping { message, .. } => message.clone(),
             Self::InvalidSample(message) => (*message).to_owned(),
             Self::Calculation { message, .. } => message.clone(),
             other => other.to_string(),
         }
+    }
+
+    fn is_permanent_counter_error(&self) -> bool {
+        matches!(
+            self,
+            Self::UnsupportedType(_) | Self::InvalidMetricMapping { .. }
+        )
     }
 }
 
@@ -141,6 +153,17 @@ fn check(operation: &'static str, path: &str, status: u32) -> Result<(), Error> 
             status,
         })
     }
+}
+
+fn is_transient_no_observation_status(status: u32) -> bool {
+    matches!(
+        status,
+        PDH_INVALID_DATA
+            | PDH_NO_DATA
+            | PDH_CALC_NEGATIVE_DENOMINATOR
+            | PDH_CALC_NEGATIVE_TIMEBASE
+            | PDH_CALC_NEGATIVE_VALUE
+    )
 }
 
 fn required_base(path: &str, base: Option<i64>) -> Result<i64, Error> {
@@ -171,6 +194,20 @@ enum BaseDelta {
 enum CollectionDisposition {
     Format,
     Omit(SampleValue),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactAddFailureDisposition {
+    Diagnostic,
+    Retry,
+}
+
+fn exact_add_failure_disposition(error: &Error) -> ExactAddFailureDisposition {
+    if error.is_permanent_counter_error() {
+        ExactAddFailureDisposition::Diagnostic
+    } else {
+        ExactAddFailureDisposition::Retry
+    }
 }
 
 fn classify_base_delta(path: &str, previous: i64, current: i64) -> Result<BaseDelta, Error> {
@@ -523,6 +560,91 @@ fn cumulative_start_time(
     *start_time_unix_nano
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MonotonicSequence {
+    start_time_unix_nano: Option<i64>,
+    previous_value: Option<i64>,
+    previous_timestamp_unix_nano: Option<i64>,
+}
+
+fn monotonic_start_time(
+    path: &str,
+    sequence: &mut MonotonicSequence,
+    value: i64,
+    timestamp_unix_nano: i64,
+) -> Result<i64, Error> {
+    if value < 0 {
+        return Err(Error::Calculation {
+            path: path.to_owned(),
+            message: format!("monotonic Sum value must be non-negative, got {value}"),
+        });
+    }
+    if sequence.start_time_unix_nano.is_none()
+        || sequence.previous_value.is_none()
+        || sequence
+            .previous_value
+            .is_some_and(|previous| value < previous)
+        || sequence
+            .previous_timestamp_unix_nano
+            .is_some_and(|previous| timestamp_unix_nano < previous)
+    {
+        sequence.start_time_unix_nano = Some(timestamp_unix_nano);
+    }
+    sequence.previous_value = Some(value);
+    sequence.previous_timestamp_unix_nano = Some(timestamp_unix_nano);
+    sequence.start_time_unix_nano.ok_or(Error::InvalidSample(
+        "monotonic Sum start time was not initialized",
+    ))
+}
+
+fn reset_monotonic_sequences_on_query_rollback<'a>(
+    previous_query_timestamp_unix_nano: i64,
+    timestamp_unix_nano: i64,
+    sequences: impl Iterator<Item = &'a mut MonotonicSequence>,
+) {
+    if timestamp_unix_nano < previous_query_timestamp_unix_nano {
+        for sequence in sequences {
+            *sequence = MonotonicSequence::default();
+        }
+    }
+}
+
+fn advance_collection_time<'a>(
+    start_time_unix_nano: &mut i64,
+    previous_timestamp_unix_nano: &mut i64,
+    timestamp_unix_nano: i64,
+    sequences: impl Iterator<Item = &'a mut MonotonicSequence>,
+) -> i64 {
+    reset_monotonic_sequences_on_query_rollback(
+        *previous_timestamp_unix_nano,
+        timestamp_unix_nano,
+        sequences,
+    );
+    cumulative_start_time(
+        start_time_unix_nano,
+        previous_timestamp_unix_nano,
+        timestamp_unix_nano,
+    )
+}
+
+fn validate_metric_mapping(
+    path: &str,
+    metric_kind: MetricKind,
+    counter_kind: CounterKind,
+) -> Result<(), Error> {
+    if matches!(metric_kind, MetricKind::Sum { monotonic: true })
+        && counter_kind != CounterKind::Direct
+    {
+        return Err(Error::InvalidMetricMapping {
+            path: path.to_owned(),
+            message: "monotonic Sum requires a direct raw-count counter type \
+                      (PERF_COUNTER_RAWCOUNT / LARGE_RAWCOUNT)"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn is_aggregation_instance(path: &str, aggregation_name: &str) -> bool {
     parse_instance(path).is_ok_and(|instance| instance.name.eq_ignore_ascii_case(aggregation_name))
 }
@@ -689,14 +811,79 @@ fn refresh_changes_with_group_resets(
     (removed, added)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CounterHistory {
+    previous_base: Option<i64>,
+    monotonic_sequence: MonotonicSequence,
+    warming: bool,
+}
+
+impl CounterHistory {
+    fn restart_pdh_sampling(&mut self, kind: CounterKind) {
+        self.previous_base = None;
+        self.warming = matches!(
+            kind,
+            CounterKind::CalculatedTwoSample | CounterKind::CalculatedTwoSampleWithBase
+        );
+    }
+}
+
+fn handle_counter_transient_status(
+    status: u32,
+    kind: CounterKind,
+    history: &mut CounterHistory,
+) -> bool {
+    if !is_transient_no_observation_status(status) {
+        return false;
+    }
+    history.restart_pdh_sampling(kind);
+    true
+}
+
+fn restart_query_pdh_sampling<'a>(
+    histories: impl Iterator<Item = (CounterKind, &'a mut CounterHistory)>,
+) {
+    for (kind, history) in histories {
+        history.restart_pdh_sampling(kind);
+    }
+}
+
+fn handle_query_collection_status<'a>(
+    status: u32,
+    histories: impl Iterator<Item = (CounterKind, &'a mut CounterHistory)>,
+) -> Result<bool, Error> {
+    if status == 0 {
+        return Ok(false);
+    }
+    restart_query_pdh_sampling(histories);
+    if is_transient_no_observation_status(status) {
+        Ok(true)
+    } else {
+        Err(Error::Pdh {
+            operation: "PdhCollectQueryData",
+            path: "<query>".to_owned(),
+            status,
+        })
+    }
+}
+
+fn handle_query_timestamp_result<'a>(
+    result: Result<i64, Error>,
+    histories: impl Iterator<Item = (CounterKind, &'a mut CounterHistory)>,
+) -> Result<i64, Error> {
+    if result.is_err() {
+        restart_query_pdh_sampling(histories);
+    }
+    result
+}
+
 struct CounterHandle {
     config_index: usize,
     path: String,
     handle: PDH_HCOUNTER,
     kind: CounterKind,
     scale_power10: i32,
-    previous_base: Option<i64>,
-    warming: bool,
+    history: CounterHistory,
     wildcard: bool,
     instance: Option<InstanceIdentity>,
 }
@@ -767,15 +954,23 @@ impl Query {
                     None,
                 ) {
                     Ok(()) => {}
-                    Err(error @ Error::UnsupportedType(_)) => return Err(error),
-                    Err(error) => {
-                        query.pending.diagnostics.counter_add_failures += 1;
-                        query
-                            .pending
-                            .failures
-                            .push(sample_failure(config_index, &error));
-                        query.schedule_retry(key, target, Instant::now());
-                    }
+                    Err(error) => match exact_add_failure_disposition(&error) {
+                        ExactAddFailureDisposition::Diagnostic => {
+                            query.pending.diagnostics.counter_add_failures += 1;
+                            query
+                                .pending
+                                .failures
+                                .push(sample_failure(config_index, &error));
+                        }
+                        ExactAddFailureDisposition::Retry => {
+                            query.pending.diagnostics.counter_add_failures += 1;
+                            query
+                                .pending
+                                .failures
+                                .push(sample_failure(config_index, &error));
+                            query.schedule_retry(key, target, Instant::now());
+                        }
+                    },
                 }
             }
         }
@@ -827,6 +1022,13 @@ impl Query {
                 return Err(error);
             }
         };
+        if let Err(error) =
+            validate_metric_mapping(&path, self.configs[config_index].metric_kind, kind)
+        {
+            // SAFETY: The incompatible handle has not entered receiver state.
+            let _ = unsafe { PdhRemoveCounter(counter) };
+            return Err(error);
+        }
         let key = CounterKey::new(config_index, &path);
         let _ = self.counters.insert(
             key,
@@ -836,11 +1038,13 @@ impl Query {
                 handle: counter,
                 kind,
                 scale_power10: self.configs[config_index].scale_power10,
-                previous_base: None,
-                warming: matches!(
-                    kind,
-                    CounterKind::CalculatedTwoSample | CounterKind::CalculatedTwoSampleWithBase
-                ),
+                history: CounterHistory {
+                    warming: matches!(
+                        kind,
+                        CounterKind::CalculatedTwoSample | CounterKind::CalculatedTwoSampleWithBase
+                    ),
+                    ..CounterHistory::default()
+                },
                 wildcard: localized,
                 instance,
             },
@@ -881,7 +1085,9 @@ impl Query {
             Err(error) => {
                 diagnostics.counter_add_failures += 1;
                 failures.push(sample_failure(target.config_index, &error));
-                self.schedule_retry(key, target, now);
+                if !error.is_permanent_counter_error() {
+                    self.schedule_retry(key, target, now);
+                }
                 false
             }
         }
@@ -1150,9 +1356,12 @@ impl Query {
 
     fn prime(&self) -> Result<(), Error> {
         // SAFETY: The query and counters remain on their owner thread.
-        check("PdhCollectQueryData(prime)", "<query>", unsafe {
-            PdhCollectQueryData(self.handle)
-        })
+        let status = unsafe { PdhCollectQueryData(self.handle) };
+        if status == 0 || is_transient_no_observation_status(status) {
+            Ok(())
+        } else {
+            check("PdhCollectQueryData(prime)", "<query>", status)
+        }
     }
 
     fn restore_pending_metadata(
@@ -1206,10 +1415,11 @@ impl Query {
                     return Err(error);
                 }
             };
-            let start_time_unix_nano = cumulative_start_time(
+            let start_time_unix_nano = advance_collection_time(
                 &mut self.start_time_unix_nano,
                 &mut self.previous_timestamp_unix_nano,
                 timestamp_unix_nano,
+                std::iter::empty(),
             );
             return Ok(Sample {
                 start_time_unix_nano,
@@ -1221,24 +1431,49 @@ impl Query {
             });
         }
         // SAFETY: The query and counters remain on their owner thread.
-        if let Err(error) = check("PdhCollectQueryData", "<query>", unsafe {
-            PdhCollectQueryData(self.handle)
-        }) {
-            self.restore_pending_metadata(diagnostics, failures, overflows);
-            return Err(error);
-        }
-        let timestamp_unix_nano = match unix_timestamp_nanos() {
+        let collect_status = unsafe { PdhCollectQueryData(self.handle) };
+        let no_query_observation = match handle_query_collection_status(
+            collect_status,
+            self.counters
+                .values_mut()
+                .map(|counter| (counter.kind, &mut counter.history)),
+        ) {
+            Ok(no_observation) => no_observation,
+            Err(error) => {
+                self.restore_pending_metadata(diagnostics, failures, overflows);
+                return Err(error);
+            }
+        };
+        let timestamp_unix_nano = match handle_query_timestamp_result(
+            unix_timestamp_nanos(),
+            self.counters
+                .values_mut()
+                .map(|counter| (counter.kind, &mut counter.history)),
+        ) {
             Ok(timestamp) => timestamp,
             Err(error) => {
                 self.restore_pending_metadata(diagnostics, failures, overflows);
                 return Err(error);
             }
         };
-        let start_time_unix_nano = cumulative_start_time(
+        let start_time_unix_nano = advance_collection_time(
             &mut self.start_time_unix_nano,
             &mut self.previous_timestamp_unix_nano,
             timestamp_unix_nano,
+            self.counters
+                .values_mut()
+                .map(|counter| &mut counter.history.monotonic_sequence),
         );
+        if no_query_observation {
+            return Ok(Sample {
+                start_time_unix_nano,
+                timestamp_unix_nano,
+                points: Vec::new(),
+                failures,
+                overflows,
+                diagnostics,
+            });
+        }
 
         // PDH advances the entire query at once. Refresh every valid receiver-side
         // base before formatting so one counter failure cannot leave later base
@@ -1254,8 +1489,19 @@ impl Query {
                         PdhGetRawCounterValue(counter.handle, null_mut(), &mut raw)
                     });
                     if let Err(error) = result {
+                        if matches!(
+                            &error,
+                            Error::Pdh { status, .. }
+                                if handle_counter_transient_status(
+                                    *status,
+                                    counter.kind,
+                                    &mut counter.history
+                                )
+                        ) {
+                            continue;
+                        }
                         if counter.kind == CounterKind::CalculatedTwoSampleWithBase {
-                            counter.previous_base = None;
+                            counter.history.previous_base = None;
                         }
                         failures.push(sample_failure(counter.config_index, &error));
                         diagnostics.counter_read_failures += 1;
@@ -1263,8 +1509,15 @@ impl Query {
                         continue;
                     }
                     if !matches!(raw.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
+                        if handle_counter_transient_status(
+                            raw.CStatus,
+                            counter.kind,
+                            &mut counter.history,
+                        ) {
+                            continue;
+                        }
                         if counter.kind == CounterKind::CalculatedTwoSampleWithBase {
-                            counter.previous_base = None;
+                            counter.history.previous_base = None;
                         }
                         let error = Error::Pdh {
                             operation: "raw counter CStatus",
@@ -1280,13 +1533,13 @@ impl Query {
                 }
                 CounterKind::Direct | CounterKind::CalculatedTwoSample => None,
             };
-            if std::mem::take(&mut counter.warming)
+            if std::mem::take(&mut counter.history.warming)
                 && matches!(
                     counter.kind,
                     CounterKind::CalculatedTwoSample | CounterKind::CalculatedTwoSampleWithBase
                 )
             {
-                counter.previous_base = raw_base;
+                counter.history.previous_base = raw_base;
                 let _ = dispositions.insert(
                     key.clone(),
                     CollectionDisposition::Omit(SampleValue::Warming),
@@ -1302,7 +1555,7 @@ impl Query {
                     .and_then(|current_base| {
                         classify_base_disposition(
                             &counter.path,
-                            &mut counter.previous_base,
+                            &mut counter.history.previous_base,
                             current_base,
                         )
                     }),
@@ -1322,7 +1575,7 @@ impl Query {
         }
 
         let mut points = Vec::with_capacity(self.counters.len());
-        for (key, counter) in &self.counters {
+        for (key, counter) in &mut self.counters {
             let Some(disposition) = dispositions.remove(key) else {
                 continue;
             };
@@ -1333,6 +1586,7 @@ impl Query {
                         counter_index: counter.config_index,
                         path: counter.path.clone(),
                         instance: counter.instance.clone(),
+                        start_time_unix_nano: None,
                         value,
                     });
                     continue;
@@ -1351,6 +1605,9 @@ impl Query {
             let status = unsafe {
                 PdhGetFormattedCounterValue(counter.handle, format, null_mut(), &mut value)
             };
+            if handle_counter_transient_status(status, counter.kind, &mut counter.history) {
+                continue;
+            }
             if let Err(error) = check("PdhGetFormattedCounterValue", &counter.path, status) {
                 failures.push(sample_failure(counter.config_index, &error));
                 diagnostics.counter_read_failures += 1;
@@ -1358,6 +1615,13 @@ impl Query {
                 continue;
             }
             if !matches!(value.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
+                if handle_counter_transient_status(
+                    value.CStatus,
+                    counter.kind,
+                    &mut counter.history,
+                ) {
+                    continue;
+                }
                 let error = Error::Pdh {
                     operation: "counter CStatus",
                     path: counter.path.clone(),
@@ -1368,18 +1632,25 @@ impl Query {
                 let _ = failed_keys.insert(key.clone());
                 continue;
             }
-            let scaled_result = match counter.kind {
+            let (scaled_result, direct_value) = match counter.kind {
                 CounterKind::Direct => {
                     // SAFETY: A successful PDH_FMT_LARGE request initialized largeValue.
-                    scale_integer(unsafe { value.Anonymous.largeValue }, counter.scale_power10)
+                    let direct_value = unsafe { value.Anonymous.largeValue };
+                    (
+                        scale_integer(direct_value, counter.scale_power10),
+                        Some(direct_value),
+                    )
                 }
                 CounterKind::RawFraction
                 | CounterKind::CalculatedTwoSample
                 | CounterKind::CalculatedTwoSampleWithBase => {
                     // SAFETY: A successful PDH_FMT_DOUBLE request initialized doubleValue.
-                    scale_double(
-                        unsafe { value.Anonymous.doubleValue },
-                        counter.scale_power10,
+                    (
+                        scale_double(
+                            unsafe { value.Anonymous.doubleValue },
+                            counter.scale_power10,
+                        ),
+                        None,
                     )
                 }
             };
@@ -1395,10 +1666,39 @@ impl Query {
                     continue;
                 }
             };
+            let point_start_time = if matches!(
+                self.configs[counter.config_index].metric_kind,
+                MetricKind::Sum { monotonic: true }
+            ) {
+                let Some(direct_value) = direct_value else {
+                    let error = Error::InvalidSample(
+                        "monotonic Sum was not backed by a direct formatted value",
+                    );
+                    failures.push(sample_failure(counter.config_index, &error));
+                    diagnostics.counter_read_failures += 1;
+                    continue;
+                };
+                match monotonic_start_time(
+                    &counter.path,
+                    &mut counter.history.monotonic_sequence,
+                    direct_value,
+                    timestamp_unix_nano,
+                ) {
+                    Ok(start) => Some(start),
+                    Err(error) => {
+                        failures.push(sample_failure(counter.config_index, &error));
+                        diagnostics.counter_read_failures += 1;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             points.push(SamplePoint {
                 counter_index: counter.config_index,
                 path: counter.path.clone(),
                 instance: counter.instance.clone(),
+                start_time_unix_nano: point_start_time,
                 value: SampleValue::Value(scaled),
             });
         }
@@ -1767,6 +2067,14 @@ mod tests {
         }
     }
 
+    fn monotonic_sum(path: &str, name: &str, unit: &str) -> CounterConfig {
+        CounterConfig {
+            metric_kind: MetricKind::Sum { monotonic: true },
+            unit: unit.to_owned(),
+            ..counter(path, name)
+        }
+    }
+
     fn query_counts() -> (usize, usize) {
         (
             QUERY_OPENS.load(Ordering::Relaxed),
@@ -2083,6 +2391,79 @@ mod tests {
         );
     }
 
+    /// Scenario: A Windows direct count is mapped to a cumulative monotonic Sum.
+    /// Guarantees: The first scrape emits the formatted value with start time equal to point time.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+    async fn collects_first_monotonic_direct_value() {
+        let _serial = super::super::TEST_PDH_LOCK.lock().await;
+        let mut worker = Worker::start(
+            vec![monotonic_sum(
+                r"\TCPv4\Connection Failures",
+                "windows.tcp.connection_failures",
+                "{failure}",
+            )],
+            Duration::from_secs(30),
+            256,
+            4_096,
+            "test".to_owned(),
+        )
+        .await
+        .unwrap();
+        let sample = worker.collect().await.unwrap();
+        assert_eq!(sample.points.len(), 1);
+        assert!(matches!(
+            sample.points[0].value,
+            SampleValue::Value(Number::Integer(value)) if value >= 0
+        ));
+        assert_eq!(
+            sample.points[0].start_time_unix_nano,
+            Some(sample.timestamp_unix_nano)
+        );
+        assert!(
+            worker
+                .shutdown(Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Scenario: Startup includes a healthy Gauge and an ineligible monotonic timer mapping.
+    /// Guarantees: The worker starts, emits the healthy point, and reports the mapping diagnostic.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+    async fn isolates_ineligible_monotonic_mapping_at_startup() {
+        let _serial = super::super::TEST_PDH_LOCK.lock().await;
+        let mut worker = Worker::start(
+            vec![
+                counter(r"\Memory\Available Bytes", "windows.memory.available"),
+                monotonic_sum(
+                    r"\Processor(_Total)\% Processor Time",
+                    "windows.processor.time",
+                    "%",
+                ),
+            ],
+            Duration::from_secs(30),
+            256,
+            4_096,
+            "test".to_owned(),
+        )
+        .await
+        .unwrap();
+        let sample = worker.collect().await.unwrap();
+        assert_eq!(sample.points.len(), 1);
+        assert_eq!(sample.points[0].counter_index, 0);
+        assert!(sample.failures.iter().any(|failure| {
+            failure.counter_index == 1 && failure.reason == "invalid_metric_mapping"
+        }));
+        assert!(
+            worker
+                .shutdown(Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
+    }
+
     /// Scenario: The local host exposes one exact gauge and dynamically enumerated process gauges.
     /// Guarantees: Native wildcard expansion returns concrete identity-keyed points without changing the exact point.
     #[tokio::test(flavor = "current_thread")]
@@ -2165,15 +2546,31 @@ mod tests {
         .await
         .unwrap();
         tokio::time::sleep(Duration::from_millis(250)).await;
+        let warming = worker.collect().await.unwrap();
+        assert!(warming.failures.is_empty(), "{:?}", warming.failures);
+        assert_eq!(warming.points.len(), 2);
+        assert!(
+            warming
+                .points
+                .iter()
+                .all(|point| point.value == SampleValue::Warming),
+            "{:?}",
+            warming.points
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let sample = worker.collect().await.unwrap();
         assert!(sample.failures.is_empty(), "{:?}", sample.failures);
         assert_eq!(sample.points.len(), 2);
-        assert!(sample.points.iter().all(|point| {
-            matches!(
-                point.value,
-                SampleValue::Value(Number::Double(value)) if value.is_finite()
-            )
-        }));
+        assert!(
+            sample.points.iter().all(|point| {
+                matches!(
+                    point.value,
+                    SampleValue::Value(Number::Double(value)) if value.is_finite()
+                )
+            }),
+            "{:?}",
+            sample.points
+        );
         assert!(
             worker
                 .shutdown(Instant::now() + Duration::from_secs(2))
@@ -2481,6 +2878,388 @@ mod tests {
         assert_eq!(cumulative_start_time(&mut start, &mut previous, 20), 10);
         assert_eq!(cumulative_start_time(&mut start, &mut previous, 15), 15);
         assert_eq!(cumulative_start_time(&mut start, &mut previous, 16), 15);
+    }
+
+    /// Scenario: A monotonic raw count advances, resets, and then advances from its new value.
+    /// Guarantees: Only a decrease or clock rollback starts a new cumulative sequence.
+    #[test]
+    fn monotonic_start_time_tracks_sum_resets() {
+        let mut sequence = MonotonicSequence::default();
+        assert_eq!(
+            monotonic_start_time("counter", &mut sequence, 10, 100).unwrap(),
+            100
+        );
+        assert_eq!(
+            monotonic_start_time("counter", &mut sequence, 10, 110).unwrap(),
+            100
+        );
+        assert_eq!(
+            monotonic_start_time("counter", &mut sequence, 15, 110).unwrap(),
+            100
+        );
+        assert_eq!(
+            monotonic_start_time("counter", &mut sequence, 20, 120).unwrap(),
+            100
+        );
+        assert_eq!(
+            monotonic_start_time("counter", &mut sequence, 30, 115).unwrap(),
+            115
+        );
+        assert_eq!(
+            monotonic_start_time("counter", &mut sequence, 2, 130).unwrap(),
+            130
+        );
+        assert!(monotonic_start_time("counter", &mut sequence, -1, 140).is_err());
+        assert_eq!(sequence.start_time_unix_nano, Some(130));
+        assert_eq!(sequence.previous_value, Some(2));
+        assert_eq!(sequence.previous_timestamp_unix_nano, Some(130));
+    }
+
+    /// Scenario: Query rollback occurs while a monotonic Sum series is omitted.
+    /// Guarantees: Cleared sequence state remains empty until the next valid observation starts fresh.
+    #[test]
+    fn rollback_during_omission_starts_next_observation_fresh() {
+        let mut sequence = MonotonicSequence::default();
+        let mut query_start = 100;
+        let mut previous_query_timestamp = 100;
+        assert_eq!(
+            advance_collection_time(
+                &mut query_start,
+                &mut previous_query_timestamp,
+                120,
+                std::iter::once(&mut sequence)
+            ),
+            100
+        );
+        assert_eq!(
+            monotonic_start_time("counter", &mut sequence, 20, 120).unwrap(),
+            120
+        );
+        assert_eq!(
+            advance_collection_time(
+                &mut query_start,
+                &mut previous_query_timestamp,
+                115,
+                std::iter::once(&mut sequence)
+            ),
+            115
+        );
+        assert_eq!(sequence.start_time_unix_nano, None);
+        assert_eq!(sequence.previous_value, None);
+        assert_eq!(sequence.previous_timestamp_unix_nano, None);
+        assert_eq!(
+            advance_collection_time(
+                &mut query_start,
+                &mut previous_query_timestamp,
+                125,
+                std::iter::once(&mut sequence)
+            ),
+            115
+        );
+        assert_eq!(
+            monotonic_start_time("counter", &mut sequence, 30, 125).unwrap(),
+            125
+        );
+    }
+
+    /// Scenario: PDH reports transient query or counter states without a usable observation.
+    /// Guarantees: Every documented transient status is classified as no observation.
+    #[test]
+    fn classifies_transient_pdh_statuses_as_no_observation() {
+        for status in [
+            PDH_INVALID_DATA,
+            PDH_NO_DATA,
+            PDH_CALC_NEGATIVE_DENOMINATOR,
+            PDH_CALC_NEGATIVE_TIMEBASE,
+            PDH_CALC_NEGATIVE_VALUE,
+        ] {
+            assert!(is_transient_no_observation_status(status));
+        }
+        assert!(!is_transient_no_observation_status(PDH_INVALID_ARGUMENT));
+    }
+
+    /// Scenario: A two-sample counter status path receives a transient after accumulating history.
+    /// Guarantees: PDH base history and warm-up restart without changing the monotonic sequence.
+    #[test]
+    fn transient_counter_status_restarts_history() {
+        let sequence = MonotonicSequence {
+            start_time_unix_nano: Some(100),
+            previous_value: Some(20),
+            previous_timestamp_unix_nano: Some(120),
+        };
+        let mut history = CounterHistory {
+            previous_base: Some(7),
+            monotonic_sequence: sequence,
+            warming: false,
+        };
+
+        assert_eq!(
+            classify_base_disposition("average", &mut history.previous_base, 9).unwrap(),
+            CollectionDisposition::Format
+        );
+        assert_eq!(history.previous_base, Some(9));
+        assert!(handle_counter_transient_status(
+            PDH_INVALID_DATA,
+            CounterKind::CalculatedTwoSampleWithBase,
+            &mut history
+        ));
+        assert_eq!(
+            history,
+            CounterHistory {
+                previous_base: None,
+                monotonic_sequence: sequence,
+                warming: true,
+            }
+        );
+    }
+
+    /// Scenario: The query status path receives a transient after multiple counters establish history.
+    /// Guarantees: All PDH bases reset, two-sample warm-up restarts, and sequences remain continuous.
+    #[test]
+    fn query_transient_restarts_all_counter_history() {
+        let first_sequence = MonotonicSequence {
+            start_time_unix_nano: Some(100),
+            previous_value: Some(20),
+            previous_timestamp_unix_nano: Some(120),
+        };
+        let second_sequence = MonotonicSequence {
+            start_time_unix_nano: Some(105),
+            previous_value: Some(30),
+            previous_timestamp_unix_nano: Some(120),
+        };
+        let mut histories = [
+            CounterHistory {
+                previous_base: Some(7),
+                monotonic_sequence: first_sequence,
+                warming: false,
+            },
+            CounterHistory {
+                previous_base: Some(9),
+                monotonic_sequence: second_sequence,
+                warming: false,
+            },
+        ];
+        let mut query_start = 100;
+        let mut previous_query_timestamp = 120;
+
+        assert!(is_transient_no_observation_status(PDH_NO_DATA));
+        assert_eq!(
+            advance_collection_time(
+                &mut query_start,
+                &mut previous_query_timestamp,
+                125,
+                histories
+                    .iter_mut()
+                    .map(|history| &mut history.monotonic_sequence)
+            ),
+            100
+        );
+        let kinds = [
+            CounterKind::CalculatedTwoSampleWithBase,
+            CounterKind::Direct,
+        ];
+        assert!(
+            handle_query_collection_status(
+                PDH_NO_DATA,
+                kinds.into_iter().zip(histories.iter_mut())
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            histories,
+            [
+                CounterHistory {
+                    previous_base: None,
+                    monotonic_sequence: first_sequence,
+                    warming: true,
+                },
+                CounterHistory {
+                    previous_base: None,
+                    monotonic_sequence: second_sequence,
+                    warming: false,
+                },
+            ]
+        );
+    }
+
+    /// Scenario: Query collection returns a hard PDH error before the existing query is retried.
+    /// Guarantees: PDH base state re-warms while the monotonic sequence remains continuous.
+    #[test]
+    fn query_collection_error_restarts_pdh_history() {
+        let sequence = MonotonicSequence {
+            start_time_unix_nano: Some(100),
+            previous_value: Some(20),
+            previous_timestamp_unix_nano: Some(120),
+        };
+        let mut history = CounterHistory {
+            previous_base: Some(7),
+            monotonic_sequence: sequence,
+            warming: false,
+        };
+
+        let error = handle_query_collection_status(
+            PDH_INVALID_ARGUMENT,
+            std::iter::once((CounterKind::CalculatedTwoSampleWithBase, &mut history)),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Pdh {
+                operation: "PdhCollectQueryData",
+                status: PDH_INVALID_ARGUMENT,
+                ..
+            }
+        ));
+        assert_eq!(
+            history,
+            CounterHistory {
+                previous_base: None,
+                monotonic_sequence: sequence,
+                warming: true,
+            }
+        );
+    }
+
+    /// Scenario: Timestamp acquisition fails after PDH successfully advances the query sample.
+    /// Guarantees: The next scrape re-warms PDH state without restarting the monotonic sequence.
+    #[test]
+    fn timestamp_error_restarts_pdh_history() {
+        let sequence = MonotonicSequence {
+            start_time_unix_nano: Some(100),
+            previous_value: Some(20),
+            previous_timestamp_unix_nano: Some(120),
+        };
+        let mut history = CounterHistory {
+            previous_base: Some(7),
+            monotonic_sequence: sequence,
+            warming: false,
+        };
+
+        let error = handle_query_timestamp_result(
+            Err(Error::InvalidSample("test timestamp failure")),
+            std::iter::once((CounterKind::CalculatedTwoSampleWithBase, &mut history)),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidSample("test timestamp failure")
+        ));
+        assert_eq!(
+            history,
+            CounterHistory {
+                previous_base: None,
+                monotonic_sequence: sequence,
+                warming: true,
+            }
+        );
+    }
+
+    /// Scenario: A monotonic value decreases from a large value to a small value.
+    /// Guarantees: The decrease begins a new sequence without wrap compensation.
+    #[test]
+    fn monotonic_start_time_restarts_after_32_bit_wrap() {
+        let mut sequence = MonotonicSequence::default();
+        assert_eq!(
+            monotonic_start_time("counter", &mut sequence, i64::from(u32::MAX), 100).unwrap(),
+            100
+        );
+        assert_eq!(
+            monotonic_start_time("counter", &mut sequence, 1, 110).unwrap(),
+            110
+        );
+    }
+
+    /// Scenario: Metric kinds are paired with direct and calculated native counter types.
+    /// Guarantees: Only monotonic Sums reject non-direct native types.
+    #[test]
+    fn validates_monotonic_sum_native_type() {
+        assert!(
+            validate_metric_mapping(
+                "counter",
+                MetricKind::Sum { monotonic: true },
+                CounterKind::Direct
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_metric_mapping(
+                "counter",
+                MetricKind::Sum { monotonic: true },
+                CounterKind::CalculatedTwoSample
+            )
+            .is_err()
+        );
+        assert!(
+            validate_metric_mapping("gauge", MetricKind::Gauge, CounterKind::CalculatedTwoSample)
+                .is_ok()
+        );
+        assert!(
+            validate_metric_mapping(
+                "sum",
+                MetricKind::Sum { monotonic: false },
+                CounterKind::CalculatedTwoSample
+            )
+            .is_ok()
+        );
+    }
+
+    /// Scenario: An ineligible monotonic mapping is added beside a healthy counter during startup.
+    /// Guarantees: The mapping is permanent and diagnostic but does not require retry.
+    #[test]
+    fn isolates_invalid_monotonic_sum_mapping() {
+        let error = validate_metric_mapping(
+            "counter",
+            MetricKind::Sum { monotonic: true },
+            CounterKind::CalculatedTwoSample,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.bounded_detail(),
+            "monotonic Sum requires a direct raw-count counter type \
+             (PERF_COUNTER_RAWCOUNT / LARGE_RAWCOUNT)"
+        );
+        assert_eq!(
+            exact_add_failure_disposition(&error),
+            ExactAddFailureDisposition::Diagnostic
+        );
+        let retryable = Error::Pdh {
+            operation: "PdhAddEnglishCounterW",
+            path: "missing".to_owned(),
+            status: 1,
+        };
+        assert_eq!(
+            exact_add_failure_disposition(&retryable),
+            ExactAddFailureDisposition::Retry
+        );
+        let unsupported = Error::UnsupportedType(UnsupportedNativeType {
+            path: "unsupported".to_owned(),
+            native_type: u32::MAX,
+        });
+        assert_eq!(
+            exact_add_failure_disposition(&unsupported),
+            ExactAddFailureDisposition::Diagnostic
+        );
+    }
+
+    /// Scenario: Decimal scaling rounds two adjacent large integers to the same double.
+    /// Guarantees: A raw formatted-value decrease still resets the sequence before scaling.
+    #[test]
+    fn detects_value_drop_before_scaling() {
+        let previous_value = i64::MAX;
+        let current_value = i64::MAX - 1;
+        assert_eq!(
+            scale_integer(previous_value, -18).unwrap(),
+            scale_integer(current_value, -18).unwrap()
+        );
+        let mut sequence = MonotonicSequence {
+            start_time_unix_nano: Some(100),
+            previous_value: Some(previous_value),
+            previous_timestamp_unix_nano: Some(100),
+        };
+        assert_eq!(
+            monotonic_start_time("counter", &mut sequence, current_value, 110).unwrap(),
+            110
+        );
     }
 
     /// Scenario: Query metadata survives a failed collection and is merged with later recovery evidence.
