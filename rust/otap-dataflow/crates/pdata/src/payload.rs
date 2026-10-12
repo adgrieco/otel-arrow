@@ -98,6 +98,47 @@ use bytes::BytesMut;
 use otel_arrow_dfe_config::{ConversionOptions, SignalFormat, SignalType};
 use prost::{EncodeError, Message};
 
+use crate::proto::consts::field_num::logs::{
+    LOGS_DATA_RESOURCE, RESOURCE_LOGS_SCOPE_LOGS, SCOPE_LOGS_LOG_RECORDS,
+};
+use crate::proto::consts::field_num::metrics::{
+    METRIC_EXPONENTIAL_HISTOGRAM, METRIC_GAUGE, METRIC_HISTOGRAM, METRIC_SUM, METRIC_SUMMARY,
+    METRICS_DATA_RESOURCE_METRICS, RESOURCE_METRICS_SCOPE_METRICS, SCOPE_METRICS_METRICS,
+};
+use crate::proto::consts::field_num::traces::{
+    RESOURCE_SPANS_SCOPE_SPANS, SCOPE_SPANS_SPANS, TRACES_DATA_RESOURCE_SPANS,
+};
+use crate::proto::consts::wire_types;
+use crate::views::otlp::bytes::decode::{field_value_range, read_varint};
+
+// Compile-time validation that metrics data-point fields are protobuf field 1, which is leveraged in count_metrics_data_points.
+const _: () = {
+    use crate::proto::consts::field_num::metrics::{
+        EXPONENTIAL_HISTOGRAM_DATA_POINTS, GAUGE_DATA_POINTS, HISTOGRAM_DATA_POINTS,
+        SUM_DATA_POINTS, SUMMARY_DATA_POINTS,
+    };
+    assert!(
+        GAUGE_DATA_POINTS == 1,
+        "count_metrics_data_points assumes GAUGE_DATA_POINTS == 1"
+    );
+    assert!(
+        SUM_DATA_POINTS == 1,
+        "count_metrics_data_points assumes SUM_DATA_POINTS == 1"
+    );
+    assert!(
+        HISTOGRAM_DATA_POINTS == 1,
+        "count_metrics_data_points assumes HISTOGRAM_DATA_POINTS == 1"
+    );
+    assert!(
+        EXPONENTIAL_HISTOGRAM_DATA_POINTS == 1,
+        "count_metrics_data_points assumes EXPONENTIAL_HISTOGRAM_DATA_POINTS == 1"
+    );
+    assert!(
+        SUMMARY_DATA_POINTS == 1,
+        "count_metrics_data_points assumes SUMMARY_DATA_POINTS == 1"
+    );
+};
+
 /// Concrete storage representation backing an [`OtapPayload`].
 ///
 /// This enum is public so callers can pattern-match on the representation via
@@ -455,75 +496,177 @@ impl OtapPayloadHelpers for OtlpProtoBytes {
     }
 
     fn num_items(&self) -> usize {
-        // Counting requires traversing the encoded protobuf record hierarchy.
-        match self {
-            Self::ExportLogsRequest(bytes) => {
-                let logs_data_view = RawLogsData::new(bytes.as_ref());
-                use otel_arrow_dfe_pdata_views::views::logs::{
-                    LogsDataView, ResourceLogsView, ScopeLogsView,
-                };
-                logs_data_view
-                    .resources()
-                    .map(|rl| {
-                        rl.scopes()
-                            .map(|sl| sl.log_records().count())
-                            .sum::<usize>()
-                    })
-                    .sum()
+        count_otlp_items(self.signal_type(), self.as_bytes())
+    }
+}
+
+/// Single-pass allocation free parsing of OTLP items bytes to count items.
+pub(crate) fn count_otlp_items(signal: SignalType, bytes: &[u8]) -> usize {
+    match signal {
+        SignalType::Logs => count_logs_records(bytes).unwrap_or(0),
+        SignalType::Traces => count_trace_spans(bytes).unwrap_or(0),
+        SignalType::Metrics => count_metrics_data_points(bytes).unwrap_or(0),
+    }
+}
+
+fn count_logs_records(bytes: &[u8]) -> Result<usize, Error> {
+    let mut count: usize = 0;
+    let mut request_position = 0;
+
+    while let Some((field, wire_type, resource_bytes)) = next_field(bytes, &mut request_position)? {
+        if field != LOGS_DATA_RESOURCE || wire_type != wire_types::LEN {
+            continue;
+        }
+
+        let mut resource_position = 0;
+
+        while let Some((field, wire_type, scope_bytes)) =
+            next_field(resource_bytes, &mut resource_position)?
+        {
+            if field != RESOURCE_LOGS_SCOPE_LOGS || wire_type != wire_types::LEN {
+                continue;
             }
-            Self::ExportTracesRequest(bytes) => {
-                let traces_data_view = RawTraceData::new(bytes.as_ref());
-                use otel_arrow_dfe_pdata_views::views::trace::{
-                    ResourceSpansView, ScopeSpansView, TracesView,
-                };
-                traces_data_view
-                    .resources()
-                    .map(|rs| rs.scopes().map(|ss| ss.spans().count()).sum::<usize>())
-                    .sum()
-            }
-            Self::ExportMetricsRequest(bytes) => {
-                let metrics_data_view = RawMetricsData::new(bytes.as_ref());
-                use otel_arrow_dfe_pdata_views::views::metrics::{
-                    DataView, ExponentialHistogramView, GaugeView, HistogramView, MetricView,
-                    MetricsView, ResourceMetricsView, ScopeMetricsView, SumView, SummaryView,
-                };
-                metrics_data_view
-                    .resources()
-                    .map(|rm| {
-                        rm.scopes()
-                            .map(|sm| {
-                                sm.metrics()
-                                    .map(|metric| {
-                                        metric
-                                            .data()
-                                            .map(|data| {
-                                                let mut count = 0;
-                                                if let Some(gauge) = data.as_gauge() {
-                                                    count += gauge.data_points().count();
-                                                } else if let Some(sum) = data.as_sum() {
-                                                    count += sum.data_points().count();
-                                                } else if let Some(histogram) = data.as_histogram()
-                                                {
-                                                    count += histogram.data_points().count();
-                                                } else if let Some(exp_histogram) =
-                                                    data.as_exponential_histogram()
-                                                {
-                                                    count += exp_histogram.data_points().count();
-                                                } else if let Some(summary) = data.as_summary() {
-                                                    count += summary.data_points().count();
-                                                }
-                                                count
-                                            })
-                                            .unwrap_or(0)
-                                    })
-                                    .sum::<usize>()
-                            })
-                            .sum::<usize>()
-                    })
-                    .sum()
+
+            let mut scope_position = 0;
+
+            while let Some((field, wire_type, _log_record_bytes)) =
+                next_field(scope_bytes, &mut scope_position)?
+            {
+                if field == SCOPE_LOGS_LOG_RECORDS && wire_type == wire_types::LEN {
+                    count += 1;
+                }
             }
         }
     }
+
+    Ok(count)
+}
+
+fn count_trace_spans(bytes: &[u8]) -> Result<usize, Error> {
+    let mut count: usize = 0;
+    let mut request_position = 0;
+
+    while let Some((field, wire_type, resource_bytes)) = next_field(bytes, &mut request_position)? {
+        if field != TRACES_DATA_RESOURCE_SPANS || wire_type != wire_types::LEN {
+            continue;
+        }
+
+        let mut resource_position = 0;
+
+        while let Some((field, wire_type, scope_bytes)) =
+            next_field(resource_bytes, &mut resource_position)?
+        {
+            if field != RESOURCE_SPANS_SCOPE_SPANS || wire_type != wire_types::LEN {
+                continue;
+            }
+
+            let mut scope_position = 0;
+
+            while let Some((field, wire_type, _span_bytes)) =
+                next_field(scope_bytes, &mut scope_position)?
+            {
+                if field == SCOPE_SPANS_SPANS && wire_type == wire_types::LEN {
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    Ok(count)
+}
+
+fn count_metrics_data_points(bytes: &[u8]) -> Result<usize, Error> {
+    let mut count: usize = 0;
+    let mut request_position = 0;
+    let metric_fields = [
+        METRIC_GAUGE,
+        METRIC_SUM,
+        METRIC_HISTOGRAM,
+        METRIC_EXPONENTIAL_HISTOGRAM,
+        METRIC_SUMMARY,
+    ];
+
+    while let Some((field, wire_type, resource_bytes)) = next_field(bytes, &mut request_position)? {
+        if field != METRICS_DATA_RESOURCE_METRICS || wire_type != wire_types::LEN {
+            continue;
+        }
+
+        let mut resource_position = 0;
+
+        while let Some((field, wire_type, scope_bytes)) =
+            next_field(resource_bytes, &mut resource_position)?
+        {
+            if field != RESOURCE_METRICS_SCOPE_METRICS || wire_type != wire_types::LEN {
+                continue;
+            }
+
+            let mut metrics_position = 0;
+
+            while let Some((field, wire_type, metrics_bytes)) =
+                next_field(scope_bytes, &mut metrics_position)?
+            {
+                if field != SCOPE_METRICS_METRICS || wire_type != wire_types::LEN {
+                    continue;
+                }
+
+                let mut data_position = 0;
+
+                let mut data_count = 0;
+
+                while let Some((field, wire_type, data_bytes)) =
+                    next_field(metrics_bytes, &mut data_position)?
+                {
+                    if !metric_fields.contains(&field) || wire_type != wire_types::LEN {
+                        continue;
+                    }
+
+                    // Reset count for each found `oneof` message (under the `data` field) to keep the last one only
+                    data_count = 0;
+                    let mut data_point_position = 0;
+
+                    while let Some((field, wire_type, _data_point_bytes)) =
+                        next_field(data_bytes, &mut data_point_position)?
+                    {
+                        // All metric data-point fields are field number 1 in the OTLP protobuf schema. This is validated by static assertions at the beginning of this file.
+                        if field == 1 && wire_type == wire_types::LEN {
+                            data_count += 1;
+                        }
+                    }
+                }
+
+                count += data_count;
+            }
+        }
+    }
+
+    Ok(count)
+}
+
+fn next_field<'a>(
+    bytes: &'a [u8],
+    position: &mut usize,
+) -> Result<Option<(u64, u64, &'a [u8])>, Error> {
+    if *position == bytes.len() {
+        return Ok(None);
+    }
+
+    let (tag, after_tag) = read_varint(bytes, *position).ok_or(Error::InvalidProtobufWireFormat)?;
+
+    let field_number = tag >> 3;
+    let wire_type = tag & 7;
+
+    if field_number == 0 {
+        return Err(Error::InvalidProtobufWireFormat);
+    }
+
+    // Finds the value's boundaries for every supported wire type.
+    // For LEN fields, the returned range excludes the length prefix.
+    let (start, end) =
+        field_value_range(bytes, wire_type, after_tag).ok_or(Error::InvalidProtobufWireFormat)?;
+
+    *position = end;
+
+    Ok(Some((field_number, wire_type, &bytes[start..end])))
 }
 
 /* -------- Conversion implementations -------- */
@@ -663,6 +806,8 @@ impl TryFrom<OtlpProtoMessage> for OtapPayload {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::otlp::common::EncodeFailure;
+    use crate::proto::consts::field_num::metrics::METRIC_SUMMARY;
     use crate::testing::fixtures::logs_with_full_resource_and_scope;
     use crate::{
         otap::OtapArrowRecords,
@@ -691,6 +836,37 @@ mod test {
     use bytes::Bytes;
     use pretty_assertions::assert_eq;
     use prost::Message;
+    use std::mem::size_of;
+
+    use crate::{
+        otlp::{BoundedBuf, ProtoBuffer},
+        proto::consts::field_num::metrics::{
+            METRIC_GAUGE, METRIC_NAME, METRIC_SUM, METRIC_UNIT, METRICS_DATA_RESOURCE_METRICS,
+            RESOURCE_METRICS_SCOPE_METRICS, SCOPE_METRICS_METRICS,
+        },
+    };
+
+    /// Scenario: The legacy payload representation is built for a 64-bit target.
+    /// Guarantees: The baseline payload layout remains fixed for codec comparisons.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn legacy_payload_layout_is_stable() {
+        assert_eq!(size_of::<PayloadData>(), 40);
+        assert_eq!(size_of::<OtapPayload>(), 72);
+    }
+
+    /// Scenario: An OTLP payload is converted back to its matching legacy representation.
+    /// Guarantees: Forwarding retains the original shared byte buffer without copying it.
+    #[test]
+    fn matching_otlp_forwarding_preserves_buffer() {
+        let original = Bytes::from_static(b"legacy-otlp");
+        let pointer = original.as_ptr();
+        let payload = OtapPayload::from(OtlpProtoBytes::ExportLogsRequest(original));
+        let forwarded: OtlpProtoBytes = payload
+            .try_into_with_default()
+            .expect("matching OTLP forwarding");
+        assert_eq!(forwarded.as_bytes().as_ptr(), pointer);
+    }
 
     #[test]
     fn test_conversion_logs() {
@@ -1716,5 +1892,147 @@ mod test {
         let otlp_bytes = OtlpProtoBytes::ExportMetricsRequest(Bytes::from(buf));
 
         assert_eq!(otlp_bytes.num_items(), 11);
+    }
+
+    fn proto_encode_sum(proto: &mut ProtoBuffer) -> Result<(), EncodeFailure> {
+        proto.encode_len_delimited(METRIC_SUM, |proto| {
+            let data = Sum {
+                data_points: vec![NumberDataPoint {
+                    value: Some(Value::AsInt(255)),
+                    attributes: vec![],
+                    exemplars: vec![],
+                    start_time_unix_nano: 0,
+                    time_unix_nano: 0,
+                    flags: 0,
+                }],
+                aggregation_temporality: 0,
+                is_monotonic: false,
+            };
+            let mut bytes_data = Vec::new();
+            data.encode(&mut bytes_data).unwrap();
+            proto.extend_from_slice(&bytes_data)
+        })
+    }
+
+    fn proto_encode_gauge(proto: &mut ProtoBuffer) -> Result<(), EncodeFailure> {
+        proto.encode_len_delimited(METRIC_GAUGE, |proto| {
+            let data = Gauge {
+                data_points: vec![
+                    NumberDataPoint {
+                        value: Some(Value::AsInt(12)),
+                        attributes: vec![],
+                        exemplars: vec![],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: 0,
+                        flags: 0,
+                    },
+                    NumberDataPoint {
+                        value: Some(Value::AsInt(10)),
+                        attributes: vec![],
+                        exemplars: vec![],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: 0,
+                        flags: 0,
+                    },
+                    NumberDataPoint {
+                        value: Some(Value::AsInt(15)),
+                        attributes: vec![],
+                        exemplars: vec![],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: 0,
+                        flags: 0,
+                    },
+                    NumberDataPoint {
+                        value: Some(Value::AsInt(14)),
+                        attributes: vec![],
+                        exemplars: vec![],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: 0,
+                        flags: 0,
+                    },
+                ],
+            };
+            let mut bytes_data = Vec::new();
+            data.encode(&mut bytes_data).unwrap();
+            proto.extend_from_slice(&bytes_data)
+        })
+    }
+
+    fn proto_encode_summary(proto: &mut ProtoBuffer) -> Result<(), EncodeFailure> {
+        proto.encode_len_delimited(METRIC_SUMMARY, |proto| {
+            let data = Summary {
+                data_points: vec![
+                    SummaryDataPoint {
+                        count: 9,
+                        sum: 33.0,
+                        quantile_values: vec![],
+                        attributes: vec![],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: 0,
+                        flags: 0,
+                    },
+                    SummaryDataPoint {
+                        count: 9,
+                        sum: 33.0,
+                        quantile_values: vec![],
+                        attributes: vec![],
+                        start_time_unix_nano: 0,
+                        time_unix_nano: 0,
+                        flags: 0,
+                    },
+                ],
+            };
+            let mut bytes_data = Vec::new();
+            data.encode(&mut bytes_data).unwrap();
+            proto.extend_from_slice(&bytes_data)
+        })
+    }
+
+    /// Scenario: Ill-formed metrics encode several ordered combinations of oneof fields.
+    /// Guarantees: Standard decoding and byte-backed item counting use each case's final field.
+    #[test]
+    fn ill_formed_metric_uses_last_oneof_field() {
+        let specs: [(fn(&mut ProtoBuffer) -> Result<(), EncodeFailure>, usize); 3] = [
+            (
+                |proto| {
+                    proto_encode_sum(proto)?;
+                    proto_encode_summary(proto)?;
+                    proto_encode_gauge(proto)
+                },
+                4,
+            ),
+            (
+                |proto| {
+                    proto_encode_gauge(proto)?;
+                    proto_encode_sum(proto)
+                },
+                1,
+            ),
+            (
+                |proto| {
+                    proto_encode_sum(proto)?;
+                    proto_encode_gauge(proto)?;
+                    proto_encode_summary(proto)
+                },
+                2,
+            ),
+        ];
+
+        for (payload_fn, expected_num_items) in specs {
+            let mut proto = ProtoBuffer::default();
+            proto
+                .encode_len_delimited(METRICS_DATA_RESOURCE_METRICS, |proto| {
+                    proto.encode_len_delimited(RESOURCE_METRICS_SCOPE_METRICS, |proto| {
+                        proto.encode_len_delimited(SCOPE_METRICS_METRICS, |proto| {
+                            proto.encode_string(METRIC_NAME, "metric1")?;
+                            proto.encode_string(METRIC_UNIT, "centimeters")?;
+                            payload_fn(proto)
+                        })
+                    })
+                })
+                .unwrap();
+            let parsed_bytes = OtlpProtoBytes::ExportMetricsRequest(proto.into_bytes());
+            assert_eq!(parsed_bytes.num_items(), expected_num_items);
+        }
     }
 }

@@ -177,23 +177,23 @@ mod tests {
     #[test]
     fn classifies_two_sample_counters() {
         for native_type in [
-            0x1041_0400,
-            0x1041_0500,
-            0x0045_0400,
-            0x0045_0500,
-            0x0055_0500,
-            0x0065_0500,
-            0x2041_0500,
-            0x2141_0500,
-            0x2051_0500,
-            0x2151_0500,
-            0x2061_0500,
-            0x2047_0500,
-            0x2057_0500,
-            0x2067_0500,
-            0x0040_0400,
-            0x0040_0500,
-            0x0041_0400,
+            0x1041_0400, // PERF_COUNTER_COUNTER
+            0x1041_0500, // PERF_COUNTER_BULK_COUNT
+            0x0045_0400, // PERF_COUNTER_QUEUELEN_TYPE
+            0x0045_0500, // PERF_COUNTER_LARGE_QUEUELEN_TYPE
+            0x0055_0500, // PERF_COUNTER_100NS_QUEUELEN_TYPE
+            0x0065_0500, // PERF_COUNTER_OBJ_TIME_QUEUELEN_TYPE
+            0x2041_0500, // PERF_COUNTER_TIMER
+            0x2141_0500, // PERF_COUNTER_TIMER_INV
+            0x2051_0500, // PERF_100NSEC_TIMER
+            0x2151_0500, // PERF_100NSEC_TIMER_INV
+            0x2061_0500, // PERF_OBJ_TIME_TIMER
+            0x2047_0500, // PERF_PRECISION_SYSTEM_TIMER
+            0x2057_0500, // PERF_PRECISION_100NS_TIMER
+            0x2067_0500, // PERF_PRECISION_OBJECT_TIMER
+            0x0040_0400, // PERF_COUNTER_DELTA
+            0x0040_0500, // PERF_COUNTER_LARGE_DELTA
+            0x0041_0400, // PERF_SAMPLE_COUNTER
         ] {
             assert_eq!(
                 classify_native_type("calculated", native_type).unwrap(),
@@ -229,11 +229,11 @@ mod tests {
     fn rejects_standalone_bases_with_diagnostics() {
         let path = r"\Object\Counter Base";
         for native_type in [
-            0x4003_0401,
-            0x4003_0402,
-            0x4003_0403,
-            0x4003_0500,
-            0x4203_0500,
+            0x4003_0401, // PERF_SAMPLE_BASE
+            0x4003_0402, // PERF_AVERAGE_BASE
+            0x4003_0403, // PERF_RAW_BASE
+            0x4003_0500, // PERF_LARGE_RAW_BASE / PERF_PRECISION_TIMESTAMP
+            0x4203_0500, // PERF_COUNTER_MULTI_BASE
         ] {
             let error = classify_native_type(path, native_type).unwrap_err();
             assert_eq!(error.path, path);
@@ -253,14 +253,14 @@ mod tests {
     #[test]
     fn rejects_non_observations_and_undecided_families() {
         for native_type in [
-            0x0000_0B00,
-            0x4000_0200,
-            0x8000_0000,
-            0x3024_0500,
-            0x2241_0500,
-            0x2341_0500,
-            0x2251_0500,
-            0x2351_0500,
+            0x0000_0B00, // PERF_COUNTER_TEXT
+            0x4000_0200, // PERF_COUNTER_NODATA
+            0x8000_0000, // PERF_COUNTER_HISTOGRAM_TYPE
+            0x3024_0500, // PERF_ELAPSED_TIME
+            0x2241_0500, // PERF_COUNTER_MULTI_TIMER
+            0x2341_0500, // PERF_COUNTER_MULTI_TIMER_INV
+            0x2251_0500, // PERF_100NSEC_MULTI_TIMER
+            0x2351_0500, // PERF_100NSEC_MULTI_TIMER_INV
         ] {
             let error = classify_native_type("unsupported", native_type).unwrap_err();
             assert_eq!(error.native_type, native_type);
@@ -273,12 +273,12 @@ mod tests {
     fn rejects_unknown_types_and_flag_combinations() {
         for native_type in [
             0xFFFF_FFFF,
-            0x0001_0001,
-            0x1041_0401,
-            0x2041_0501,
-            0x2002_0401,
-            0x3002_0401,
-            0x0001_0200,
+            0x0001_0001, // raw count with a reserved low bit
+            0x1041_0401, // rate with a reserved low bit
+            0x2041_0501, // timer with a reserved low bit
+            0x2002_0401, // fraction with a reserved low bit
+            0x3002_0401, // average with a reserved low bit
+            0x0001_0200, // number with zero-length size
         ] {
             let error = classify_native_type("unknown", native_type).unwrap_err();
             assert_eq!(error.native_type, native_type);

@@ -1209,13 +1209,12 @@ impl<A: PdhApi> Query<A> {
         let mut diagnostics = pending.diagnostics;
         let mut failures = pending.failures;
         let mut overflows = pending.overflows;
-        if self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval {
-            if let Err(error) =
+        if self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval
+            && let Err(error) =
                 self.refresh_wildcards(&mut diagnostics, &mut failures, &mut overflows)
-            {
-                self.restore_pending_metadata(diagnostics, failures, overflows);
-                return Err(error);
-            }
+        {
+            self.restore_pending_metadata(diagnostics, failures, overflows);
+            return Err(error);
         }
         self.retry_counters(Instant::now(), &mut diagnostics, &mut failures);
         if self.counters.is_empty() {
