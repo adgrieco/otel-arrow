@@ -122,11 +122,15 @@ the receiver emits a Gauge named from the full configured PDH path, including
 its instance pattern, with unit `"1"` and an empty description. Mapping
 `attributes` are ignored in this mode. An implicit path-named Gauge is rejected
 if its name exactly matches an explicitly defined metric name, avoiding
-incompatible metadata or kinds under one output stream. Duplicate normalized
-counter paths are also rejected.
+incompatible metadata or kinds under one output stream.
 
 For mappings that reference a metric, optional `attributes` contains static
 string key/value pairs added to each emitted point.
+One normalized PDH path may feed multiple distinct metric mappings. The
+receiver opens an independent handle for each mapping and routes each sample by
+its configured mapping identity. Repeating the same path, metric name, and
+static attributes is rejected because it would emit duplicate points for one
+series.
 `scale_power10` defaults to zero and accepts values from `-18` through `18`.
 `recreate_query` defaults to `false`. Setting it to `true` is rejected until
 per-mapping query isolation and replacement priming are implemented; it is

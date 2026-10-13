@@ -50,6 +50,7 @@ struct FakeCounter {
 
 struct FakeState {
     counters: Vec<FakeCounter>,
+    added: Vec<String>,
     collect_has_data: bool,
     collect_error: bool,
     timestamp: i64,
@@ -65,8 +66,8 @@ impl PdhApi for FakePdh {
     type Counter = usize;
 
     fn add(&mut self, path: &str, _localized: bool) -> Result<Self::Counter, Error> {
-        self.0
-            .borrow()
+        let mut state = self.0.borrow_mut();
+        let counter = state
             .counters
             .iter()
             .position(|counter| counter.path == path)
@@ -74,7 +75,9 @@ impl PdhApi for FakePdh {
                 operation: "PdhAddEnglishCounterW",
                 path: path.to_owned(),
                 status: 1,
-            })
+            })?;
+        state.added.push(path.to_owned());
+        Ok(counter)
     }
 
     fn remove(&mut self, counter: &Self::Counter, _path: &str) -> Result<(), Error> {
@@ -177,6 +180,7 @@ fn fake_query(
 ) -> (Rc<RefCell<FakeState>>, Query<FakePdh>) {
     let state = Rc::new(RefCell::new(FakeState {
         counters,
+        added: Vec::new(),
         collect_has_data: true,
         collect_error: false,
         timestamp: 100,
@@ -196,6 +200,45 @@ fn fake_query(
     (state, query)
 }
 
+/// Scenario: Two metric mappings use the same exact PDH path.
+/// Guarantees: The query adds two handles and routes one point to each configured mapping index.
+#[test]
+fn same_path_mappings_use_independent_query_entries() {
+    let path = r"\Memory\Available Bytes";
+    let configs = vec![
+        counter(path, "windows.memory.available"),
+        counter(path, "windows.memory.available_copy"),
+    ];
+    let (state, mut query) = fake_query(
+        configs,
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x0001_0100,
+            raw: None,
+            formatted: Some(Number::Integer(42)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+
+    assert_eq!(state.borrow().added, [path, path]);
+    let sample = query.collect().unwrap();
+    assert_eq!(
+        sample
+            .points
+            .iter()
+            .map(|point| point.counter_index)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert!(
+        sample
+            .points
+            .iter()
+            .all(|point| matches!(point.value, SampleValue::Value(Number::Integer(42))))
+    );
+}
+
 /// Scenario: Counter inspection fails and native cleanup also reports an error.
 /// Guarantees: The counter-local diagnostic preserves both failures instead of silently dropping cleanup evidence.
 #[test]
@@ -210,6 +253,7 @@ fn setup_diagnostic_preserves_cleanup_failure() {
             raw_error: false,
             formatted_error: false,
         }],
+        added: Vec::new(),
         collect_has_data: true,
         collect_error: false,
         timestamp: 100,
@@ -874,6 +918,34 @@ async fn live_pdh_collects_parsed_instance_paths() {
     drop(processes);
     std::fs::remove_file(executable).unwrap();
     std::fs::remove_dir(directory).unwrap();
+}
+
+/// Scenario: Two metric mappings open the same exact native counter in one query.
+/// Guarantees: PDH accepts both handles and collection routes a ready point to each mapping.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+async fn live_pdh_collects_one_path_for_multiple_mappings() {
+    let _serial = super::super::TEST_PDH_LOCK.lock().await;
+    let path = r"\Memory\Available Bytes";
+    let configs = vec![
+        counter(path, "windows.memory.available"),
+        counter(path, "windows.memory.available_copy"),
+    ];
+    let mut query = open_live_query(configs, "same-path-mappings");
+
+    let sample = query.collect().unwrap();
+    assert!(sample.failures.is_empty(), "{:?}", sample.failures);
+    assert_eq!(
+        sample
+            .points
+            .iter()
+            .map(|point| point.counter_index)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert!(sample.points.iter().all(
+        |point| matches!(point.value, SampleValue::Value(Number::Integer(value)) if value >= 0)
+    ));
 }
 
 /// Scenario: Two native queries collect exact direct counters repeatedly and are dropped independently.
