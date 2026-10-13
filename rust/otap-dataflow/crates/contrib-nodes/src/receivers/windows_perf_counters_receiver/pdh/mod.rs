@@ -1331,6 +1331,14 @@ impl<A: PdhApi> Query<A> {
         Ok(())
     }
 
+    fn record_prime_failure(&mut self, error: &Error) {
+        self.pending.diagnostics.counter_read_failures +=
+            u64::try_from(self.configs.len()).unwrap_or(u64::MAX);
+        self.pending.failures.extend(
+            (0..self.configs.len()).map(|counter_index| sample_failure(counter_index, error)),
+        );
+    }
+
     fn collect(&mut self) -> Result<Sample, Error> {
         let pending = std::mem::take(&mut self.pending);
         let mut diagnostics = pending.diagnostics;
@@ -1517,13 +1525,6 @@ impl Worker {
         max_expanded_counters: usize,
         node: String,
     ) -> Result<Self, Error> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let (init_tx, init_rx) = oneshot::channel();
-        let (completion_tx, completion_rx) = oneshot::channel();
-        let accepted = Arc::new(AtomicBool::new(false));
-        let worker_accepted = Arc::clone(&accepted);
-        let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let worker_shutdown = Arc::clone(&shutdown_requested);
         let settings = QuerySettings {
             counters,
             wildcard_refresh_interval,
@@ -1531,26 +1532,45 @@ impl Worker {
             max_expanded_counters,
             node,
         };
+        Self::start_with(wildcard_refresh_interval, move || settings.open()).await
+    }
+
+    async fn start_with<A, F>(query_retry_cap: Duration, mut open: F) -> Result<Self, Error>
+    where
+        A: PdhApi + 'static,
+        F: FnMut() -> Result<Query<A>, Error> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (init_tx, init_rx) = oneshot::channel();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let worker_accepted = Arc::clone(&accepted);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown_requested);
         let join = std::thread::Builder::new()
             .name("windowsperfcounters-pdh".to_owned())
             .spawn(move || {
                 {
-                    let mut query = match settings.open() {
+                    let mut query = match open() {
                         Ok(query) => query,
                         Err(error) => {
                             let _ = init_tx.send(Err(error));
                             return;
                         }
                     };
-                    if let Err(error) = query.prime() {
-                        let _ = init_tx.send(Err(error));
-                        return;
+                    let prime_error = query.prime().err();
+                    if let Some(error) = &prime_error {
+                        query.record_prime_failure(error);
                     }
                     if init_tx.send(Ok(())).is_err() {
                         return;
                     }
                     let mut query = Some(query);
-                    let mut query_failure_attempts = 0_u32;
+                    let mut query_failure_attempts = u32::from(
+                        prime_error
+                            .as_ref()
+                            .is_some_and(Error::is_query_collection_failure),
+                    );
                     let mut next_query_retry = Instant::now();
                     let mut rebuild_attempts = 0_u32;
                     let mut next_rebuild = Instant::now();
@@ -1585,7 +1605,7 @@ impl Worker {
                                     })
                                 } else {
                                     pending.diagnostics.query_rebuild_attempts += 1;
-                                    match settings.open() {
+                                    match open() {
                                         Ok(rebuilt) => {
                                             pending.diagnostics.query_rebuild_recoveries += 1;
                                             rebuild_attempts = 0;
@@ -1600,10 +1620,7 @@ impl Worker {
                                         Err(error) => {
                                             rebuild_attempts = rebuild_attempts.saturating_add(1);
                                             next_rebuild = now
-                                                + retry_delay(
-                                                    rebuild_attempts,
-                                                    settings.wildcard_refresh_interval,
-                                                );
+                                                + retry_delay(rebuild_attempts, query_retry_cap);
                                             Err(error)
                                         }
                                     }
@@ -1614,11 +1631,8 @@ impl Worker {
                                 {
                                     query_failure_attempts =
                                         query_failure_attempts.saturating_add(1);
-                                    next_query_retry = now
-                                        + retry_delay(
-                                            query_failure_attempts,
-                                            settings.wildcard_refresh_interval,
-                                        );
+                                    next_query_retry =
+                                        now + retry_delay(query_failure_attempts, query_retry_cap);
                                     if should_rebuild_query(query_failure_attempts) {
                                         if let Some(active_query) = query.as_mut() {
                                             active_query.move_pending_metadata_to(
@@ -1644,8 +1658,7 @@ impl Worker {
                                     }
                                     query = None;
                                     rebuild_attempts = 0;
-                                    next_rebuild =
-                                        now + retry_delay(1, settings.wildcard_refresh_interval);
+                                    next_rebuild = now + retry_delay(1, query_retry_cap);
                                 } else if result.is_ok() {
                                     if was_query_retry {
                                         pending.diagnostics.retry_recoveries += 1;

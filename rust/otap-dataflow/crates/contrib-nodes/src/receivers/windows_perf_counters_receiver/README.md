@@ -274,9 +274,10 @@ For example, `\Memory\Available Bytes` remains an exact byte count with unit
 The receiver opens the PDH query on its worker and performs one startup
 collection without emitting points. This prime seeds valid native and
 receiver-side sample history before `initial_delay` and the first scheduled
-scrape. A hard query or timestamp failure during priming fails initialization.
-No-data, invalid, or counter-local failures retain their normal omission and
-diagnostic behavior without fabricating readiness.
+scrape. A priming collection, timestamp, or refresh failure is retained as
+bounded diagnostics while the worker starts and follows its normal retry and
+query-rebuild policy. No-data, invalid, or counter-local failures retain their
+normal omission and diagnostic behavior without fabricating readiness.
 
 - Wildcards are expanded at startup and then at
   `wildcard_refresh_interval`. Concrete paths are joined by configured counter

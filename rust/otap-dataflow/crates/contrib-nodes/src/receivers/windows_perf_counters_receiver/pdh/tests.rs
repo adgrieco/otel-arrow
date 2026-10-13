@@ -194,6 +194,69 @@ impl PdhApi for FakePdh {
     }
 }
 
+struct RecoveringPrimePdh {
+    collect_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PdhApi for RecoveringPrimePdh {
+    type Counter = ();
+
+    fn add(&mut self, _path: &str, _localized: bool) -> Result<Self::Counter, Error> {
+        Ok(())
+    }
+
+    fn remove(&mut self, _counter: &Self::Counter, _path: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn counter_type(&mut self, _counter: &Self::Counter, _path: &str) -> Result<u32, Error> {
+        Ok(0x2041_0500)
+    }
+
+    fn collect(&mut self) -> Result<bool, Error> {
+        if self.collect_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            Err(Error::Pdh {
+                operation: "PdhCollectQueryData",
+                path: "<query>".to_owned(),
+                status: 1,
+            })
+        } else {
+            Ok(true)
+        }
+    }
+
+    fn raw(&mut self, _counter: &Self::Counter, _path: &str) -> Result<Option<RawSample>, Error> {
+        Ok(Some(RawSample {
+            second_value: i64::try_from(self.collect_calls.load(Ordering::Relaxed))
+                .unwrap_or(i64::MAX),
+            multi_count: 1,
+        }))
+    }
+
+    fn formatted(
+        &mut self,
+        _counter: &Self::Counter,
+        _path: &str,
+        _format: ValueFormat,
+    ) -> Result<Option<Number>, Error> {
+        Ok(Some(Number::Double(1.0)))
+    }
+
+    fn timestamp(&mut self) -> Result<i64, Error> {
+        Ok(100 + i64::try_from(self.collect_calls.load(Ordering::Relaxed)).unwrap_or(i64::MAX))
+    }
+
+    fn expand(&mut self, _path: &str) -> Result<Vec<String>, Error> {
+        Ok(Vec::new())
+    }
+
+    fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
+        Err(Error::InvalidCounterToken {
+            path: path.to_owned(),
+        })
+    }
+}
+
 fn fake_query(
     configs: Vec<CounterConfig>,
     counters: Vec<FakeCounter>,
@@ -379,6 +442,50 @@ fn startup_prime_preserves_counter_failures() {
     assert_eq!(sample.failures.len(), 1);
     assert_eq!(sample.failures[0].counter_index, 0);
     assert_eq!(sample.diagnostics.counter_read_failures, 1);
+}
+
+/// Scenario: The worker's startup prime receives a hard query collection failure.
+/// Guarantees: Startup succeeds, the first scrape warms, and later collection recovers through normal retry state.
+#[tokio::test(flavor = "current_thread")]
+async fn startup_prime_query_failure_starts_and_recovers() {
+    let path = r"\Processor(_Total)\% Processor Time";
+    let counters = vec![counter(path, "system.cpu.time")];
+    let collect_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factory_calls = Arc::clone(&collect_calls);
+    let mut worker = Worker::start_with(Duration::from_secs(30), move || {
+        Query::open_with(
+            RecoveringPrimePdh {
+                collect_calls: Arc::clone(&factory_calls),
+            },
+            counters.clone(),
+            Duration::from_secs(30),
+            256,
+            4_096,
+        )
+    })
+    .await
+    .unwrap();
+
+    let warming = worker.collect().await.unwrap();
+    assert_eq!(warming.points[0].value, SampleValue::Warming);
+    assert_eq!(warming.failures.len(), 1);
+    assert_eq!(warming.failures[0].counter_index, 0);
+    assert_eq!(warming.failures[0].reason, "PdhCollectQueryData");
+    assert_eq!(warming.diagnostics.counter_read_failures, 1);
+    assert_eq!(warming.diagnostics.retry_attempts, 1);
+    assert_eq!(warming.diagnostics.retry_recoveries, 1);
+
+    let recovered = worker.collect().await.unwrap();
+    assert!(matches!(
+        recovered.points[0].value,
+        SampleValue::Value(Number::Double(1.0))
+    ));
+    assert!(
+        worker
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap()
+    );
 }
 
 /// Scenario: One exact configured path names a duplicate process instance.
