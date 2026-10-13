@@ -82,6 +82,9 @@ least that interval. Both expansion limits must be between
 limit. Normalization produces between 1 and 256 configured exact or wildcard
 paths, bounding query setup and native handles independently from wildcard
 membership. Zero or negative `initial_delay` starts collection immediately.
+Sub-second collection intervals are accepted, matching Go, but rate and other
+two-sample counters generally need about one second or more between samples to
+produce meaningful values.
 
 ### Metric options
 
