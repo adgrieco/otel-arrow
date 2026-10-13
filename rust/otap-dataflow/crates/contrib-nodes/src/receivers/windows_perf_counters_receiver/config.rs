@@ -63,7 +63,7 @@ enum Aggregation {
 pub(super) struct Config {
     /// Exact or instance-wildcard counters to collect.
     pub(super) counters: Vec<CounterConfig>,
-    /// Time between collections; defaults to 30 seconds.
+    /// Time between collections; defaults to one minute.
     pub(super) collection_interval: Duration,
     /// Delay before the first collection request; defaults to one second.
     pub(super) initial_delay: Duration,
@@ -210,7 +210,7 @@ struct CounterMapping {
 }
 
 fn default_interval() -> Duration {
-    Duration::from_secs(30)
+    Duration::from_secs(60)
 }
 
 fn default_initial_delay() -> Duration {
@@ -717,9 +717,9 @@ mod tests {
         assert_eq!(config.counters[1].attributes["state"], "active");
         assert_eq!(config.counters[2].attributes["state"], "idle");
         assert_eq!(config.counters[1].excluded_aggregation_instance, None);
-        assert_eq!(config.collection_interval, Duration::from_secs(30));
+        assert_eq!(config.collection_interval, Duration::from_secs(60));
         assert_eq!(config.initial_delay, Duration::from_secs(1));
-        assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(30));
+        assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(60));
     }
 
     /// Scenario: A cumulative Sum omits its optional monotonic setting.

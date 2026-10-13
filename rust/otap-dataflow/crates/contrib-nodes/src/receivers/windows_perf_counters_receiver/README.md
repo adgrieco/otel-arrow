@@ -70,7 +70,7 @@ config:
 | `metrics` | No | Empty | Optional metric metadata keyed by OTel metric name |
 | `perfcounters` | Yes | None | Performance objects and counter mappings |
 | `initial_delay` | No | `1s` | Delay before the first collection request |
-| `collection_interval` | No | `30s` | Interval from `1s` through `24h` |
+| `collection_interval` | No | `1m` | Interval from `1s` through `24h` |
 | `wildcard_refresh_interval` | No | See below | Wildcard discovery cadence |
 | `max_instances_per_wildcard` | No | `256` | Per-path expansion limit |
 | `max_expanded_counters` | No | `4096` | Receiver-wide expansion limit |
