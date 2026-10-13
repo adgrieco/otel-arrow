@@ -4,7 +4,7 @@
 //! Owns native handles, aligned metadata storage, and PDH status/value decoding.
 #![allow(unsafe_code)]
 
-use super::{Error, InstanceIdentity, Number, PdhApi, ValueFormat};
+use super::{Error, InstanceIdentity, Number, PdhApi, RawSample, ValueFormat};
 use std::mem::{size_of, size_of_val};
 use std::ptr::{null, null_mut};
 use std::slice;
@@ -353,7 +353,7 @@ impl NativePdh {
     pub(super) fn raw_with(
         path: &str,
         read: impl FnOnce(&mut PDH_RAW_COUNTER) -> u32,
-    ) -> Result<Option<i64>, Error> {
+    ) -> Result<Option<RawSample>, Error> {
         let mut raw = PDH_RAW_COUNTER::default();
         let status = read(&mut raw);
         if is_no_observation_status(status) {
@@ -364,7 +364,10 @@ impl NativePdh {
             return Ok(None);
         }
         check_data("raw counter CStatus", path, raw.CStatus)?;
-        Ok(Some(raw.SecondValue))
+        Ok(Some(RawSample {
+            second_value: raw.SecondValue,
+            multi_count: raw.MultiCount,
+        }))
     }
 
     pub(super) fn counter_type_with(
@@ -508,7 +511,7 @@ impl PdhApi for NativePdh {
         Self::collect_status(unsafe { PdhCollectQueryData(self.query) })
     }
 
-    fn raw(&mut self, counter: &CounterToken, path: &str) -> Result<Option<i64>, Error> {
+    fn raw(&mut self, counter: &CounterToken, path: &str) -> Result<Option<RawSample>, Error> {
         let handle = self.counter_handle(counter, path)?;
         Self::raw_with(path, |raw| {
             // SAFETY: Lookup returned an owned, live counter and the adapter
@@ -601,7 +604,7 @@ mod tests {
         }
     }
 
-    /// Scenario: Windows formats rate, delta, percentage, fraction and average successive samples.
+    /// Scenario: Windows formats successive rate, delta, timer, fraction and average samples.
     /// Guarantees: Native formulas preserve delta differences, CPU above 100 percent, and no display scaling.
     #[test]
     fn native_formulas_from_raw_fixtures() {
@@ -624,6 +627,82 @@ mod tests {
                 CStatus: PDH_CSTATUS_VALID_DATA,
                 FirstValue: previous_first,
                 SecondValue: previous_second,
+                ..Default::default()
+            };
+            let value =
+                NativePdh::formatted_with("fixture", ValueFormat::Double, |flags, value| {
+                    // SAFETY: All pointers reference initialized fixture values and writable output.
+                    unsafe {
+                        PdhFormatFromRawValue(
+                            native_type,
+                            flags,
+                            &time_base,
+                            &current,
+                            &previous,
+                            value,
+                        )
+                    }
+                })
+                .unwrap();
+            let Some(Number::Double(actual)) = value else {
+                panic!("successful native double formatting must return a double");
+            };
+            assert!((actual - expected).abs() < 1e-9);
+        }
+    }
+
+    /// Scenario: Windows formats elapsed time from one raw sample and no previous sample.
+    /// Guarantees: PERF_ELAPSED_TIME uses the current object timestamp and frequency without two-sample warm-up.
+    #[test]
+    fn native_elapsed_formula_from_single_raw_fixture() {
+        let current = PDH_RAW_COUNTER {
+            CStatus: PDH_CSTATUS_VALID_DATA,
+            FirstValue: 100,
+            SecondValue: 250,
+            ..Default::default()
+        };
+        let time_base = 10;
+        let value = NativePdh::formatted_with("fixture", ValueFormat::Double, |flags, value| {
+            // SAFETY: Current and output point to initialized storage; elapsed time needs no older raw sample.
+            unsafe {
+                PdhFormatFromRawValue(0x3024_0500, flags, &time_base, &current, null(), value)
+            }
+        })
+        .unwrap();
+        assert_eq!(value, Some(Number::Double(15.0)));
+    }
+
+    /// Scenario: Windows formats normal and inverse system-clock and 100-nanosecond multi-timers.
+    /// Guarantees: PDH consumes each current native MultiCount without capping percentages above 100.
+    #[test]
+    fn native_multi_timer_formulas_from_raw_fixtures() {
+        for (
+            native_type,
+            first,
+            second,
+            previous_first,
+            previous_second,
+            time_base,
+            multi_count,
+            expected,
+        ) in [
+            (0x2241_0500, 160, 12, 100, 10, 10, 4, 750.0),
+            (0x2341_0500, 102, 20, 100, 10, 10, 4, 380.0),
+            (0x2251_0500, 150, 200, 100, 180, 10_000_000, 4, 62.5),
+            (0x2351_0500, 150, 200, 100, 180, 10_000_000, 4, 150.0),
+        ] {
+            let current = PDH_RAW_COUNTER {
+                CStatus: PDH_CSTATUS_VALID_DATA,
+                FirstValue: first,
+                SecondValue: second,
+                MultiCount: multi_count,
+                ..Default::default()
+            };
+            let previous = PDH_RAW_COUNTER {
+                CStatus: PDH_CSTATUS_VALID_DATA,
+                FirstValue: previous_first,
+                SecondValue: previous_second,
+                MultiCount: multi_count,
                 ..Default::default()
             };
             let value =
@@ -698,10 +777,14 @@ mod tests {
             NativePdh::raw_with("fixture", |raw| {
                 raw.CStatus = PDH_CSTATUS_VALID_DATA;
                 raw.SecondValue = 42;
+                raw.MultiCount = 3;
                 0
             })
             .unwrap(),
-            Some(42)
+            Some(RawSample {
+                second_value: 42,
+                multi_count: 3,
+            })
         );
         assert!(NativePdh::raw_with("fixture", |_| PDH_INVALID_ARGUMENT).is_err());
     }

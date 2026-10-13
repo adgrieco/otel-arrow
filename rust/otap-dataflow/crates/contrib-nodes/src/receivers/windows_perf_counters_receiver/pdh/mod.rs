@@ -159,6 +159,13 @@ pub(super) enum ValueFormat {
     Double,
 }
 
+/// Checked native fields used to validate receiver-side sampling state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RawSample {
+    second_value: i64,
+    multi_count: u32,
+}
+
 /// Owns an open query and its counters; raw handles and unchecked statuses stay native.
 pub(super) trait PdhApi {
     type Counter;
@@ -168,8 +175,8 @@ pub(super) trait PdhApi {
     fn counter_type(&mut self, counter: &Self::Counter, path: &str) -> Result<u32, Error>;
     /// Returns whether collection has data; an expected omission returns false.
     fn collect(&mut self) -> Result<bool, Error>;
-    /// Returns a checked raw base, an expected omission, or a validated failure.
-    fn raw(&mut self, counter: &Self::Counter, path: &str) -> Result<Option<i64>, Error>;
+    /// Returns checked raw sampling fields, an expected omission, or a validated failure.
+    fn raw(&mut self, counter: &Self::Counter, path: &str) -> Result<Option<RawSample>, Error>;
     /// Returns an unscaled value, an expected omission, or a validated failure.
     fn formatted(
         &mut self,
@@ -222,6 +229,17 @@ fn validate_positive_base(path: &str, base: i64) -> Result<(), Error> {
         Err(Error::Calculation {
             path: path.to_owned(),
             message: format!("base denominator must be positive, got {base}"),
+        })
+    }
+}
+
+fn validate_positive_multi_base(path: &str, base: u32) -> Result<(), Error> {
+    if base > 0 {
+        Ok(())
+    } else {
+        Err(Error::Calculation {
+            path: path.to_owned(),
+            message: "multi-counter base denominator must be positive, got 0".to_owned(),
         })
     }
 }
@@ -690,9 +708,12 @@ impl<C> CounterHandle<C> {
         metric_kind: MetricKind,
         timestamp_unix_nano: i64,
     ) -> Result<(SampleValue, Option<i64>), Error> {
-        if self.kind != CounterKind::Direct {
-            let base = match api.raw(&self.handle, &self.path) {
-                Ok(Some(base)) => base,
+        if !matches!(
+            self.kind,
+            CounterKind::Direct | CounterKind::FormattedSingleSample
+        ) {
+            let raw = match api.raw(&self.handle, &self.path) {
+                Ok(Some(raw)) => raw,
                 Ok(None) => {
                     self.reset_readiness();
                     return Ok((SampleValue::NoObservation, None));
@@ -703,16 +724,22 @@ impl<C> CounterHandle<C> {
                 }
             };
             if self.kind == CounterKind::RawFraction {
-                validate_positive_base(&self.path, base)?;
+                validate_positive_base(&self.path, raw.second_value)?;
             } else {
-                let Some(previous) = self.history.previous_base.replace(base) else {
+                if self.kind == CounterKind::CalculatedTwoSampleWithMultiBase
+                    && let Err(error) = validate_positive_multi_base(&self.path, raw.multi_count)
+                {
+                    self.reset_readiness();
+                    return Err(error);
+                }
+                let Some(previous) = self.history.previous_base.replace(raw.second_value) else {
                     if self.kind == CounterKind::Delta {
                         self.history.delta_baseline_unix_nano = Some(timestamp_unix_nano);
                     }
                     return Ok((SampleValue::Warming, None));
                 };
                 if self.kind == CounterKind::CalculatedTwoSampleWithBase {
-                    match base.cmp(&previous) {
+                    match raw.second_value.cmp(&previous) {
                         std::cmp::Ordering::Less => {
                             self.reset_readiness();
                             return Ok((SampleValue::NoObservation, None));

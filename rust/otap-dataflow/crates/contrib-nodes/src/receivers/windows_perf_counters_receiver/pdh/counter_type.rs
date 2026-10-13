@@ -7,11 +7,12 @@
 //! <https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/winperf.h>.
 
 use windows_sys::Win32::System::Performance::{
-    PERF_COUNTER_FRACTION, PERF_COUNTER_PRECISION, PERF_COUNTER_QUEUELEN, PERF_COUNTER_RATE,
-    PERF_DELTA_BASE, PERF_DELTA_COUNTER, PERF_DISPLAY_NO_SUFFIX, PERF_DISPLAY_NOSHOW,
-    PERF_DISPLAY_PER_SEC, PERF_DISPLAY_PERCENT, PERF_DISPLAY_SECONDS, PERF_INVERSE_COUNTER,
-    PERF_NUMBER_DECIMAL, PERF_NUMBER_HEX, PERF_OBJECT_TIMER, PERF_SIZE_DWORD, PERF_SIZE_LARGE,
-    PERF_TIMER_100NS, PERF_TYPE_COUNTER, PERF_TYPE_NUMBER,
+    PERF_COUNTER_ELAPSED, PERF_COUNTER_FRACTION, PERF_COUNTER_PRECISION, PERF_COUNTER_QUEUELEN,
+    PERF_COUNTER_RATE, PERF_DELTA_BASE, PERF_DELTA_COUNTER, PERF_DISPLAY_NO_SUFFIX,
+    PERF_DISPLAY_NOSHOW, PERF_DISPLAY_PER_SEC, PERF_DISPLAY_PERCENT, PERF_DISPLAY_SECONDS,
+    PERF_INVERSE_COUNTER, PERF_MULTI_COUNTER, PERF_NUMBER_DECIMAL, PERF_NUMBER_HEX,
+    PERF_OBJECT_TIMER, PERF_SIZE_DWORD, PERF_SIZE_LARGE, PERF_TIMER_100NS, PERF_TYPE_COUNTER,
+    PERF_TYPE_NUMBER,
 };
 
 // TODO: Replace these composite definitions with windows-sys constants once released.
@@ -55,7 +56,16 @@ const PERF_COUNTER_TIMER: u32 = PERF_SIZE_LARGE
 const PERF_COUNTER_TIMER_INV: u32 = PERF_COUNTER_TIMER | PERF_INVERSE_COUNTER;
 const PERF_100NSEC_TIMER: u32 = PERF_COUNTER_TIMER | PERF_TIMER_100NS;
 const PERF_100NSEC_TIMER_INV: u32 = PERF_100NSEC_TIMER | PERF_INVERSE_COUNTER;
+const PERF_COUNTER_MULTI_TIMER: u32 = PERF_COUNTER_TIMER | PERF_MULTI_COUNTER;
+const PERF_COUNTER_MULTI_TIMER_INV: u32 = PERF_COUNTER_MULTI_TIMER | PERF_INVERSE_COUNTER;
+const PERF_100NSEC_MULTI_TIMER: u32 = PERF_100NSEC_TIMER | PERF_MULTI_COUNTER;
+const PERF_100NSEC_MULTI_TIMER_INV: u32 = PERF_100NSEC_MULTI_TIMER | PERF_INVERSE_COUNTER;
 const PERF_OBJ_TIME_TIMER: u32 = PERF_COUNTER_TIMER | PERF_OBJECT_TIMER;
+const PERF_ELAPSED_TIME: u32 = PERF_SIZE_LARGE
+    | PERF_TYPE_COUNTER
+    | PERF_COUNTER_ELAPSED
+    | PERF_OBJECT_TIMER
+    | PERF_DISPLAY_SECONDS;
 const PERF_PRECISION_SYSTEM_TIMER: u32 = PERF_SIZE_LARGE
     | PERF_TYPE_COUNTER
     | PERF_COUNTER_PRECISION
@@ -92,6 +102,8 @@ const PERF_AVERAGE_BULK: u32 =
 pub(super) enum CounterKind {
     /// A raw count requiring only the current sample.
     Direct,
+    /// A PDH-formatted calculation requiring only the current sample.
+    FormattedSingleSample,
     /// A fraction requiring the current numerator and a positive current base.
     RawFraction,
     /// A PDH formula requiring successive samples (including private-clock timers).
@@ -100,6 +112,8 @@ pub(super) enum CounterKind {
     Delta,
     /// A fraction or average requiring successive samples and advancing base values.
     CalculatedTwoSampleWithBase,
+    /// A successive-sample timer requiring a positive current multi-counter base.
+    CalculatedTwoSampleWithMultiBase,
 }
 
 /// Metadata outside the supported native-type allowlist.
@@ -107,7 +121,7 @@ pub(super) enum CounterKind {
 #[error(
     "unsupported native counter type 0x{native_type:08X} for {path}; \
      supported types are direct raw counts, rates, deltas, queue lengths, \
-     single-counter timers, fractions, and averages"
+     timers, elapsed time, fractions, and averages"
 )]
 pub(in super::super) struct UnsupportedNativeType {
     /// Counter path to identify the unsupported observation source.
@@ -118,8 +132,7 @@ pub(in super::super) struct UnsupportedNativeType {
 
 /// Classify exact SDK types; unknown flag combinations must not inherit support.
 ///
-/// Standalone bases, text and no-data types are not observations. Elapsed-time
-/// and multi-timer support remains undecided and is deliberately excluded.
+/// Standalone bases, text and no-data types are not observations.
 pub(super) fn classify_native_type(
     path: &str,
     native_type: u32,
@@ -129,6 +142,7 @@ pub(super) fn classify_native_type(
         | PERF_COUNTER_LARGE_RAWCOUNT
         | PERF_COUNTER_RAWCOUNT_HEX
         | PERF_COUNTER_LARGE_RAWCOUNT_HEX => Ok(CounterKind::Direct),
+        PERF_ELAPSED_TIME => Ok(CounterKind::FormattedSingleSample),
         PERF_COUNTER_COUNTER
         | PERF_COUNTER_BULK_COUNT
         | PERF_COUNTER_QUEUELEN_TYPE
@@ -144,6 +158,10 @@ pub(super) fn classify_native_type(
         | PERF_PRECISION_100NS_TIMER
         | PERF_PRECISION_OBJECT_TIMER
         | PERF_SAMPLE_COUNTER => Ok(CounterKind::CalculatedTwoSample),
+        PERF_COUNTER_MULTI_TIMER
+        | PERF_COUNTER_MULTI_TIMER_INV
+        | PERF_100NSEC_MULTI_TIMER
+        | PERF_100NSEC_MULTI_TIMER_INV => Ok(CounterKind::CalculatedTwoSampleWithMultiBase),
         PERF_COUNTER_DELTA | PERF_COUNTER_LARGE_DELTA => Ok(CounterKind::Delta),
         PERF_SAMPLE_FRACTION | PERF_AVERAGE_TIMER | PERF_AVERAGE_BULK => {
             Ok(CounterKind::CalculatedTwoSampleWithBase)
@@ -197,6 +215,28 @@ mod tests {
             assert_eq!(
                 classify_native_type("calculated", native_type).unwrap(),
                 CounterKind::CalculatedTwoSample,
+                "native type 0x{native_type:08X}"
+            );
+        }
+    }
+
+    /// Scenario: SDK metadata describes elapsed time and normal or inverse multi-timers.
+    /// Guarantees: Elapsed time formats from one sample while every multi-timer requires two samples and a native base.
+    #[test]
+    fn classifies_elapsed_and_multi_timers() {
+        assert_eq!(
+            classify_native_type("elapsed", 0x3024_0500).unwrap(),
+            CounterKind::FormattedSingleSample
+        );
+        for native_type in [
+            0x2241_0500, // PERF_COUNTER_MULTI_TIMER
+            0x2341_0500, // PERF_COUNTER_MULTI_TIMER_INV
+            0x2251_0500, // PERF_100NSEC_MULTI_TIMER
+            0x2351_0500, // PERF_100NSEC_MULTI_TIMER_INV
+        ] {
+            assert_eq!(
+                classify_native_type("multi timer", native_type).unwrap(),
+                CounterKind::CalculatedTwoSampleWithMultiBase,
                 "native type 0x{native_type:08X}"
             );
         }
@@ -263,19 +303,14 @@ mod tests {
         }
     }
 
-    /// Scenario: Metadata describes nonnumeric types or elapsed/multi-timer families without policy.
-    /// Guarantees: No-data, text, histogram and undecided timer types do not become observations.
+    /// Scenario: Metadata describes nonnumeric or histogram counter types.
+    /// Guarantees: No-data, text and histogram types do not become observations.
     #[test]
-    fn rejects_non_observations_and_undecided_families() {
+    fn rejects_non_observations() {
         for native_type in [
             0x0000_0B00, // PERF_COUNTER_TEXT
             0x4000_0200, // PERF_COUNTER_NODATA
             0x8000_0000, // PERF_COUNTER_HISTOGRAM_TYPE
-            0x3024_0500, // PERF_ELAPSED_TIME
-            0x2241_0500, // PERF_COUNTER_MULTI_TIMER
-            0x2341_0500, // PERF_COUNTER_MULTI_TIMER_INV
-            0x2251_0500, // PERF_100NSEC_MULTI_TIMER
-            0x2351_0500, // PERF_100NSEC_MULTI_TIMER_INV
         ] {
             let error = classify_native_type("unsupported", native_type).unwrap_err();
             assert_eq!(error.native_type, native_type);

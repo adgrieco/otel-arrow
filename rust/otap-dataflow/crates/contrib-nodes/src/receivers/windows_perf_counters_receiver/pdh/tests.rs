@@ -59,6 +59,7 @@ struct FakeCounter {
     path: String,
     native_type: u32,
     raw: Option<i64>,
+    multi_count: u32,
     formatted: Option<Number>,
     raw_error: bool,
     formatted_error: bool,
@@ -127,7 +128,7 @@ impl PdhApi for FakePdh {
         }
     }
 
-    fn raw(&mut self, counter: &Self::Counter, path: &str) -> Result<Option<i64>, Error> {
+    fn raw(&mut self, counter: &Self::Counter, path: &str) -> Result<Option<RawSample>, Error> {
         let state = self.0.borrow();
         let counter = &state.counters[*counter];
         if counter.raw_error {
@@ -137,7 +138,10 @@ impl PdhApi for FakePdh {
                 status: 1,
             })
         } else {
-            Ok(counter.raw)
+            Ok(counter.raw.map(|second_value| RawSample {
+                second_value,
+                multi_count: counter.multi_count,
+            }))
         }
     }
 
@@ -231,6 +235,7 @@ fn same_path_mappings_use_independent_query_entries() {
             path: path.to_owned(),
             native_type: 0x0001_0100,
             raw: None,
+            multi_count: 1,
             formatted: Some(Number::Integer(42)),
             raw_error: false,
             formatted_error: false,
@@ -269,6 +274,7 @@ fn exact_instance_path_preserves_identity() {
             path: path.to_owned(),
             native_type: 0x0001_0100,
             raw: None,
+            multi_count: 1,
             formatted: Some(Number::Integer(42)),
             raw_error: false,
             formatted_error: false,
@@ -296,6 +302,7 @@ fn setup_diagnostic_preserves_cleanup_failure() {
             path: path.to_owned(),
             native_type: 0x4003_0401,
             raw: None,
+            multi_count: 1,
             formatted: None,
             raw_error: false,
             formatted_error: false,
@@ -1069,6 +1076,40 @@ async fn live_pdh_calculated_counters() {
     assert!(into_otap(&configs, sample).unwrap().is_some());
 }
 
+/// Scenario: Live Windows PDH reads system elapsed time and a processor multi-timer.
+/// Guarantees: Elapsed time emits on the first collection while the multi-timer warms and later emits a finite value.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+async fn live_pdh_elapsed_and_multi_timer_counters() {
+    let _serial = super::super::TEST_PDH_LOCK.lock().await;
+    let configs = vec![
+        counter(r"\System\System Up Time", "system.uptime"),
+        counter(
+            r"\Processor Information(_Total)\% Processor Utility",
+            "system.cpu.utility",
+        ),
+    ];
+    let mut query = open_live_query(configs.clone(), "elapsed-multi");
+    let first = query.collect().unwrap();
+    assert!(first.failures.is_empty(), "{:?}", first.failures);
+    assert!(matches!(
+        first.points[0].value,
+        SampleValue::Value(Number::Double(value)) if value.is_finite() && value >= 0.0
+    ));
+    assert_eq!(first.points[1].value, SampleValue::Warming);
+
+    std::thread::sleep(Duration::from_millis(250));
+    let second = query.collect().unwrap();
+    assert!(second.failures.is_empty(), "{:?}", second.failures);
+    assert!(second.points.iter().all(|point| {
+        matches!(
+            point.value,
+            SampleValue::Value(Number::Double(value)) if value.is_finite() && value >= 0.0
+        )
+    }));
+    assert!(into_otap(&configs, second).unwrap().is_some());
+}
+
 /// Scenario: An invalid exact path is configured beside a valid counter and then by itself.
 /// Guarantees: Healthy collection continues, while an all-invalid set starts empty with diagnostics.
 #[tokio::test(flavor = "current_thread")]
@@ -1328,6 +1369,7 @@ fn query_rollback_during_omission_resets_monotonic_sequence() {
             path: path.to_owned(),
             native_type: 0,
             raw: None,
+            multi_count: 1,
             formatted: Some(Number::Integer(20)),
             raw_error: false,
             formatted_error: false,
@@ -1367,6 +1409,7 @@ fn formatted_transient_preserves_monotonic_sequence() {
             path: path.to_owned(),
             native_type: 0,
             raw: None,
+            multi_count: 1,
             formatted: Some(Number::Integer(20)),
             raw_error: false,
             formatted_error: false,
@@ -1410,6 +1453,7 @@ fn collection_failures_restart_calculated_readiness() {
             path: path.to_owned(),
             native_type: 0x4002_0500,
             raw: Some(10),
+            multi_count: 1,
             formatted: Some(Number::Double(4.0)),
             raw_error: false,
             formatted_error: false,
@@ -1471,6 +1515,82 @@ fn collection_failures_restart_calculated_readiness() {
     assert_eq!(
         query.collect().unwrap().points[0].value,
         SampleValue::Warming
+    );
+}
+
+/// Scenario: An elapsed-time counter has one valid collected sample.
+/// Guarantees: The receiver emits PDH's formatted seconds immediately without two-sample warm-up.
+#[test]
+fn elapsed_time_emits_from_first_sample() {
+    let path = r"\System\System Up Time";
+    let (_, mut query) = fake_query(
+        vec![counter(path, "system.uptime")],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x3024_0500,
+            raw: None,
+            multi_count: 1,
+            formatted: Some(Number::Double(42.5)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Value(Number::Double(42.5))
+    );
+}
+
+/// Scenario: A multi-timer warms, receives a zero native multi-counter base, then recovers.
+/// Guarantees: Zero is diagnosed without division and clears readiness before later samples resume.
+#[test]
+fn multi_timer_validates_base_and_restarts_readiness() {
+    let path = r"\Processor Information(_Total)\% Processor Utility";
+    let (state, mut query) = fake_query(
+        vec![counter(path, "system.cpu.utility")],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x2351_0500,
+            raw: Some(10),
+            multi_count: 4,
+            formatted: Some(Number::Double(25.0)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Warming
+    );
+    {
+        let mut state = state.borrow_mut();
+        state.counters[0].raw = Some(20);
+        state.counters[0].multi_count = 0;
+    }
+    let sample = query.collect().unwrap();
+    assert!(sample.points.is_empty());
+    assert_eq!(sample.failures.len(), 1);
+    assert!(
+        sample.failures[0]
+            .error
+            .contains("multi-counter base denominator must be positive")
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.counters[0].raw = Some(30);
+        state.counters[0].multi_count = 4;
+    }
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Warming
+    );
+    state.borrow_mut().counters[0].raw = Some(40);
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Value(Number::Double(25.0))
     );
 }
 
@@ -1606,6 +1726,7 @@ fn isolates_invalid_delta_sum_mapping() {
                 path: direct_path.to_owned(),
                 native_type: 0x0001_0100,
                 raw: None,
+                multi_count: 1,
                 formatted: Some(Number::Integer(42)),
                 raw_error: false,
                 formatted_error: false,
@@ -1614,6 +1735,7 @@ fn isolates_invalid_delta_sum_mapping() {
                 path: invalid_path.to_owned(),
                 native_type: 0x2041_0500,
                 raw: Some(10),
+                multi_count: 1,
                 formatted: Some(Number::Double(1.0)),
                 raw_error: false,
                 formatted_error: false,
@@ -1642,6 +1764,7 @@ fn delta_sum_tracks_previous_valid_sample_intervals() {
             path: path.to_owned(),
             native_type: 0x0040_0500,
             raw: Some(10),
+            multi_count: 1,
             formatted: Some(Number::Double(2.0)),
             raw_error: false,
             formatted_error: false,
@@ -1720,6 +1843,7 @@ fn delta_sum_transient_restarts_interval_readiness() {
             path: path.to_owned(),
             native_type: 0x0040_0500,
             raw: Some(10),
+            multi_count: 1,
             formatted: Some(Number::Double(2.0)),
             raw_error: false,
             formatted_error: false,
@@ -1773,6 +1897,7 @@ fn delta_sum_collection_gaps_restart_interval_readiness() {
             path: path.to_owned(),
             native_type: 0x0040_0500,
             raw: Some(10),
+            multi_count: 1,
             formatted: Some(Number::Double(2.0)),
             raw_error: false,
             formatted_error: false,
@@ -1840,6 +1965,7 @@ fn delta_sum_negative_values_follow_monotonicity() {
                 path: path.to_owned(),
                 native_type: 0x0040_0500,
                 raw: Some(10),
+                multi_count: 1,
                 formatted: Some(Number::Double(1.0)),
                 raw_error: false,
                 formatted_error: false,

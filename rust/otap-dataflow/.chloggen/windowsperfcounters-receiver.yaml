@@ -18,4 +18,4 @@ issues: []
 # Use pipe (|) for multiline entries. Breaking entries must include a `Migration:`
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
-subtext: Supports Gauges, cumulative and eligible delta Sums, Go-compatible instance attributes and overrides, structured selection, PDH calculations, scaling, bounded expansion, isolated failures, and recovery diagnostics.
+subtext: Supports Gauges, cumulative and eligible delta Sums, Go-compatible instances, elapsed and multi-timer PDH calculations, scaling, bounded expansion, isolated failures, and recovery diagnostics.

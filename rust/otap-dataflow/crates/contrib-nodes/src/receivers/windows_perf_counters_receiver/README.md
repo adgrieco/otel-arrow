@@ -210,6 +210,8 @@ reach PDH's 2048-unit native limit are omitted and diagnosed.
 | Samples | `PERF_SAMPLE_COUNTER` | Two | Double |
 | Queue lengths | DWORD, large, 100-nanosecond, and object-time queue variants | Two | Double |
 | Timer percentages | System, 100-nanosecond, object-time, inverse, and precision timer variants | Two | Double |
+| Multi-timer percentages | System and 100-nanosecond normal and inverse variants | Two | Double |
+| Elapsed time | `PERF_ELAPSED_TIME` | One | Double |
 | Raw fractions | `PERF_RAW_FRACTION`, `PERF_LARGE_RAW_FRACTION` | One | Double |
 | Sample fractions | `PERF_SAMPLE_FRACTION` | Two | Double |
 | Averages | `PERF_AVERAGE_TIMER`, `PERF_AVERAGE_BULK` | Two | Double |
@@ -234,12 +236,12 @@ delta is emitted only when `monotonic: false`; a monotonic delta omits the
 negative interval but remains ready for the next sample.
 
 PDH performs rate, timer, fraction, and average calculations and associates
-visible fraction/average numerators with their provider-defined base counters.
-Configure only the visible numerator path. Standalone base counters are not
-metrics and are rejected.
-
-Elapsed-time and multi-timer counter families remain unsupported because they
-require output semantics beyond the existing regular PDH formatting path.
+visible fraction, average, and multi-timer numerators with their
+provider-defined base counters. Configure only the visible numerator path.
+Multi-timers require a positive native `MultiCount`; an invalid zero base omits
+the point, reports a counter-local failure, and restarts two-sample warm-up.
+Standalone base counters are not metrics and are rejected. Elapsed-time
+counters format from the current sample and do not require warm-up.
 
 All mappings emit regular PDH formatted values. Raw reads are used only to
 validate provider-defined bases for fractions and averages. Geneva-specific
