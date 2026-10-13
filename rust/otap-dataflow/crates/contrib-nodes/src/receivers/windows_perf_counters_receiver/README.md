@@ -128,6 +128,9 @@ counter paths are also rejected.
 For mappings that reference a metric, optional `attributes` contains static
 string key/value pairs added to each emitted point.
 `scale_power10` defaults to zero and accepts values from `-18` through `18`.
+`recreate_query` defaults to `false`. Setting it to `true` is rejected until
+per-mapping query isolation and replacement priming are implemented; it is
+never silently ignored.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
 Counter names may contain parentheses, as required by counters such as

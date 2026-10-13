@@ -208,6 +208,8 @@ struct CounterMapping {
     #[serde(default)]
     metric: Option<String>,
     #[serde(default)]
+    recreate_query: bool,
+    #[serde(default)]
     attributes: BTreeMap<String, String>,
     #[serde(default)]
     scale_power10: i32,
@@ -532,6 +534,11 @@ impl Config {
                 let counter_field = format!("{object_field}.counters[{counter_index}]");
                 let counter_name =
                     validate_counter_name(&format!("{counter_field}.name"), &mapping.name)?;
+                if mapping.recreate_query {
+                    return Err(invalid(format!(
+                        "{counter_field}.recreate_query is not supported yet; omit it or set it to false"
+                    )));
+                }
                 let metric_name = mapping
                     .metric
                     .as_deref()
@@ -899,6 +906,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.counters[0].name, r"\Memory\Available Bytes");
+    }
+
+    /// Scenario: A mapping explicitly disables or enables query recreation.
+    /// Guarantees: False is accepted while true fails instead of being silently ignored.
+    #[test]
+    fn rejects_unimplemented_query_recreation() {
+        let config = |recreate_query| {
+            json!({
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{
+                        "name": "Available Bytes",
+                        "recreate_query": recreate_query
+                    }]
+                }]
+            })
+        };
+
+        let _ = Config::from_json(&config(false)).unwrap();
+        assert_config_error(
+            config(true),
+            "recreate_query is not supported yet; omit it or set it to false",
+        );
     }
 
     /// Scenario: A wildcard omits the default or custom aggregation instance unless selected.
