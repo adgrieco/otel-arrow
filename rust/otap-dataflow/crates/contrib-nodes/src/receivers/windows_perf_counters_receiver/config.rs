@@ -299,14 +299,17 @@ pub(super) struct CounterConfig {
 pub(super) enum MetricKind {
     /// A point-in-time Gauge.
     Gauge,
-    /// A Sum. This receiver always emits cumulative aggregation temporality.
-    Sum { monotonic: bool },
+    /// A Sum with configured aggregation temporality and monotonicity.
+    Sum {
+        aggregation: Aggregation,
+        monotonic: bool,
+    },
 }
 
 /// OTel Sum aggregation temporality accepted by the configuration parser.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Aggregation {
+pub(super) enum Aggregation {
     Cumulative,
     Delta,
 }
@@ -366,7 +369,7 @@ where
     Option::<SumConfig>::deserialize(deserializer)?
         .ok_or_else(|| {
             serde::de::Error::custom(
-                "sum must be a mapping with explicit aggregation: cumulative; null Sum is invalid",
+                "sum must be a mapping with explicit aggregation: cumulative or delta; null Sum is invalid",
             )
         })
         .map(Some)
@@ -389,13 +392,8 @@ impl MetricConfig {
             )));
         }
         if let Some(sum) = &self.sum {
-            if sum.aggregation == Aggregation::Delta {
-                return Err(invalid(format!(
-                    "metrics.{name}: delta Sum is not supported yet; use gauge or sum with \
-                     aggregation: cumulative"
-                )));
-            }
             Ok(MetricKind::Sum {
+                aggregation: sum.aggregation,
                 monotonic: sum.monotonic,
             })
         } else {
@@ -820,7 +818,10 @@ mod tests {
         );
         assert_eq!(
             config.counters[0].metric_kind,
-            MetricKind::Sum { monotonic: false }
+            MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: false
+            }
         );
     }
 
@@ -842,7 +843,10 @@ mod tests {
         assert_eq!(config.counters[0].name, "windows.operations");
         assert_eq!(
             config.counters[0].metric_kind,
-            MetricKind::Sum { monotonic: true }
+            MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: true
+            }
         );
     }
 
@@ -1478,12 +1482,12 @@ mod tests {
         }
     }
 
-    /// Scenario: Sum selects delta temporality before delta execution is available.
-    /// Guarantees: Delta is rejected explicitly without implying it will never be supported.
+    /// Scenario: Sum selects delta temporality with either monotonicity setting.
+    /// Guarantees: Configuration preserves delta aggregation for native eligibility validation.
     #[test]
-    fn rejects_delta_sum_not_supported_yet() {
+    fn normalizes_delta_sum_configuration() {
         for monotonic in [false, true] {
-            let error = Config::from_json(&json!({
+            let config = Config::from_json(&json!({
                 "metrics": {"test": {
                     "description": "Value.",
                     "unit": "1",
@@ -1494,13 +1498,13 @@ mod tests {
                     "counters": [{"name": "Available Bytes", "metric": "test"}]
                 }]
             }))
-            .unwrap_err()
-            .to_string();
-            assert!(error.contains("metrics.test"), "{error}");
-            assert!(error.contains("delta Sum is not supported yet"), "{error}");
-            assert!(
-                error.contains("use gauge or sum with aggregation: cumulative"),
-                "{error}"
+            .unwrap();
+            assert_eq!(
+                config.counters[0].metric_kind,
+                MetricKind::Sum {
+                    aggregation: Aggregation::Delta,
+                    monotonic,
+                }
             );
         }
     }
@@ -1549,19 +1553,6 @@ mod tests {
             }),
             json!({
                 "metrics": {"test": {"description": "x", "unit": "1", "sum": {}}},
-                "perfcounters": [{
-                    "object": "Memory",
-                    "counters": [{"name": "Available Bytes", "metric": "test"}]
-                }]
-            }),
-            json!({
-                "metrics": {
-                    "test": {
-                        "description": "x",
-                        "unit": "1",
-                        "sum": {"aggregation": "delta", "monotonic": true}
-                    }
-                },
                 "perfcounters": [{
                     "object": "Memory",
                     "counters": [{"name": "Available Bytes", "metric": "test"}]

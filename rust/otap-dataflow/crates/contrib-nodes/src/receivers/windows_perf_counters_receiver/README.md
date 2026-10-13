@@ -91,18 +91,21 @@ produce meaningful values.
 Each `metrics` key is an OTel metric name. `description` defaults to empty and
 `unit` defaults to `"1"`. Definitions may be unused. A definition may select
 one `gauge: {}` or `sum:` object; omitting both defaults to Gauge. A Sum
-requires `aggregation: cumulative`; `monotonic` defaults to `false`. Delta Sum
-is not supported yet. Empty and null Sum configurations are rejected. Metrics
+requires `aggregation: cumulative` or `aggregation: delta`; `monotonic`
+defaults to `false`. Empty and null Sum configurations are rejected. Metrics
 that configure both Gauge and Sum are also rejected. Gauge may use YAML
 shorthand such as `gauge:`. Metric names must be non-empty after trimming but
-are otherwise OTLP stream names rather than SDK instrument names, so names such
-as `\Memory\Available Bytes` are accepted. Units are trimmed but have no
+are otherwise OTLP stream names rather than SDK instrument names, so names
+such as `\Memory\Available Bytes` are accepted. Units are trimmed but have no
 receiver-specific character or length restriction.
 Multiple counter mappings may reference one metric and contribute points
 distinguished by their configured attributes. Gauges have point-in-time
-semantics and no start timestamp. Monotonic Sums are cumulative and limited to
-non-negative direct raw counts. Non-monotonic Sums are cumulative, and their
-start timestamp is the opening time of the current PDH query.
+semantics and no start timestamp. Cumulative monotonic Sums are limited to
+non-negative direct raw counts. Cumulative non-monotonic Sums are available
+for every supported numeric family. Delta Sums are limited to
+`PERF_COUNTER_DELTA` and `PERF_COUNTER_LARGE_DELTA`; PDH calculates the
+difference and the receiver emits it as a double without subtracting raw
+totals.
 
 ```yaml
 windows.operations:
@@ -185,7 +188,8 @@ reach PDH's 2048-unit native limit are omitted and diagnosed.
 | --- | --- | --- | --- |
 | Direct values | `PERF_COUNTER_RAWCOUNT`, `PERF_COUNTER_LARGE_RAWCOUNT`, and hexadecimal variants | One | Integer |
 | Rates | `PERF_COUNTER_COUNTER`, `PERF_COUNTER_BULK_COUNT` | Two | Double |
-| Deltas and samples | `PERF_COUNTER_DELTA`, `PERF_COUNTER_LARGE_DELTA`, `PERF_SAMPLE_COUNTER` | Two | Double |
+| Delta counts | `PERF_COUNTER_DELTA`, `PERF_COUNTER_LARGE_DELTA` | Two | Double |
+| Samples | `PERF_SAMPLE_COUNTER` | Two | Double |
 | Queue lengths | DWORD, large, 100-nanosecond, and object-time queue variants | Two | Double |
 | Timer percentages | System, 100-nanosecond, object-time, inverse, and precision timer variants | Two | Double |
 | Raw fractions | `PERF_RAW_FRACTION`, `PERF_LARGE_RAW_FRACTION` | One | Double |
@@ -201,6 +205,15 @@ additive current values such as committed private memory. Metric names, units,
 and descriptions must preserve the emitted semantics; Windows Private Bytes
 includes committed memory that may reside in RAM or the page file and must not
 be labeled as the physical-memory metric `process.memory.usage`.
+
+A delta Sum accepts only the two native delta-count types. Its first valid
+sample establishes an interval baseline and emits no point. Each later point
+uses the immediately preceding valid sample timestamp as its start time.
+Transient statuses, collection errors, timestamp failures, and handle
+replacement clear readiness and require a fresh baseline. Equal or decreasing
+timestamps are omitted and become the next baseline. A negative formatted
+delta is emitted only when `monotonic: false`; a monotonic delta omits the
+negative interval but remains ready for the next sample.
 
 PDH performs rate, timer, fraction, and average calculations and associates
 visible fraction/average numerators with their provider-defined base counters.
@@ -246,6 +259,8 @@ therefore warm on scheduled collections; startup retries remain independent.
   and full case-insensitive path, including PDH's `#n` duplicate index.
 - One-sample counters can emit immediately. Two-sample counters warm
   independently and become eligible at the next configured interval.
+- Delta Sum intervals require `0 < start_time < time_unix_nano`; each series
+  tracks its own previous valid native sample timestamp.
 - Removed instances stop emitting after the next discovery refresh.
 - When a sample-fraction or average base does not advance, no relevant
   operation occurred; that value is omitted rather than replaced with zero. A
@@ -253,10 +268,10 @@ therefore warm on scheduled collections; startup retries remain independent.
 - `PDH_INVALID_DATA`, `PDH_NO_DATA`, and `PDH_CALC_NEGATIVE_*` statuses mean
   no observation. They emit no point, do not count as failures, and preserve
   the counter handle and monotonic Sum sequence. Saved PDH base history is
-  cleared, and affected two-sample counters restart warm-up so later values are
-  not compared with stale PDH samples. Other counter-local invalid statuses,
-  non-finite output, or scaling failures omit only that point; healthy peers
-  remain in the batch.
+  cleared, affected two-sample counters restart warm-up, and delta interval
+  baselines are invalidated so later values are not compared with stale PDH
+  samples. Other counter-local invalid statuses, non-finite output, or scaling
+  failures omit only that point; healthy peers remain in the batch.
 - Counter add failures retry with exponential backoff capped by
   `wildcard_refresh_interval`. Counter read failures omit only the affected
   point and retain the existing handle for the next scheduled collection.
@@ -264,9 +279,9 @@ therefore warm on scheduled collections; startup retries remain independent.
   points until a configured counter becomes available.
 - Query-level `PDH_NO_DATA` and the other transient no-observation statuses
   emit an empty batch without counting as failures, clear saved PDH base
-  history, and restart two-sample warm-up while preserving monotonic Sum
-  sequences. Other query-level collection failures and post-collection
-  timestamp failures also clear PDH base history and restart warm-up before
+  history, invalidate delta intervals, and restart two-sample warm-up while
+  preserving cumulative monotonic Sum sequences. Other query-level collection
+  failures and post-collection timestamp failures apply the same reset before
   returning an error. Query collection failures retry the existing query with
   bounded exponential backoff. Three consecutive failures rebuild the
   worker-owned query and all counters.

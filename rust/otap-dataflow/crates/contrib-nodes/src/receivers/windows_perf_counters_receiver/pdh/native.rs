@@ -601,12 +601,13 @@ mod tests {
         }
     }
 
-    /// Scenario: Windows formats rate, percentage, fraction and average fixtures from successive raw samples.
-    /// Guarantees: Native formulas remain finite, preserve CPU above 100 percent, and use no display scaling.
+    /// Scenario: Windows formats rate, delta, percentage, fraction and average successive samples.
+    /// Guarantees: Native formulas preserve delta differences, CPU above 100 percent, and no display scaling.
     #[test]
     fn native_formulas_from_raw_fixtures() {
         for (native_type, first, second, previous_first, previous_second, time_base, expected) in [
             (0x1041_0400, 160, 12, 100, 10, 10, 300.0),
+            (0x0040_0500, 200, 1, 100, 1, 1, 100.0),
             (0x2051_0500, 150, 200, 100, 180, 10_000_000, 250.0),
             (0x2002_0400, 25, 100, 0, 0, 1, 25.0),
             (0x20C2_0400, 160, 200, 100, 100, 1, 60.0),

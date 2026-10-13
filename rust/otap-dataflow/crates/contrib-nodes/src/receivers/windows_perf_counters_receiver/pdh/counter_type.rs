@@ -96,6 +96,8 @@ pub(super) enum CounterKind {
     RawFraction,
     /// A PDH formula requiring successive samples (including private-clock timers).
     CalculatedTwoSample,
+    /// A PDH-provided raw difference eligible for delta Sum temporality.
+    Delta,
     /// A fraction or average requiring successive samples and advancing base values.
     CalculatedTwoSampleWithBase,
 }
@@ -141,9 +143,8 @@ pub(super) fn classify_native_type(
         | PERF_PRECISION_SYSTEM_TIMER
         | PERF_PRECISION_100NS_TIMER
         | PERF_PRECISION_OBJECT_TIMER
-        | PERF_COUNTER_DELTA
-        | PERF_COUNTER_LARGE_DELTA
         | PERF_SAMPLE_COUNTER => Ok(CounterKind::CalculatedTwoSample),
+        PERF_COUNTER_DELTA | PERF_COUNTER_LARGE_DELTA => Ok(CounterKind::Delta),
         PERF_SAMPLE_FRACTION | PERF_AVERAGE_TIMER | PERF_AVERAGE_BULK => {
             Ok(CounterKind::CalculatedTwoSampleWithBase)
         }
@@ -172,8 +173,8 @@ mod tests {
         }
     }
 
-    /// Scenario: SDK metadata describes rates, queues, ordinary/private-clock timers and deltas.
-    /// Guarantees: Every supported type requires two samples, including inverse and object timers.
+    /// Scenario: SDK metadata describes rates, queues, and ordinary or private-clock timers.
+    /// Guarantees: Supported calculated types remain distinct from delta-count Sum eligibility.
     #[test]
     fn classifies_two_sample_counters() {
         for native_type in [
@@ -191,13 +192,27 @@ mod tests {
             0x2047_0500, // PERF_PRECISION_SYSTEM_TIMER
             0x2057_0500, // PERF_PRECISION_100NS_TIMER
             0x2067_0500, // PERF_PRECISION_OBJECT_TIMER
-            0x0040_0400, // PERF_COUNTER_DELTA
-            0x0040_0500, // PERF_COUNTER_LARGE_DELTA
             0x0041_0400, // PERF_SAMPLE_COUNTER
         ] {
             assert_eq!(
                 classify_native_type("calculated", native_type).unwrap(),
                 CounterKind::CalculatedTwoSample,
+                "native type 0x{native_type:08X}"
+            );
+        }
+    }
+
+    /// Scenario: SDK metadata describes DWORD and LARGE delta-count counters.
+    /// Guarantees: Only the two raw-difference types receive delta Sum eligibility.
+    #[test]
+    fn classifies_delta_counts() {
+        for native_type in [
+            0x0040_0400, // PERF_COUNTER_DELTA
+            0x0040_0500, // PERF_COUNTER_LARGE_DELTA
+        ] {
+            assert_eq!(
+                classify_native_type("delta", native_type).unwrap(),
+                CounterKind::Delta,
                 "native type 0x{native_type:08X}"
             );
         }

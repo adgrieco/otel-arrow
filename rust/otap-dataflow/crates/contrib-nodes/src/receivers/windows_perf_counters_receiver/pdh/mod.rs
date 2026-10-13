@@ -3,7 +3,7 @@
 
 //! Persistent synchronous PDH worker. Windows handles never leave its thread.
 
-use super::config::{CounterConfig, MetricKind};
+use super::config::{Aggregation, CounterConfig, MetricKind};
 use super::model::{
     ExpansionOverflow, InstanceIdentity, Number, Sample, SampleDiagnostics, SampleFailure,
     SamplePoint, SampleValue, ScaleError, scale_double, scale_integer,
@@ -426,17 +426,60 @@ fn validate_metric_mapping(
     metric_kind: MetricKind,
     counter_kind: CounterKind,
 ) -> Result<(), Error> {
-    if matches!(metric_kind, MetricKind::Sum { monotonic: true })
-        && counter_kind != CounterKind::Direct
-    {
-        return Err(Error::InvalidMetricMapping {
-            path: path.to_owned(),
-            message: "monotonic Sum requires a direct raw-count counter type \
-                      (PERF_COUNTER_RAWCOUNT / LARGE_RAWCOUNT)"
-                .to_owned(),
-        });
+    match metric_kind {
+        MetricKind::Sum {
+            aggregation: Aggregation::Delta,
+            ..
+        } if counter_kind != CounterKind::Delta => {
+            return Err(Error::InvalidMetricMapping {
+                path: path.to_owned(),
+                message: "delta Sum requires a native delta-count counter type \
+                          (PERF_COUNTER_DELTA / LARGE_DELTA)"
+                    .to_owned(),
+            });
+        }
+        MetricKind::Sum {
+            aggregation: Aggregation::Cumulative,
+            monotonic: true,
+        } if counter_kind != CounterKind::Direct => {
+            return Err(Error::InvalidMetricMapping {
+                path: path.to_owned(),
+                message: "monotonic Sum requires a direct raw-count counter type \
+                          (PERF_COUNTER_RAWCOUNT / LARGE_RAWCOUNT)"
+                    .to_owned(),
+            });
+        }
+        _ => {}
     }
     Ok(())
+}
+
+fn delta_interval_start(
+    path: &str,
+    baseline_unix_nano: &mut Option<i64>,
+    number: Number,
+    monotonic: bool,
+    timestamp_unix_nano: i64,
+) -> Result<Option<i64>, Error> {
+    let Number::Double(value) = number else {
+        return Err(Error::InvalidSample(
+            "delta Sum was not backed by a formatted double value",
+        ));
+    };
+    let previous = baseline_unix_nano.replace(timestamp_unix_nano);
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    if timestamp_unix_nano <= previous || (monotonic && value < 0.0) {
+        return Ok(None);
+    }
+    if !value.is_finite() {
+        return Err(Error::Calculation {
+            path: path.to_owned(),
+            message: "delta Sum value must be finite".to_owned(),
+        });
+    }
+    Ok(Some(previous))
 }
 
 fn is_aggregation_instance(path: &str, aggregation_name: &str) -> bool {
@@ -609,11 +652,13 @@ fn refresh_changes_with_group_resets(
 struct CounterHistory {
     previous_base: Option<i64>,
     monotonic_sequence: MonotonicSequence,
+    delta_baseline_unix_nano: Option<i64>,
 }
 
 impl CounterHistory {
     fn restart_pdh_sampling(&mut self) {
         self.previous_base = None;
+        self.delta_baseline_unix_nano = None;
     }
 }
 
@@ -661,6 +706,9 @@ impl<C> CounterHandle<C> {
                 validate_positive_base(&self.path, base)?;
             } else {
                 let Some(previous) = self.history.previous_base.replace(base) else {
+                    if self.kind == CounterKind::Delta {
+                        self.history.delta_baseline_unix_nano = Some(timestamp_unix_nano);
+                    }
                     return Ok((SampleValue::Warming, None));
                 };
                 if self.kind == CounterKind::CalculatedTwoSampleWithBase {
@@ -690,7 +738,7 @@ impl<C> CounterHandle<C> {
                 return Ok((SampleValue::NoObservation, None));
             }
             Err(error) => {
-                if matches!(error, Error::CounterData { .. }) {
+                if self.kind == CounterKind::Delta || matches!(error, Error::CounterData { .. }) {
                     self.reset_readiness();
                 }
                 return Err(error);
@@ -700,6 +748,24 @@ impl<C> CounterHandle<C> {
             Number::Integer(value) => Some(value),
             Number::Double(_) => None,
         };
+        let delta_start_time = if let MetricKind::Sum {
+            aggregation: Aggregation::Delta,
+            monotonic,
+        } = metric_kind
+        {
+            match delta_interval_start(
+                &self.path,
+                &mut self.history.delta_baseline_unix_nano,
+                number,
+                monotonic,
+                timestamp_unix_nano,
+            )? {
+                Some(start_time) => Some(start_time),
+                None => return Ok((SampleValue::NoObservation, None)),
+            }
+        } else {
+            None
+        };
         let scaled = match number {
             Number::Integer(value) => scale_integer(value, self.scale_power10),
             Number::Double(value) => scale_double(value, self.scale_power10),
@@ -708,20 +774,32 @@ impl<C> CounterHandle<C> {
             path: self.path.clone(),
             source,
         })?;
-        let point_start_time = if matches!(metric_kind, MetricKind::Sum { monotonic: true }) {
-            let Some(direct_value) = direct_value else {
-                return Err(Error::InvalidSample(
-                    "monotonic Sum was not backed by a direct formatted value",
-                ));
-            };
-            Some(monotonic_start_time(
-                &self.path,
-                &mut self.history.monotonic_sequence,
-                direct_value,
-                timestamp_unix_nano,
-            )?)
-        } else {
-            None
+        let point_start_time = match metric_kind {
+            MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: true,
+            } => {
+                let Some(direct_value) = direct_value else {
+                    return Err(Error::InvalidSample(
+                        "monotonic Sum was not backed by a direct formatted value",
+                    ));
+                };
+                Some(monotonic_start_time(
+                    &self.path,
+                    &mut self.history.monotonic_sequence,
+                    direct_value,
+                    timestamp_unix_nano,
+                )?)
+            }
+            MetricKind::Sum {
+                aggregation: Aggregation::Delta,
+                ..
+            } => delta_start_time,
+            MetricKind::Gauge
+            | MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: false,
+            } => None,
         };
         Ok((SampleValue::Value(scaled), point_start_time))
     }
@@ -1225,14 +1303,13 @@ impl<A: PdhApi> Query<A> {
                     return Err(error);
                 }
             };
-            let start_time_unix_nano = advance_collection_time(
+            let _ = advance_collection_time(
                 &mut self.start_time_unix_nano,
                 &mut self.previous_timestamp_unix_nano,
                 timestamp_unix_nano,
                 std::iter::empty(),
             );
             return Ok(Sample {
-                start_time_unix_nano,
                 timestamp_unix_nano,
                 points: Vec::new(),
                 failures,
@@ -1298,6 +1375,17 @@ impl<A: PdhApi> Query<A> {
             if matches!(value, SampleValue::Warming) {
                 diagnostics.warmup_omissions += 1;
             }
+            let point_start_time = match (metric_kind, value, point_start_time) {
+                (
+                    MetricKind::Sum {
+                        aggregation: Aggregation::Cumulative,
+                        monotonic: false,
+                    },
+                    SampleValue::Value(_),
+                    None,
+                ) => Some(start_time_unix_nano),
+                (_, _, point_start_time) => point_start_time,
+            };
             points.push(SamplePoint {
                 counter_index: counter.config_index,
                 path: counter.path.clone(),
@@ -1312,7 +1400,6 @@ impl<A: PdhApi> Query<A> {
             .filter(|counter| counter.wildcard)
             .count();
         Ok(Sample {
-            start_time_unix_nano,
             timestamp_unix_nano,
             points,
             failures,

@@ -60,7 +60,7 @@ pub(super) struct SamplePoint {
     pub(super) path: String,
     /// Parsed identity for an expanded wildcard instance.
     pub(super) instance: Option<InstanceIdentity>,
-    /// Start of this point's cumulative sequence when it differs from the query.
+    /// Start of this point's cumulative sequence or delta interval.
     pub(super) start_time_unix_nano: Option<i64>,
     /// Ready value or expected omission.
     pub(super) value: SampleValue,
@@ -126,8 +126,6 @@ pub(super) struct SampleDiagnostics {
 /// A successful point-in-time PDH reading, independent of Windows handles.
 #[derive(Debug, Clone)]
 pub(super) struct Sample {
-    /// Start of the current PDH query as nanoseconds since the Unix epoch.
-    pub(super) start_time_unix_nano: i64,
     /// Collection time as nanoseconds since the Unix epoch.
     pub(super) timestamp_unix_nano: i64,
     /// Exact and expanded points keyed by configured counter and concrete path.

@@ -26,8 +26,22 @@ fn counter(path: &str, name: &str) -> CounterConfig {
 
 fn monotonic_sum(path: &str, name: &str, unit: &str) -> CounterConfig {
     CounterConfig {
-        metric_kind: MetricKind::Sum { monotonic: true },
+        metric_kind: MetricKind::Sum {
+            aggregation: Aggregation::Cumulative,
+            monotonic: true,
+        },
         unit: unit.to_owned(),
+        ..counter(path, name)
+    }
+}
+
+fn delta_sum(path: &str, name: &str, monotonic: bool) -> CounterConfig {
+    CounterConfig {
+        metric_kind: MetricKind::Sum {
+            aggregation: Aggregation::Delta,
+            monotonic,
+        },
+        unit: "{operation}".to_owned(),
         ..counter(path, name)
     }
 }
@@ -307,7 +321,6 @@ fn simulated_blocked_worker(cleanup_complete: Arc<AtomicBool>) -> (Worker, mpsc:
 
 fn empty_sample() -> Sample {
     Sample {
-        start_time_unix_nano: 1,
         timestamp_unix_nano: 2,
         points: Vec::new(),
         failures: Vec::new(),
@@ -1298,7 +1311,7 @@ fn query_rollback_during_omission_resets_monotonic_sequence() {
         state.counters[0].formatted = None;
     }
     let sample = query.collect().unwrap();
-    assert_eq!(sample.start_time_unix_nano, 115);
+    assert_eq!(sample.timestamp_unix_nano, 115);
     assert_eq!(sample.points[0].value, SampleValue::NoObservation);
 
     {
@@ -1443,14 +1456,17 @@ fn monotonic_start_time_restarts_after_32_bit_wrap() {
     );
 }
 
-/// Scenario: Metric kinds are paired with direct and calculated native counter types.
-/// Guarantees: Only monotonic Sums reject non-direct native types.
+/// Scenario: Metric kinds are paired with direct, calculated, and delta native counter types.
+/// Guarantees: Cumulative monotonic and delta Sums enforce their distinct native eligibility.
 #[test]
-fn validates_monotonic_sum_native_type() {
+fn validates_sum_native_type() {
     assert!(
         validate_metric_mapping(
             "counter",
-            MetricKind::Sum { monotonic: true },
+            MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: true
+            },
             CounterKind::Direct
         )
         .is_ok()
@@ -1458,7 +1474,10 @@ fn validates_monotonic_sum_native_type() {
     assert!(
         validate_metric_mapping(
             "counter",
-            MetricKind::Sum { monotonic: true },
+            MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: true
+            },
             CounterKind::CalculatedTwoSample
         )
         .is_err()
@@ -1470,11 +1489,38 @@ fn validates_monotonic_sum_native_type() {
     assert!(
         validate_metric_mapping(
             "sum",
-            MetricKind::Sum { monotonic: false },
+            MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: false,
+            },
             CounterKind::CalculatedTwoSample
         )
         .is_ok()
     );
+    for monotonic in [false, true] {
+        assert!(
+            validate_metric_mapping(
+                "delta",
+                MetricKind::Sum {
+                    aggregation: Aggregation::Delta,
+                    monotonic,
+                },
+                CounterKind::Delta
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_metric_mapping(
+                "delta",
+                MetricKind::Sum {
+                    aggregation: Aggregation::Delta,
+                    monotonic,
+                },
+                CounterKind::CalculatedTwoSample
+            )
+            .is_err()
+        );
+    }
 }
 
 /// Scenario: An ineligible monotonic mapping is added beside a healthy counter during startup.
@@ -1483,7 +1529,10 @@ fn validates_monotonic_sum_native_type() {
 fn isolates_invalid_monotonic_sum_mapping() {
     let error = validate_metric_mapping(
         "counter",
-        MetricKind::Sum { monotonic: true },
+        MetricKind::Sum {
+            aggregation: Aggregation::Cumulative,
+            monotonic: true,
+        },
         CounterKind::CalculatedTwoSample,
     )
     .unwrap_err();
@@ -1505,6 +1554,300 @@ fn isolates_invalid_monotonic_sum_mapping() {
         exact_add_failure_disposition(&retryable),
         ExactAddFailureDisposition::Retry
     );
+}
+
+/// Scenario: An ineligible delta Sum mapping starts beside a healthy direct Gauge.
+/// Guarantees: The invalid mapping is diagnostic and non-retryable while the healthy peer emits.
+#[test]
+fn isolates_invalid_delta_sum_mapping() {
+    let direct_path = r"\Memory\Available Bytes";
+    let invalid_path = r"\Processor(_Total)\% Processor Time";
+    let configs = vec![
+        counter(direct_path, "windows.memory.available"),
+        delta_sum(invalid_path, "windows.processor.delta", true),
+    ];
+    let (_state, mut query) = fake_query(
+        configs,
+        vec![
+            FakeCounter {
+                path: direct_path.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            },
+            FakeCounter {
+                path: invalid_path.to_owned(),
+                native_type: 0x2041_0500,
+                raw: Some(10),
+                formatted: Some(Number::Double(1.0)),
+                raw_error: false,
+                formatted_error: false,
+            },
+        ],
+    );
+
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points.len(), 1);
+    assert_eq!(sample.points[0].counter_index, 0);
+    assert!(sample.failures.iter().any(|failure| {
+        failure.counter_index == 1
+            && failure.reason == "invalid_metric_mapping"
+            && failure.error.contains("PERF_COUNTER_DELTA / LARGE_DELTA")
+    }));
+}
+
+/// Scenario: A native delta count warms, emits, sees equal and rollback timestamps, and resumes.
+/// Guarantees: Every emitted interval starts at the immediately preceding valid sample timestamp.
+#[test]
+fn delta_sum_tracks_previous_valid_sample_intervals() {
+    let path = r"\Provider\Operations Delta";
+    let (state, mut query) = fake_query(
+        vec![delta_sum(path, "windows.operations", false)],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x0040_0500,
+            raw: Some(10),
+            formatted: Some(Number::Double(2.0)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Warming
+    );
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 110;
+        state.counters[0].raw = Some(20);
+        state.counters[0].formatted = Some(Number::Double(3.0));
+    }
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points[0].start_time_unix_nano, Some(100));
+    assert_eq!(
+        sample.points[0].value,
+        SampleValue::Value(Number::Double(3.0))
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.counters[0].raw = Some(30);
+        state.counters[0].formatted = Some(Number::Double(4.0));
+    }
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::NoObservation
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 120;
+        state.counters[0].raw = Some(40);
+        state.counters[0].formatted = Some(Number::Double(5.0));
+    }
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points[0].start_time_unix_nano, Some(110));
+    assert_eq!(
+        sample.points[0].value,
+        SampleValue::Value(Number::Double(5.0))
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 115;
+        state.counters[0].raw = Some(50);
+        state.counters[0].formatted = Some(Number::Double(6.0));
+    }
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::NoObservation
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 130;
+        state.counters[0].raw = Some(60);
+        state.counters[0].formatted = Some(Number::Double(7.0));
+    }
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points[0].start_time_unix_nano, Some(115));
+}
+
+/// Scenario: A formatted transient interrupts a ready native delta count.
+/// Guarantees: The interval baseline is invalidated and one valid sample re-warms before emission.
+#[test]
+fn delta_sum_transient_restarts_interval_readiness() {
+    let path = r"\Provider\Operations Delta";
+    let (state, mut query) = fake_query(
+        vec![delta_sum(path, "windows.operations", false)],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x0040_0500,
+            raw: Some(10),
+            formatted: Some(Number::Double(2.0)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Warming
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 110;
+        state.counters[0].raw = Some(20);
+        state.counters[0].formatted = None;
+    }
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::NoObservation
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 120;
+        state.counters[0].raw = Some(30);
+        state.counters[0].formatted = Some(Number::Double(3.0));
+    }
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Warming
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 130;
+        state.counters[0].raw = Some(40);
+        state.counters[0].formatted = Some(Number::Double(4.0));
+    }
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points[0].start_time_unix_nano, Some(120));
+}
+
+/// Scenario: Query collection and timestamp failures interrupt a ready native delta count.
+/// Guarantees: Each gap clears interval readiness so the next valid sample warms a fresh baseline.
+#[test]
+fn delta_sum_collection_gaps_restart_interval_readiness() {
+    let path = r"\Provider\Operations Delta";
+    let (state, mut query) = fake_query(
+        vec![delta_sum(path, "windows.operations", false)],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x0040_0500,
+            raw: Some(10),
+            formatted: Some(Number::Double(2.0)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Warming
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.collect_error = true;
+    }
+    assert!(query.collect().is_err());
+    {
+        let mut state = state.borrow_mut();
+        state.collect_error = false;
+        state.timestamp = 120;
+        state.counters[0].raw = Some(20);
+    }
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Warming
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp_error = true;
+        state.counters[0].raw = Some(30);
+    }
+    assert!(query.collect().is_err());
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp_error = false;
+        state.timestamp = 140;
+        state.counters[0].raw = Some(40);
+    }
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Warming
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 150;
+        state.counters[0].raw = Some(50);
+        state.counters[0].formatted = Some(Number::Double(5.0));
+    }
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points[0].start_time_unix_nano, Some(140));
+}
+
+/// Scenario: Scaling would underflow a negative native delta difference to signed zero.
+/// Guarantees: Monotonicity checks the native sign first; non-monotonic output preserves signed zero.
+#[test]
+fn delta_sum_negative_values_follow_monotonicity() {
+    for monotonic in [false, true] {
+        let path = r"\Provider\Operations Delta";
+        let mut config = delta_sum(path, "windows.operations", monotonic);
+        config.scale_power10 = -18;
+        let (state, mut query) = fake_query(
+            vec![config],
+            vec![FakeCounter {
+                path: path.to_owned(),
+                native_type: 0x0040_0500,
+                raw: Some(10),
+                formatted: Some(Number::Double(1.0)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+        );
+        assert_eq!(
+            query.collect().unwrap().points[0].value,
+            SampleValue::Warming
+        );
+
+        {
+            let mut state = state.borrow_mut();
+            state.timestamp = 110;
+            state.counters[0].raw = Some(20);
+            state.counters[0].formatted = Some(Number::Double(-f64::MIN_POSITIVE));
+        }
+        let sample = query.collect().unwrap();
+        if monotonic {
+            assert_eq!(sample.points[0].value, SampleValue::NoObservation);
+        } else {
+            assert_eq!(sample.points[0].start_time_unix_nano, Some(100));
+            let SampleValue::Value(Number::Double(value)) = sample.points[0].value else {
+                panic!("expected a scaled non-monotonic delta value");
+            };
+            assert_eq!(value, 0.0);
+            assert!(value.is_sign_negative());
+        }
+
+        {
+            let mut state = state.borrow_mut();
+            state.timestamp = 120;
+            state.counters[0].raw = Some(30);
+            state.counters[0].formatted = Some(Number::Double(3.0));
+        }
+        let sample = query.collect().unwrap();
+        assert_eq!(sample.points[0].start_time_unix_nano, Some(110));
+        assert!(matches!(
+            sample.points[0].value,
+            SampleValue::Value(Number::Double(value)) if value > 0.0
+        ));
+    }
     let unsupported = Error::UnsupportedType(UnsupportedNativeType {
         path: "unsupported".to_owned(),
         native_type: u32::MAX,
@@ -1636,7 +1979,6 @@ fn pending_metadata_bundle_preserves_worker_merge_order() {
         }],
     };
     let mut sample = Sample {
-        start_time_unix_nano: 1,
         timestamp_unix_nano: 2,
         points: Vec::new(),
         failures: vec![SampleFailure {

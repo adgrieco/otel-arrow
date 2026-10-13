@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::config::{CounterConfig, MetricKind};
+use super::config::{Aggregation, CounterConfig, MetricKind};
 #[cfg(test)]
 use super::model::SamplePoint;
 use super::model::{Number, Sample, SampleValue};
@@ -17,7 +17,17 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::sync::Arc;
 
+const AGGREGATION_TEMPORALITY_DELTA: i32 = 1;
 const AGGREGATION_TEMPORALITY_CUMULATIVE: i32 = 2;
+
+fn sum_kind(aggregation: Aggregation, monotonic: bool) -> &'static str {
+    match (aggregation, monotonic) {
+        (Aggregation::Cumulative, true) => "monotonic cumulative Sum",
+        (Aggregation::Cumulative, false) => "non-monotonic cumulative Sum",
+        (Aggregation::Delta, true) => "monotonic delta Sum",
+        (Aggregation::Delta, false) => "non-monotonic delta Sum",
+    }
+}
 
 /// Project the ready values from one scrape directly into OTAP metric streams.
 pub(super) fn into_otap(
@@ -51,29 +61,39 @@ pub(super) fn into_otap(
         })?;
         let point_start_time = match counter.metric_kind {
             MetricKind::Gauge => None,
-            MetricKind::Sum { monotonic: true } => {
-                Some(point.start_time_unix_nano.ok_or_else(|| {
-                    ArrowError::InvalidArgumentError(format!(
-                        "monotonic Sum {} ({}) is missing its cumulative start time",
-                        counter.name, point.path
-                    ))
-                })?)
-            }
-            MetricKind::Sum { monotonic: false } => Some(sample.start_time_unix_nano),
+            MetricKind::Sum {
+                aggregation,
+                monotonic,
+            } => Some(point.start_time_unix_nano.ok_or_else(|| {
+                ArrowError::InvalidArgumentError(format!(
+                    "{} {} ({}) is missing its start time",
+                    sum_kind(aggregation, monotonic),
+                    counter.name,
+                    point.path
+                ))
+            })?),
         };
         if let Some(start_time) = point_start_time
-            && (start_time <= 0 || start_time > sample.timestamp_unix_nano)
+            && (start_time <= 0
+                || start_time > sample.timestamp_unix_nano
+                || matches!(
+                    counter.metric_kind,
+                    MetricKind::Sum {
+                        aggregation: Aggregation::Delta,
+                        ..
+                    }
+                ) && start_time == sample.timestamp_unix_nano)
         {
-            let (kind, path) = match counter.metric_kind {
-                MetricKind::Sum { monotonic: true } => ("monotonic Sum", point.path.as_str()),
-                MetricKind::Sum { monotonic: false } => {
-                    ("non-monotonic Sum", counter.path.as_str())
-                }
+            let kind = match counter.metric_kind {
+                MetricKind::Sum {
+                    aggregation,
+                    monotonic,
+                } => sum_kind(aggregation, monotonic),
                 MetricKind::Gauge => unreachable!("Gauge points do not have start times"),
             };
             return Err(ArrowError::InvalidArgumentError(format!(
                 "{kind} {} ({}) has invalid start time {} for timestamp {}",
-                counter.name, path, start_time, sample.timestamp_unix_nano
+                counter.name, point.path, start_time, sample.timestamp_unix_nano
             )));
         }
         let metric_id = if let Some(metric_id) = metric_ids.get(&counter.name) {
@@ -96,15 +116,16 @@ pub(super) fn into_otap(
                     metrics.append_aggregation_temporality(None);
                     metrics.append_is_monotonic(None);
                 }
-                MetricKind::Sum { monotonic: true } => {
-                    metrics
-                        .append_aggregation_temporality(Some(AGGREGATION_TEMPORALITY_CUMULATIVE));
-                    metrics.append_is_monotonic(Some(true));
-                }
-                MetricKind::Sum { monotonic: false } => {
-                    metrics
-                        .append_aggregation_temporality(Some(AGGREGATION_TEMPORALITY_CUMULATIVE));
-                    metrics.append_is_monotonic(Some(false));
+                MetricKind::Sum {
+                    aggregation,
+                    monotonic,
+                } => {
+                    let temporality = match aggregation {
+                        Aggregation::Cumulative => AGGREGATION_TEMPORALITY_CUMULATIVE,
+                        Aggregation::Delta => AGGREGATION_TEMPORALITY_DELTA,
+                    };
+                    metrics.append_aggregation_temporality(Some(temporality));
+                    metrics.append_is_monotonic(Some(monotonic));
                 }
             }
             let _ = metric_ids.insert(counter.name.clone(), metric_id);
@@ -230,14 +251,30 @@ mod tests {
 
     fn non_monotonic_sum(path: &str, name: &str, unit: &str) -> CounterConfig {
         CounterConfig {
-            metric_kind: MetricKind::Sum { monotonic: false },
+            metric_kind: MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: false,
+            },
             ..counter(path, name, unit)
         }
     }
 
     fn monotonic_sum(path: &str, name: &str, unit: &str) -> CounterConfig {
         CounterConfig {
-            metric_kind: MetricKind::Sum { monotonic: true },
+            metric_kind: MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: true,
+            },
+            ..counter(path, name, unit)
+        }
+    }
+
+    fn delta_sum(path: &str, name: &str, unit: &str, monotonic: bool) -> CounterConfig {
+        CounterConfig {
+            metric_kind: MetricKind::Sum {
+                aggregation: Aggregation::Delta,
+                monotonic,
+            },
             ..counter(path, name, unit)
         }
     }
@@ -252,7 +289,7 @@ mod tests {
         }
     }
 
-    fn monotonic_sum_point(
+    fn sum_point(
         counter_index: usize,
         path: &str,
         start_time_unix_nano: i64,
@@ -277,7 +314,6 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
-                start_time_unix_nano: 1,
                 timestamp_unix_nano: timestamp,
                 points: vec![
                     point(
@@ -370,12 +406,12 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
-                start_time_unix_nano: 5,
                 timestamp_unix_nano: 10,
-                points: vec![point(
+                points: vec![sum_point(
                     0,
                     r"\Process(worker)\Private Bytes",
-                    SampleValue::Value(Number::Integer(42)),
+                    5,
+                    Number::Integer(42),
                 )],
                 failures: Vec::new(),
                 overflows: Vec::new(),
@@ -436,9 +472,8 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
-                start_time_unix_nano: 1,
                 timestamp_unix_nano: 10,
-                points: vec![monotonic_sum_point(
+                points: vec![sum_point(
                     0,
                     r"\Custom Provider\Operations",
                     10,
@@ -503,7 +538,6 @@ mod tests {
         let missing = into_otap(
             &counters,
             Sample {
-                start_time_unix_nano: 1,
                 timestamp_unix_nano: 10,
                 points: vec![point(
                     0,
@@ -518,16 +552,15 @@ mod tests {
         assert!(matches!(
             missing,
             Err(ArrowError::InvalidArgumentError(message))
-                if message == "monotonic Sum windows.operations (\\Custom Provider\\Operations) is missing its cumulative start time"
+                if message == "monotonic cumulative Sum windows.operations (\\Custom Provider\\Operations) is missing its start time"
         ));
         for start in [i64::MIN, -1, 0, 11, i64::MAX] {
             assert!(matches!(
                 into_otap(
                     &counters,
                     Sample {
-                        start_time_unix_nano: 1,
                         timestamp_unix_nano: 10,
-                        points: vec![monotonic_sum_point(
+                        points: vec![sum_point(
                             0,
                             r"\Custom Provider\Operations",
                             start,
@@ -540,7 +573,7 @@ mod tests {
                 ),
                 Err(ArrowError::InvalidArgumentError(message))
                     if message == format!(
-                        "monotonic Sum windows.operations (\\Custom Provider\\Operations) \
+                        "monotonic cumulative Sum windows.operations (\\Custom Provider\\Operations) \
                          has invalid start time {start} for timestamp 10"
                     )
             ));
@@ -561,12 +594,12 @@ mod tests {
                 into_otap(
                     &counters,
                     Sample {
-                        start_time_unix_nano: start,
                         timestamp_unix_nano: 10,
-                        points: vec![point(
+                        points: vec![sum_point(
                             0,
                             r"\Process(worker)\Private Bytes",
-                            SampleValue::Value(Number::Integer(42)),
+                            start,
+                            Number::Integer(42),
                         )],
                         failures: Vec::new(),
                         overflows: Vec::new(),
@@ -575,7 +608,7 @@ mod tests {
                 ),
                 Err(ArrowError::InvalidArgumentError(message))
                     if message == format!(
-                        "non-monotonic Sum windows.process.private (\\Process(*)\\Private Bytes) \
+                        "non-monotonic cumulative Sum windows.process.private (\\Process(worker)\\Private Bytes) \
                          has invalid start time {start} for timestamp 10"
                     )
             ));
@@ -585,12 +618,12 @@ mod tests {
                 into_otap(
                     &counters,
                     Sample {
-                        start_time_unix_nano: start,
                         timestamp_unix_nano: 10,
-                        points: vec![point(
+                        points: vec![sum_point(
                             0,
                             r"\Process(worker)\Private Bytes",
-                            SampleValue::Value(Number::Integer(42)),
+                            start,
+                            Number::Integer(42),
                         )],
                         failures: Vec::new(),
                         overflows: Vec::new(),
@@ -600,6 +633,122 @@ mod tests {
                 .unwrap()
                 .is_some()
             );
+        }
+    }
+
+    /// Scenario: Two native delta-count mappings share one metric with different valid intervals.
+    /// Guarantees: Projection emits delta Sum metadata and preserves each point's strict interval start.
+    #[test]
+    fn projects_delta_sum_intervals() {
+        let counters = [
+            delta_sum(
+                r"\Provider\Delta A",
+                "windows.operations",
+                "{operation}",
+                true,
+            ),
+            delta_sum(
+                r"\Provider\Delta B",
+                "windows.operations",
+                "{operation}",
+                true,
+            ),
+        ];
+        let records = into_otap(
+            &counters,
+            Sample {
+                timestamp_unix_nano: 10,
+                points: vec![
+                    sum_point(0, r"\Provider\Delta A", 5, Number::Double(2.0)),
+                    sum_point(1, r"\Provider\Delta B", 7, Number::Double(3.0)),
+                ],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let metrics = records.get(ArrowPayloadType::UnivariateMetrics).unwrap();
+        assert_eq!(metrics.num_rows(), 1);
+        assert_eq!(
+            array_value_to_string(
+                metrics
+                    .column_by_name("aggregation_temporality")
+                    .unwrap()
+                    .as_ref(),
+                0
+            )
+            .unwrap(),
+            AGGREGATION_TEMPORALITY_DELTA.to_string()
+        );
+        assert_eq!(
+            array_value_to_string(metrics.column_by_name("is_monotonic").unwrap().as_ref(), 0)
+                .unwrap(),
+            "true"
+        );
+        let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
+        let starts = points
+            .column_by_name("start_time_unix_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!([starts.value(0), starts.value(1)], [5, 7]);
+    }
+
+    /// Scenario: A delta Sum interval has a missing, non-positive, or non-increasing start.
+    /// Guarantees: Projection requires every delta point to satisfy 0 < start < observation time.
+    #[test]
+    fn validates_delta_sum_start_time() {
+        let counters = [delta_sum(
+            r"\Provider\Operations Delta",
+            "windows.operations",
+            "{operation}",
+            false,
+        )];
+        let missing = into_otap(
+            &counters,
+            Sample {
+                timestamp_unix_nano: 10,
+                points: vec![point(
+                    0,
+                    r"\Provider\Operations Delta",
+                    SampleValue::Value(Number::Double(2.0)),
+                )],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        );
+        assert!(matches!(
+            missing,
+            Err(ArrowError::InvalidArgumentError(message))
+                if message == "non-monotonic delta Sum windows.operations (\\Provider\\Operations Delta) is missing its start time"
+        ));
+        for start in [i64::MIN, -1, 0, 10, 11, i64::MAX] {
+            assert!(matches!(
+                into_otap(
+                    &counters,
+                    Sample {
+                        timestamp_unix_nano: 10,
+                        points: vec![sum_point(
+                            0,
+                            r"\Provider\Operations Delta",
+                            start,
+                            Number::Double(2.0),
+                        )],
+                        failures: Vec::new(),
+                        overflows: Vec::new(),
+                        diagnostics: Default::default(),
+                    },
+                ),
+                Err(ArrowError::InvalidArgumentError(message))
+                    if message == format!(
+                        "non-monotonic delta Sum windows.operations (\\Provider\\Operations Delta) \
+                         has invalid start time {start} for timestamp 10"
+                    )
+            ));
         }
     }
 
@@ -616,7 +765,6 @@ mod tests {
             into_otap(
                 &counters,
                 Sample {
-                    start_time_unix_nano: 2,
                     timestamp_unix_nano: 1,
                     points: vec![point(
                         0,
@@ -648,7 +796,6 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
-                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![
                     point(
@@ -691,7 +838,6 @@ mod tests {
             into_otap(
                 &counters,
                 Sample {
-                    start_time_unix_nano: 1,
                     timestamp_unix_nano: 1,
                     points: vec![point(
                         0,
@@ -728,7 +874,6 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
-                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![
                     point(
@@ -779,7 +924,6 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
-                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![point(
                     0,
@@ -818,7 +962,6 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
-                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![point(
                     0,
@@ -860,7 +1003,6 @@ mod tests {
             into_otap(
                 &counters,
                 Sample {
-                    start_time_unix_nano: 1,
                     timestamp_unix_nano: 1,
                     points: vec![point(
                         1,
@@ -879,7 +1021,6 @@ mod tests {
                 into_otap(
                     &counters,
                     Sample {
-                        start_time_unix_nano: 1,
                         timestamp_unix_nano: timestamp,
                         points: vec![point(
                             0,
@@ -899,7 +1040,6 @@ mod tests {
             into_otap(
                 &counters,
                 Sample {
-                    start_time_unix_nano: 1,
                     timestamp_unix_nano: 1,
                     points: vec![point(
                         0,
@@ -918,7 +1058,6 @@ mod tests {
                 into_otap(
                     &counters,
                     Sample {
-                        start_time_unix_nano: 1,
                         timestamp_unix_nano: 1,
                         points: vec![point(
                             0,
@@ -950,7 +1089,6 @@ mod tests {
         let records = into_otap(
             &counters,
             Sample {
-                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![
                     SamplePoint {
@@ -1020,7 +1158,6 @@ mod tests {
         let records = into_otap(
             &[active, idle],
             Sample {
-                start_time_unix_nano: 1,
                 timestamp_unix_nano: 1,
                 points: vec![
                     point(
