@@ -19,6 +19,8 @@ fn counter(path: &str, name: &str) -> CounterConfig {
         description: Arc::from(format!("Description for {name}.")),
         metric_kind: MetricKind::Gauge,
         attributes: Arc::new(BTreeMap::new()),
+        has_instance: false,
+        emit_instance_attribute: false,
         excluded_aggregation_instance: None,
         scale_power10: 0,
     }
@@ -250,6 +252,37 @@ fn same_path_mappings_use_independent_query_entries() {
             .points
             .iter()
             .all(|point| matches!(point.value, SampleValue::Value(Number::Integer(42))))
+    );
+}
+
+/// Scenario: One exact configured path names a duplicate process instance.
+/// Guarantees: Query opening preserves parsed instance identity for non-wildcard counters.
+#[test]
+fn exact_instance_path_preserves_identity() {
+    let path = r"\Process(worker#1)\Private Bytes";
+    let mut config = counter(path, "windows.process.private");
+    config.has_instance = true;
+    config.emit_instance_attribute = true;
+    let (_, mut query) = fake_query(
+        vec![config],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x0001_0100,
+            raw: None,
+            formatted: Some(Number::Integer(42)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+
+    let sample = query.collect().unwrap();
+    assert_eq!(
+        sample.points[0].instance,
+        Some(InstanceIdentity {
+            name: "worker".to_owned(),
+            parent: None,
+            index: 1,
+        })
     );
 }
 

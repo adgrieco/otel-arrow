@@ -440,6 +440,8 @@ mod tests {
                     description: Arc::from("Available physical memory."),
                     metric_kind: MetricKind::Gauge,
                     attributes: Arc::new(BTreeMap::new()),
+                    has_instance: false,
+                    emit_instance_attribute: false,
                     excluded_aggregation_instance: None,
                     scale_power10: 0,
                 }],

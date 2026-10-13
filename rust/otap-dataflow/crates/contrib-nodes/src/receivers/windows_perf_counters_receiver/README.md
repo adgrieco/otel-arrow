@@ -15,8 +15,10 @@
 Reads configured exact or instance-wildcard Windows performance-counter paths
 through PDH and emits OTel Gauges or cumulative Sums. Each data point includes
 the configured metric identity and concrete `windows.perf_counter.path`
-attribute. Wildcard points also include their configured path template and
-instance identity. The resource includes `os.type=windows`.
+attribute. Instance points emit Go-compatible `instance` identity plus
+extended `windows.perf_counter.*` identity attributes. Wildcard points also
+include their configured path template. The resource includes
+`os.type=windows`.
 
 The receiver constructs PDH paths from configured performance objects,
 instances, and counters, and periodically refreshes wildcard instances.
@@ -133,7 +135,14 @@ if its name exactly matches an explicitly defined metric name, avoiding
 incompatible metadata or kinds under one output stream.
 
 For mappings that reference a metric, optional `attributes` contains static
-string key/value pairs added to each emitted point.
+string key/value pairs added to each emitted point. The `instance` key is
+allowed and overwrites the receiver-generated Go-compatible value. On an
+object with multiple or wildcard instances, this override produces a
+configuration warning because a fixed value can collapse distinct points into
+the same OTel series when no other attributes distinguish them. This is a
+series collision, not automatic summation; internal counter histories and
+point values remain independent. Metric-less mappings do not warn because
+their configured attributes are ignored.
 One normalized PDH path may feed multiple distinct metric mappings. The
 receiver opens an independent handle for each mapping and routes each sample by
 its configured mapping identity. Repeating the same path, metric name, and
@@ -164,6 +173,14 @@ that exact instance. Empty `aggregation_name` uses `_Total`; set another value
 when a provider uses a name such as `_Global_`. Filtering occurs before
 expansion limits, and explicit wildcard inclusion does not create a duplicate
 aggregate query.
+
+Points for named instances emit `instance=<name>`. Duplicate PDH instances use
+the canonical suffix, such as `instance=process#1`; index zero omits `#0`.
+An aggregate selected alone omits `instance`, matching Go. An aggregate
+explicitly included with `"*"` retains it. The receiver also emits
+`windows.perf_counter.instance`, optional
+`windows.perf_counter.parent_instance`, and
+`windows.perf_counter.instance_index` for lossless PDH identity.
 
 Explicit PDH duplicate-instance indexes are canonicalized before path and
 duplicate checks: the first occurrence omits `#0`, and leading zeroes are
@@ -361,6 +378,9 @@ query-level failures, scrape timeouts, shutdown timeouts, and query-close
 failures use the same `otelcol.node.windowsperfcounters.*` event namespace.
 Repeated scrape and counter warnings are suppressed until the affected
 condition recovers.
+Configuration emits
+`otelcol.node.windowsperfcounters.config.instance_override` when a static
+`instance` value can collapse multiple selected native instances.
 
 The `receiver.windowsperfcounters.scrapes` measurement metric set attributes
 collection attempts by outcome. The `receiver.windowsperfcounters` health

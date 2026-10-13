@@ -37,6 +37,16 @@ pub(super) struct Config {
     pub(super) max_expanded_counters: usize,
 }
 
+fn should_warn_instance_override(
+    instances: Option<&[String]>,
+    attributes: &BTreeMap<String, String>,
+) -> bool {
+    attributes.contains_key("instance")
+        && instances.is_some_and(|instances| {
+            instances.len() > 1 || instances.iter().any(|instance| instance.contains('*'))
+        })
+}
+
 impl Config {
     /// Effective wildcard refresh interval.
     #[must_use]
@@ -166,18 +176,34 @@ impl Config {
                             metric_name
                         ))
                     })?;
+                    let attributes = normalize_attributes(&counter_field, &mapping.attributes)?;
+                    if should_warn_instance_override(instances.as_deref(), &attributes) {
+                        otel_arrow_dfe_telemetry::otel_warn!(
+                            "otelcol.node.windowsperfcounters.config.instance_override",
+                            message = "a static instance attribute overrides generated instance \
+                                       identity for multiple or wildcard instances and may merge \
+                                       distinct series",
+                            object_index = object_index,
+                            counter_index = counter_index
+                        );
+                    }
                     Some((
                         metric_name.to_owned(),
                         metric.unit.clone(),
                         Arc::clone(&metric.description),
                         metric.kind,
-                        Arc::new(normalize_attributes(&counter_field, &mapping.attributes)?),
+                        Arc::new(attributes),
                     ))
                 } else {
                     None
                 };
                 let paths = match &instances {
-                    None => vec![(format!(r"\{object_name}\{counter_name}"), None)],
+                    None => vec![(
+                        format!(r"\{object_name}\{counter_name}"),
+                        None,
+                        false,
+                        false,
+                    )],
                     Some(instances) if instances.iter().any(|instance| instance == "*") => {
                         let include_aggregation = instances
                             .iter()
@@ -185,19 +211,29 @@ impl Config {
                         vec![(
                             format!(r"\{object_name}(*)\{counter_name}"),
                             (!include_aggregation).then(|| aggregation_name.clone()),
+                            true,
+                            true,
                         )]
                     }
-                    Some(instances) => instances
-                        .iter()
-                        .map(|instance| {
-                            (
-                                format!(r"\{object_name}({instance})\{counter_name}"),
-                                instance.contains('*').then(|| aggregation_name.clone()),
-                            )
-                        })
-                        .collect(),
+                    Some(instances) => {
+                        let aggregate_alone = instances.len() == 1
+                            && instances[0].eq_ignore_ascii_case(&aggregation_name);
+                        instances
+                            .iter()
+                            .map(|instance| {
+                                (
+                                    format!(r"\{object_name}({instance})\{counter_name}"),
+                                    instance.contains('*').then(|| aggregation_name.clone()),
+                                    true,
+                                    !aggregate_alone,
+                                )
+                            })
+                            .collect()
+                    }
                 };
-                for (path, excluded_aggregation_instance) in paths {
+                for (path, excluded_aggregation_instance, has_instance, emit_instance_attribute) in
+                    paths
+                {
                     let (name, unit, description, metric_kind, attributes) =
                         if let Some((name, unit, description, metric_kind, attributes)) =
                             &explicit_metric
@@ -231,6 +267,8 @@ impl Config {
                         description,
                         metric_kind,
                         attributes,
+                        has_instance,
+                        emit_instance_attribute,
                         excluded_aggregation_instance,
                         scale_power10: mapping.scale_power10,
                     });
@@ -288,6 +326,10 @@ pub(super) struct CounterConfig {
     pub(super) metric_kind: MetricKind,
     /// Static attributes shared by paths expanded from one counter mapping.
     pub(super) attributes: Arc<BTreeMap<String, String>>,
+    /// Whether the configured PDH path contains an instance segment.
+    pub(super) has_instance: bool,
+    /// Whether to emit Go's `instance` attribute for parsed instance identity.
+    pub(super) emit_instance_attribute: bool,
     /// Provider aggregation instance omitted from this wildcard, when any.
     pub(super) excluded_aggregation_instance: Option<String>,
     /// Base-10 scaling applied after PDH calculates the native value.
@@ -715,6 +757,10 @@ mod tests {
         assert_eq!(config.counters[1].metric_kind, MetricKind::Gauge);
         assert_eq!(config.counters[1].attributes["state"], "active");
         assert_eq!(config.counters[2].attributes["state"], "idle");
+        assert!(!config.counters[0].has_instance);
+        assert!(!config.counters[0].emit_instance_attribute);
+        assert!(config.counters[1].has_instance);
+        assert!(config.counters[1].emit_instance_attribute);
         assert_eq!(config.counters[1].excluded_aggregation_instance, None);
         assert_eq!(config.collection_interval, Duration::from_secs(60));
         assert_eq!(config.initial_delay, Duration::from_secs(1));
@@ -993,6 +1039,20 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(included.counters[0].excluded_aggregation_instance, None);
+        assert!(included.counters[0].emit_instance_attribute);
+
+        let aggregate_alone = Config::from_json(&json!({
+            "metrics": {"test": metric()},
+            "perfcounters": [{
+                "object": "Custom Object",
+                "instances": "_Global_",
+                "aggregation_name": "_Global_",
+                "counters": [{"name": "Counter", "metric": "test"}]
+            }]
+        }))
+        .unwrap();
+        assert!(aggregate_alone.counters[0].has_instance);
+        assert!(!aggregate_alone.counters[0].emit_instance_attribute);
     }
 
     /// Scenario: Multiple named instances are selected without a wildcard.
@@ -1020,6 +1080,38 @@ mod tests {
             ]
         );
         assert!(config.counters.iter().all(|counter| counter.name == "test"));
+        assert!(config.counters.iter().all(|counter| counter.has_instance));
+        assert!(
+            config
+                .counters
+                .iter()
+                .all(|counter| counter.emit_instance_attribute)
+        );
+    }
+
+    /// Scenario: Static `instance` attributes are configured for exact, multiple, wildcard, or ignored mappings.
+    /// Guarantees: Only effective overrides that can collapse multiple selected instances request a warning.
+    #[test]
+    fn identifies_risky_instance_overrides() {
+        let override_attributes = BTreeMap::from([("instance".to_owned(), "fixed".to_owned())]);
+        let ignored_attributes = BTreeMap::new();
+
+        assert!(!should_warn_instance_override(
+            Some(&["worker".to_owned()]),
+            &override_attributes
+        ));
+        assert!(should_warn_instance_override(
+            Some(&["worker".to_owned(), "service".to_owned()]),
+            &override_attributes
+        ));
+        assert!(should_warn_instance_override(
+            Some(&["worker*".to_owned()]),
+            &override_attributes
+        ));
+        assert!(!should_warn_instance_override(
+            Some(&["*".to_owned()]),
+            &ignored_attributes
+        ));
     }
 
     /// Scenario: A canonical Windows counter name contains parentheses.

@@ -864,17 +864,32 @@ impl<A: PdhApi> Query<A> {
             if !query.configs[config_index].path.contains('*') {
                 let path = query.configs[config_index].path.clone();
                 let key = CounterKey::new(config_index, &path);
+                let instance = if query.configs[config_index].has_instance {
+                    match query.api.parse_instance(&path) {
+                        Ok(instance) => Some(instance),
+                        Err(error) => {
+                            query.pending.diagnostics.counter_add_failures += 1;
+                            query
+                                .pending
+                                .failures
+                                .push(sample_failure(config_index, &error));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let target = CounterTarget {
                     config_index,
                     path,
                     localized: false,
-                    instance: None,
+                    instance: instance.clone(),
                 };
                 match query.add_counter(
                     target.config_index,
                     target.path.clone(),
                     target.localized,
-                    None,
+                    instance,
                 ) {
                     Ok(()) => {}
                     Err(error) => match exact_add_failure_disposition(&error) {

@@ -4,7 +4,7 @@
 use super::config::{Aggregation, CounterConfig, MetricKind};
 #[cfg(test)]
 use super::model::SamplePoint;
-use super::model::{Number, Sample, SampleValue};
+use super::model::{InstanceIdentity, Number, Sample, SampleValue};
 use arrow::error::ArrowError;
 use otel_arrow_dfe_pdata::encode::record::attributes::StrKeysAttributesRecordBatchBuilder;
 use otel_arrow_dfe_pdata::encode::record::metrics::{
@@ -26,6 +26,14 @@ fn sum_kind(aggregation: Aggregation, monotonic: bool) -> &'static str {
         (Aggregation::Cumulative, false) => "non-monotonic cumulative Sum",
         (Aggregation::Delta, true) => "monotonic delta Sum",
         (Aggregation::Delta, false) => "non-monotonic delta Sum",
+    }
+}
+
+fn instance_attribute_value(instance: &InstanceIdentity) -> String {
+    if instance.index == 0 {
+        instance.name.clone()
+    } else {
+        format!("{}#{}", instance.name, instance.index)
     }
 }
 
@@ -170,6 +178,13 @@ pub(super) fn into_otap(
             attrs.any_values_builder.append_str(counter.path.as_bytes());
         }
         if let Some(instance) = point.instance {
+            if counter.emit_instance_attribute && !counter.attributes.contains_key("instance") {
+                attrs.append_parent_id(&point_id);
+                attrs.append_key("instance");
+                attrs
+                    .any_values_builder
+                    .append_str(instance_attribute_value(&instance).as_bytes());
+            }
             attrs.append_parent_id(&point_id);
             attrs.append_key("windows.perf_counter.instance");
             attrs
@@ -244,6 +259,8 @@ mod tests {
             description: Arc::from(format!("Description for {name}.")),
             metric_kind: MetricKind::Gauge,
             attributes: Arc::new(BTreeMap::new()),
+            has_instance: false,
+            emit_instance_attribute: false,
             excluded_aggregation_instance: None,
             scale_power10: 0,
         }
@@ -287,6 +304,22 @@ mod tests {
             start_time_unix_nano: None,
             value,
         }
+    }
+
+    fn string_attributes(records: &OtapArrowRecords) -> Vec<(String, String, String)> {
+        let attrs = records.get(ArrowPayloadType::NumberDpAttrs).unwrap();
+        let parent_ids = attrs.column_by_name("parent_id").unwrap();
+        let keys = attrs.column_by_name("key").unwrap();
+        let values = attrs.column_by_name("str").unwrap();
+        (0..attrs.num_rows())
+            .map(|index| {
+                (
+                    array_value_to_string(parent_ids.as_ref(), index).unwrap(),
+                    array_value_to_string(keys.as_ref(), index).unwrap(),
+                    array_value_to_string(values.as_ref(), index).unwrap(),
+                )
+            })
+            .collect()
     }
 
     fn sum_point(
@@ -1081,11 +1114,14 @@ mod tests {
     /// Guarantees: Concrete paths and parsed duplicate identities are emitted without positional joining.
     #[test]
     fn projects_wildcard_instance_identity() {
-        let counters = [counter(
+        let mut wildcard = counter(
             r"\Process(*)\Private Bytes",
             "windows.process.private",
             "By",
-        )];
+        );
+        wildcard.has_instance = true;
+        wildcard.emit_instance_attribute = true;
+        let counters = [wildcard];
         let records = into_otap(
             &counters,
             Sample {
@@ -1137,6 +1173,143 @@ mod tests {
         assert!(display.contains("windows.perf_counter.parent_instance"));
         assert!(display.contains("worker"));
         assert!(display.contains("service"));
+        assert_eq!(
+            string_attributes(&records)
+                .into_iter()
+                .filter(|(_, key, _)| key == "instance")
+                .collect::<Vec<_>>(),
+            [
+                ("0".to_owned(), "instance".to_owned(), "worker".to_owned()),
+                ("1".to_owned(), "instance".to_owned(), "worker#1".to_owned())
+            ]
+        );
+    }
+
+    /// Scenario: An aggregate is collected alone or explicitly included with other instances.
+    /// Guarantees: Go's `instance` attribute is omitted only for the aggregate-only mapping.
+    #[test]
+    fn projects_aggregate_instance_selection() {
+        let mut aggregate_alone = counter(r"\Processor(_Total)\Counter", "aggregate.alone", "1");
+        aggregate_alone.has_instance = true;
+        aggregate_alone.emit_instance_attribute = false;
+        let mut explicitly_included = counter(r"\Processor(*)\Counter", "aggregate.included", "1");
+        explicitly_included.has_instance = true;
+        explicitly_included.emit_instance_attribute = true;
+        let aggregate = InstanceIdentity {
+            name: "_Total".to_owned(),
+            parent: None,
+            index: 0,
+        };
+        let records = into_otap(
+            &[aggregate_alone, explicitly_included],
+            Sample {
+                timestamp_unix_nano: 1,
+                points: vec![
+                    SamplePoint {
+                        counter_index: 0,
+                        path: r"\Processor(_Total)\Counter".to_owned(),
+                        instance: Some(aggregate.clone()),
+                        start_time_unix_nano: None,
+                        value: SampleValue::Value(Number::Integer(10)),
+                    },
+                    SamplePoint {
+                        counter_index: 1,
+                        path: r"\Processor(_Total)\Counter".to_owned(),
+                        instance: Some(aggregate),
+                        start_time_unix_nano: None,
+                        value: SampleValue::Value(Number::Integer(20)),
+                    },
+                ],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let attrs = string_attributes(&records);
+        assert_eq!(
+            attrs
+                .iter()
+                .filter(|(_, key, _)| key == "instance")
+                .cloned()
+                .collect::<Vec<_>>(),
+            [("1".to_owned(), "instance".to_owned(), "_Total".to_owned())]
+        );
+        assert_eq!(
+            attrs
+                .iter()
+                .filter(|(_, key, _)| key == "windows.perf_counter.instance")
+                .count(),
+            2
+        );
+    }
+
+    /// Scenario: Two native instances share one fixed user `instance` attribute.
+    /// Guarantees: User precedence can collide emitted series without merging or dropping either point.
+    #[test]
+    fn static_instance_override_preserves_distinct_points() {
+        let mut wildcard = counter(r"\Process(*)\Private Bytes", "process.private", "By");
+        wildcard.has_instance = true;
+        wildcard.emit_instance_attribute = true;
+        wildcard.attributes = Arc::new(BTreeMap::from([(
+            "instance".to_owned(),
+            "fixed".to_owned(),
+        )]));
+        let records = into_otap(
+            &[wildcard],
+            Sample {
+                timestamp_unix_nano: 1,
+                points: vec![
+                    SamplePoint {
+                        counter_index: 0,
+                        path: r"\Process(worker)\Private Bytes".to_owned(),
+                        instance: Some(InstanceIdentity {
+                            name: "worker".to_owned(),
+                            parent: None,
+                            index: 0,
+                        }),
+                        start_time_unix_nano: None,
+                        value: SampleValue::Value(Number::Integer(10)),
+                    },
+                    SamplePoint {
+                        counter_index: 0,
+                        path: r"\Process(service)\Private Bytes".to_owned(),
+                        instance: Some(InstanceIdentity {
+                            name: "service".to_owned(),
+                            parent: None,
+                            index: 0,
+                        }),
+                        start_time_unix_nano: None,
+                        value: SampleValue::Value(Number::Integer(20)),
+                    },
+                ],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            records
+                .get(ArrowPayloadType::NumberDataPoints)
+                .unwrap()
+                .num_rows(),
+            2
+        );
+        assert_eq!(
+            string_attributes(&records)
+                .into_iter()
+                .filter(|(_, key, _)| key == "instance")
+                .collect::<Vec<_>>(),
+            [
+                ("0".to_owned(), "instance".to_owned(), "fixed".to_owned()),
+                ("1".to_owned(), "instance".to_owned(), "fixed".to_owned())
+            ]
+        );
     }
 
     /// Scenario: Two counters map to one metric and use custom attributes to distinguish their points.
