@@ -266,8 +266,8 @@ fn validate_path_element<'a>(
 }
 
 /// Canonicalizes PDH's decimal instance index, where the first occurrence omits `#0`.
-fn normalize_instance(field: &str, value: &str) -> Result<String, Error> {
-    let value = validate_path_element(field, value, false)?;
+fn normalize_instance(field: &str, value: &str, allow_star: bool) -> Result<String, Error> {
+    let value = validate_path_element(field, value, allow_star)?;
     let Some((name, index)) = value.rsplit_once('#') else {
         return Ok(value.to_owned());
     };
@@ -456,7 +456,7 @@ impl Config {
         let mut metric_identities = HashSet::new();
         for (name, metric) in &user.metrics {
             let name = validate_metric_name(name)?;
-            if !metric_identities.insert(name.to_ascii_lowercase()) {
+            if !metric_identities.insert(name.to_owned()) {
                 return Err(invalid(format!("metrics contains duplicate {name:?}")));
             }
             let description = metric.description.trim();
@@ -488,18 +488,16 @@ impl Config {
             }
             let aggregation_name = object
                 .aggregation_name
+                .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_AGGREGATION_NAME.to_owned());
             let aggregation_name = normalize_instance(
                 &format!("{object_field}.aggregation_name"),
                 &aggregation_name,
+                false,
             )?;
             let instances = match object.instances.map(OneOrMany::into_vec) {
                 None => None,
-                Some(instances) if instances.is_empty() => {
-                    return Err(invalid(format!(
-                        "{object_field}.instances must not be empty"
-                    )));
-                }
+                Some(instances) if instances.is_empty() => None,
                 Some(instances) => {
                     let field = format!("{object_field}.instances");
                     let mut unique = HashSet::new();
@@ -508,7 +506,7 @@ impl Config {
                         let instance = if instance.trim() == "*" {
                             validate_path_element(&field, &instance, true)?.to_owned()
                         } else {
-                            normalize_instance(&field, &instance)?
+                            normalize_instance(&field, &instance, instance.contains('*'))?
                         };
                         if !unique.insert(instance.to_lowercase()) {
                             return Err(invalid(format!(
@@ -516,15 +514,6 @@ impl Config {
                             )));
                         }
                         normalized.push(instance);
-                    }
-                    if normalized.iter().any(|instance| instance == "*")
-                        && normalized.iter().any(|instance| {
-                            instance != "*" && !instance.eq_ignore_ascii_case(&aggregation_name)
-                        })
-                    {
-                        return Err(invalid(format!(
-                            "{object_field}.instances may combine \"*\" only with aggregation_name"
-                        )));
                     }
                     Some(normalized)
                 }
@@ -575,7 +564,10 @@ impl Config {
                     Some(instances) => instances
                         .iter()
                         .map(|instance| {
-                            (format!(r"\{object_name}({instance})\{counter_name}"), None)
+                            (
+                                format!(r"\{object_name}({instance})\{counter_name}"),
+                                instance.contains('*').then(|| aggregation_name.clone()),
+                            )
                         })
                         .collect(),
                 };
@@ -1081,13 +1073,13 @@ mod tests {
     }
 
     /// Scenario: Normalized metric names or attribute keys collide.
-    /// Guarantees: Case-folded and post-trim duplicates fail instead of silently merging.
+    /// Guarantees: Exact post-trim duplicates fail while case-distinct OTel stream names remain distinct.
     #[test]
     fn rejects_normalized_identity_collisions() {
         let definition = json!({"description": "Value.", "unit": "By", "gauge": {}});
         assert_config_error(
             json!({
-                "metrics": {"cpu": definition.clone(), " CPU": definition},
+                "metrics": {"cpu": definition.clone(), " cpu ": definition},
                 "perfcounters": [{
                     "object": "Processor",
                     "counters": [{"name": "% Processor Time", "metric": "cpu"}]
@@ -1109,6 +1101,80 @@ mod tests {
             }),
             "contains duplicate attribute key",
         );
+    }
+
+    /// Scenario: Metric names differ only by ASCII case and are referenced independently.
+    /// Guarantees: OTel's case-sensitive stream identity is preserved during normalization.
+    #[test]
+    fn accepts_case_distinct_metric_names() {
+        let config = Config::from_json(&json!({
+            "metrics": {
+                "cpu": {"unit": "1"},
+                "CPU": {"unit": "%"}
+            },
+            "perfcounters": [{
+                "object": "Processor",
+                "counters": [
+                    {"name": "% Processor Time", "metric": "cpu"},
+                    {"name": "% Idle Time", "metric": "CPU"}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(config.counters[0].name, "cpu");
+        assert_eq!(config.counters[1].name, "CPU");
+    }
+
+    /// Scenario: Instances are empty, use a partial wildcard, or combine full wildcard with explicit names.
+    /// Guarantees: Empty means no instance, partial patterns are preserved, and full wildcard follows Go selection.
+    #[test]
+    fn accepts_go_instance_selection_forms() {
+        let empty = Config::from_json(&json!({
+            "perfcounters": [{
+                "object": "Memory",
+                "instances": [],
+                "aggregation_name": "",
+                "counters": [{"name": "Available Bytes"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(empty.counters[0].path, r"\Memory\Available Bytes");
+
+        let partial = Config::from_json(&json!({
+            "perfcounters": [{
+                "object": "Process",
+                "instances": ["worker*", "service"],
+                "counters": [{"name": "Private Bytes"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            partial
+                .counters
+                .iter()
+                .map(|counter| counter.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                r"\Process(worker*)\Private Bytes",
+                r"\Process(service)\Private Bytes"
+            ]
+        );
+        assert_eq!(
+            partial.counters[0].excluded_aggregation_instance.as_deref(),
+            Some("_Total")
+        );
+
+        let full = Config::from_json(&json!({
+            "perfcounters": [{
+                "object": "Process",
+                "instances": ["*", "worker"],
+                "counters": [{"name": "Private Bytes"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(full.counters.len(), 1);
+        assert_eq!(full.counters[0].path, r"\Process(*)\Private Bytes");
     }
 
     /// Scenario: A path segment contains an embedded NUL character.
@@ -1445,14 +1511,6 @@ mod tests {
                 "perfcounters": [{
                     "object": "Memory",
                     "counters": [{"name": "Available Bytes", "metric": "test"}]
-                }]
-            }),
-            json!({
-                "metrics": {"test": metric()},
-                "perfcounters": [{
-                    "object": "Process",
-                    "instances": ["*", "worker"],
-                    "counters": [{"name": "Private Bytes", "metric": "test"}]
                 }]
             }),
             json!({

@@ -143,13 +143,15 @@ the receiver asks PDH to translate the English template to its localized full
 path, expands that localized template, and adds the resulting concrete paths
 through the localized API.
 
-Omit `instances` for objects without instances. Specify one name or a list for
-exact instances. Specify `"*"` to discover all concrete instances while
-omitting the configured aggregation instance. Specify `["*", "_Total"]` to
-retain `_Total`, or select `"_Total"` alone to collect only that exact
-instance. Set `aggregation_name` when a provider uses another name such as
-`_Global_`. Filtering occurs before expansion limits, and explicit wildcard
-inclusion does not create a duplicate aggregate query.
+Omit `instances`, or use an empty list, for objects without instances. Specify
+one name or a list for exact instances. Partial patterns such as `"worker*"` are
+expanded independently. If a list contains `"*"`, Go-compatible selection uses
+the full wildcard and ignores other explicit non-aggregate names. Specify
+`["*", "_Total"]` to retain `_Total`, or select `"_Total"` alone to collect only
+that exact instance. Empty `aggregation_name` uses `_Total`; set another value
+when a provider uses a name such as `_Global_`. Filtering occurs before
+expansion limits, and explicit wildcard inclusion does not create a duplicate
+aggregate query.
 
 Explicit PDH duplicate-instance indexes are canonicalized before path and
 duplicate checks: the first occurrence omits `#0`, and leading zeroes are
