@@ -86,10 +86,9 @@ limit. Normalization produces between 1 and 256 exact or wildcard paths, and
 Each `metrics` key is an OTel metric name. Its value requires `description`,
 `unit`, and optionally one `gauge: {}` or `sum:` object. Omitting both defaults
 to Gauge. A Sum requires `aggregation: cumulative`; `monotonic` defaults to
-`false`. Delta, empty, and null Sum configurations are rejected because the
-receiver emits cumulative Sums; apply downstream conversion when delta
-temporality is required. Metrics that configure both Gauge and Sum are also
-rejected. Gauge may use YAML shorthand such as `gauge:`. Metric names follow
+`false`. Delta Sum is not supported yet. Empty and null Sum configurations are
+rejected. Metrics that configure both Gauge and Sum are also rejected. Gauge
+may use YAML shorthand such as `gauge:`. Metric names follow
 the OTel instrument-name syntax and are limited to 255 characters. Units must
 be printable ASCII and at most 63 characters.
 Multiple counter mappings may reference one metric and contribute points

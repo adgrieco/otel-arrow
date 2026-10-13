@@ -50,6 +50,14 @@ pub(super) enum MetricKind {
     Sum { monotonic: bool },
 }
 
+/// OTel Sum aggregation temporality accepted by the configuration parser.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Aggregation {
+    Cumulative,
+    Delta,
+}
+
 /// Configuration normalized for Windows performance-counter collection.
 #[derive(Debug, Clone)]
 pub(super) struct Config {
@@ -102,7 +110,7 @@ struct EmptyConfig {}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SumConfig {
-    aggregation: String,
+    aggregation: Aggregation,
     #[serde(default)]
     monotonic: bool,
 }
@@ -111,7 +119,13 @@ fn present_sum<'de, D>(deserializer: D) -> Result<Option<SumConfig>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Some(SumConfig::deserialize(deserializer)?))
+    Option::<SumConfig>::deserialize(deserializer)?
+        .ok_or_else(|| {
+            serde::de::Error::custom(
+                "sum must be a mapping with explicit aggregation: cumulative; null Sum is invalid",
+            )
+        })
+        .map(Some)
 }
 
 fn present_marker<'de, D>(deserializer: D) -> Result<Option<EmptyConfig>, D::Error>
@@ -127,14 +141,14 @@ impl MetricConfig {
     fn kind(&self, name: &str) -> Result<MetricKind, Error> {
         if self.gauge.is_some() && self.sum.is_some() {
             return Err(invalid(format!(
-                "metrics.{name} must configure at most one of gauge or sum"
+                "metrics.{name} must not contain both gauge and sum"
             )));
         }
         if let Some(sum) = &self.sum {
-            if sum.aggregation != "cumulative" {
+            if sum.aggregation == Aggregation::Delta {
                 return Err(invalid(format!(
-                    "metrics.{name}.sum.aggregation must be cumulative because this receiver \
-                     emits cumulative Sums; apply downstream conversion if delta temporality is required"
+                    "metrics.{name}: delta Sum is not supported yet; use gauge or sum with \
+                     aggregation: cumulative"
                 )));
             }
             Ok(MetricKind::Sum {
@@ -1111,36 +1125,81 @@ mod tests {
         assert_eq!(config.counters[0].metric_kind, MetricKind::Gauge);
     }
 
-    /// Scenario: Sum configuration is null, empty, delta, or combined with Gauge.
-    /// Guarantees: Invalid Sum shapes and conflicting metric kinds fail during configuration.
+    /// Scenario: Sum is null, empty, lacks aggregation or selects an invalid aggregation.
+    /// Guarantees: Sum never silently becomes Gauge or defaults its aggregation.
     #[test]
-    fn rejects_invalid_sum_configuration() {
-        for definition in [
-            json!({"description": "Value.", "unit": "1", "sum": null}),
-            json!({"description": "Value.", "unit": "1", "sum": {}}),
-            json!({
-                "description": "Value.",
-                "unit": "1",
-                "sum": {"aggregation": "delta"}
-            }),
-            json!({
-                "description": "Value.",
-                "unit": "1",
-                "gauge": {},
-                "sum": {"aggregation": "cumulative"}
-            }),
+    fn rejects_missing_or_invalid_sum_aggregation() {
+        for (sum, expected) in [
+            (json!(null), "null Sum is invalid"),
+            (json!({}), "missing field `aggregation`"),
+            (json!({"monotonic": false}), "missing field `aggregation`"),
+            (json!({"aggregation": null}), "expected string or map"),
+            (json!({"aggregation": ""}), "unknown variant"),
+            (json!({"aggregation": "invalid"}), "unknown variant"),
         ] {
-            assert!(
-                Config::from_json(&json!({
-                    "metrics": {"test": definition},
+            assert_config_error(
+                json!({
+                    "metrics": {"test": {
+                        "description": "Value.",
+                        "unit": "1",
+                        "sum": sum
+                    }},
                     "perfcounters": [{
                         "object": "Memory",
                         "counters": [{"name": "Available Bytes", "metric": "test"}]
                     }]
-                }))
-                .is_err()
+                }),
+                expected,
             );
         }
+    }
+
+    /// Scenario: Sum selects delta temporality before delta execution is available.
+    /// Guarantees: Delta is rejected explicitly without implying it will never be supported.
+    #[test]
+    fn rejects_delta_sum_not_supported_yet() {
+        for monotonic in [false, true] {
+            let error = Config::from_json(&json!({
+                "metrics": {"test": {
+                    "description": "Value.",
+                    "unit": "1",
+                    "sum": {"aggregation": "delta", "monotonic": monotonic}
+                }},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }]
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("metrics.test"), "{error}");
+            assert!(error.contains("delta Sum is not supported yet"), "{error}");
+            assert!(
+                error.contains("use gauge or sum with aggregation: cumulative"),
+                "{error}"
+            );
+        }
+    }
+
+    /// Scenario: A metric definition selects both Gauge and cumulative Sum.
+    /// Guarantees: Conflicting metric kinds are rejected with the PR A diagnostic.
+    #[test]
+    fn rejects_conflicting_metric_kinds() {
+        assert_config_error(
+            json!({
+                "metrics": {"test": {
+                    "description": "Value.",
+                    "unit": "1",
+                    "gauge": {},
+                    "sum": {"aggregation": "cumulative"}
+                }},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }]
+            }),
+            "metrics.test must not contain both gauge and sum",
+        );
     }
 
     /// Scenario: Invalid metadata, references, path elements, attributes, limits, or metric types are used.
