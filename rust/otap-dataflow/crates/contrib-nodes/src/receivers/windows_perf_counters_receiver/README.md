@@ -239,9 +239,10 @@ PDH performs rate, timer, fraction, and average calculations and associates
 visible fraction, average, and multi-timer numerators with their
 provider-defined base counters. Configure only the visible numerator path.
 Multi-timers require a positive native `MultiCount`; an invalid zero base omits
-the point, reports a counter-local failure, and restarts two-sample warm-up.
-Standalone base counters are not metrics and are rejected. Elapsed-time
-counters format from the current sample and do not require warm-up.
+the point and reports a counter-local failure. The raw sample still becomes the
+baseline for the next interval because that calculation uses the next sample's
+current `MultiCount`. Standalone base counters are not metrics and are rejected.
+Elapsed-time counters format from the current sample and do not require warm-up.
 
 All mappings emit regular PDH formatted values. Raw reads are used only to
 validate provider-defined bases for fractions and averages. Geneva-specific

@@ -726,13 +726,13 @@ impl<C> CounterHandle<C> {
             if self.kind == CounterKind::RawFraction {
                 validate_positive_base(&self.path, raw.second_value)?;
             } else {
+                let previous = self.history.previous_base.replace(raw.second_value);
                 if self.kind == CounterKind::CalculatedTwoSampleWithMultiBase
                     && let Err(error) = validate_positive_multi_base(&self.path, raw.multi_count)
                 {
-                    self.reset_readiness();
                     return Err(error);
                 }
-                let Some(previous) = self.history.previous_base.replace(raw.second_value) else {
+                let Some(previous) = previous else {
                     if self.kind == CounterKind::Delta {
                         self.history.delta_baseline_unix_nano = Some(timestamp_unix_nano);
                     }

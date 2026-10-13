@@ -1543,9 +1543,9 @@ fn elapsed_time_emits_from_first_sample() {
 }
 
 /// Scenario: A multi-timer warms, receives a zero native multi-counter base, then recovers.
-/// Guarantees: Zero is diagnosed without division and clears readiness before later samples resume.
+/// Guarantees: Zero diagnoses only its interval while advancing the raw baseline for the next good sample.
 #[test]
-fn multi_timer_validates_base_and_restarts_readiness() {
+fn multi_timer_invalid_base_preserves_readiness() {
     let path = r"\Processor Information(_Total)\% Processor Utility";
     let (state, mut query) = fake_query(
         vec![counter(path, "system.cpu.utility")],
@@ -1583,11 +1583,6 @@ fn multi_timer_validates_base_and_restarts_readiness() {
         state.counters[0].raw = Some(30);
         state.counters[0].multi_count = 4;
     }
-    assert_eq!(
-        query.collect().unwrap().points[0].value,
-        SampleValue::Warming
-    );
-    state.borrow_mut().counters[0].raw = Some(40);
     assert_eq!(
         query.collect().unwrap().points[0].value,
         SampleValue::Value(Number::Double(25.0))
