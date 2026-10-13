@@ -79,8 +79,9 @@ config:
 `wildcard_refresh_interval` defaults to `collection_interval` and must be
 between `collection_interval` and `24h`. Both expansion limits must be between
 `1` and `16384`, and the per-wildcard limit cannot exceed the receiver-wide
-limit. Normalization produces between 1 and 256 exact or wildcard paths, and
-`initial_delay` accepts `0s` through `24h`.
+limit. Normalization produces between 1 and 256 configured exact or wildcard
+paths, bounding query setup and native handles independently from wildcard
+membership. `initial_delay` accepts `0s` through `24h`.
 
 ### Metric options
 
@@ -165,10 +166,12 @@ Unknown fields, empty metadata, undefined or unused metrics, duplicate
 instances, duplicate normalized paths, invalid intervals, and unsupported
 scales are configuration errors. Surrounding whitespace is removed from metric
 identities, metadata, path segments, references, and attribute keys before
-duplicate detection. Embedded NUL characters are rejected. At most 256 metric
-definitions and 256 normalized exact or wildcard counter paths are accepted;
-the path total is checked before materialization. Repeated metric descriptions
-and mapping attributes are shared across explicit instance expansions.
+duplicate detection. Embedded NUL characters are rejected. Metric definitions
+have no receiver-specific count limit. At most 256 normalized configured exact
+or wildcard counter paths are accepted; the path total is checked before
+materialization. Wildcard expansion has separate configurable limits. Repeated
+metric descriptions and mapping attributes are shared across explicit instance
+expansions.
 Configured paths are limited to 2047 UTF-16 code units. Expanded paths that
 reach PDH's 2048-unit native limit are omitted and diagnosed.
 

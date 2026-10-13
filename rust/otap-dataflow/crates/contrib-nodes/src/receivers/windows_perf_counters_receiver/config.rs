@@ -10,7 +10,7 @@ use std::time::Duration;
 pub(super) const MIN_SCALE_POWER10: i32 = -18;
 pub(super) const MAX_SCALE_POWER10: i32 = 18;
 
-const MAX_COUNTERS: usize = 256;
+const MAX_CONFIGURED_COUNTER_PATHS: usize = 256;
 const MAX_METRIC_NAME_LEN: usize = 255;
 const MAX_METRIC_UNIT_LEN: usize = 63;
 const MAX_INSTANCE_LIMIT: usize = 16_384;
@@ -352,7 +352,7 @@ fn normalize_attributes(
 fn expanded_counter_count(objects: &[ObjectConfig]) -> Result<usize, Error> {
     let too_many = || {
         invalid(format!(
-            "perfcounters must normalize to at most {MAX_COUNTERS} counter paths"
+            "perfcounters must normalize to at most {MAX_CONFIGURED_COUNTER_PATHS} counter paths"
         ))
     };
     let mut total = 0usize;
@@ -373,7 +373,7 @@ fn expanded_counter_count(objects: &[ObjectConfig]) -> Result<usize, Error> {
             .checked_mul(object.counters.len())
             .ok_or_else(too_many)?;
         total = total.checked_add(paths).ok_or_else(too_many)?;
-        if total > MAX_COUNTERS {
+        if total > MAX_CONFIGURED_COUNTER_PATHS {
             return Err(too_many());
         }
     }
@@ -427,11 +427,6 @@ impl Config {
             return Err(invalid(
                 "wildcard_refresh_interval must be between collection_interval and 24h",
             ));
-        }
-        if user.metrics.len() > MAX_COUNTERS {
-            return Err(invalid(format!(
-                "metrics must contain at most {MAX_COUNTERS} entries"
-            )));
         }
         if user.perfcounters.is_empty() {
             return Err(invalid("perfcounters must contain at least one entry"));
@@ -1065,23 +1060,22 @@ mod tests {
         assert!(Config::from_json(&config("system.memory_usage-1/s", "{item}/s")).is_ok());
     }
 
-    /// Scenario: More metric definitions are configured than normalized counters can reference.
-    /// Guarantees: The bounded metric count fails before producing a large unused-metric error.
+    /// Scenario: More than 256 metric definitions are configured but only one is referenced.
+    /// Guarantees: Unused metadata definitions do not consume the configured PDH path budget.
     #[test]
-    fn bounds_metric_definitions() {
-        let metrics = (0..=MAX_COUNTERS)
+    fn allows_metric_definitions_beyond_counter_path_limit() {
+        let metrics = (0..=MAX_CONFIGURED_COUNTER_PATHS)
             .map(|index| (format!("m{index}"), metric()))
             .collect::<serde_json::Map<_, _>>();
-        assert_config_error(
-            json!({
-                "metrics": metrics,
-                "perfcounters": [{
-                    "object": "Memory",
-                    "counters": [{"name": "Available Bytes", "metric": "m0"}]
-                }]
-            }),
-            "metrics must contain at most 256 entries",
-        );
+        let config = Config::from_json(&json!({
+            "metrics": metrics,
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{"name": "Available Bytes", "metric": "m0"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(config.counters.len(), 1);
     }
 
     /// Scenario: Normalized metric names or attribute keys collide.
@@ -1240,7 +1234,7 @@ mod tests {
                 .unwrap()
                 .counters
                 .len(),
-            MAX_COUNTERS
+            MAX_CONFIGURED_COUNTER_PATHS
         );
         assert_config_error(
             config(json!([object(17, 16)])),
