@@ -1324,6 +1324,13 @@ impl<A: PdhApi> Query<A> {
         );
     }
 
+    fn prime(&mut self) -> Result<(), Error> {
+        let sample = self.collect()?;
+        self.pending
+            .merge(sample.diagnostics, sample.failures, sample.overflows);
+        Ok(())
+    }
+
     fn collect(&mut self) -> Result<Sample, Error> {
         let pending = std::mem::take(&mut self.pending);
         let mut diagnostics = pending.diagnostics;
@@ -1528,13 +1535,17 @@ impl Worker {
             .name("windowsperfcounters-pdh".to_owned())
             .spawn(move || {
                 {
-                    let query = match settings.open() {
+                    let mut query = match settings.open() {
                         Ok(query) => query,
                         Err(error) => {
                             let _ = init_tx.send(Err(error));
                             return;
                         }
                     };
+                    if let Err(error) = query.prime() {
+                        let _ = init_tx.send(Err(error));
+                        return;
+                    }
                     if init_tx.send(Ok(())).is_err() {
                         return;
                     }
@@ -1547,7 +1558,7 @@ impl Worker {
                     while !worker_shutdown.load(Ordering::Acquire) {
                         match rx.recv() {
                             Ok(Command::Collect(response)) => {
-                                let _accepted =
+                                let accepted =
                                     AcceptedCollectGuard::new(Arc::clone(&worker_accepted));
                                 let now = Instant::now();
                                 let was_query_retry = query.is_some()
@@ -1645,6 +1656,7 @@ impl Worker {
                                 if let Ok(sample) = &mut result {
                                     pending.merge_into_sample(sample);
                                 }
+                                drop(accepted);
                                 let _ = response.send(result);
                             }
                             Ok(Command::Shutdown) | Err(_) => break,

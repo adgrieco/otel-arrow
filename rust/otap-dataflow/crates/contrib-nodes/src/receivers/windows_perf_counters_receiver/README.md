@@ -271,15 +271,19 @@ For example, `\Memory\Available Bytes` remains an exact byte count with unit
 
 ## Collection behavior
 
-The receiver opens the PDH query during startup without collecting, waits
-`initial_delay`, then performs its first scheduled scrape. Two-sample counters
-therefore warm on scheduled collections; startup retries remain independent.
+The receiver opens the PDH query on its worker and performs one startup
+collection without emitting points. This prime seeds valid native and
+receiver-side sample history before `initial_delay` and the first scheduled
+scrape. A hard query or timestamp failure during priming fails initialization.
+No-data, invalid, or counter-local failures retain their normal omission and
+diagnostic behavior without fabricating readiness.
 
 - Wildcards are expanded at startup and then at
   `wildcard_refresh_interval`. Concrete paths are joined by configured counter
   and full case-insensitive path, including PDH's `#n` duplicate index.
-- One-sample counters can emit immediately. Two-sample counters warm
-  independently and become eligible at the next configured interval.
+- One-sample counters can emit immediately. A valid startup prime normally
+  makes two-sample counters eligible on the first scheduled scrape. Insufficient
+  elapsed time or an invalid/missing prime still requires fresh warm-up.
 - Delta Sum intervals require `0 < start_time < time_unix_nano`; each series
   tracks its own previous valid native sample timestamp.
 - Removed instances stop emitting after the next discovery refresh.

@@ -260,6 +260,127 @@ fn same_path_mappings_use_independent_query_entries() {
     );
 }
 
+/// Scenario: Startup priming reads a calculated Gauge and native delta Sum before their first scrape.
+/// Guarantees: The first requested scrape emits both values using receiver-side readiness and the prime timestamp.
+#[test]
+fn startup_prime_seeds_two_sample_histories() {
+    let rate_path = r"\Processor(_Total)\% Processor Time";
+    let delta_path = r"\Provider\Operations Delta";
+    let (state, mut query) = fake_query(
+        vec![
+            counter(rate_path, "system.cpu.time"),
+            delta_sum(delta_path, "provider.operations", false),
+        ],
+        vec![
+            FakeCounter {
+                path: rate_path.to_owned(),
+                native_type: 0x2041_0500,
+                raw: Some(10),
+                multi_count: 1,
+                formatted: Some(Number::Double(1.0)),
+                raw_error: false,
+                formatted_error: false,
+            },
+            FakeCounter {
+                path: delta_path.to_owned(),
+                native_type: 0x0040_0500,
+                raw: Some(10),
+                multi_count: 1,
+                formatted: Some(Number::Double(2.0)),
+                raw_error: false,
+                formatted_error: false,
+            },
+        ],
+    );
+
+    query.prime().unwrap();
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 110;
+        state.counters[0].raw = Some(20);
+        state.counters[1].raw = Some(20);
+        state.counters[1].formatted = Some(Number::Double(3.0));
+    }
+    let sample = query.collect().unwrap();
+    assert!(matches!(
+        sample.points[0].value,
+        SampleValue::Value(Number::Double(1.0))
+    ));
+    assert_eq!(sample.points[1].start_time_unix_nano, Some(100));
+    assert!(matches!(
+        sample.points[1].value,
+        SampleValue::Value(Number::Double(3.0))
+    ));
+    assert_eq!(sample.diagnostics.warmup_omissions, 2);
+}
+
+/// Scenario: The native startup collection reports no data before a calculated counter becomes valid.
+/// Guarantees: Priming fabricates no readiness, so the first valid sample warms and the following sample emits.
+#[test]
+fn startup_prime_no_data_requires_fresh_warmup() {
+    let path = r"\Processor(_Total)\% Processor Time";
+    let (state, mut query) = fake_query(
+        vec![counter(path, "system.cpu.time")],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x2041_0500,
+            raw: Some(10),
+            multi_count: 1,
+            formatted: Some(Number::Double(1.0)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+    state.borrow_mut().collect_has_data = false;
+
+    query.prime().unwrap();
+    {
+        let mut state = state.borrow_mut();
+        state.collect_has_data = true;
+        state.timestamp = 110;
+    }
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Warming
+    );
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 120;
+        state.counters[0].raw = Some(20);
+    }
+    assert!(matches!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Value(Number::Double(1.0))
+    ));
+}
+
+/// Scenario: A direct counter has a counter-local formatted failure during startup priming.
+/// Guarantees: Initialization continues and the priming failure is delivered with the next successful scrape.
+#[test]
+fn startup_prime_preserves_counter_failures() {
+    let path = r"\Memory\Available Bytes";
+    let (state, mut query) = fake_query(
+        vec![counter(path, "system.memory.available")],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x0001_0100,
+            raw: None,
+            multi_count: 1,
+            formatted: Some(Number::Integer(42)),
+            raw_error: false,
+            formatted_error: true,
+        }],
+    );
+
+    query.prime().unwrap();
+    state.borrow_mut().counters[0].formatted_error = false;
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points.len(), 1);
+    assert_eq!(sample.failures.len(), 1);
+    assert_eq!(sample.failures[0].counter_index, 0);
+    assert_eq!(sample.diagnostics.counter_read_failures, 1);
+}
+
 /// Scenario: One exact configured path names a duplicate process instance.
 /// Guarantees: Query opening preserves parsed instance identity for non-wildcard counters.
 #[test]
@@ -389,13 +510,15 @@ fn controlled_worker() -> (
         while !worker_shutdown.load(Ordering::Acquire) {
             match rx.recv() {
                 Ok(Command::Collect(response)) => {
-                    let _accepted = AcceptedCollectGuard::new(Arc::clone(&worker_accepted));
+                    let accepted = AcceptedCollectGuard::new(Arc::clone(&worker_accepted));
                     if let Some((started, release, released)) = first.take() {
                         let _ = started.send(());
                         let _ = release.blocking_recv();
+                        drop(accepted);
                         let _ = response.send(Ok(empty_sample()));
                         let _ = released.send(());
                     } else {
+                        drop(accepted);
                         let _ = response.send(Ok(empty_sample()));
                     }
                 }
@@ -536,11 +659,11 @@ async fn live_pdh_independent_workers_can_collect_concurrently() {
     assert_eq!(after.1 - before.1, 2);
 }
 
-/// Scenario: The first post-prime scrape has direct, raw-fraction, and two-sample values.
-/// Guarantees: One-sample values emit immediately while only the two-sample timer is omitted.
+/// Scenario: Worker startup primes direct, raw-fraction, and two-sample counters before the first request.
+/// Guarantees: The first requested scrape emits every valid family after sufficient elapsed time.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
-async fn live_pdh_first_scrape_emits_one_sample_values_and_warms_two_sample() {
+async fn live_pdh_startup_prime_enables_first_calculated_scrape() {
     let _serial = super::super::TEST_PDH_LOCK.lock().await;
     let counters = vec![
         counter(r"\Memory\Available Bytes", "windows.memory.available"),
@@ -562,6 +685,7 @@ async fn live_pdh_first_scrape_emits_one_sample_values_and_warms_two_sample() {
     )
     .await
     .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
     let sample = worker.collect().await.unwrap();
     assert!(matches!(
         sample.points[0].value,
@@ -570,7 +694,9 @@ async fn live_pdh_first_scrape_emits_one_sample_values_and_warms_two_sample() {
     assert!(
         matches!(sample.points[1].value, SampleValue::Value(Number::Double(value)) if value.is_finite())
     );
-    assert_eq!(sample.points[2].value, SampleValue::Warming);
+    assert!(
+        matches!(sample.points[2].value, SampleValue::Value(Number::Double(value)) if value.is_finite())
+    );
     assert!(
         worker
             .shutdown(Instant::now() + Duration::from_secs(2))
@@ -579,8 +705,8 @@ async fn live_pdh_first_scrape_emits_one_sample_values_and_warms_two_sample() {
     );
 }
 
-/// Scenario: A Windows direct count is mapped to a cumulative monotonic Sum.
-/// Guarantees: The first scrape emits the formatted value with start time equal to point time.
+/// Scenario: Worker startup primes a Windows direct count mapped to a cumulative monotonic Sum.
+/// Guarantees: The first scrape emits with a sequence start retained from the earlier prime.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_collects_first_monotonic_direct_value() {
@@ -598,16 +724,16 @@ async fn live_pdh_collects_first_monotonic_direct_value() {
     )
     .await
     .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
     let sample = worker.collect().await.unwrap();
     assert_eq!(sample.points.len(), 1);
     assert!(matches!(
         sample.points[0].value,
         SampleValue::Value(Number::Integer(value)) if value >= 0
     ));
-    assert_eq!(
-        sample.points[0].start_time_unix_nano,
-        Some(sample.timestamp_unix_nano)
-    );
+    let start_time = sample.points[0].start_time_unix_nano.unwrap();
+    assert!(start_time > 0);
+    assert!(start_time < sample.timestamp_unix_nano);
     assert!(
         worker
             .shutdown(Instant::now() + Duration::from_secs(2))
@@ -711,8 +837,8 @@ async fn live_pdh_collects_exact_and_wildcard_counters() {
     );
 }
 
-/// Scenario: Live Windows PDH formats common disk queue-length and precision-timer counters.
-/// Guarantees: Both additional two-sample families produce finite values from one query.
+/// Scenario: Worker startup primes common disk queue-length and precision-timer counters.
+/// Guarantees: Both two-sample families produce finite values on the first requested scrape.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_collects_common_calculated_disk_counters() {
@@ -734,28 +860,14 @@ async fn live_pdh_collects_common_calculated_disk_counters() {
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let warming = worker.collect().await.unwrap();
-    assert!(warming.failures.is_empty(), "{:?}", warming.failures);
-    assert_eq!(warming.points.len(), 2);
-    assert!(
-        warming
-            .points
-            .iter()
-            .all(|point| point.value == SampleValue::Warming),
-        "{:?}",
-        warming.points
-    );
-    tokio::time::sleep(Duration::from_millis(250)).await;
     let sample = worker.collect().await.unwrap();
     assert!(sample.failures.is_empty(), "{:?}", sample.failures);
     assert_eq!(sample.points.len(), 2);
     assert!(
-        sample.points.iter().all(|point| {
-            matches!(
-                point.value,
-                SampleValue::Value(Number::Double(value)) if value.is_finite()
-            )
-        }),
+        sample.points.iter().all(|point| matches!(
+            point.value,
+            SampleValue::Value(Number::Double(value)) if value.is_finite()
+        )),
         "{:?}",
         sample.points
     );
