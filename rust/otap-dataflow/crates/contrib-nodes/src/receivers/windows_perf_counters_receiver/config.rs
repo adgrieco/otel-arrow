@@ -67,6 +67,8 @@ pub(super) struct Config {
     pub(super) collection_interval: Duration,
     /// Delay before the first collection request; defaults to one second.
     pub(super) initial_delay: Duration,
+    /// Maximum wait for one scrape; `None` disables the deadline.
+    pub(super) timeout: Option<Duration>,
     /// Time between wildcard discovery refreshes; defaults to the collection interval.
     pub(super) wildcard_refresh_interval: Option<Duration>,
     /// Maximum expanded instances retained for one wildcard path.
@@ -85,6 +87,8 @@ struct UserConfig {
     collection_interval: Duration,
     #[serde(default = "default_initial_delay", with = "humantime_serde")]
     initial_delay: Duration,
+    #[serde(default, with = "humantime_serde")]
+    timeout: Option<Duration>,
     #[serde(default, with = "humantime_serde")]
     wildcard_refresh_interval: Option<Duration>,
     #[serde(default = "default_max_instances_per_wildcard")]
@@ -620,6 +624,11 @@ impl Config {
             counters,
             collection_interval: user.collection_interval,
             initial_delay: user.initial_delay,
+            timeout: match user.timeout {
+                Some(Duration::ZERO) => None,
+                Some(timeout) => Some(timeout),
+                None => Some(user.collection_interval),
+            },
             wildcard_refresh_interval: user.wildcard_refresh_interval,
             max_instances_per_wildcard: user.max_instances_per_wildcard,
             max_expanded_counters: user.max_expanded_counters,
@@ -719,7 +728,39 @@ mod tests {
         assert_eq!(config.counters[1].excluded_aggregation_instance, None);
         assert_eq!(config.collection_interval, Duration::from_secs(60));
         assert_eq!(config.initial_delay, Duration::from_secs(1));
+        assert_eq!(config.timeout, Some(Duration::from_secs(60)));
         assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(60));
+    }
+
+    /// Scenario: Timeout is omitted, positive, zero, or negative.
+    /// Guarantees: Omission follows the interval, positive values are retained, zero disables it, and negatives fail.
+    #[test]
+    fn normalizes_scrape_timeout() {
+        let base = json!({
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{"name": "Available Bytes"}]
+            }],
+            "collection_interval": "45s"
+        });
+
+        let omitted = Config::from_json(&base).unwrap();
+        assert_eq!(omitted.timeout, Some(Duration::from_secs(45)));
+
+        let mut positive = base.clone();
+        positive["timeout"] = json!("10s");
+        assert_eq!(
+            Config::from_json(&positive).unwrap().timeout,
+            Some(Duration::from_secs(10))
+        );
+
+        let mut disabled = base.clone();
+        disabled["timeout"] = json!("0s");
+        assert_eq!(Config::from_json(&disabled).unwrap().timeout, None);
+
+        let mut negative = base;
+        negative["timeout"] = json!("-1s");
+        assert_config_error(negative, "invalid value");
     }
 
     /// Scenario: A cumulative Sum omits its optional monotonic setting.

@@ -20,6 +20,7 @@ use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
 use otel_arrow_dfe_telemetry::common_attributes::Outcome;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, timeout};
@@ -38,6 +39,19 @@ struct WindowsPerfCountersReceiver {
 
 async fn wait_initial_delay(delay: Duration) {
     tokio::time::sleep(delay).await;
+}
+
+async fn with_optional_timeout<F>(
+    duration: Option<Duration>,
+    future: F,
+) -> Result<F::Output, tokio::time::error::Elapsed>
+where
+    F: Future,
+{
+    match duration {
+        Some(duration) => timeout(duration, future).await,
+        None => Ok(future.await),
+    }
 }
 
 fn worker_shutdown_deadline(now: Instant, pipeline_deadline: Instant) -> Instant {
@@ -115,7 +129,7 @@ impl WindowsPerfCountersReceiver {
         loop {
             let _ = interval.tick().await;
             let scrape_start = Instant::now();
-            let sample = match timeout(self.config.collection_interval, worker.collect()).await {
+            let sample = match with_optional_timeout(self.config.timeout, worker.collect()).await {
                 Ok(Ok(sample)) => {
                     let mut metrics = self.metrics.borrow_mut();
                     metrics.record_scrape(Outcome::Success);
@@ -209,7 +223,7 @@ impl WindowsPerfCountersReceiver {
                         otel_arrow_dfe_telemetry::otel_warn!(
                             "otelcol.node.windowsperfcounters.scrape.timeout",
                             node = self.node.as_str(),
-                            timeout_seconds = self.config.collection_interval.as_secs_f64()
+                            timeout_seconds = self.config.timeout.unwrap_or_default().as_secs_f64()
                         );
                         scrape_failed = true;
                     }
@@ -431,6 +445,7 @@ mod tests {
                 }],
                 collection_interval: Duration::from_secs(1),
                 initial_delay: Duration::ZERO,
+                timeout: Some(Duration::from_secs(1)),
                 wildcard_refresh_interval: None,
                 max_instances_per_wildcard: 256,
                 max_expanded_counters: 4_096,
@@ -475,5 +490,20 @@ mod tests {
     fn completes_drain_and_shutdown_through_engine_harness() {
         run_live_lifecycle(true);
         run_live_lifecycle(false);
+    }
+
+    /// Scenario: Scrape timeout is enabled or explicitly disabled.
+    /// Guarantees: Enabled deadlines expire while disabled deadlines await the same future to completion.
+    #[tokio::test(start_paused = true)]
+    async fn optional_timeout_controls_scrape_deadline() {
+        let timed = with_optional_timeout(
+            Some(Duration::from_secs(1)),
+            tokio::time::sleep(Duration::from_secs(2)),
+        )
+        .await;
+        assert!(timed.is_err());
+
+        let untimed = with_optional_timeout(None, async { 42 }).await;
+        assert_eq!(untimed.unwrap(), 42);
     }
 }
