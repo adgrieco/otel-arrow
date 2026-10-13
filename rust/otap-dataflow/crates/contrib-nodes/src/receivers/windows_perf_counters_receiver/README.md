@@ -67,7 +67,7 @@ config:
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `metrics` | Yes | None | Metric metadata keyed by OTel metric name |
+| `metrics` | No | Empty | Optional metric metadata keyed by OTel metric name |
 | `perfcounters` | Yes | None | Performance objects and counter mappings |
 | `initial_delay` | No | `1s` | Delay before the first collection request |
 | `collection_interval` | No | `30s` | Interval from `1s` through `24h` |
@@ -83,12 +83,13 @@ limit. Normalization produces between 1 and 256 exact or wildcard paths, and
 
 ### Metric options
 
-Each `metrics` key is an OTel metric name. Its value requires `description`,
-`unit`, and optionally one `gauge: {}` or `sum:` object. Omitting both defaults
-to Gauge. A Sum requires `aggregation: cumulative`; `monotonic` defaults to
-`false`. Delta Sum is not supported yet. Empty and null Sum configurations are
-rejected. Metrics that configure both Gauge and Sum are also rejected. Gauge
-may use YAML shorthand such as `gauge:`. Metric names follow
+Each `metrics` key is an OTel metric name. `description` defaults to empty and
+`unit` defaults to `"1"`. Definitions may be unused. A definition may select
+one `gauge: {}` or `sum:` object; omitting both defaults to Gauge. A Sum
+requires `aggregation: cumulative`; `monotonic` defaults to `false`. Delta Sum
+is not supported yet. Empty and null Sum configurations are rejected. Metrics
+that configure both Gauge and Sum are also rejected. Gauge may use YAML
+shorthand such as `gauge:`. Metric names follow
 the OTel instrument-name syntax and are limited to 255 characters. Units must
 be printable ASCII and at most 63 characters.
 Multiple counter mappings may reference one metric and contribute points
@@ -115,8 +116,16 @@ windows.operations:
 | `aggregation_name` | No | `_Total` | Provider aggregation instance |
 | `counters` | Yes | None | Counter mappings for the object |
 
-Each counter mapping requires `name` and `metric`. Optional `attributes`
-contains static string key/value pairs added to each emitted point.
+Each counter mapping requires `name`; `metric` is optional. Without `metric`,
+the receiver emits a Gauge named from the full configured PDH path, including
+its instance pattern, with unit `"1"` and an empty description. Mapping
+`attributes` are ignored in this mode. An implicit path-named Gauge is rejected
+if its name exactly matches an explicitly defined metric name, avoiding
+incompatible metadata or kinds under one output stream. Duplicate normalized
+counter paths are also rejected.
+
+For mappings that reference a metric, optional `attributes` contains static
+string key/value pairs added to each emitted point.
 `scale_power10` defaults to zero and accepts values from `-18` through `18`.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.

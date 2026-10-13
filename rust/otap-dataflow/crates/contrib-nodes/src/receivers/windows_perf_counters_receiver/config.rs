@@ -78,6 +78,7 @@ pub(super) struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserConfig {
+    #[serde(default)]
     metrics: BTreeMap<String, MetricConfig>,
     perfcounters: Vec<ObjectConfig>,
     #[serde(default = "default_interval", with = "humantime_serde")]
@@ -95,7 +96,9 @@ struct UserConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MetricConfig {
+    #[serde(default)]
     description: String,
+    #[serde(default)]
     unit: String,
     #[serde(default, deserialize_with = "present_marker")]
     gauge: Option<EmptyConfig>,
@@ -198,7 +201,8 @@ impl OneOrMany {
 #[serde(deny_unknown_fields)]
 struct CounterMapping {
     name: String,
-    metric: String,
+    #[serde(default)]
+    metric: Option<String>,
     #[serde(default)]
     attributes: BTreeMap<String, String>,
     #[serde(default)]
@@ -418,9 +422,6 @@ impl Config {
                 "wildcard_refresh_interval must be between collection_interval and 24h",
             ));
         }
-        if user.metrics.is_empty() {
-            return Err(invalid("metrics must contain at least one entry"));
-        }
         if user.metrics.len() > MAX_COUNTERS {
             return Err(invalid(format!(
                 "metrics must contain at most {MAX_COUNTERS} entries"
@@ -453,8 +454,11 @@ impl Config {
                 return Err(invalid(format!("metrics contains duplicate {name:?}")));
             }
             let description = metric.description.trim();
-            require_name(&format!("metrics.{name}.description"), description)?;
-            let unit = validate_metric_unit(name, &metric.unit)?;
+            let unit = if metric.unit.trim().is_empty() {
+                "1"
+            } else {
+                validate_metric_unit(name, &metric.unit)?
+            };
             let _ = metrics.insert(
                 name.to_owned(),
                 NormalizedMetric {
@@ -467,7 +471,6 @@ impl Config {
 
         let expanded_count = expanded_counter_count(&user.perfcounters)?;
         let mut counters = Vec::with_capacity(expanded_count);
-        let mut referenced_metrics = HashSet::new();
         for (object_index, object) in user.perfcounters.into_iter().enumerate() {
             let object_field = format!("perfcounters[{object_index}]");
             let object_name =
@@ -525,16 +528,28 @@ impl Config {
                 let counter_field = format!("{object_field}.counters[{counter_index}]");
                 let counter_name =
                     validate_counter_name(&format!("{counter_field}.name"), &mapping.name)?;
-                let metric_name = mapping.metric.trim();
-                let metric = metrics.get(metric_name).ok_or_else(|| {
-                    invalid(format!(
-                        "{counter_field}.metric references undefined metric {:?}",
-                        metric_name
+                let metric_name = mapping
+                    .metric
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
+                let explicit_metric = if let Some(metric_name) = metric_name {
+                    let metric = metrics.get(metric_name).ok_or_else(|| {
+                        invalid(format!(
+                            "{counter_field}.metric references undefined metric {:?}",
+                            metric_name
+                        ))
+                    })?;
+                    Some((
+                        metric_name.to_owned(),
+                        metric.unit.clone(),
+                        Arc::clone(&metric.description),
+                        metric.kind,
+                        Arc::new(normalize_attributes(&counter_field, &mapping.attributes)?),
                     ))
-                })?;
-                let _ = referenced_metrics.insert(metric_name.to_owned());
-                let attributes =
-                    Arc::new(normalize_attributes(&counter_field, &mapping.attributes)?);
+                } else {
+                    None
+                };
                 let paths = match &instances {
                     None => vec![(format!(r"\{object_name}\{counter_name}"), None)],
                     Some(instances) if instances.iter().any(|instance| instance == "*") => {
@@ -554,29 +569,44 @@ impl Config {
                         .collect(),
                 };
                 for (path, excluded_aggregation_instance) in paths {
+                    let (name, unit, description, metric_kind, attributes) =
+                        if let Some((name, unit, description, metric_kind, attributes)) =
+                            &explicit_metric
+                        {
+                            (
+                                name.clone(),
+                                unit.clone(),
+                                Arc::clone(description),
+                                *metric_kind,
+                                Arc::clone(attributes),
+                            )
+                        } else {
+                            if metrics.contains_key(&path) {
+                                return Err(invalid(format!(
+                                    "{counter_field} implicit path-named Gauge {path:?} conflicts \
+                                     with an explicitly defined metric of the same name"
+                                )));
+                            }
+                            (
+                                path.clone(),
+                                "1".to_owned(),
+                                Arc::from(""),
+                                MetricKind::Gauge,
+                                Arc::new(BTreeMap::new()),
+                            )
+                        };
                     counters.push(CounterConfig {
                         path,
-                        name: metric_name.to_owned(),
-                        unit: metric.unit.clone(),
-                        description: Arc::clone(&metric.description),
-                        metric_kind: metric.kind,
-                        attributes: Arc::clone(&attributes),
+                        name,
+                        unit,
+                        description,
+                        metric_kind,
+                        attributes,
                         excluded_aggregation_instance,
                         scale_power10: mapping.scale_power10,
                     });
                 }
             }
-        }
-        let unused = metrics
-            .keys()
-            .filter(|name| !referenced_metrics.contains(*name))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !unused.is_empty() {
-            return Err(invalid(format!(
-                "metrics are not referenced by any counter: {}",
-                unused.join(", ")
-            )));
         }
         let mut paths = HashSet::with_capacity(counters.len());
         for (index, counter) in counters.iter().enumerate() {
@@ -762,6 +792,72 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(config.counters[0].metric_kind, MetricKind::Gauge);
+    }
+
+    /// Scenario: Metrics and a counter's metric reference are omitted.
+    /// Guarantees: The full configured path names a default Gauge and mapping attributes are ignored.
+    #[test]
+    fn defaults_metricless_mapping_to_path_named_gauge() {
+        let config = Config::from_json(&json!({
+            "perfcounters": [{
+                "object": "Process",
+                "instances": "*",
+                "counters": [{
+                    "name": "Private Bytes",
+                    "attributes": {
+                        "state": "ignored",
+                        "windows.perf_counter.path": "also ignored"
+                    }
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let counter = &config.counters[0];
+        assert_eq!(counter.path, r"\Process(*)\Private Bytes");
+        assert_eq!(counter.name, counter.path);
+        assert_eq!(counter.unit, "1");
+        assert!(counter.description.is_empty());
+        assert_eq!(counter.metric_kind, MetricKind::Gauge);
+        assert!(counter.attributes.is_empty());
+    }
+
+    /// Scenario: Metric metadata fields are omitted and another definition is unused.
+    /// Guarantees: Referenced metadata receives Go-compatible defaults and unused definitions are allowed.
+    #[test]
+    fn defaults_optional_metric_metadata_and_allows_unused_definitions() {
+        let config = Config::from_json(&json!({
+            "metrics": {
+                "used": {"gauge": {}},
+                "unused": {}
+            },
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{"name": "Available Bytes", "metric": "used"}]
+            }]
+        }))
+        .unwrap();
+
+        let counter = &config.counters[0];
+        assert_eq!(counter.name, "used");
+        assert_eq!(counter.unit, "1");
+        assert!(counter.description.is_empty());
+        assert_eq!(counter.metric_kind, MetricKind::Gauge);
+    }
+
+    /// Scenario: A counter supplies an empty metric name.
+    /// Guarantees: Go's zero-value mapping behavior treats it as an implicit path-named Gauge.
+    #[test]
+    fn treats_empty_metric_name_as_omitted() {
+        let config = Config::from_json(&json!({
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{"name": "Available Bytes", "metric": "  "}]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(config.counters[0].name, r"\Memory\Available Bytes");
     }
 
     /// Scenario: A wildcard omits the default or custom aggregation instance unless selected.
@@ -1315,13 +1411,6 @@ mod tests {
                         "metric": "test",
                         "scale_power10": 19
                     }]
-                }]
-            }),
-            json!({
-                "metrics": {"unused": metric(), "test": metric()},
-                "perfcounters": [{
-                    "object": "Memory",
-                    "counters": [{"name": "Available Bytes", "metric": "test"}]
                 }]
             }),
         ] {
