@@ -18,6 +18,261 @@ const DEFAULT_MAX_EXPANDED_COUNTERS: usize = 4_096;
 const DEFAULT_AGGREGATION_NAME: &str = "_Total";
 const RECEIVER_ATTRIBUTE_PREFIX: &str = "windows.perf_counter.";
 
+/// Configuration normalized for Windows performance-counter collection.
+#[derive(Debug, Clone)]
+pub(super) struct Config {
+    /// Exact or instance-wildcard counters to collect.
+    pub(super) counters: Vec<CounterConfig>,
+    /// Time between collections; defaults to one minute.
+    pub(super) collection_interval: Duration,
+    /// Delay before the first collection request; defaults to one second.
+    pub(super) initial_delay: Duration,
+    /// Maximum wait for one scrape; `None` disables the deadline.
+    pub(super) timeout: Option<Duration>,
+    /// Time between wildcard discovery refreshes; defaults to the collection interval.
+    pub(super) wildcard_refresh_interval: Option<Duration>,
+    /// Maximum expanded instances retained for one wildcard path.
+    pub(super) max_instances_per_wildcard: usize,
+    /// Maximum expanded wildcard counters retained by this receiver.
+    pub(super) max_expanded_counters: usize,
+}
+
+impl Config {
+    /// Effective wildcard refresh interval.
+    #[must_use]
+    pub(super) fn wildcard_refresh_interval(&self) -> Duration {
+        self.wildcard_refresh_interval
+            .unwrap_or(self.collection_interval)
+    }
+
+    /// Parse, validate, and normalize the public configuration contract.
+    pub(super) fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
+        let user: UserConfig =
+            serde_json::from_value(value.clone()).map_err(|err| invalid(err.to_string()))?;
+        if user.collection_interval.is_zero() {
+            return Err(invalid("collection_interval must be greater than zero"));
+        }
+        if let Some(refresh_interval) = user.wildcard_refresh_interval
+            && refresh_interval < user.collection_interval
+        {
+            return Err(invalid(
+                "wildcard_refresh_interval must be at least collection_interval",
+            ));
+        }
+        if user.perfcounters.is_empty() {
+            return Err(invalid("perfcounters must contain at least one entry"));
+        }
+        if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_instances_per_wildcard) {
+            return Err(invalid(format!(
+                "max_instances_per_wildcard must be between 1 and {MAX_INSTANCE_LIMIT}"
+            )));
+        }
+        if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_expanded_counters) {
+            return Err(invalid(format!(
+                "max_expanded_counters must be between 1 and {MAX_INSTANCE_LIMIT}"
+            )));
+        }
+        if user.max_instances_per_wildcard > user.max_expanded_counters {
+            return Err(invalid(
+                "max_instances_per_wildcard must not exceed max_expanded_counters",
+            ));
+        }
+
+        let mut metrics = BTreeMap::new();
+        let mut metric_identities = HashSet::new();
+        for (name, metric) in &user.metrics {
+            let name = validate_metric_name(name)?;
+            if !metric_identities.insert(name.to_owned()) {
+                return Err(invalid(format!("metrics contains duplicate {name:?}")));
+            }
+            let description = metric.description.trim();
+            let unit = if metric.unit.trim().is_empty() {
+                "1"
+            } else {
+                metric.unit.trim()
+            };
+            let _ = metrics.insert(
+                name.to_owned(),
+                NormalizedMetric {
+                    description: Arc::from(description),
+                    unit: unit.to_owned(),
+                    kind: metric.kind(name)?,
+                },
+            );
+        }
+
+        let expanded_count = expanded_counter_count(&user.perfcounters)?;
+        let mut counters = Vec::with_capacity(expanded_count);
+        for (object_index, object) in user.perfcounters.into_iter().enumerate() {
+            let object_field = format!("perfcounters[{object_index}]");
+            let object_name =
+                validate_path_element(&format!("{object_field}.object"), &object.object, false)?;
+            if object.counters.is_empty() {
+                return Err(invalid(format!(
+                    "{object_field}.counters must contain at least one entry"
+                )));
+            }
+            let aggregation_name = object
+                .aggregation_name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_AGGREGATION_NAME.to_owned());
+            let aggregation_name = normalize_instance(
+                &format!("{object_field}.aggregation_name"),
+                &aggregation_name,
+                false,
+            )?;
+            let instances = match object.instances.map(OneOrMany::into_vec) {
+                None => None,
+                Some(instances) if instances.is_empty() => None,
+                Some(instances) => {
+                    let field = format!("{object_field}.instances");
+                    let mut unique = HashSet::new();
+                    let mut normalized = Vec::with_capacity(instances.len());
+                    for instance in instances {
+                        let instance = if instance.trim() == "*" {
+                            validate_path_element(&field, &instance, true)?.to_owned()
+                        } else {
+                            normalize_instance(&field, &instance, instance.contains('*'))?
+                        };
+                        if !unique.insert(instance.to_lowercase()) {
+                            return Err(invalid(format!(
+                                "{object_field}.instances contains duplicate {instance:?}"
+                            )));
+                        }
+                        normalized.push(instance);
+                    }
+                    Some(normalized)
+                }
+            };
+
+            for (counter_index, mapping) in object.counters.into_iter().enumerate() {
+                let counter_field = format!("{object_field}.counters[{counter_index}]");
+                let counter_name =
+                    validate_counter_name(&format!("{counter_field}.name"), &mapping.name)?;
+                if mapping.recreate_query {
+                    return Err(invalid(format!(
+                        "{counter_field}.recreate_query is not supported yet; omit it or set it to false"
+                    )));
+                }
+                let metric_name = mapping
+                    .metric
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
+                let explicit_metric = if let Some(metric_name) = metric_name {
+                    let metric = metrics.get(metric_name).ok_or_else(|| {
+                        invalid(format!(
+                            "{counter_field}.metric references undefined metric {:?}",
+                            metric_name
+                        ))
+                    })?;
+                    Some((
+                        metric_name.to_owned(),
+                        metric.unit.clone(),
+                        Arc::clone(&metric.description),
+                        metric.kind,
+                        Arc::new(normalize_attributes(&counter_field, &mapping.attributes)?),
+                    ))
+                } else {
+                    None
+                };
+                let paths = match &instances {
+                    None => vec![(format!(r"\{object_name}\{counter_name}"), None)],
+                    Some(instances) if instances.iter().any(|instance| instance == "*") => {
+                        let include_aggregation = instances
+                            .iter()
+                            .any(|instance| instance.eq_ignore_ascii_case(&aggregation_name));
+                        vec![(
+                            format!(r"\{object_name}(*)\{counter_name}"),
+                            (!include_aggregation).then(|| aggregation_name.clone()),
+                        )]
+                    }
+                    Some(instances) => instances
+                        .iter()
+                        .map(|instance| {
+                            (
+                                format!(r"\{object_name}({instance})\{counter_name}"),
+                                instance.contains('*').then(|| aggregation_name.clone()),
+                            )
+                        })
+                        .collect(),
+                };
+                for (path, excluded_aggregation_instance) in paths {
+                    let (name, unit, description, metric_kind, attributes) =
+                        if let Some((name, unit, description, metric_kind, attributes)) =
+                            &explicit_metric
+                        {
+                            (
+                                name.clone(),
+                                unit.clone(),
+                                Arc::clone(description),
+                                *metric_kind,
+                                Arc::clone(attributes),
+                            )
+                        } else {
+                            if metrics.contains_key(&path) {
+                                return Err(invalid(format!(
+                                    "{counter_field} implicit path-named Gauge {path:?} conflicts \
+                                     with an explicitly defined metric of the same name"
+                                )));
+                            }
+                            (
+                                path.clone(),
+                                "1".to_owned(),
+                                Arc::from(""),
+                                MetricKind::Gauge,
+                                Arc::new(BTreeMap::new()),
+                            )
+                        };
+                    counters.push(CounterConfig {
+                        path,
+                        name,
+                        unit,
+                        description,
+                        metric_kind,
+                        attributes,
+                        excluded_aggregation_instance,
+                        scale_power10: mapping.scale_power10,
+                    });
+                }
+            }
+        }
+        let mut output_identities = HashSet::with_capacity(counters.len());
+        for (index, counter) in counters.iter().enumerate() {
+            validate_counter(counter, index)?;
+            let identity = (
+                counter.path.to_lowercase(),
+                counter.name.clone(),
+                counter
+                    .attributes
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Vec<_>>(),
+            );
+            if !output_identities.insert(identity) {
+                return Err(invalid(format!(
+                    "duplicate counter output mapping for path {} and metric {}",
+                    counter.path, counter.name
+                )));
+            }
+        }
+
+        Ok(Self {
+            counters,
+            collection_interval: user.collection_interval,
+            initial_delay: user.initial_delay,
+            timeout: match user.timeout {
+                Some(Duration::ZERO) => None,
+                Some(timeout) => Some(timeout),
+                None => Some(user.collection_interval),
+            },
+            wildcard_refresh_interval: user.wildcard_refresh_interval,
+            max_instances_per_wildcard: user.max_instances_per_wildcard,
+            max_expanded_counters: user.max_expanded_counters,
+        })
+    }
+}
+
 /// One normalized counter consumed by the existing PDH worker and OTAP builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CounterConfig {
@@ -54,25 +309,6 @@ pub(super) enum MetricKind {
 enum Aggregation {
     Cumulative,
     Delta,
-}
-
-/// Configuration normalized for Windows performance-counter collection.
-#[derive(Debug, Clone)]
-pub(super) struct Config {
-    /// Exact or instance-wildcard counters to collect.
-    pub(super) counters: Vec<CounterConfig>,
-    /// Time between collections; defaults to one minute.
-    pub(super) collection_interval: Duration,
-    /// Delay before the first collection request; defaults to one second.
-    pub(super) initial_delay: Duration,
-    /// Maximum wait for one scrape; `None` disables the deadline.
-    pub(super) timeout: Option<Duration>,
-    /// Time between wildcard discovery refreshes; defaults to the collection interval.
-    pub(super) wildcard_refresh_interval: Option<Duration>,
-    /// Maximum expanded instances retained for one wildcard path.
-    pub(super) max_instances_per_wildcard: usize,
-    /// Maximum expanded wildcard counters retained by this receiver.
-    pub(super) max_expanded_counters: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,242 +626,6 @@ fn validate_counter(counter: &CounterConfig, index: usize) -> Result<(), Error> 
         )));
     }
     Ok(())
-}
-
-impl Config {
-    /// Effective wildcard refresh interval.
-    #[must_use]
-    pub(super) fn wildcard_refresh_interval(&self) -> Duration {
-        self.wildcard_refresh_interval
-            .unwrap_or(self.collection_interval)
-    }
-
-    /// Parse, validate, and normalize the public configuration contract.
-    pub(super) fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
-        let user: UserConfig =
-            serde_json::from_value(value.clone()).map_err(|err| invalid(err.to_string()))?;
-        if user.collection_interval.is_zero() {
-            return Err(invalid("collection_interval must be greater than zero"));
-        }
-        if let Some(refresh_interval) = user.wildcard_refresh_interval
-            && refresh_interval < user.collection_interval
-        {
-            return Err(invalid(
-                "wildcard_refresh_interval must be at least collection_interval",
-            ));
-        }
-        if user.perfcounters.is_empty() {
-            return Err(invalid("perfcounters must contain at least one entry"));
-        }
-        if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_instances_per_wildcard) {
-            return Err(invalid(format!(
-                "max_instances_per_wildcard must be between 1 and {MAX_INSTANCE_LIMIT}"
-            )));
-        }
-        if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_expanded_counters) {
-            return Err(invalid(format!(
-                "max_expanded_counters must be between 1 and {MAX_INSTANCE_LIMIT}"
-            )));
-        }
-        if user.max_instances_per_wildcard > user.max_expanded_counters {
-            return Err(invalid(
-                "max_instances_per_wildcard must not exceed max_expanded_counters",
-            ));
-        }
-
-        let mut metrics = BTreeMap::new();
-        let mut metric_identities = HashSet::new();
-        for (name, metric) in &user.metrics {
-            let name = validate_metric_name(name)?;
-            if !metric_identities.insert(name.to_owned()) {
-                return Err(invalid(format!("metrics contains duplicate {name:?}")));
-            }
-            let description = metric.description.trim();
-            let unit = if metric.unit.trim().is_empty() {
-                "1"
-            } else {
-                metric.unit.trim()
-            };
-            let _ = metrics.insert(
-                name.to_owned(),
-                NormalizedMetric {
-                    description: Arc::from(description),
-                    unit: unit.to_owned(),
-                    kind: metric.kind(name)?,
-                },
-            );
-        }
-
-        let expanded_count = expanded_counter_count(&user.perfcounters)?;
-        let mut counters = Vec::with_capacity(expanded_count);
-        for (object_index, object) in user.perfcounters.into_iter().enumerate() {
-            let object_field = format!("perfcounters[{object_index}]");
-            let object_name =
-                validate_path_element(&format!("{object_field}.object"), &object.object, false)?;
-            if object.counters.is_empty() {
-                return Err(invalid(format!(
-                    "{object_field}.counters must contain at least one entry"
-                )));
-            }
-            let aggregation_name = object
-                .aggregation_name
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_AGGREGATION_NAME.to_owned());
-            let aggregation_name = normalize_instance(
-                &format!("{object_field}.aggregation_name"),
-                &aggregation_name,
-                false,
-            )?;
-            let instances = match object.instances.map(OneOrMany::into_vec) {
-                None => None,
-                Some(instances) if instances.is_empty() => None,
-                Some(instances) => {
-                    let field = format!("{object_field}.instances");
-                    let mut unique = HashSet::new();
-                    let mut normalized = Vec::with_capacity(instances.len());
-                    for instance in instances {
-                        let instance = if instance.trim() == "*" {
-                            validate_path_element(&field, &instance, true)?.to_owned()
-                        } else {
-                            normalize_instance(&field, &instance, instance.contains('*'))?
-                        };
-                        if !unique.insert(instance.to_lowercase()) {
-                            return Err(invalid(format!(
-                                "{object_field}.instances contains duplicate {instance:?}"
-                            )));
-                        }
-                        normalized.push(instance);
-                    }
-                    Some(normalized)
-                }
-            };
-
-            for (counter_index, mapping) in object.counters.into_iter().enumerate() {
-                let counter_field = format!("{object_field}.counters[{counter_index}]");
-                let counter_name =
-                    validate_counter_name(&format!("{counter_field}.name"), &mapping.name)?;
-                if mapping.recreate_query {
-                    return Err(invalid(format!(
-                        "{counter_field}.recreate_query is not supported yet; omit it or set it to false"
-                    )));
-                }
-                let metric_name = mapping
-                    .metric
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty());
-                let explicit_metric = if let Some(metric_name) = metric_name {
-                    let metric = metrics.get(metric_name).ok_or_else(|| {
-                        invalid(format!(
-                            "{counter_field}.metric references undefined metric {:?}",
-                            metric_name
-                        ))
-                    })?;
-                    Some((
-                        metric_name.to_owned(),
-                        metric.unit.clone(),
-                        Arc::clone(&metric.description),
-                        metric.kind,
-                        Arc::new(normalize_attributes(&counter_field, &mapping.attributes)?),
-                    ))
-                } else {
-                    None
-                };
-                let paths = match &instances {
-                    None => vec![(format!(r"\{object_name}\{counter_name}"), None)],
-                    Some(instances) if instances.iter().any(|instance| instance == "*") => {
-                        let include_aggregation = instances
-                            .iter()
-                            .any(|instance| instance.eq_ignore_ascii_case(&aggregation_name));
-                        vec![(
-                            format!(r"\{object_name}(*)\{counter_name}"),
-                            (!include_aggregation).then(|| aggregation_name.clone()),
-                        )]
-                    }
-                    Some(instances) => instances
-                        .iter()
-                        .map(|instance| {
-                            (
-                                format!(r"\{object_name}({instance})\{counter_name}"),
-                                instance.contains('*').then(|| aggregation_name.clone()),
-                            )
-                        })
-                        .collect(),
-                };
-                for (path, excluded_aggregation_instance) in paths {
-                    let (name, unit, description, metric_kind, attributes) =
-                        if let Some((name, unit, description, metric_kind, attributes)) =
-                            &explicit_metric
-                        {
-                            (
-                                name.clone(),
-                                unit.clone(),
-                                Arc::clone(description),
-                                *metric_kind,
-                                Arc::clone(attributes),
-                            )
-                        } else {
-                            if metrics.contains_key(&path) {
-                                return Err(invalid(format!(
-                                    "{counter_field} implicit path-named Gauge {path:?} conflicts \
-                                     with an explicitly defined metric of the same name"
-                                )));
-                            }
-                            (
-                                path.clone(),
-                                "1".to_owned(),
-                                Arc::from(""),
-                                MetricKind::Gauge,
-                                Arc::new(BTreeMap::new()),
-                            )
-                        };
-                    counters.push(CounterConfig {
-                        path,
-                        name,
-                        unit,
-                        description,
-                        metric_kind,
-                        attributes,
-                        excluded_aggregation_instance,
-                        scale_power10: mapping.scale_power10,
-                    });
-                }
-            }
-        }
-        let mut output_identities = HashSet::with_capacity(counters.len());
-        for (index, counter) in counters.iter().enumerate() {
-            validate_counter(counter, index)?;
-            let identity = (
-                counter.path.to_lowercase(),
-                counter.name.clone(),
-                counter
-                    .attributes
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect::<Vec<_>>(),
-            );
-            if !output_identities.insert(identity) {
-                return Err(invalid(format!(
-                    "duplicate counter output mapping for path {} and metric {}",
-                    counter.path, counter.name
-                )));
-            }
-        }
-
-        Ok(Self {
-            counters,
-            collection_interval: user.collection_interval,
-            initial_delay: user.initial_delay,
-            timeout: match user.timeout {
-                Some(Duration::ZERO) => None,
-                Some(timeout) => Some(timeout),
-                None => Some(user.collection_interval),
-            },
-            wildcard_refresh_interval: user.wildcard_refresh_interval,
-            max_instances_per_wildcard: user.max_instances_per_wildcard,
-            max_expanded_counters: user.max_expanded_counters,
-        })
-    }
 }
 
 #[cfg(test)]
