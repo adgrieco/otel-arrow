@@ -215,21 +215,19 @@ impl Config {
                             true,
                         )]
                     }
-                    Some(instances) => {
-                        let aggregate_alone = instances.len() == 1
-                            && instances[0].eq_ignore_ascii_case(&aggregation_name);
-                        instances
-                            .iter()
-                            .map(|instance| {
-                                (
-                                    format!(r"\{object_name}({instance})\{counter_name}"),
-                                    instance.contains('*').then(|| aggregation_name.clone()),
-                                    true,
-                                    !aggregate_alone,
-                                )
-                            })
-                            .collect()
-                    }
+                    Some(instances) => instances
+                        .iter()
+                        .map(|instance| {
+                            let is_exact_aggregation = !instance.contains('*')
+                                && instance.eq_ignore_ascii_case(&aggregation_name);
+                            (
+                                format!(r"\{object_name}({instance})\{counter_name}"),
+                                instance.contains('*').then(|| aggregation_name.clone()),
+                                true,
+                                !is_exact_aggregation,
+                            )
+                        })
+                        .collect(),
                 };
                 for (path, excluded_aggregation_instance, has_instance, emit_instance_attribute) in
                     paths
@@ -1053,6 +1051,27 @@ mod tests {
         .unwrap();
         assert!(aggregate_alone.counters[0].has_instance);
         assert!(!aggregate_alone.counters[0].emit_instance_attribute);
+
+        let aggregate_with_peer = Config::from_json(&json!({
+            "metrics": {"test": metric()},
+            "perfcounters": [{
+                "object": "Processor",
+                "instances": ["_Total", "worker"],
+                "counters": [{"name": "Counter", "metric": "test"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            aggregate_with_peer
+                .counters
+                .iter()
+                .map(|counter| (counter.path.as_str(), counter.emit_instance_attribute))
+                .collect::<Vec<_>>(),
+            [
+                (r"\Processor(_Total)\Counter", false),
+                (r"\Processor(worker)\Counter", true)
+            ]
+        );
     }
 
     /// Scenario: Multiple named instances are selected without a wildcard.

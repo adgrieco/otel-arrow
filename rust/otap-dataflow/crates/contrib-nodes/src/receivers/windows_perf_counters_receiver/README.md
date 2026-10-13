@@ -176,8 +176,9 @@ aggregate query.
 
 Points for named instances emit `instance=<name>`. Duplicate PDH instances use
 the canonical suffix, such as `instance=process#1`; index zero omits `#0`.
-An aggregate selected alone omits `instance`, matching Go. An aggregate
-explicitly included with `"*"` retains it. The receiver also emits
+An exact aggregate entry omits `instance`, including when other exact entries
+are configured beside it, matching Go's per-entry watcher behavior. An
+aggregate explicitly included with `"*"` retains it. The receiver also emits
 `windows.perf_counter.instance`, optional
 `windows.perf_counter.parent_instance`, and
 `windows.perf_counter.instance_index` for lossless PDH identity.
