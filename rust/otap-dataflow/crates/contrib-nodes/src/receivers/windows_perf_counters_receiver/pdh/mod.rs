@@ -11,6 +11,7 @@ use super::model::{
 
 mod counter_type;
 mod native;
+mod status_shim;
 use counter_type::{CounterKind, UnsupportedNativeType, classify_native_type};
 use native::NativePdh;
 

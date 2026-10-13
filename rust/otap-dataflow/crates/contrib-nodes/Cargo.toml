@@ -92,7 +92,7 @@ rdkafka = { workspace = true, features = ["cmake-build", "curl-static"], optiona
 # which is not a valid Win32 executable (os error 193).
 [target.'cfg(target_os = "windows")'.dependencies]
 rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
-windows-sys = { workspace = true, optional = true, features = ["Win32_System_Performance"] }
+windows-sys = { git = "https://github.com/microsoft/windows-rs", rev = "e978672b068a7ef1b1f494c014660f0325e977eb", optional = true, features = ["pdh", "winperf"] }
 
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 one_collect = { workspace = true, optional = true }

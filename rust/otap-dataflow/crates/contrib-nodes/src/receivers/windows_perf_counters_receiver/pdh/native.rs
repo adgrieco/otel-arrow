@@ -4,22 +4,21 @@
 //! Owns native handles, aligned metadata storage, and PDH status/value decoding.
 #![allow(unsafe_code)]
 
+use super::status_shim::{
+    PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
+    PDH_CSTATUS_INVALID_DATA, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_INVALID_DATA,
+    PDH_MORE_DATA, PDH_NO_DATA,
+};
 use super::{Error, Number, PdhApi, ValueFormat};
 use std::mem::{size_of, size_of_val};
 use std::ptr::{null, null_mut};
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::System::Performance::{
-    PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
-    PDH_COUNTER_INFO_W, PDH_CSTATUS_INVALID_DATA, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA,
-    PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY,
-    PDH_INVALID_DATA, PDH_MORE_DATA, PDH_NO_DATA, PDH_RAW_COUNTER, PdhAddEnglishCounterW,
+use windows_sys::Win32::pdh::{
+    PDH_COUNTER_INFO_W, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_FMT_NOCAP100,
+    PDH_FMT_NOSCALE, PDH_HCOUNTER, PDH_HQUERY, PDH_RAW_COUNTER, PdhAddEnglishCounterW,
     PdhCloseQuery, PdhCollectQueryData, PdhGetCounterInfoW, PdhGetFormattedCounterValue,
     PdhGetRawCounterValue, PdhOpenQueryW, PdhRemoveCounter,
 };
-
-// These flags are not exposed by windows-sys 0.61.2.
-const PDH_FMT_NOSCALE: u32 = 0x0000_1000;
-const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
 
 pub(super) fn check(operation: &'static str, path: &str, status: u32) -> Result<(), Error> {
     if status == 0 {
@@ -83,7 +82,7 @@ impl NativePdh {
         let mut query = null_mut();
         // SAFETY: Null selects live local data; the output handle is writable.
         check("PdhOpenQueryW", "<query>", unsafe {
-            PdhOpenQueryW(null(), 0, &mut query)
+            PdhOpenQueryW(null(), 0, &mut query).cast_unsigned()
         })?;
         Ok(Self {
             query,
@@ -211,7 +210,7 @@ impl PdhApi for NativePdh {
         // SAFETY: The adapter owns the live query, path is NUL-terminated,
         // and the output handle is writable.
         check("PdhAddEnglishCounterW", path, unsafe {
-            PdhAddEnglishCounterW(self.query, wide_path.as_ptr(), 0, &mut handle)
+            PdhAddEnglishCounterW(self.query, wide_path.as_ptr(), 0, &mut handle).cast_unsigned()
         })?;
         let token = CounterToken {
             index: self.counters.len(),
@@ -225,7 +224,7 @@ impl PdhApi for NativePdh {
         // SAFETY: Lookup returns an owned, live counter; successful removal
         // invalidates its slot before another operation can borrow the adapter.
         check("PdhRemoveCounter", path, unsafe {
-            PdhRemoveCounter(handle)
+            PdhRemoveCounter(handle).cast_unsigned()
         })?;
         self.counters[counter.index] = None;
         Ok(())
@@ -246,13 +245,13 @@ impl PdhApi for NativePdh {
             // SAFETY: Lookup returned an owned, live counter. For filling, size
             // and the aligned pointer come from the same writable slice above;
             // sizing uses null and zero. The size output is writable.
-            Ok(unsafe { PdhGetCounterInfoW(handle, false, size, info) })
+            Ok(unsafe { PdhGetCounterInfoW(handle, 0, size, info).cast_unsigned() })
         })
     }
 
     fn collect(&mut self) -> Result<bool, Error> {
         // SAFETY: The adapter owns the live query and is borrowed exclusively.
-        Self::collect_status(unsafe { PdhCollectQueryData(self.query) })
+        Self::collect_status(unsafe { PdhCollectQueryData(self.query).cast_unsigned() })
     }
 
     fn raw(&mut self, counter: &CounterToken, path: &str) -> Result<Option<i64>, Error> {
@@ -260,7 +259,7 @@ impl PdhApi for NativePdh {
         Self::raw_with(path, |raw| {
             // SAFETY: Lookup returned an owned, live counter and the adapter
             // supplies initialized, writable output.
-            unsafe { PdhGetRawCounterValue(handle, null_mut(), raw) }
+            unsafe { PdhGetRawCounterValue(handle, null_mut(), raw).cast_unsigned() }
         })
     }
 
@@ -274,7 +273,7 @@ impl PdhApi for NativePdh {
         Self::formatted_with(path, format, |flags, value| {
             // SAFETY: Lookup returned an owned, live counter and the adapter
             // supplies initialized, writable storage for the format it decodes.
-            unsafe { PdhGetFormattedCounterValue(handle, flags, null_mut(), value) }
+            unsafe { PdhGetFormattedCounterValue(handle, flags, null_mut(), value).cast_unsigned() }
         })
     }
 
@@ -292,7 +291,7 @@ impl Drop for NativePdh {
     fn drop(&mut self) {
         // SAFETY: Construction opened this exclusively owned query. Drop is
         // its only close path; no counter can be read through this adapter afterward.
-        let status = unsafe { PdhCloseQuery(self.query) };
+        let status = unsafe { PdhCloseQuery(self.query).cast_unsigned() };
         if status != 0 {
             otel_arrow_dfe_telemetry::otel_warn!(
                 "otelcol.node.windows_perf_counters.close.fail",
@@ -306,7 +305,7 @@ impl Drop for NativePdh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::Performance::PdhFormatFromRawValue;
+    use windows_sys::Win32::pdh::PdhFormatFromRawValue;
 
     /// Scenario: Native formatting is requested for an exact large integer and a double above 100.
     /// Guarantees: PDH display scaling is disabled, doubles are not capped, and the matching union field preserves each value.
@@ -350,13 +349,13 @@ mod tests {
             (0x3002_0400, 200, 5, 100, 3, 100, 0.5),
             (0x4002_0500, 200, 5, 100, 3, 1, 50.0),
         ] {
-            let current = PDH_RAW_COUNTER {
+            let mut current = PDH_RAW_COUNTER {
                 CStatus: PDH_CSTATUS_VALID_DATA,
                 FirstValue: first,
                 SecondValue: second,
                 ..Default::default()
             };
-            let previous = PDH_RAW_COUNTER {
+            let mut previous = PDH_RAW_COUNTER {
                 CStatus: PDH_CSTATUS_VALID_DATA,
                 FirstValue: previous_first,
                 SecondValue: previous_second,
@@ -370,10 +369,11 @@ mod tests {
                             native_type,
                             flags,
                             &time_base,
-                            &current,
-                            &previous,
+                            &mut current,
+                            &mut previous,
                             value,
                         )
+                        .cast_unsigned()
                     }
                 })
                 .unwrap();

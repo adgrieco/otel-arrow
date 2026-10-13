@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::native::check;
+use super::status_shim::{
+    PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
+    PDH_CSTATUS_INVALID_DATA, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_INSTANCE,
+    PDH_CSTATUS_VALID_DATA, PDH_INVALID_ARGUMENT, PDH_INVALID_DATA, PDH_MORE_DATA, PDH_NO_DATA,
+};
 use super::*;
 use crate::receivers::windows_perf_counters_receiver::config::{MetricKind, RuntimeConfig};
 use crate::receivers::windows_perf_counters_receiver::model::Number;
@@ -14,11 +19,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
-use windows_sys::Win32::System::Performance::{
-    PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
-    PDH_COUNTER_INFO_W, PDH_CSTATUS_INVALID_DATA, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_INSTANCE,
-    PDH_CSTATUS_VALID_DATA, PDH_INVALID_ARGUMENT, PDH_INVALID_DATA, PDH_MORE_DATA, PDH_NO_DATA,
-};
+use windows_sys::Win32::pdh::PDH_COUNTER_INFO_W;
 
 const OMISSION_STATUSES: [u32; 5] = [
     PDH_INVALID_DATA,
