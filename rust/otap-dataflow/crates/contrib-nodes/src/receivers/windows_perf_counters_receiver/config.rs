@@ -11,8 +11,6 @@ pub(super) const MIN_SCALE_POWER10: i32 = -18;
 pub(super) const MAX_SCALE_POWER10: i32 = 18;
 
 const MAX_CONFIGURED_COUNTER_PATHS: usize = 256;
-const MAX_METRIC_NAME_LEN: usize = 255;
-const MAX_METRIC_UNIT_LEN: usize = 63;
 const MAX_INSTANCE_LIMIT: usize = 16_384;
 const MAX_COUNTER_PATH_LEN: usize = 2_047;
 const DEFAULT_MAX_INSTANCES_PER_WILDCARD: usize = 256;
@@ -301,30 +299,7 @@ fn validate_counter_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Err
 fn validate_metric_name(name: &str) -> Result<&str, Error> {
     let name = name.trim();
     require_name("metric name", name)?;
-    let mut chars = name.chars();
-    let valid = name.len() <= MAX_METRIC_NAME_LEN
-        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '/'));
-    if !valid {
-        return Err(invalid(format!(
-            "metric name {name:?} must start with an ASCII letter, contain only ASCII \
-             letters, digits, '_', '.', '-', or '/', and be at most {MAX_METRIC_NAME_LEN} characters"
-        )));
-    }
     Ok(name)
-}
-
-fn validate_metric_unit<'a>(name: &str, unit: &'a str) -> Result<&'a str, Error> {
-    let unit = unit.trim();
-    let field = format!("metrics.{name}.unit");
-    require_name(&field, unit)?;
-    if unit.len() > MAX_METRIC_UNIT_LEN || !unit.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
-    {
-        return Err(invalid(format!(
-            "{field} must be printable ASCII and at most {MAX_METRIC_UNIT_LEN} characters"
-        )));
-    }
-    Ok(unit)
 }
 
 fn normalize_attributes(
@@ -458,7 +433,7 @@ impl Config {
             let unit = if metric.unit.trim().is_empty() {
                 "1"
             } else {
-                validate_metric_unit(name, &metric.unit)?
+                metric.unit.trim()
             };
             let _ = metrics.insert(
                 name.to_owned(),
@@ -1036,10 +1011,10 @@ mod tests {
         );
     }
 
-    /// Scenario: OTel metric names or units violate their public syntax constraints.
-    /// Guarantees: Invalid identities are rejected before constructing PDH paths.
+    /// Scenario: Metric names use PDH paths or Unicode and units exceed SDK instrument guidance.
+    /// Guarantees: OTLP stream identity accepts arbitrary non-empty names and unit strings.
     #[test]
-    fn validates_metric_names_and_units() {
+    fn accepts_otlp_metric_names_and_units() {
         let config = |name: &str, unit: &str| {
             json!({
                 "metrics": {name: {"description": "Value.", "unit": unit, "gauge": {}}},
@@ -1049,15 +1024,18 @@ mod tests {
                 }]
             })
         };
-        let long_name = format!("a{}", "b".repeat(MAX_METRIC_NAME_LEN));
-        for name in ["1value", "value space", "\u{e9}", long_name.as_str()] {
-            assert_config_error(config(name, "By"), "must start with an ASCII letter");
+        let long_name = format!("metric {}", "x".repeat(512));
+        let long_unit = format!("{{{}}}", "u".repeat(128));
+        for (name, unit) in [
+            (r"\Memory\Available Bytes", "By"),
+            ("1 value", "\u{b5}s"),
+            (long_name.as_str(), long_unit.as_str()),
+        ] {
+            let normalized = Config::from_json(&config(name, unit)).unwrap();
+            assert_eq!(normalized.counters[0].name, name);
+            assert_eq!(normalized.counters[0].unit, unit);
         }
-        let long_unit = "a".repeat(MAX_METRIC_UNIT_LEN + 1);
-        for unit in ["\u{b5}s", "B\ty", long_unit.as_str()] {
-            assert_config_error(config("value", unit), "must be printable ASCII");
-        }
-        assert!(Config::from_json(&config("system.memory_usage-1/s", "{item}/s")).is_ok());
+        assert_config_error(config(" ", "By"), "metric name must not be empty");
     }
 
     /// Scenario: More than 256 metric definitions are configured but only one is referenced.
@@ -1106,6 +1084,18 @@ mod tests {
                 }]
             }),
             "contains duplicate attribute key",
+        );
+        assert_config_error(
+            json!({
+                "metrics": {
+                    r"\Memory\Available Bytes": {"unit": "By"}
+                },
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes"}]
+                }]
+            }),
+            "implicit path-named Gauge",
         );
     }
 

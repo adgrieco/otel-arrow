@@ -91,9 +91,10 @@ one `gauge: {}` or `sum:` object; omitting both defaults to Gauge. A Sum
 requires `aggregation: cumulative`; `monotonic` defaults to `false`. Delta Sum
 is not supported yet. Empty and null Sum configurations are rejected. Metrics
 that configure both Gauge and Sum are also rejected. Gauge may use YAML
-shorthand such as `gauge:`. Metric names follow
-the OTel instrument-name syntax and are limited to 255 characters. Units must
-be printable ASCII and at most 63 characters.
+shorthand such as `gauge:`. Metric names must be non-empty after trimming but
+are otherwise OTLP stream names rather than SDK instrument names, so names such
+as `\Memory\Available Bytes` are accepted. Units are trimmed but have no
+receiver-specific character or length restriction.
 Multiple counter mappings may reference one metric and contribute points
 distinguished by their configured attributes. Gauges have point-in-time
 semantics and no start timestamp. Monotonic Sums are cumulative and limited to
