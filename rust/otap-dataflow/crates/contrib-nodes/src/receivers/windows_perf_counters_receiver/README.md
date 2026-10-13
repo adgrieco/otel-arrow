@@ -69,19 +69,19 @@ config:
 | --- | --- | --- | --- |
 | `metrics` | No | Empty | Optional metric metadata keyed by OTel metric name |
 | `perfcounters` | Yes | None | Performance objects and counter mappings |
-| `initial_delay` | No | `1s` | Delay before the first collection request |
-| `collection_interval` | No | `1m` | Interval from `1s` through `24h` |
+| `initial_delay` | No | `1s` | Delay before the first collection request; non-positive means immediate |
+| `collection_interval` | No | `1m` | Any positive collection interval |
 | `timeout` | No | Collection interval | Scrape deadline; `0s` disables it |
 | `wildcard_refresh_interval` | No | See below | Wildcard discovery cadence |
 | `max_instances_per_wildcard` | No | `256` | Per-path expansion limit |
 | `max_expanded_counters` | No | `4096` | Receiver-wide expansion limit |
 
-`wildcard_refresh_interval` defaults to `collection_interval` and must be
-between `collection_interval` and `24h`. Both expansion limits must be between
+`wildcard_refresh_interval` defaults to `collection_interval` and must be at
+least that interval. Both expansion limits must be between
 `1` and `16384`, and the per-wildcard limit cannot exceed the receiver-wide
 limit. Normalization produces between 1 and 256 configured exact or wildcard
 paths, bounding query setup and native handles independently from wildcard
-membership. `initial_delay` accepts `0s` through `24h`.
+membership. Zero or negative `initial_delay` starts collection immediately.
 
 ### Metric options
 

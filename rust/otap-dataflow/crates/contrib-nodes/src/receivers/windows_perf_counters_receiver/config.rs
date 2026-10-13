@@ -83,7 +83,10 @@ struct UserConfig {
     perfcounters: Vec<ObjectConfig>,
     #[serde(default = "default_interval", with = "humantime_serde")]
     collection_interval: Duration,
-    #[serde(default = "default_initial_delay", with = "humantime_serde")]
+    #[serde(
+        default = "default_initial_delay",
+        deserialize_with = "deserialize_initial_delay"
+    )]
     initial_delay: Duration,
     #[serde(default, with = "humantime_serde")]
     timeout: Option<Duration>,
@@ -219,6 +222,20 @@ fn default_interval() -> Duration {
 
 fn default_initial_delay() -> Duration {
     Duration::from_secs(1)
+}
+
+fn deserialize_initial_delay<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let value = value.trim();
+    if let Some(magnitude) = value.strip_prefix('-') {
+        let _ = humantime::parse_duration(magnitude).map_err(serde::de::Error::custom)?;
+        Ok(Duration::ZERO)
+    } else {
+        humantime::parse_duration(value).map_err(serde::de::Error::custom)
+    }
 }
 
 fn default_max_instances_per_wildcard() -> usize {
@@ -387,20 +404,14 @@ impl Config {
     pub(super) fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
         let user: UserConfig =
             serde_json::from_value(value.clone()).map_err(|err| invalid(err.to_string()))?;
-        if !(Duration::from_secs(1)..=Duration::from_secs(86400))
-            .contains(&user.collection_interval)
-        {
-            return Err(invalid("collection_interval must be between 1s and 24h"));
-        }
-        if user.initial_delay > Duration::from_secs(86400) {
-            return Err(invalid("initial_delay must be between 0s and 24h"));
+        if user.collection_interval.is_zero() {
+            return Err(invalid("collection_interval must be greater than zero"));
         }
         if let Some(refresh_interval) = user.wildcard_refresh_interval
-            && (!(Duration::from_secs(1)..=Duration::from_secs(86400)).contains(&refresh_interval)
-                || refresh_interval < user.collection_interval)
+            && refresh_interval < user.collection_interval
         {
             return Err(invalid(
-                "wildcard_refresh_interval must be between collection_interval and 24h",
+                "wildcard_refresh_interval must be at least collection_interval",
             ));
         }
         if user.perfcounters.is_empty() {
@@ -742,6 +753,48 @@ mod tests {
         let mut negative = base;
         negative["timeout"] = json!("-1s");
         assert_config_error(negative, "invalid value");
+    }
+
+    /// Scenario: Timing uses sub-second, multi-day, zero, and negative configured durations.
+    /// Guarantees: Collection accepts any positive interval and non-positive initial delay is immediate.
+    #[test]
+    fn accepts_go_timing_range() {
+        let config = |collection_interval: &str, initial_delay: &str, refresh_interval: &str| {
+            Config::from_json(&json!({
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes"}]
+                }],
+                "collection_interval": collection_interval,
+                "initial_delay": initial_delay,
+                "wildcard_refresh_interval": refresh_interval
+            }))
+        };
+
+        let fast = config("1ms", "-5s", "2ms").unwrap();
+        assert_eq!(fast.collection_interval, Duration::from_millis(1));
+        assert_eq!(fast.initial_delay, Duration::ZERO);
+        assert_eq!(fast.wildcard_refresh_interval(), Duration::from_millis(2));
+
+        let slow = config("48h", "72h", "96h").unwrap();
+        assert_eq!(slow.collection_interval, Duration::from_secs(48 * 60 * 60));
+        assert_eq!(slow.initial_delay, Duration::from_secs(72 * 60 * 60));
+        assert_eq!(
+            slow.wildcard_refresh_interval(),
+            Duration::from_secs(96 * 60 * 60)
+        );
+
+        assert_config_error(
+            json!({
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes"}]
+                }],
+                "collection_interval": "2s",
+                "wildcard_refresh_interval": "1s"
+            }),
+            "must be at least collection_interval",
+        );
     }
 
     /// Scenario: A cumulative Sum omits its optional monotonic setting.
@@ -1585,8 +1638,6 @@ mod tests {
         }
         for (key, value) in [
             ("collection_interval", json!("0s")),
-            ("initial_delay", json!("25h")),
-            ("wildcard_refresh_interval", json!("25h")),
             ("max_instances_per_wildcard", json!(0)),
             ("max_expanded_counters", json!(16_385)),
         ] {
