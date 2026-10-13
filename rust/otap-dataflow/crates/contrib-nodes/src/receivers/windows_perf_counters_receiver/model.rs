@@ -123,6 +123,10 @@ pub(super) struct SampleDiagnostics {
     pub(super) query_rebuild_attempts: u64,
     /// Number of worker-owned query rebuilds that recovered.
     pub(super) query_rebuild_recoveries: u64,
+    /// Number of configured post-scrape query recreations attempted.
+    pub(super) query_recreation_attempts: u64,
+    /// Number of configured post-scrape query recreations that failed.
+    pub(super) query_recreation_failures: u64,
     /// Number of independently warming points omitted.
     pub(super) warmup_omissions: u64,
 }

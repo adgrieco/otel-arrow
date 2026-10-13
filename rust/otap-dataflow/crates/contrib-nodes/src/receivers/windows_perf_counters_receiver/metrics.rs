@@ -85,6 +85,12 @@ pub(super) struct WindowsPerfCountersMetrics {
     /// Worker-owned query rebuilds that recovered.
     #[metric(unit = "{recovery}")]
     pub query_rebuild_recoveries: Counter<u64>,
+    /// Configured post-scrape query recreations attempted.
+    #[metric(unit = "{attempt}")]
+    pub query_recreation_attempts: Counter<u64>,
+    /// Configured post-scrape query recreations that failed.
+    #[metric(unit = "{failure}")]
+    pub query_recreation_failures: Counter<u64>,
     /// Points omitted while independently warming.
     #[metric(unit = "{metric}")]
     pub warmup_omissions: Counter<u64>,
@@ -112,6 +118,10 @@ impl WindowsPerfCountersMetrics {
             .add(diagnostics.query_rebuild_attempts);
         self.query_rebuild_recoveries
             .add(diagnostics.query_rebuild_recoveries);
+        self.query_recreation_attempts
+            .add(diagnostics.query_recreation_attempts);
+        self.query_recreation_failures
+            .add(diagnostics.query_recreation_failures);
         self.warmup_omissions.add(diagnostics.warmup_omissions);
     }
 }

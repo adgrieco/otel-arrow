@@ -182,6 +182,7 @@ impl WindowsPerfCountersReceiver {
                     if sample.diagnostics.retry_attempts > 0
                         || sample.diagnostics.retry_recoveries > 0
                         || sample.diagnostics.query_rebuild_attempts > 0
+                        || sample.diagnostics.query_recreation_failures > 0
                     {
                         otel_arrow_dfe_telemetry::otel_info!(
                             "otelcol.node.windowsperfcounters.recovery",
@@ -189,7 +190,11 @@ impl WindowsPerfCountersReceiver {
                             retry_attempts = sample.diagnostics.retry_attempts,
                             retry_recoveries = sample.diagnostics.retry_recoveries,
                             query_rebuild_attempts = sample.diagnostics.query_rebuild_attempts,
-                            query_rebuild_recoveries = sample.diagnostics.query_rebuild_recoveries
+                            query_rebuild_recoveries = sample.diagnostics.query_rebuild_recoveries,
+                            query_recreation_attempts =
+                                sample.diagnostics.query_recreation_attempts,
+                            query_recreation_failures =
+                                sample.diagnostics.query_recreation_failures
                         );
                     }
                     sample
@@ -477,6 +482,8 @@ mod tests {
                     emit_instance_attribute: false,
                     excluded_aggregation_instance: None,
                     scale_power10: 0,
+                    recreate_query: false,
+                    source_mapping_index: 0,
                 }],
                 collection_interval: Duration::from_secs(1),
                 initial_delay: Duration::ZERO,

@@ -263,6 +263,8 @@ mod tests {
             emit_instance_attribute: false,
             excluded_aggregation_instance: None,
             scale_power10: 0,
+            recreate_query: false,
+            source_mapping_index: 0,
         }
     }
 

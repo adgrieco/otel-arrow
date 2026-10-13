@@ -524,6 +524,8 @@ fn merge_diagnostics(target: &mut SampleDiagnostics, delta: SampleDiagnostics) {
     target.retry_recoveries += delta.retry_recoveries;
     target.query_rebuild_attempts += delta.query_rebuild_attempts;
     target.query_rebuild_recoveries += delta.query_rebuild_recoveries;
+    target.query_recreation_attempts += delta.query_recreation_attempts;
+    target.query_recreation_failures += delta.query_recreation_failures;
     target.warmup_omissions += delta.warmup_omissions;
 }
 
@@ -1327,6 +1329,17 @@ impl<A: PdhApi> Query<A> {
         );
     }
 
+    fn active_expanded_count(&self) -> usize {
+        self.counters
+            .values()
+            .filter(|counter| counter.wildcard)
+            .count()
+    }
+
+    fn set_max_expanded_counters(&mut self, max_expanded_counters: usize) {
+        self.max_expanded_counters = max_expanded_counters;
+    }
+
     fn prime(&mut self) -> Result<(), Error> {
         let sample = self.collect()?;
         self.pending
@@ -1458,11 +1471,7 @@ impl<A: PdhApi> Query<A> {
                 value,
             });
         }
-        diagnostics.active_expanded_counters = self
-            .counters
-            .values()
-            .filter(|counter| counter.wildcard)
-            .count();
+        diagnostics.active_expanded_counters = self.active_expanded_count();
         Ok(Sample {
             timestamp_unix_nano,
             points,
@@ -1496,23 +1505,384 @@ impl Drop for AcceptedCollectGuard {
 
 #[derive(Clone)]
 struct QuerySettings {
-    counters: Vec<CounterConfig>,
     wildcard_refresh_interval: Duration,
     max_instances_per_wildcard: usize,
-    max_expanded_counters: usize,
     node: String,
 }
 
 impl QuerySettings {
-    fn open(&self) -> Result<Query, Error> {
+    fn open(
+        &self,
+        counters: Vec<CounterConfig>,
+        max_expanded_counters: usize,
+    ) -> Result<Query, Error> {
         Query::open(
-            self.counters.clone(),
+            counters,
             self.wildcard_refresh_interval,
             self.max_instances_per_wildcard,
-            self.max_expanded_counters,
+            max_expanded_counters,
             self.node.clone(),
         )
     }
+}
+
+struct QueryPlan {
+    configs: Vec<CounterConfig>,
+    global_indices: Vec<usize>,
+    recreate_query: bool,
+}
+
+fn query_plans(counters: Vec<CounterConfig>) -> Vec<QueryPlan> {
+    let mut plans = Vec::new();
+    for (global_index, counter) in counters.into_iter().enumerate() {
+        let append_to_current = plans.last().is_some_and(|plan: &QueryPlan| {
+            if counter.recreate_query {
+                plan.recreate_query
+                    && plan.configs[0].source_mapping_index == counter.source_mapping_index
+            } else {
+                !plan.recreate_query
+            }
+        });
+        if append_to_current && let Some(plan) = plans.last_mut() {
+            plan.configs.push(counter);
+            plan.global_indices.push(global_index);
+            continue;
+        }
+        plans.push(QueryPlan {
+            recreate_query: counter.recreate_query,
+            configs: vec![counter],
+            global_indices: vec![global_index],
+        });
+    }
+    plans
+}
+
+struct QuerySlot<A: PdhApi> {
+    plan: QueryPlan,
+    query: Option<Query<A>>,
+    query_failure_attempts: u32,
+    next_query_retry: Instant,
+    rebuild_attempts: u32,
+    next_rebuild: Instant,
+    pending: PendingMetadata,
+}
+
+impl<A: PdhApi> QuerySlot<A> {
+    fn open_initial<F>(
+        plan: QueryPlan,
+        max_expanded_counters: usize,
+        open: &mut F,
+    ) -> Result<Self, Error>
+    where
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+    {
+        let mut query = open(plan.configs.clone(), max_expanded_counters)?;
+        let prime_error = query.prime().err();
+        if let Some(error) = &prime_error {
+            query.record_prime_failure(error);
+        }
+        Ok(Self {
+            plan,
+            query: Some(query),
+            query_failure_attempts: u32::from(
+                prime_error
+                    .as_ref()
+                    .is_some_and(Error::is_query_collection_failure),
+            ),
+            next_query_retry: Instant::now(),
+            rebuild_attempts: 0,
+            next_rebuild: Instant::now(),
+            pending: PendingMetadata::default(),
+        })
+    }
+
+    fn collect<F>(
+        &mut self,
+        now: Instant,
+        query_retry_cap: Duration,
+        max_expanded_counters: usize,
+        open: &mut F,
+    ) -> Result<Sample, Error>
+    where
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+    {
+        let was_query_retry =
+            self.query.is_some() && self.query_failure_attempts > 0 && now >= self.next_query_retry;
+        if was_query_retry {
+            self.pending.diagnostics.retry_attempts += 1;
+        }
+        let mut result = if let Some(active_query) = self.query.as_mut() {
+            active_query.set_max_expanded_counters(max_expanded_counters);
+            if now < self.next_query_retry {
+                Err(Error::QueryRecoveryPending {
+                    retry_after_ms: self.next_query_retry.duration_since(now).as_millis(),
+                })
+            } else {
+                active_query.collect()
+            }
+        } else if now < self.next_rebuild {
+            Err(Error::QueryRecoveryPending {
+                retry_after_ms: self.next_rebuild.duration_since(now).as_millis(),
+            })
+        } else {
+            self.pending.diagnostics.query_rebuild_attempts += 1;
+            match open(self.plan.configs.clone(), max_expanded_counters) {
+                Ok(mut rebuilt) => {
+                    self.pending.diagnostics.query_rebuild_recoveries += 1;
+                    self.rebuild_attempts = 0;
+                    self.query_failure_attempts = 0;
+                    self.next_query_retry = now;
+                    let result = rebuilt.collect();
+                    self.query = Some(rebuilt);
+                    result
+                }
+                Err(error) => {
+                    self.rebuild_attempts = self.rebuild_attempts.saturating_add(1);
+                    self.next_rebuild = now + retry_delay(self.rebuild_attempts, query_retry_cap);
+                    Err(error)
+                }
+            }
+        };
+        if result
+            .as_ref()
+            .is_err_and(Error::is_query_collection_failure)
+        {
+            self.query_failure_attempts = self.query_failure_attempts.saturating_add(1);
+            self.next_query_retry = now + retry_delay(self.query_failure_attempts, query_retry_cap);
+            if should_rebuild_query(self.query_failure_attempts) {
+                if let Some(active_query) = self.query.as_mut() {
+                    active_query.move_pending_metadata_to(
+                        &mut self.pending.diagnostics,
+                        &mut self.pending.failures,
+                        &mut self.pending.overflows,
+                    );
+                }
+                self.query = None;
+                self.rebuild_attempts = 0;
+                self.next_rebuild = self.next_query_retry;
+            }
+        } else if result
+            .as_ref()
+            .is_err_and(Error::requires_immediate_query_rebuild)
+        {
+            if let Some(active_query) = self.query.as_mut() {
+                active_query.move_pending_metadata_to(
+                    &mut self.pending.diagnostics,
+                    &mut self.pending.failures,
+                    &mut self.pending.overflows,
+                );
+            }
+            self.query = None;
+            self.rebuild_attempts = 0;
+            self.next_rebuild = now + retry_delay(1, query_retry_cap);
+        } else if result.is_ok() {
+            if was_query_retry {
+                self.pending.diagnostics.retry_recoveries += 1;
+            }
+            self.query_failure_attempts = 0;
+            self.next_query_retry = now;
+        }
+        if let Ok(sample) = &mut result {
+            self.pending.merge_into_sample(sample);
+        }
+        result
+    }
+
+    fn recreate<F>(
+        &mut self,
+        now: Instant,
+        max_expanded_counters: usize,
+        open: &mut F,
+        diagnostics: &mut SampleDiagnostics,
+        failures: &mut Vec<SampleFailure>,
+    ) where
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+    {
+        if !self.plan.recreate_query {
+            return;
+        }
+        diagnostics.query_recreation_attempts += 1;
+        let replacement =
+            open(self.plan.configs.clone(), max_expanded_counters).and_then(|mut query| {
+                query.prime()?;
+                Ok(query)
+            });
+        match replacement {
+            Ok(query) => {
+                self.query = Some(query);
+                self.query_failure_attempts = 0;
+                self.next_query_retry = now;
+                self.rebuild_attempts = 0;
+                self.next_rebuild = now;
+            }
+            Err(error) => {
+                diagnostics.query_recreation_failures += 1;
+                if error.is_query_collection_failure() {
+                    diagnostics.scrape_failures += 1;
+                }
+                failures.extend(self.plan.global_indices.iter().map(|&counter_index| {
+                    SampleFailure {
+                        counter_index,
+                        reason: error.reason(),
+                        error: error.bounded_detail(),
+                        diagnostic_only: true,
+                    }
+                }));
+            }
+        }
+    }
+
+    fn remap_sample(&self, mut sample: Sample) -> Result<Sample, Error> {
+        let remap = |local_index: usize| {
+            self.plan
+                .global_indices
+                .get(local_index)
+                .copied()
+                .ok_or(Error::InvalidSample(
+                    "query returned an unknown local counter index",
+                ))
+        };
+        for point in &mut sample.points {
+            point.counter_index = remap(point.counter_index)?;
+        }
+        for failure in &mut sample.failures {
+            failure.counter_index = remap(failure.counter_index)?;
+        }
+        for overflow in &mut sample.overflows {
+            overflow.counter_index = remap(overflow.counter_index)?;
+        }
+        Ok(sample)
+    }
+
+    fn active_expanded_count(&self) -> usize {
+        self.query.as_ref().map_or(0, Query::active_expanded_count)
+    }
+}
+
+fn merge_query_samples(samples: Vec<Sample>) -> Result<Sample, Error> {
+    let mut merged = None::<Sample>;
+    for sample in samples {
+        if let Some(target) = &mut merged {
+            target.timestamp_unix_nano = target.timestamp_unix_nano.max(sample.timestamp_unix_nano);
+            target.diagnostics.active_expanded_counters +=
+                sample.diagnostics.active_expanded_counters;
+            merge_sample_metadata(
+                &mut target.diagnostics,
+                &mut target.failures,
+                &mut target.overflows,
+                sample.diagnostics,
+                sample.failures,
+                sample.overflows,
+            );
+            target.points.extend(sample.points);
+        } else {
+            merged = Some(sample);
+        }
+    }
+    let mut merged = merged.ok_or(Error::InvalidSample(
+        "worker has no performance-counter query",
+    ))?;
+    merged.points.sort_by(|left, right| {
+        (left.counter_index, &left.path).cmp(&(right.counter_index, &right.path))
+    });
+    merged
+        .failures
+        .sort_by_key(|failure| (failure.counter_index, failure.reason));
+    merged
+        .overflows
+        .sort_by_key(|overflow| (overflow.counter_index, overflow.reason));
+    Ok(merged)
+}
+
+fn collect_queries<A, F>(
+    queries: &mut [QuerySlot<A>],
+    query_retry_cap: Duration,
+    max_expanded_counters: usize,
+    open: &mut F,
+) -> Result<Sample, Error>
+where
+    A: PdhApi,
+    F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+{
+    let now = Instant::now();
+    let mut samples = Vec::with_capacity(queries.len());
+    let mut collection_succeeded = vec![false; queries.len()];
+    let mut first_collection_error = None;
+    let mut query_failures = Vec::new();
+    for query_index in 0..queries.len() {
+        let other_active = queries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != query_index)
+            .map(|(_, query)| query.active_expanded_count())
+            .sum::<usize>();
+        let query_limit = max_expanded_counters.saturating_sub(other_active);
+        let query = &mut queries[query_index];
+        match query.collect(now, query_retry_cap, query_limit, open) {
+            Ok(sample) => {
+                collection_succeeded[query_index] = true;
+                samples.push(query.remap_sample(sample)?);
+            }
+            Err(error) if error.is_collection_failure() => {
+                let reason = error.reason();
+                let detail = error.bounded_detail();
+                query_failures.extend(query.plan.global_indices.iter().map(|&counter_index| {
+                    SampleFailure {
+                        counter_index,
+                        reason,
+                        error: detail.clone(),
+                        diagnostic_only: false,
+                    }
+                }));
+                if first_collection_error.is_none() {
+                    first_collection_error = Some(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if samples.is_empty() {
+        return Err(first_collection_error.unwrap_or(Error::InvalidSample(
+            "worker has no successful performance-counter query",
+        )));
+    }
+    let mut sample = merge_query_samples(samples)?;
+    if !query_failures.is_empty() {
+        merge_sample_metadata(
+            &mut sample.diagnostics,
+            &mut sample.failures,
+            &mut sample.overflows,
+            SampleDiagnostics {
+                scrape_failures: 1,
+                ..Default::default()
+            },
+            query_failures,
+            Vec::new(),
+        );
+    }
+    for query_index in 0..queries.len() {
+        if !collection_succeeded[query_index] {
+            continue;
+        }
+        let other_active = queries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != query_index)
+            .map(|(_, query)| query.active_expanded_count())
+            .sum::<usize>();
+        let query_limit = max_expanded_counters.saturating_sub(other_active);
+        queries[query_index].recreate(
+            now,
+            query_limit,
+            open,
+            &mut sample.diagnostics,
+            &mut sample.failures,
+        );
+    }
+    sample
+        .failures
+        .sort_by_key(|failure| (failure.counter_index, failure.reason));
+    Ok(sample)
 }
 
 /// Capacity-one command client for the thread that owns the persistent query.
@@ -1533,20 +1903,30 @@ impl Worker {
         node: String,
     ) -> Result<Self, Error> {
         let settings = QuerySettings {
-            counters,
             wildcard_refresh_interval,
             max_instances_per_wildcard,
-            max_expanded_counters,
             node,
         };
-        Self::start_with(wildcard_refresh_interval, move || settings.open()).await
+        Self::start_with(
+            counters,
+            wildcard_refresh_interval,
+            max_expanded_counters,
+            move |counters, query_limit| settings.open(counters, query_limit),
+        )
+        .await
     }
 
-    async fn start_with<A, F>(query_retry_cap: Duration, mut open: F) -> Result<Self, Error>
+    async fn start_with<A, F>(
+        counters: Vec<CounterConfig>,
+        query_retry_cap: Duration,
+        max_expanded_counters: usize,
+        mut open: F,
+    ) -> Result<Self, Error>
     where
         A: PdhApi + 'static,
-        F: FnMut() -> Result<Query<A>, Error> + Send + 'static,
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error> + Send + 'static,
     {
+        let plans = query_plans(counters);
         let (tx, rx) = mpsc::sync_channel(1);
         let (init_tx, init_rx) = oneshot::channel();
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -1558,124 +1938,35 @@ impl Worker {
             .name("windowsperfcounters-pdh".to_owned())
             .spawn(move || {
                 {
-                    let mut query = match open() {
-                        Ok(query) => query,
-                        Err(error) => {
-                            let _ = init_tx.send(Err(error));
-                            return;
+                    let mut queries = Vec::with_capacity(plans.len());
+                    for plan in plans {
+                        let active_expanded = queries
+                            .iter()
+                            .map(QuerySlot::active_expanded_count)
+                            .sum::<usize>();
+                        let query_limit = max_expanded_counters.saturating_sub(active_expanded);
+                        match QuerySlot::open_initial(plan, query_limit, &mut open) {
+                            Ok(query) => queries.push(query),
+                            Err(error) => {
+                                let _ = init_tx.send(Err(error));
+                                return;
+                            }
                         }
-                    };
-                    let prime_error = query.prime().err();
-                    if let Some(error) = &prime_error {
-                        query.record_prime_failure(error);
                     }
                     if init_tx.send(Ok(())).is_err() {
                         return;
                     }
-                    let mut query = Some(query);
-                    let mut query_failure_attempts = u32::from(
-                        prime_error
-                            .as_ref()
-                            .is_some_and(Error::is_query_collection_failure),
-                    );
-                    let mut next_query_retry = Instant::now();
-                    let mut rebuild_attempts = 0_u32;
-                    let mut next_rebuild = Instant::now();
-                    let mut pending = PendingMetadata::default();
                     while !worker_shutdown.load(Ordering::Acquire) {
                         match rx.recv() {
                             Ok(Command::Collect(response)) => {
                                 let accepted =
                                     AcceptedCollectGuard::new(Arc::clone(&worker_accepted));
-                                let now = Instant::now();
-                                let was_query_retry = query.is_some()
-                                    && query_failure_attempts > 0
-                                    && now >= next_query_retry;
-                                if was_query_retry {
-                                    pending.diagnostics.retry_attempts += 1;
-                                }
-                                let mut result = if let Some(active_query) = query.as_mut() {
-                                    if now < next_query_retry {
-                                        Err(Error::QueryRecoveryPending {
-                                            retry_after_ms: next_query_retry
-                                                .duration_since(now)
-                                                .as_millis(),
-                                        })
-                                    } else {
-                                        active_query.collect()
-                                    }
-                                } else if now < next_rebuild {
-                                    Err(Error::QueryRecoveryPending {
-                                        retry_after_ms: next_rebuild
-                                            .duration_since(now)
-                                            .as_millis(),
-                                    })
-                                } else {
-                                    pending.diagnostics.query_rebuild_attempts += 1;
-                                    match open() {
-                                        Ok(rebuilt) => {
-                                            pending.diagnostics.query_rebuild_recoveries += 1;
-                                            rebuild_attempts = 0;
-                                            query_failure_attempts = 0;
-                                            next_query_retry = now;
-                                            query = Some(rebuilt);
-                                            query
-                                                .as_mut()
-                                                .expect("query was just restored")
-                                                .collect()
-                                        }
-                                        Err(error) => {
-                                            rebuild_attempts = rebuild_attempts.saturating_add(1);
-                                            next_rebuild = now
-                                                + retry_delay(rebuild_attempts, query_retry_cap);
-                                            Err(error)
-                                        }
-                                    }
-                                };
-                                if result
-                                    .as_ref()
-                                    .is_err_and(Error::is_query_collection_failure)
-                                {
-                                    query_failure_attempts =
-                                        query_failure_attempts.saturating_add(1);
-                                    next_query_retry =
-                                        now + retry_delay(query_failure_attempts, query_retry_cap);
-                                    if should_rebuild_query(query_failure_attempts) {
-                                        if let Some(active_query) = query.as_mut() {
-                                            active_query.move_pending_metadata_to(
-                                                &mut pending.diagnostics,
-                                                &mut pending.failures,
-                                                &mut pending.overflows,
-                                            );
-                                        }
-                                        query = None;
-                                        rebuild_attempts = 0;
-                                        next_rebuild = next_query_retry;
-                                    }
-                                } else if result
-                                    .as_ref()
-                                    .is_err_and(Error::requires_immediate_query_rebuild)
-                                {
-                                    if let Some(active_query) = query.as_mut() {
-                                        active_query.move_pending_metadata_to(
-                                            &mut pending.diagnostics,
-                                            &mut pending.failures,
-                                            &mut pending.overflows,
-                                        );
-                                    }
-                                    query = None;
-                                    rebuild_attempts = 0;
-                                    next_rebuild = now + retry_delay(1, query_retry_cap);
-                                } else if result.is_ok() {
-                                    if was_query_retry {
-                                        pending.diagnostics.retry_recoveries += 1;
-                                    }
-                                    query_failure_attempts = 0;
-                                    next_query_retry = now;
-                                }
-                                if let Ok(sample) = &mut result {
-                                    pending.merge_into_sample(sample);
-                                }
+                                let result = collect_queries(
+                                    &mut queries,
+                                    query_retry_cap,
+                                    max_expanded_counters,
+                                    &mut open,
+                                );
                                 drop(accepted);
                                 let _ = response.send(result);
                             }

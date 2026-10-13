@@ -5,7 +5,7 @@ use super::super::config::MetricKind;
 use super::super::model::Number;
 use super::super::{config::Config, otap_builder::into_otap};
 use super::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command as ProcessCommand, Stdio};
@@ -23,6 +23,8 @@ fn counter(path: &str, name: &str) -> CounterConfig {
         emit_instance_attribute: false,
         excluded_aggregation_instance: None,
         scale_power10: 0,
+        recreate_query: false,
+        source_mapping_index: 0,
     }
 }
 
@@ -283,6 +285,318 @@ fn fake_query(
     (state, query)
 }
 
+fn advance_fake_queries(states: &Rc<RefCell<Vec<Rc<RefCell<FakeState>>>>>) {
+    for state in states.borrow().iter() {
+        let mut state = state.borrow_mut();
+        state.timestamp += 10;
+        for counter in &mut state.counters {
+            if let Some(raw) = &mut counter.raw {
+                *raw += 10;
+            }
+        }
+    }
+}
+
+/// Scenario: Shared mappings and independently recreated mappings expand to multiple normalized paths.
+/// Guarantees: Ordinary paths share one query while every opted-in source mapping receives exactly one isolated query.
+#[test]
+fn query_plans_isolate_recreated_source_mappings() {
+    let mut shared_first = counter(r"\Shared(first)\Value", "shared.first");
+    shared_first.source_mapping_index = 0;
+    let mut recreated_first = counter(r"\Isolated(first)\Value", "isolated.first");
+    recreated_first.recreate_query = true;
+    recreated_first.source_mapping_index = 1;
+    let mut shared_second = counter(r"\Shared(second)\Value", "shared.second");
+    shared_second.source_mapping_index = 2;
+    let mut recreated_second = counter(r"\Isolated(second)\Value", "isolated.second");
+    recreated_second.recreate_query = true;
+    recreated_second.source_mapping_index = 1;
+    let mut another_recreated = counter(r"\Another\Value", "another");
+    another_recreated.recreate_query = true;
+    another_recreated.source_mapping_index = 3;
+
+    let plans = query_plans(vec![
+        shared_first,
+        shared_second,
+        recreated_first,
+        recreated_second,
+        another_recreated,
+    ]);
+
+    assert_eq!(plans.len(), 3);
+    assert_eq!(plans[0].global_indices, [0, 1]);
+    assert!(!plans[0].recreate_query);
+    assert_eq!(plans[1].global_indices, [2, 3]);
+    assert!(plans[1].recreate_query);
+    assert_eq!(plans[2].global_indices, [4]);
+    assert!(plans[2].recreate_query);
+}
+
+/// Scenario: Multiple recreated wildcard mappings compete for one receiver-wide expansion limit.
+/// Guarantees: Initial queries and overlapping replacements share the configured limit instead of multiplying it per query.
+#[test]
+fn recreated_queries_share_receiver_expansion_limit() {
+    let mut first = counter(r"\Process(first*)\Private Bytes", "process.first");
+    first.has_instance = true;
+    first.recreate_query = true;
+    first.source_mapping_index = 0;
+    let mut second = counter(r"\Process(second*)\Private Bytes", "process.second");
+    second.has_instance = true;
+    second.recreate_query = true;
+    second.source_mapping_index = 1;
+
+    let observed_limits = Rc::new(RefCell::new(Vec::new()));
+    let factory_limits = Rc::clone(&observed_limits);
+    let mut open = move |configs: Vec<CounterConfig>, max_expanded_counters: usize| {
+        factory_limits.borrow_mut().push(max_expanded_counters);
+        let template = configs[0].path.clone();
+        let prefix = if configs[0].source_mapping_index == 0 {
+            "first"
+        } else {
+            "second"
+        };
+        let paths = (0..3)
+            .map(|index| format!(r"\Process({prefix}{index})\Private Bytes"))
+            .collect::<Vec<_>>();
+        let state = Rc::new(RefCell::new(FakeState {
+            counters: paths
+                .iter()
+                .map(|path| FakeCounter {
+                    path: path.clone(),
+                    native_type: 0x0001_0100,
+                    raw: None,
+                    multi_count: 1,
+                    formatted: Some(Number::Integer(42)),
+                    raw_error: false,
+                    formatted_error: false,
+                })
+                .collect(),
+            added: Vec::new(),
+            collect_has_data: true,
+            collect_error: false,
+            timestamp: 100,
+            timestamp_error: false,
+            remove_error: false,
+            removed: Vec::new(),
+            expansions: [(template, paths)].into_iter().collect(),
+        }));
+        Query::open_with(
+            FakePdh(state),
+            configs,
+            Duration::from_secs(30),
+            256,
+            max_expanded_counters,
+        )
+    };
+
+    let mut queries = Vec::new();
+    for plan in query_plans(vec![first, second]) {
+        let active = queries
+            .iter()
+            .map(QuerySlot::active_expanded_count)
+            .sum::<usize>();
+        queries.push(QuerySlot::open_initial(plan, 4 - active, &mut open).unwrap());
+    }
+    assert_eq!(
+        queries
+            .iter()
+            .map(QuerySlot::active_expanded_count)
+            .collect::<Vec<_>>(),
+        [3, 1]
+    );
+
+    let sample = collect_queries(&mut queries, Duration::from_secs(30), 4, &mut open).unwrap();
+    assert_eq!(sample.diagnostics.active_expanded_counters, 4);
+    assert_eq!(observed_limits.borrow().as_slice(), [4, 1, 3, 1]);
+    assert_eq!(
+        queries
+            .iter()
+            .map(QuerySlot::active_expanded_count)
+            .sum::<usize>(),
+        4
+    );
+}
+
+/// Scenario: One isolated query fails collection while a shared peer remains healthy.
+/// Guarantees: The scrape emits the healthy peer, reports the isolated mapping failure, and does not recreate the failed query.
+#[test]
+fn isolated_query_failure_preserves_healthy_peer_output() {
+    let shared_path = r"\Memory\Available Bytes";
+    let isolated_path = r"\Processor(_Total)\% Processor Time";
+    let mut shared = monotonic_sum(shared_path, "windows.memory.available", "By");
+    shared.source_mapping_index = 0;
+    let mut isolated = counter(isolated_path, "windows.processor.time");
+    isolated.recreate_query = true;
+    isolated.source_mapping_index = 1;
+
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let open_calls = Rc::new(Cell::new(0_usize));
+    let factory_open_calls = Rc::clone(&open_calls);
+    let mut open = move |configs: Vec<CounterConfig>, _max_expanded_counters: usize| {
+        factory_open_calls.set(factory_open_calls.get() + 1);
+        let config = &configs[0];
+        let native_counter = if config.path == shared_path {
+            FakeCounter {
+                path: config.path.clone(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            }
+        } else {
+            FakeCounter {
+                path: config.path.clone(),
+                native_type: 0x2041_0500,
+                raw: Some(10),
+                multi_count: 1,
+                formatted: Some(Number::Double(1.0)),
+                raw_error: false,
+                formatted_error: false,
+            }
+        };
+        let (state, query) = fake_query(configs, vec![native_counter]);
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let mut queries = query_plans(vec![shared, isolated])
+        .into_iter()
+        .map(|plan| QuerySlot::open_initial(plan, 4_096, &mut open).unwrap())
+        .collect::<Vec<_>>();
+    states.borrow()[1].borrow_mut().collect_error = true;
+    advance_fake_queries(&states);
+
+    let sample = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+
+    assert_eq!(sample.points.len(), 1);
+    assert_eq!(sample.points[0].counter_index, 0);
+    assert_eq!(sample.points[0].start_time_unix_nano, Some(100));
+    assert_eq!(sample.failures.len(), 1);
+    assert_eq!(sample.failures[0].counter_index, 1);
+    assert_eq!(sample.failures[0].reason, "PdhCollectQueryData");
+    assert!(!sample.failures[0].diagnostic_only);
+    assert_eq!(sample.diagnostics.scrape_failures, 1);
+    assert_eq!(sample.diagnostics.query_recreation_attempts, 0);
+    assert_eq!(open_calls.get(), 2);
+}
+
+/// Scenario: An isolated query is recreated repeatedly while construction and priming fail in sequence.
+/// Guarantees: The old isolated query survives both failures, its replacement is primed before use, and the shared peer's cumulative sequence is unchanged.
+#[test]
+fn recreated_query_primes_before_swap_and_preserves_old_query_on_failure() {
+    let shared_path = r"\Memory\Available Bytes";
+    let isolated_path = r"\Processor(_Total)\% Processor Time";
+    let mut shared = monotonic_sum(shared_path, "windows.memory.available", "By");
+    shared.source_mapping_index = 0;
+    let mut isolated = counter(isolated_path, "windows.processor.time");
+    isolated.recreate_query = true;
+    isolated.source_mapping_index = 1;
+
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let open_calls = Rc::new(Cell::new(0_usize));
+    let factory_open_calls = Rc::clone(&open_calls);
+    let mut open = move |configs: Vec<CounterConfig>, _max_expanded_counters: usize| {
+        let open_index = factory_open_calls.get();
+        factory_open_calls.set(open_index + 1);
+        if open_index == 2 {
+            return Err(Error::Pdh {
+                operation: "PdhOpenQueryW",
+                path: "<query>".to_owned(),
+                status: 1,
+            });
+        }
+        let counters = configs
+            .iter()
+            .map(|config| {
+                if config.path == shared_path {
+                    FakeCounter {
+                        path: config.path.clone(),
+                        native_type: 0x0001_0100,
+                        raw: None,
+                        multi_count: 1,
+                        formatted: Some(Number::Integer(42)),
+                        raw_error: false,
+                        formatted_error: false,
+                    }
+                } else {
+                    FakeCounter {
+                        path: config.path.clone(),
+                        native_type: 0x2041_0500,
+                        raw: Some(10),
+                        multi_count: 1,
+                        formatted: Some(Number::Double(1.0)),
+                        raw_error: false,
+                        formatted_error: false,
+                    }
+                }
+            })
+            .collect();
+        let (state, query) = fake_query(configs, counters);
+        if open_index == 3 {
+            state.borrow_mut().collect_error = true;
+        }
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let plans = query_plans(vec![shared, isolated]);
+    let mut queries = plans
+        .into_iter()
+        .map(|plan| QuerySlot::open_initial(plan, 4_096, &mut open).unwrap())
+        .collect::<Vec<_>>();
+
+    let mut shared_start = None;
+    for scrape_index in 0..4 {
+        advance_fake_queries(&states);
+        let sample =
+            collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+        assert_eq!(
+            sample
+                .points
+                .iter()
+                .map(|point| point.counter_index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(matches!(
+            sample.points[1].value,
+            SampleValue::Value(Number::Double(1.0))
+        ));
+        let current_shared_start = sample.points[0].start_time_unix_nano;
+        if let Some(shared_start) = shared_start {
+            assert_eq!(current_shared_start, Some(shared_start));
+        } else {
+            shared_start = current_shared_start;
+        }
+
+        assert_eq!(sample.diagnostics.query_recreation_attempts, 1);
+        match scrape_index {
+            0 => {
+                assert_eq!(sample.diagnostics.query_recreation_failures, 1);
+                assert_eq!(sample.diagnostics.scrape_failures, 0);
+                assert_eq!(sample.failures.len(), 1);
+                assert_eq!(sample.failures[0].reason, "PdhOpenQueryW");
+                assert!(sample.failures[0].diagnostic_only);
+            }
+            1 => {
+                assert_eq!(sample.diagnostics.query_recreation_failures, 1);
+                assert_eq!(sample.diagnostics.scrape_failures, 1);
+                assert_eq!(sample.failures.len(), 1);
+                assert_eq!(sample.failures[0].reason, "PdhCollectQueryData");
+                assert!(sample.failures[0].diagnostic_only);
+            }
+            _ => {
+                assert_eq!(sample.diagnostics.query_recreation_failures, 0);
+                assert_eq!(sample.diagnostics.scrape_failures, 0);
+                assert!(sample.failures.is_empty());
+            }
+        }
+    }
+    assert_eq!(open_calls.get(), 6);
+}
+
 /// Scenario: Two metric mappings use the same exact PDH path.
 /// Guarantees: The query adds two handles and routes one point to each configured mapping index.
 #[test]
@@ -452,17 +766,22 @@ async fn startup_prime_query_failure_starts_and_recovers() {
     let counters = vec![counter(path, "system.cpu.time")];
     let collect_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let factory_calls = Arc::clone(&collect_calls);
-    let mut worker = Worker::start_with(Duration::from_secs(30), move || {
-        Query::open_with(
-            RecoveringPrimePdh {
-                collect_calls: Arc::clone(&factory_calls),
-            },
-            counters.clone(),
-            Duration::from_secs(30),
-            256,
-            4_096,
-        )
-    })
+    let mut worker = Worker::start_with(
+        counters,
+        Duration::from_secs(30),
+        4_096,
+        move |counters, max_expanded_counters| {
+            Query::open_with(
+                RecoveringPrimePdh {
+                    collect_calls: Arc::clone(&factory_calls),
+                },
+                counters,
+                Duration::from_secs(30),
+                256,
+                max_expanded_counters,
+            )
+        },
+    )
     .await
     .unwrap();
 
@@ -718,6 +1037,55 @@ async fn live_pdh_persistent_worker_reuses_and_closes_query() {
     let after = query_counts();
     assert_eq!(after.0 - before.0, 1);
     assert_eq!(after.1 - before.1, 1);
+}
+
+/// Scenario: One live calculated mapping opts into query recreation beside a persistent direct mapping.
+/// Guarantees: Every scrape replaces and primes only the opted-in query, both mappings stay ready, and shutdown closes every opened query.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+async fn live_pdh_recreates_and_primes_opted_in_query() {
+    let _serial = super::super::TEST_PDH_LOCK.lock().await;
+    let before = query_counts();
+    let shared = counter(r"\Memory\Available Bytes", "windows.memory.available");
+    let mut recreated = counter(
+        r"\Processor(_Total)\% Processor Time",
+        "windows.processor.time",
+    );
+    recreated.recreate_query = true;
+    recreated.source_mapping_index = 1;
+    let mut worker = Worker::start(
+        vec![shared, recreated],
+        Duration::from_secs(30),
+        256,
+        4_096,
+        "test".to_owned(),
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let sample = worker.collect().await.unwrap();
+        assert_eq!(sample.points.len(), 2);
+        assert!(matches!(
+            sample.points[0].value,
+            SampleValue::Value(Number::Integer(value)) if value >= 0
+        ));
+        assert!(
+            matches!(sample.points[1].value, SampleValue::Value(Number::Double(value)) if value.is_finite())
+        );
+        assert_eq!(sample.diagnostics.query_recreation_attempts, 1);
+        assert_eq!(sample.diagnostics.query_recreation_failures, 0);
+    }
+    assert!(
+        worker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap()
+    );
+    let after = query_counts();
+    assert_eq!(after.0 - before.0, 4);
+    assert_eq!(after.1 - before.1, 4);
 }
 
 /// Scenario: Two independently configured receiver workers collect in one process.

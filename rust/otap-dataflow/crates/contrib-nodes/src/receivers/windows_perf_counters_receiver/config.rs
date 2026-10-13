@@ -113,6 +113,7 @@ impl Config {
 
         let expanded_count = expanded_counter_count(&user.perfcounters)?;
         let mut counters = Vec::with_capacity(expanded_count);
+        let mut source_mapping_index = 0;
         for (object_index, object) in user.perfcounters.into_iter().enumerate() {
             let object_field = format!("perfcounters[{object_index}]");
             let object_name =
@@ -159,11 +160,6 @@ impl Config {
                 let counter_field = format!("{object_field}.counters[{counter_index}]");
                 let counter_name =
                     validate_counter_name(&format!("{counter_field}.name"), &mapping.name)?;
-                if mapping.recreate_query {
-                    return Err(invalid(format!(
-                        "{counter_field}.recreate_query is not supported yet; omit it or set it to false"
-                    )));
-                }
                 let metric_name = mapping
                     .metric
                     .as_deref()
@@ -269,8 +265,11 @@ impl Config {
                         emit_instance_attribute,
                         excluded_aggregation_instance,
                         scale_power10: mapping.scale_power10,
+                        recreate_query: mapping.recreate_query,
+                        source_mapping_index,
                     });
                 }
+                source_mapping_index += 1;
             }
         }
         let mut output_identities = HashSet::with_capacity(counters.len());
@@ -332,6 +331,10 @@ pub(super) struct CounterConfig {
     pub(super) excluded_aggregation_instance: Option<String>,
     /// Base-10 scaling applied after PDH calculates the native value.
     pub(super) scale_power10: i32,
+    /// Whether this configured mapping receives a fresh, primed query after each scrape.
+    pub(super) recreate_query: bool,
+    /// Identity shared by normalized paths expanded from one configured mapping.
+    pub(super) source_mapping_index: usize,
 }
 
 /// Supported OTel metric stream kinds.
@@ -983,27 +986,39 @@ mod tests {
         assert_eq!(config.counters[0].name, r"\Memory\Available Bytes");
     }
 
-    /// Scenario: A mapping explicitly disables or enables query recreation.
-    /// Guarantees: False is accepted while true fails instead of being silently ignored.
+    /// Scenario: Mappings explicitly disable or enable query recreation across expanded paths.
+    /// Guarantees: The option is retained and every path from one source mapping shares its identity.
     #[test]
-    fn rejects_unimplemented_query_recreation() {
+    fn retains_query_recreation_by_source_mapping() {
         let config = |recreate_query| {
             json!({
                 "perfcounters": [{
                     "object": "Memory",
-                    "counters": [{
-                        "name": "Available Bytes",
-                        "recreate_query": recreate_query
-                    }]
+                    "instances": ["first", "second"],
+                    "counters": [
+                        {
+                            "name": "Available Bytes",
+                            "recreate_query": recreate_query
+                        },
+                        {"name": "Committed Bytes"}
+                    ]
                 }]
             })
         };
 
-        let _ = Config::from_json(&config(false)).unwrap();
-        assert_config_error(
-            config(true),
-            "recreate_query is not supported yet; omit it or set it to false",
-        );
+        let disabled = Config::from_json(&config(false)).unwrap();
+        assert!(!disabled.counters[0].recreate_query);
+        assert_eq!(disabled.counters[0].source_mapping_index, 0);
+        assert_eq!(disabled.counters[1].source_mapping_index, 0);
+
+        let enabled = Config::from_json(&config(true)).unwrap();
+        assert!(enabled.counters[0].recreate_query);
+        assert!(enabled.counters[1].recreate_query);
+        assert_eq!(enabled.counters[0].source_mapping_index, 0);
+        assert_eq!(enabled.counters[1].source_mapping_index, 0);
+        assert!(!enabled.counters[2].recreate_query);
+        assert_eq!(enabled.counters[2].source_mapping_index, 1);
+        assert_eq!(enabled.counters[3].source_mapping_index, 1);
     }
 
     /// Scenario: A wildcard omits the default or custom aggregation instance unless selected.

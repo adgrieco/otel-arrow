@@ -149,9 +149,13 @@ its configured mapping identity. Repeating the same path, metric name, and
 static attributes is rejected because it would emit duplicate points for one
 series.
 `scale_power10` defaults to zero and accepts values from `-18` through `18`.
-`recreate_query` defaults to `false`. Setting it to `true` is rejected until
-per-mapping query isolation and replacement priming are implemented; it is
-never silently ignored.
+`recreate_query` defaults to `false`. When `true`, the mapping owns an isolated
+PDH query. After every successful scrape, including an empty scrape, the
+receiver creates and primes a replacement before releasing the old query. If
+replacement construction or priming fails, collection continues with the old
+query and reports the bounded mapping failure. Wildcard-expanded instances and
+explicit instance paths from the same mapping share its isolated query;
+unrelated mappings keep their own sampling histories.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
 Counter names may contain parentheses, as required by counters such as
