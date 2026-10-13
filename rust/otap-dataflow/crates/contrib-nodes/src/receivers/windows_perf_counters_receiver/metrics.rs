@@ -105,6 +105,7 @@ impl WindowsPerfCountersMetrics {
             .add(diagnostics.counter_add_failures);
         self.counter_read_failures
             .add(diagnostics.counter_read_failures);
+        self.scrape_failures.add(diagnostics.scrape_failures);
         self.retry_attempts.add(diagnostics.retry_attempts);
         self.retry_recoveries.add(diagnostics.retry_recoveries);
         self.query_rebuild_attempts

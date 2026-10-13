@@ -349,6 +349,7 @@ fn sample_failure(counter_index: usize, error: &Error) -> SampleFailure {
         counter_index,
         reason: error.reason(),
         error: error.bounded_detail(),
+        diagnostic_only: false,
     }
 }
 
@@ -518,6 +519,7 @@ fn merge_diagnostics(target: &mut SampleDiagnostics, delta: SampleDiagnostics) {
     target.instances_omitted_over_limit += delta.instances_omitted_over_limit;
     target.counter_add_failures += delta.counter_add_failures;
     target.counter_read_failures += delta.counter_read_failures;
+    target.scrape_failures += delta.scrape_failures;
     target.retry_attempts += delta.retry_attempts;
     target.retry_recoveries += delta.retry_recoveries;
     target.query_rebuild_attempts += delta.query_rebuild_attempts;
@@ -1168,6 +1170,7 @@ impl<A: PdhApi> Query<A> {
                     error: format!(
                         "{oversized} expanded paths reached the PDH {PDH_MAX_COUNTER_PATH}-unit limit"
                     ),
+                    diagnostic_only: false,
                 });
                 paths.retain(|path| path.encode_utf16().count() < PDH_MAX_COUNTER_PATH as usize);
             }
@@ -1332,11 +1335,15 @@ impl<A: PdhApi> Query<A> {
     }
 
     fn record_prime_failure(&mut self, error: &Error) {
-        self.pending.diagnostics.counter_read_failures +=
-            u64::try_from(self.configs.len()).unwrap_or(u64::MAX);
-        self.pending.failures.extend(
-            (0..self.configs.len()).map(|counter_index| sample_failure(counter_index, error)),
-        );
+        self.pending.diagnostics.scrape_failures += 1;
+        self.pending
+            .failures
+            .extend((0..self.configs.len()).map(|counter_index| SampleFailure {
+                counter_index,
+                reason: error.reason(),
+                error: error.bounded_detail(),
+                diagnostic_only: true,
+            }));
     }
 
     fn collect(&mut self) -> Result<Sample, Error> {

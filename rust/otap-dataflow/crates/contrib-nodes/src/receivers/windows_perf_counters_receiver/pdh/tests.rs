@@ -471,7 +471,9 @@ async fn startup_prime_query_failure_starts_and_recovers() {
     assert_eq!(warming.failures.len(), 1);
     assert_eq!(warming.failures[0].counter_index, 0);
     assert_eq!(warming.failures[0].reason, "PdhCollectQueryData");
-    assert_eq!(warming.diagnostics.counter_read_failures, 1);
+    assert!(warming.failures[0].diagnostic_only);
+    assert_eq!(warming.diagnostics.counter_read_failures, 0);
+    assert_eq!(warming.diagnostics.scrape_failures, 1);
     assert_eq!(warming.diagnostics.retry_attempts, 1);
     assert_eq!(warming.diagnostics.retry_recoveries, 1);
 
@@ -2264,6 +2266,7 @@ fn sample_metadata_merge_preserves_pending_evidence() {
         counter_index: 0,
         reason: "initial",
         error: "initial failure".to_owned(),
+        diagnostic_only: false,
     }];
     let mut overflows = vec![ExpansionOverflow {
         counter_index: 0,
@@ -2285,6 +2288,7 @@ fn sample_metadata_merge_preserves_pending_evidence() {
             counter_index: 1,
             reason: "recovery",
             error: "recovery failure".to_owned(),
+            diagnostic_only: false,
         }],
         vec![ExpansionOverflow {
             counter_index: 1,
@@ -2313,6 +2317,7 @@ fn sample_metadata_merge_preserves_pending_evidence() {
             counter_index: 0,
             reason: "initial",
             error: "latest failure".to_owned(),
+            diagnostic_only: false,
         }],
         vec![ExpansionOverflow {
             counter_index: 0,
@@ -2342,6 +2347,7 @@ fn pending_metadata_bundle_preserves_worker_merge_order() {
             counter_index: 0,
             reason: "pending",
             error: "pending failure".to_owned(),
+            diagnostic_only: false,
         }],
         overflows: vec![ExpansionOverflow {
             counter_index: 0,
@@ -2358,6 +2364,7 @@ fn pending_metadata_bundle_preserves_worker_merge_order() {
             counter_index: 1,
             reason: "current",
             error: "current failure".to_owned(),
+            diagnostic_only: false,
         }],
         overflows: vec![ExpansionOverflow {
             counter_index: 1,

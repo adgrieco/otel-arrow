@@ -75,6 +75,8 @@ pub(super) struct SampleFailure {
     pub(super) reason: &'static str,
     /// Native status or calculation detail without expanded instance identity.
     pub(super) error: String,
+    /// Whether this entry exists only to provide per-mapping log context.
+    pub(super) diagnostic_only: bool,
 }
 
 /// One explicit wildcard expansion limit reached during discovery.
@@ -111,6 +113,8 @@ pub(super) struct SampleDiagnostics {
     pub(super) counter_add_failures: u64,
     /// Number of counter read, status, or projection failures.
     pub(super) counter_read_failures: u64,
+    /// Number of query-level collection failures preserved outside a requested scrape.
+    pub(super) scrape_failures: u64,
     /// Number of deferred counter retry attempts.
     pub(super) retry_attempts: u64,
     /// Number of deferred counter retries that recovered.

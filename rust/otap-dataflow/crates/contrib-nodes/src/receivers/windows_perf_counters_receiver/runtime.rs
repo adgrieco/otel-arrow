@@ -5,6 +5,7 @@
 
 use super::config::Config;
 use super::metrics::WindowsPerfCountersReceiverMetrics;
+use super::model::SampleFailure;
 use super::otap_builder::into_otap;
 use super::pdh;
 use async_trait::async_trait;
@@ -30,6 +31,16 @@ pub const WINDOWSPERFCOUNTERS_RECEIVER_URN: &str = "urn:otel:receiver:windowsper
 
 const WORKER_SHUTDOWN_MAX_WAIT: Duration = Duration::from_secs(1);
 const PIPELINE_COMPLETION_RESERVE: Duration = Duration::from_millis(500);
+
+fn failed_counter_value_count(failures: &[SampleFailure]) -> u64 {
+    u64::try_from(
+        failures
+            .iter()
+            .filter(|failure| !failure.diagnostic_only)
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
+}
 
 struct WindowsPerfCountersReceiver {
     config: Config,
@@ -142,7 +153,7 @@ impl WindowsPerfCountersReceiver {
                     metrics
                         .health
                         .failed_counter_values
-                        .add(sample.failures.len() as u64);
+                        .add(failed_counter_value_count(&sample.failures));
                     drop(metrics);
                     scrape_failed = false;
                     for overflow in &sample.overflows {
@@ -384,6 +395,28 @@ mod tests {
     use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_ctx};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    /// Scenario: A sample contains one value failure and one query-level log entry.
+    /// Guarantees: Only the actual counter-value omission contributes to failed-value metrics.
+    #[test]
+    fn diagnostic_only_failures_do_not_count_as_failed_values() {
+        let failures = vec![
+            SampleFailure {
+                counter_index: 0,
+                reason: "counter CStatus",
+                error: "PDH_INVALID_DATA".to_owned(),
+                diagnostic_only: false,
+            },
+            SampleFailure {
+                counter_index: 1,
+                reason: "PdhCollectQueryData",
+                error: "PDH status 0x00000001".to_owned(),
+                diagnostic_only: true,
+            },
+        ];
+
+        assert_eq!(failed_counter_value_count(&failures), 1);
+    }
 
     /// Scenario: Collection has a nonzero initial delay before its first request.
     /// Guarantees: The delay remains pending until the configured duration has fully elapsed.

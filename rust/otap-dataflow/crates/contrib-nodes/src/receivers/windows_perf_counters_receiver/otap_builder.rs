@@ -967,6 +967,7 @@ mod tests {
                     counter_index: 1,
                     reason: "PdhGetFormattedCounterValue",
                     error: "PDH_INVALID_DATA".to_owned(),
+                    diagnostic_only: false,
                 }],
                 overflows: Vec::new(),
                 diagnostics: Default::default(),
