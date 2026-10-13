@@ -155,7 +155,9 @@ receiver creates and primes a replacement before releasing the old query. If
 replacement construction or priming fails, collection continues with the old
 query and reports the bounded mapping failure. Wildcard-expanded instances and
 explicit instance paths from the same mapping share its isolated query;
-unrelated mappings keep their own sampling histories.
+unrelated mappings keep their own sampling histories. Each successful
+replacement starts a new cumulative sequence, so cumulative Sum points from a
+mapping with `recreate_query: true` have a new start time on every scrape.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
 Counter names may contain parentheses, as required by counters such as

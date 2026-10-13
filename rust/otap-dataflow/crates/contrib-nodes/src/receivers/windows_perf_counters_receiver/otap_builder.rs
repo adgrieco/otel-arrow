@@ -61,6 +61,12 @@ pub(super) fn into_otap(
         });
     let mut point_count = 0;
     for (index, (point, value)) in ready.enumerate() {
+        if point.timestamp_unix_nano <= 0 {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "counter {} has non-positive timestamp {}",
+                point.path, point.timestamp_unix_nano
+            )));
+        }
         let counter = counters.get(point.counter_index).ok_or_else(|| {
             ArrowError::InvalidArgumentError(format!(
                 "sample references missing configured counter {}",
@@ -83,14 +89,14 @@ pub(super) fn into_otap(
         };
         if let Some(start_time) = point_start_time
             && (start_time <= 0
-                || start_time > sample.timestamp_unix_nano
+                || start_time > point.timestamp_unix_nano
                 || matches!(
                     counter.metric_kind,
                     MetricKind::Sum {
                         aggregation: Aggregation::Delta,
                         ..
                     }
-                ) && start_time == sample.timestamp_unix_nano)
+                ) && start_time == point.timestamp_unix_nano)
         {
             let kind = match counter.metric_kind {
                 MetricKind::Sum {
@@ -101,7 +107,7 @@ pub(super) fn into_otap(
             };
             return Err(ArrowError::InvalidArgumentError(format!(
                 "{kind} {} ({}) has invalid start time {} for timestamp {}",
-                counter.name, point.path, start_time, sample.timestamp_unix_nano
+                counter.name, point.path, start_time, point.timestamp_unix_nano
             )));
         }
         let metric_id = if let Some(metric_id) = metric_ids.get(&counter.name) {
@@ -145,7 +151,7 @@ pub(super) fn into_otap(
         points.append_id(point_id);
         points.append_parent_id(metric_id);
         points.append_start_time_unix_nano(point_start_time);
-        points.append_time_unix_nano(sample.timestamp_unix_nano);
+        points.append_time_unix_nano(point.timestamp_unix_nano);
         match value {
             Number::Integer(value) => {
                 points.append_int_value(Some(value));
@@ -299,10 +305,20 @@ mod tests {
     }
 
     fn point(counter_index: usize, path: &str, value: SampleValue) -> SamplePoint {
+        point_at(counter_index, path, 1, value)
+    }
+
+    fn point_at(
+        counter_index: usize,
+        path: &str,
+        timestamp_unix_nano: i64,
+        value: SampleValue,
+    ) -> SamplePoint {
         SamplePoint {
             counter_index,
             path: path.to_owned(),
             instance: None,
+            timestamp_unix_nano,
             start_time_unix_nano: None,
             value,
         }
@@ -331,6 +347,7 @@ mod tests {
         value: Number,
     ) -> SamplePoint {
         SamplePoint {
+            timestamp_unix_nano: 10,
             start_time_unix_nano: Some(start_time_unix_nano),
             ..point(counter_index, path, SampleValue::Value(value))
         }
@@ -351,14 +368,16 @@ mod tests {
             Sample {
                 timestamp_unix_nano: timestamp,
                 points: vec![
-                    point(
+                    point_at(
                         0,
                         r"\Memory\Available Bytes",
+                        timestamp,
                         SampleValue::Value(Number::Integer(bytes)),
                     ),
-                    point(
+                    point_at(
                         1,
                         r"\Memory\Committed Bytes",
+                        timestamp,
                         SampleValue::Value(Number::Integer(42)),
                     ),
                 ],
@@ -425,6 +444,48 @@ mod tests {
             .downcast_ref::<arrow::array::TimestampNanosecondArray>()
             .unwrap();
         assert_eq!(time.value(0), timestamp);
+    }
+
+    /// Scenario: A delta point from an earlier query is merged into a sample with a later peer timestamp.
+    /// Guarantees: OTAP uses the point's own interval end instead of stretching it to the merged sample timestamp.
+    #[test]
+    fn projects_delta_with_its_query_timestamp() {
+        let counter = delta_sum(
+            r"\Provider\Operations Delta",
+            "provider.operations",
+            "{operation}",
+            false,
+        );
+        let mut point = sum_point(0, r"\Provider\Operations Delta", 100, Number::Double(2.0));
+        point.timestamp_unix_nano = 110;
+        let records = into_otap(
+            &[counter],
+            Sample {
+                timestamp_unix_nano: 115,
+                points: vec![point],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
+        let start = points
+            .column_by_name("start_time_unix_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .unwrap();
+        let end = points
+            .column_by_name("time_unix_nano")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .unwrap();
+
+        assert_eq!(start.value(0), 100);
+        assert_eq!(end.value(0), 110);
     }
 
     /// Scenario: Process memory is configured as a non-monotonic Sum with a current integer value.
@@ -1138,6 +1199,7 @@ mod tests {
                             parent: None,
                             index: 0,
                         }),
+                        timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(10)),
                     },
@@ -1149,6 +1211,7 @@ mod tests {
                             parent: Some("service".to_owned()),
                             index: 1,
                         }),
+                        timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(20)),
                     },
@@ -1212,6 +1275,7 @@ mod tests {
                         counter_index: 0,
                         path: r"\Processor(_Total)\Counter".to_owned(),
                         instance: Some(aggregate.clone()),
+                        timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(10)),
                     },
@@ -1219,6 +1283,7 @@ mod tests {
                         counter_index: 1,
                         path: r"\Processor(_Total)\Counter".to_owned(),
                         instance: Some(aggregate),
+                        timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(20)),
                     },
@@ -1273,6 +1338,7 @@ mod tests {
                             parent: None,
                             index: 0,
                         }),
+                        timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(10)),
                     },
@@ -1284,6 +1350,7 @@ mod tests {
                             parent: None,
                             index: 0,
                         }),
+                        timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(20)),
                     },

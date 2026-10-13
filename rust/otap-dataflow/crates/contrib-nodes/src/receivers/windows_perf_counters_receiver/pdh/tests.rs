@@ -259,6 +259,69 @@ impl PdhApi for RecoveringPrimePdh {
     }
 }
 
+struct RebuildPrimePdh {
+    fail_collect: Arc<AtomicBool>,
+    collect_calls: usize,
+}
+
+impl PdhApi for RebuildPrimePdh {
+    type Counter = ();
+
+    fn add(&mut self, _path: &str, _localized: bool) -> Result<Self::Counter, Error> {
+        Ok(())
+    }
+
+    fn remove(&mut self, _counter: &Self::Counter, _path: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn counter_type(&mut self, _counter: &Self::Counter, _path: &str) -> Result<u32, Error> {
+        Ok(0x2041_0500)
+    }
+
+    fn collect(&mut self) -> Result<bool, Error> {
+        if self.fail_collect.load(Ordering::Relaxed) {
+            return Err(Error::Pdh {
+                operation: "PdhCollectQueryData",
+                path: "<query>".to_owned(),
+                status: 1,
+            });
+        }
+        self.collect_calls += 1;
+        Ok(true)
+    }
+
+    fn raw(&mut self, _counter: &Self::Counter, _path: &str) -> Result<Option<RawSample>, Error> {
+        Ok(Some(RawSample {
+            second_value: i64::try_from(self.collect_calls).unwrap_or(i64::MAX) * 10,
+            multi_count: 1,
+        }))
+    }
+
+    fn formatted(
+        &mut self,
+        _counter: &Self::Counter,
+        _path: &str,
+        _format: ValueFormat,
+    ) -> Result<Option<Number>, Error> {
+        Ok(Some(Number::Double(self.collect_calls as f64)))
+    }
+
+    fn timestamp(&mut self) -> Result<i64, Error> {
+        Ok(100 + i64::try_from(self.collect_calls).unwrap_or(i64::MAX) * 10)
+    }
+
+    fn expand(&mut self, _path: &str) -> Result<Vec<String>, Error> {
+        Ok(Vec::new())
+    }
+
+    fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
+        Err(Error::InvalidCounterToken {
+            path: path.to_owned(),
+        })
+    }
+}
+
 fn fake_query(
     configs: Vec<CounterConfig>,
     counters: Vec<FakeCounter>,
@@ -415,6 +478,85 @@ fn recreated_queries_share_receiver_expansion_limit() {
             .sum::<usize>(),
         4
     );
+}
+
+/// Scenario: A delta mapping and a recreated peer collect through separate queries with different clocks.
+/// Guarantees: Each delta interval starts exactly at that series' previous point timestamp without overlap from the later peer timestamp.
+#[test]
+fn cross_query_delta_intervals_use_their_own_timestamps() {
+    let delta_path = r"\Provider\Operations Delta";
+    let peer_path = r"\Memory\Available Bytes";
+    let mut delta = delta_sum(delta_path, "provider.operations", false);
+    delta.source_mapping_index = 0;
+    let mut recreated_peer = counter(peer_path, "windows.memory.available");
+    recreated_peer.recreate_query = true;
+    recreated_peer.source_mapping_index = 1;
+
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>, _max_expanded_counters: usize| {
+        let config = &configs[0];
+        let native_counter = if config.path == delta_path {
+            FakeCounter {
+                path: config.path.clone(),
+                native_type: 0x0040_0500,
+                raw: Some(10),
+                multi_count: 1,
+                formatted: Some(Number::Double(1.0)),
+                raw_error: false,
+                formatted_error: false,
+            }
+        } else {
+            FakeCounter {
+                path: config.path.clone(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            }
+        };
+        let (state, query) = fake_query(configs, vec![native_counter]);
+        if state.borrow().counters[0].path == peer_path {
+            state.borrow_mut().timestamp = 105;
+        }
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let mut queries = query_plans(vec![delta, recreated_peer])
+        .into_iter()
+        .map(|plan| QuerySlot::open_initial(plan, 4_096, &mut open).unwrap())
+        .collect::<Vec<_>>();
+    {
+        let states = states.borrow();
+        let mut delta = states[0].borrow_mut();
+        delta.timestamp = 110;
+        delta.counters[0].raw = Some(20);
+        delta.counters[0].formatted = Some(Number::Double(2.0));
+        states[1].borrow_mut().timestamp = 115;
+    }
+
+    let first = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    assert_eq!(first.timestamp_unix_nano, 115);
+    assert_eq!(first.points[0].start_time_unix_nano, Some(100));
+    assert_eq!(first.points[0].timestamp_unix_nano, 110);
+
+    {
+        let states = states.borrow();
+        let mut delta = states[0].borrow_mut();
+        delta.timestamp = 120;
+        delta.counters[0].raw = Some(30);
+        delta.counters[0].formatted = Some(Number::Double(3.0));
+        states[2].borrow_mut().timestamp = 125;
+    }
+    let second = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    assert_eq!(second.timestamp_unix_nano, 125);
+    assert_eq!(
+        second.points[0].start_time_unix_nano,
+        Some(first.points[0].timestamp_unix_nano)
+    );
+    assert_eq!(second.points[0].timestamp_unix_nano, 120);
 }
 
 /// Scenario: One isolated query fails collection while a shared peer remains healthy.
@@ -807,6 +949,64 @@ async fn startup_prime_query_failure_starts_and_recovers() {
             .await
             .unwrap()
     );
+}
+
+/// Scenario: A calculated query reaches the failure threshold and is rebuilt.
+/// Guarantees: The rebuilt query is primed before the recovery collection, so that collection emits instead of warming.
+#[test]
+fn rebuilt_query_primes_before_recovery_collection() {
+    let path = r"\Processor(_Total)\% Processor Time";
+    let first_query_failure = Arc::new(AtomicBool::new(false));
+    let factory_first_query_failure = Arc::clone(&first_query_failure);
+    let open_calls = Rc::new(Cell::new(0_usize));
+    let factory_open_calls = Rc::clone(&open_calls);
+    let mut open = move |configs: Vec<CounterConfig>, max_expanded_counters: usize| {
+        let open_index = factory_open_calls.get();
+        factory_open_calls.set(open_index + 1);
+        Query::open_with(
+            RebuildPrimePdh {
+                fail_collect: if open_index == 0 {
+                    Arc::clone(&factory_first_query_failure)
+                } else {
+                    Arc::new(AtomicBool::new(false))
+                },
+                collect_calls: 0,
+            },
+            configs,
+            Duration::from_secs(30),
+            256,
+            max_expanded_counters,
+        )
+    };
+    let plan = query_plans(vec![counter(path, "system.cpu.time")])
+        .pop()
+        .unwrap();
+    let mut query = QuerySlot::open_initial(plan, 4_096, &mut open).unwrap();
+    first_query_failure.store(true, Ordering::Relaxed);
+    let now = Instant::now();
+    for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
+        assert!(matches!(
+            query.collect(now, Duration::ZERO, 4_096, &mut open),
+            Err(Error::Pdh {
+                operation: "PdhCollectQueryData",
+                ..
+            })
+        ));
+    }
+
+    let recovered = query
+        .collect(now, Duration::ZERO, 4_096, &mut open)
+        .unwrap();
+
+    assert!(matches!(
+        recovered.points[0].value,
+        SampleValue::Value(Number::Double(2.0))
+    ));
+    assert_eq!(recovered.points[0].timestamp_unix_nano, 120);
+    assert_eq!(recovered.diagnostics.query_rebuild_attempts, 1);
+    assert_eq!(recovered.diagnostics.query_rebuild_recoveries, 1);
+    assert_eq!(recovered.diagnostics.warmup_omissions, 2);
+    assert_eq!(open_calls.get(), 2);
 }
 
 /// Scenario: One exact configured path names a duplicate process instance.

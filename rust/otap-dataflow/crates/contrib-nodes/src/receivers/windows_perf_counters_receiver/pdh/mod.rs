@@ -1467,6 +1467,7 @@ impl<A: PdhApi> Query<A> {
                 counter_index: counter.config_index,
                 path: counter.path.clone(),
                 instance: counter.instance.clone(),
+                timestamp_unix_nano,
                 start_time_unix_nano: point_start_time,
                 value,
             });
@@ -1628,13 +1629,26 @@ impl<A: PdhApi> QuerySlot<A> {
             self.pending.diagnostics.query_rebuild_attempts += 1;
             match open(self.plan.configs.clone(), max_expanded_counters) {
                 Ok(mut rebuilt) => {
-                    self.pending.diagnostics.query_rebuild_recoveries += 1;
                     self.rebuild_attempts = 0;
                     self.query_failure_attempts = 0;
                     self.next_query_retry = now;
-                    let result = rebuilt.collect();
+                    let prime_error = rebuilt.prime().err();
+                    if let Some(error) = &prime_error {
+                        rebuilt.record_prime_failure(error);
+                    } else {
+                        self.pending.diagnostics.query_rebuild_recoveries += 1;
+                    }
                     self.query = Some(rebuilt);
-                    result
+                    if let Some(error) = prime_error {
+                        Err(error)
+                    } else {
+                        self.query
+                            .as_mut()
+                            .ok_or(Error::InvalidSample(
+                                "rebuilt query was not retained after priming",
+                            ))?
+                            .collect()
+                    }
                 }
                 Err(error) => {
                     self.rebuild_attempts = self.rebuild_attempts.saturating_add(1);

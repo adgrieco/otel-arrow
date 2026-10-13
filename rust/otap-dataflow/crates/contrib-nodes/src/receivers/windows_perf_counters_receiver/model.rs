@@ -60,6 +60,8 @@ pub(super) struct SamplePoint {
     pub(super) path: String,
     /// Parsed identity for an expanded wildcard instance.
     pub(super) instance: Option<InstanceIdentity>,
+    /// End of this point's observation or delta interval.
+    pub(super) timestamp_unix_nano: i64,
     /// Start of this point's cumulative sequence or delta interval.
     pub(super) start_time_unix_nano: Option<i64>,
     /// Ready value or expected omission.
