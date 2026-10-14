@@ -388,13 +388,7 @@ impl<A: PdhApi> QuerySlot<A> {
             return Err(error);
         }
         self.pending.diagnostics.query_rebuild_recoveries += 1;
-        let mut sample = Sample {
-            timestamp_unix_nano: rebuilt.previous_timestamp_unix_nano,
-            points: Vec::new(),
-            failures: Vec::new(),
-            overflows: Vec::new(),
-            diagnostics: SampleDiagnostics::default(),
-        };
+        let mut sample = Sample::empty(rebuilt.previous_timestamp_unix_nano);
         let mut metadata = PendingMetadata::default();
         rebuilt.move_pending_metadata_to(&mut metadata);
         metadata.merge_into_sample(&mut sample);

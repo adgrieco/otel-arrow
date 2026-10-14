@@ -150,6 +150,18 @@ pub(super) struct Sample {
     pub(super) diagnostics: SampleDiagnostics,
 }
 
+impl Sample {
+    pub(super) fn empty(timestamp_unix_nano: i64) -> Self {
+        Self {
+            timestamp_unix_nano,
+            points: Vec::new(),
+            failures: Vec::new(),
+            overflows: Vec::new(),
+            diagnostics: SampleDiagnostics::default(),
+        }
+    }
+}
+
 pub(super) fn merge_diagnostics(target: &mut SampleDiagnostics, delta: SampleDiagnostics) {
     target.discovery_refreshes += delta.discovery_refreshes;
     target.discovery_failures += delta.discovery_failures;

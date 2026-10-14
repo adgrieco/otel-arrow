@@ -521,6 +521,28 @@ impl<A: PdhApi> Query<A> {
         self.pending.merge(metadata);
     }
 
+    fn restore_collection_error(&mut self, metadata: PendingMetadata, error: Error) -> Error {
+        self.restore_pending_metadata(metadata);
+        error
+    }
+
+    fn restart_sampling(&mut self) {
+        restart_query_pdh_sampling(
+            self.counters
+                .values_mut()
+                .map(|counter| &mut counter.history),
+        );
+    }
+
+    fn restart_sampling_and_restore_collection_error(
+        &mut self,
+        metadata: PendingMetadata,
+        error: Error,
+    ) -> Error {
+        self.restart_sampling();
+        self.restore_collection_error(metadata, error)
+    }
+
     pub(super) fn move_pending_metadata_to(&mut self, target: &mut PendingMetadata) {
         target.merge(std::mem::take(&mut self.pending));
     }
@@ -560,8 +582,7 @@ impl<A: PdhApi> Query<A> {
         if self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval
             && let Err(error) = self.refresh_wildcards(&mut metadata)
         {
-            self.restore_pending_metadata(metadata);
-            return Err(error);
+            return Err(self.restore_collection_error(metadata, error));
         }
         self.retry_counters(
             Instant::now(),
@@ -572,8 +593,7 @@ impl<A: PdhApi> Query<A> {
             let timestamp_unix_nano = match self.api.timestamp().and_then(positive_timestamp) {
                 Ok(timestamp) => timestamp,
                 Err(error) => {
-                    self.restore_pending_metadata(metadata);
-                    return Err(error);
+                    return Err(self.restore_collection_error(metadata, error));
                 }
             };
             let _ = advance_collection_time(
@@ -582,43 +602,23 @@ impl<A: PdhApi> Query<A> {
                 timestamp_unix_nano,
                 std::iter::empty(),
             );
-            return Ok(Sample {
-                timestamp_unix_nano,
-                points: Vec::new(),
-                failures: metadata.failures,
-                overflows: metadata.overflows,
-                diagnostics: metadata.diagnostics,
-            });
+            let mut sample = Sample::empty(timestamp_unix_nano);
+            metadata.restore_to_sample(&mut sample);
+            return Ok(sample);
         }
         let has_data = match self.api.collect() {
             Ok(has_data) => has_data,
             Err(error) => {
-                restart_query_pdh_sampling(
-                    self.counters
-                        .values_mut()
-                        .map(|counter| &mut counter.history),
-                );
-                self.restore_pending_metadata(metadata);
-                return Err(error);
+                return Err(self.restart_sampling_and_restore_collection_error(metadata, error));
             }
         };
         if !has_data {
-            restart_query_pdh_sampling(
-                self.counters
-                    .values_mut()
-                    .map(|counter| &mut counter.history),
-            );
+            self.restart_sampling();
         }
         let timestamp_unix_nano = match self.api.timestamp().and_then(positive_timestamp) {
             Ok(timestamp) => timestamp,
             Err(error) => {
-                restart_query_pdh_sampling(
-                    self.counters
-                        .values_mut()
-                        .map(|counter| &mut counter.history),
-                );
-                self.restore_pending_metadata(metadata);
-                return Err(error);
+                return Err(self.restart_sampling_and_restore_collection_error(metadata, error));
             }
         };
         let start_time_unix_nano = advance_collection_time(
