@@ -4,7 +4,7 @@
 use otel_arrow_dfe_config::error::Error;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 pub(super) const MIN_SCALE_POWER10: i32 = -18;
@@ -374,38 +374,8 @@ fn validate_counter_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Err
 fn validate_metric_name(name: &str) -> Result<&str, Error> {
     let name = name.trim();
     require_name("metric name", name)?;
-    if let Some(path) = name.strip_prefix('\\') {
-        let field = format!("metric name {name:?}");
-        let invalid_padding = || {
-            invalid(format!(
-                "{field} segments must not have surrounding whitespace"
-            ))
-        };
-        let (object, counter) = path
-            .split_once('\\')
-            .ok_or_else(|| invalid(format!("{field} must be a full counter path")))?;
-        let object = if let Some((object, instance)) = object.split_once('(') {
-            let instance = instance
-                .strip_suffix(')')
-                .ok_or_else(|| invalid(format!("{field} must close its instance parentheses")))?;
-            let checked_instance = if instance.contains('*') {
-                validate_instance_pattern(&field, instance)?
-            } else {
-                validate_instance(&field, instance)?
-            };
-            if checked_instance != instance {
-                return Err(invalid_padding());
-            }
-            object
-        } else {
-            object
-        };
-        let checked_object = validate_object(&field, object)?;
-        let checked_counter = validate_counter_name(&field, counter)?;
-        if checked_object != object || checked_counter != counter {
-            return Err(invalid_padding());
-        }
-        validate_path_length("metric name", name)?;
+    if name.starts_with('\\') {
+        validate_path_metric_name(name)?;
         return Ok(name);
     }
     let mut chars = name.chars();
@@ -419,6 +389,43 @@ fn validate_metric_name(name: &str) -> Result<&str, Error> {
         )));
     }
     Ok(name)
+}
+
+fn validate_path_metric_name(name: &str) -> Result<(), Error> {
+    let field = format!("metric name {name:?}");
+    let invalid_padding = || {
+        invalid(format!(
+            "{field} segments must not have surrounding whitespace"
+        ))
+    };
+    let path = name
+        .strip_prefix('\\')
+        .ok_or_else(|| invalid(format!("{field} must start with '\\'")))?;
+    let (object, counter) = path
+        .split_once('\\')
+        .ok_or_else(|| invalid(format!("{field} must be a full counter path")))?;
+    let object = if let Some((object, instance)) = object.split_once('(') {
+        let instance = instance
+            .strip_suffix(')')
+            .ok_or_else(|| invalid(format!("{field} must close its instance parentheses")))?;
+        let checked_instance = if instance.contains('*') {
+            validate_instance_pattern(&field, instance)?
+        } else {
+            validate_instance(&field, instance)?
+        };
+        if checked_instance != instance {
+            return Err(invalid_padding());
+        }
+        object
+    } else {
+        object
+    };
+    let checked_object = validate_object(&field, object)?;
+    let checked_counter = validate_counter_name(&field, counter)?;
+    if checked_object != object || checked_counter != counter {
+        return Err(invalid_padding());
+    }
+    validate_path_length("metric name", name)
 }
 
 fn validate_metric_unit<'a>(name: &str, unit: &'a str) -> Result<&'a str, Error> {
@@ -502,6 +509,8 @@ struct NormalizedMetric {
     kind: MetricKind,
 }
 
+static DEFAULT_METRIC: LazyLock<NormalizedMetric> = LazyLock::new(default_metric);
+
 fn default_metric() -> NormalizedMetric {
     NormalizedMetric {
         description: Arc::from(""),
@@ -510,14 +519,7 @@ fn default_metric() -> NormalizedMetric {
     }
 }
 
-struct ExplicitMetric {
-    name: String,
-    unit: String,
-    description: Arc<str>,
-    kind: MetricKind,
-    attributes: Arc<BTreeMap<String, String>>,
-}
-
+#[derive(Clone)]
 struct ResolvedMetric {
     name: String,
     unit: String,
@@ -718,19 +720,12 @@ impl ObjectNormalizer<'_> {
     fn resolve_metric(
         &self,
         configured_path: &str,
-        explicit: Option<&ExplicitMetric>,
+        explicit: Option<&ResolvedMetric>,
     ) -> ResolvedMetric {
         if let Some(explicit) = explicit {
-            return ResolvedMetric {
-                name: explicit.name.clone(),
-                unit: explicit.unit.clone(),
-                description: Arc::clone(&explicit.description),
-                kind: explicit.kind,
-                attributes: Arc::clone(&explicit.attributes),
-            };
+            return explicit.clone();
         }
-        let default_metric = default_metric();
-        let metric = self.metrics.get(configured_path).unwrap_or(&default_metric);
+        let metric = self.metrics.get(configured_path).unwrap_or(&DEFAULT_METRIC);
         ResolvedMetric {
             name: configured_path.to_owned(),
             unit: metric.unit.clone(),
@@ -746,7 +741,7 @@ impl ObjectNormalizer<'_> {
         counter_field: &str,
         metric_name: Option<&str>,
         configured_attributes: &BTreeMap<String, String>,
-    ) -> Result<Option<ExplicitMetric>, Error> {
+    ) -> Result<Option<ResolvedMetric>, Error> {
         let Some(name) = metric_name else {
             return Ok(None);
         };
@@ -765,7 +760,7 @@ impl ObjectNormalizer<'_> {
                 counter_index = counter_index
             );
         }
-        Ok(Some(ExplicitMetric {
+        Ok(Some(ResolvedMetric {
             name: name.to_owned(),
             unit: metric.unit.clone(),
             description: Arc::clone(&metric.description),

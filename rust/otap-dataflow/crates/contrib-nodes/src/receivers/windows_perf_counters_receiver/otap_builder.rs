@@ -171,38 +171,25 @@ fn point_start_time(
     counter: &CounterConfig,
     point: &SamplePoint,
 ) -> Result<Option<i64>, ArrowError> {
-    let start_time = match counter.metric_kind {
-        MetricKind::Gauge => None,
-        MetricKind::Sum {
-            aggregation,
-            monotonic,
-        } => Some(point.start_time_unix_nano.ok_or_else(|| {
-            ArrowError::InvalidArgumentError(format!(
-                "{} {} ({}) is missing its start time",
-                sum_kind(aggregation, monotonic),
-                counter.name,
-                point.path
-            ))
-        })?),
+    let MetricKind::Sum {
+        aggregation,
+        monotonic,
+    } = counter.metric_kind
+    else {
+        return Ok(None);
     };
-    if let Some(start_time) = start_time
-        && (start_time <= 0
-            || start_time > point.timestamp_unix_nano
-            || matches!(
-                counter.metric_kind,
-                MetricKind::Sum {
-                    aggregation: Aggregation::Delta,
-                    ..
-                }
-            ) && start_time == point.timestamp_unix_nano)
+    let start_time = point.start_time_unix_nano.ok_or_else(|| {
+        ArrowError::InvalidArgumentError(format!(
+            "{} {} ({}) is missing its start time",
+            sum_kind(aggregation, monotonic),
+            counter.name,
+            point.path
+        ))
+    })?;
+    if start_time <= 0
+        || start_time > point.timestamp_unix_nano
+        || aggregation == Aggregation::Delta && start_time == point.timestamp_unix_nano
     {
-        let MetricKind::Sum {
-            aggregation,
-            monotonic,
-        } = counter.metric_kind
-        else {
-            unreachable!("Gauge points do not have start times");
-        };
         return Err(ArrowError::InvalidArgumentError(format!(
             "{} {} ({}) has invalid start time {} for timestamp {}",
             sum_kind(aggregation, monotonic),
@@ -212,7 +199,7 @@ fn point_start_time(
             point.timestamp_unix_nano
         )));
     }
-    Ok(start_time)
+    Ok(Some(start_time))
 }
 
 fn append_number(
