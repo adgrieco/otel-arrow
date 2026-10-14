@@ -149,14 +149,14 @@ impl WindowsPerfCountersReceiver {
                         .health
                         .scrape_duration
                         .record(scrape_start.elapsed().as_secs_f64());
-                    metrics.health.apply(&sample.diagnostics);
+                    metrics.health.apply(&sample.metadata.diagnostics);
                     metrics
                         .health
                         .failed_counter_values
-                        .add(failed_counter_value_count(&sample.failures));
+                        .add(failed_counter_value_count(&sample.metadata.failures));
                     drop(metrics);
                     scrape_failed = false;
-                    for overflow in &sample.overflows {
+                    for overflow in &sample.metadata.overflows {
                         let path_template = &self.config.counters[overflow.counter_index].path;
                         otel_arrow_dfe_telemetry::otel_warn!(
                             "otelcol.node.windowsperfcounters.instance_limit.exceeded",
@@ -168,33 +168,35 @@ impl WindowsPerfCountersReceiver {
                             omitted = overflow.omitted as u64
                         );
                     }
-                    if sample.diagnostics.instances_added > 0
-                        || sample.diagnostics.instances_removed > 0
+                    if sample.metadata.diagnostics.instances_added > 0
+                        || sample.metadata.diagnostics.instances_removed > 0
                     {
                         otel_arrow_dfe_telemetry::otel_info!(
                             "otelcol.node.windowsperfcounters.instances.change",
                             node = self.node.as_str(),
-                            added = sample.diagnostics.instances_added,
-                            removed = sample.diagnostics.instances_removed,
-                            active = sample.diagnostics.active_expanded_counters as u64
+                            added = sample.metadata.diagnostics.instances_added,
+                            removed = sample.metadata.diagnostics.instances_removed,
+                            active = sample.metadata.diagnostics.active_expanded_counters as u64
                         );
                     }
-                    if sample.diagnostics.retry_attempts > 0
-                        || sample.diagnostics.retry_recoveries > 0
-                        || sample.diagnostics.query_rebuild_attempts > 0
-                        || sample.diagnostics.query_recreation_failures > 0
+                    if sample.metadata.diagnostics.retry_attempts > 0
+                        || sample.metadata.diagnostics.retry_recoveries > 0
+                        || sample.metadata.diagnostics.query_rebuild_attempts > 0
+                        || sample.metadata.diagnostics.query_recreation_failures > 0
                     {
                         otel_arrow_dfe_telemetry::otel_info!(
                             "otelcol.node.windowsperfcounters.recovery",
                             node = self.node.as_str(),
-                            retry_attempts = sample.diagnostics.retry_attempts,
-                            retry_recoveries = sample.diagnostics.retry_recoveries,
-                            query_rebuild_attempts = sample.diagnostics.query_rebuild_attempts,
-                            query_rebuild_recoveries = sample.diagnostics.query_rebuild_recoveries,
+                            retry_attempts = sample.metadata.diagnostics.retry_attempts,
+                            retry_recoveries = sample.metadata.diagnostics.retry_recoveries,
+                            query_rebuild_attempts =
+                                sample.metadata.diagnostics.query_rebuild_attempts,
+                            query_rebuild_recoveries =
+                                sample.metadata.diagnostics.query_rebuild_recoveries,
                             query_recreation_attempts =
-                                sample.diagnostics.query_recreation_attempts,
+                                sample.metadata.diagnostics.query_recreation_attempts,
                             query_recreation_failures =
-                                sample.diagnostics.query_recreation_failures
+                                sample.metadata.diagnostics.query_recreation_failures
                         );
                     }
                     sample
@@ -247,7 +249,7 @@ impl WindowsPerfCountersReceiver {
                 }
             };
             let mut current_counter_failures = BTreeSet::new();
-            for counter_failure in &sample.failures {
+            for counter_failure in &sample.metadata.failures {
                 let Some(counter) = self.config.counters.get(counter_failure.counter_index) else {
                     return Err(failure(format!(
                         "sample failure references missing configured counter {}",

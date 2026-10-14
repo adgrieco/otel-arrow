@@ -3,8 +3,8 @@
 
 use super::super::config::{Aggregation, CounterConfig, InstanceConfig, MetricKind};
 use super::super::model::{
-    ExpansionOverflow, InstanceIdentity, Number, Sample, SampleDiagnostics, SampleFailure,
-    SampleValue, merge_diagnostics, scale_integer,
+    ExpansionOverflow, InstanceIdentity, Number, PendingMetadata, Sample, SampleDiagnostics,
+    SampleFailure, SampleValue, merge_diagnostics, scale_integer,
 };
 use super::super::{TEST_PDH_LOCK, config::Config, otap_builder::into_otap};
 use super::counter_type::*;

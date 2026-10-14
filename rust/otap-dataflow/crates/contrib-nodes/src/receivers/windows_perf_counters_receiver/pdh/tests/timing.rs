@@ -166,7 +166,7 @@ fn formatted_transient_preserves_monotonic_sequence() {
     }
     let sample = query.collect().unwrap();
     assert!(sample.points.is_empty());
-    assert_eq!(sample.failures.len(), 1);
+    assert_eq!(sample.metadata.failures.len(), 1);
 
     {
         let mut state = state.borrow_mut();
@@ -309,9 +309,9 @@ fn multi_timer_invalid_base_preserves_readiness() {
     }
     let sample = query.collect().unwrap();
     assert!(sample.points.is_empty());
-    assert_eq!(sample.failures.len(), 1);
+    assert_eq!(sample.metadata.failures.len(), 1);
     assert!(
-        sample.failures[0]
+        sample.metadata.failures[0]
             .error
             .contains("multi-counter base denominator must be positive")
     );
@@ -479,7 +479,7 @@ fn isolates_invalid_delta_sum_mapping() {
     let sample = query.collect().unwrap();
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.points[0].counter_index, 0);
-    assert!(sample.failures.iter().any(|failure| {
+    assert!(sample.metadata.failures.iter().any(|failure| {
         failure.counter_index == 1
             && failure.reason == "invalid_metric_mapping"
             && failure.error.contains("PERF_COUNTER_DELTA / LARGE_DELTA")

@@ -5,8 +5,8 @@
 
 use super::super::config::{Aggregation, CounterConfig, MetricKind};
 use super::super::model::{
-    ExpansionOverflow, InstanceIdentity, Number, Sample, SampleDiagnostics, SampleFailure,
-    SamplePoint, SampleValue, merge_diagnostics, scale_double, scale_integer,
+    ExpansionOverflow, InstanceIdentity, Number, PendingMetadata, Sample, SampleDiagnostics,
+    SampleFailure, SamplePoint, SampleValue, scale_double, scale_integer,
 };
 use super::counter_type::{CounterKind, classify_native_type, validate_metric_mapping};
 use super::error::{Error, sample_failure};
@@ -562,9 +562,8 @@ impl<A: PdhApi> Query<A> {
     }
 
     pub(super) fn prime(&mut self) -> Result<(), Error> {
-        let mut sample = self.collect()?;
-        self.pending
-            .merge(PendingMetadata::take_from_sample(&mut sample));
+        let sample = self.collect()?;
+        self.pending.merge(sample.metadata);
         Ok(())
     }
 
@@ -605,9 +604,11 @@ impl<A: PdhApi> Query<A> {
                 timestamp_unix_nano,
                 std::iter::empty(),
             );
-            let mut sample = Sample::empty(timestamp_unix_nano);
-            metadata.restore_to_sample(&mut sample);
-            return Ok(sample);
+            return Ok(Sample {
+                timestamp_unix_nano,
+                points: Vec::new(),
+                metadata,
+            });
         }
         let has_data = match self.api.collect() {
             Ok(has_data) => has_data,
@@ -672,9 +673,7 @@ impl<A: PdhApi> Query<A> {
         Ok(Sample {
             timestamp_unix_nano,
             points,
-            failures: metadata.failures,
-            overflows: metadata.overflows,
-            diagnostics: metadata.diagnostics,
+            metadata,
         })
     }
 }
@@ -796,13 +795,6 @@ fn schedule_retry_state(
     );
 }
 
-#[derive(Default)]
-pub(super) struct PendingMetadata {
-    pub(super) diagnostics: SampleDiagnostics,
-    pub(super) failures: Vec<SampleFailure>,
-    pub(super) overflows: Vec<ExpansionOverflow>,
-}
-
 impl PendingMetadata {
     fn record_expansion_overflows(
         &mut self,
@@ -834,52 +826,6 @@ impl PendingMetadata {
                 .saturating_add(allocation.total_omitted),
         )
         .unwrap_or(u64::MAX);
-    }
-
-    pub(super) fn take_from_sample(sample: &mut Sample) -> Self {
-        Self {
-            diagnostics: std::mem::take(&mut sample.diagnostics),
-            failures: std::mem::take(&mut sample.failures),
-            overflows: std::mem::take(&mut sample.overflows),
-        }
-    }
-
-    pub(super) fn merge(&mut self, delta: Self) {
-        merge_diagnostics(&mut self.diagnostics, delta.diagnostics);
-        for failure in delta.failures {
-            if let Some(existing) = self.failures.iter_mut().find(|existing| {
-                existing.counter_index == failure.counter_index && existing.reason == failure.reason
-            }) {
-                *existing = failure;
-            } else {
-                self.failures.push(failure);
-            }
-        }
-        for overflow in delta.overflows {
-            if let Some(existing) = self.overflows.iter_mut().find(|existing| {
-                existing.counter_index == overflow.counter_index
-                    && existing.reason == overflow.reason
-            }) {
-                *existing = overflow;
-            } else {
-                self.overflows.push(overflow);
-            }
-        }
-    }
-
-    pub(super) fn restore_to_sample(self, sample: &mut Sample) {
-        sample.diagnostics = self.diagnostics;
-        sample.failures = self.failures;
-        sample.overflows = self.overflows;
-    }
-
-    pub(super) fn merge_into_sample(&mut self, sample: &mut Sample) {
-        let mut pending = std::mem::take(self);
-        merge_diagnostics(&mut sample.diagnostics, pending.diagnostics);
-        pending.failures.append(&mut sample.failures);
-        sample.failures = pending.failures;
-        pending.overflows.append(&mut sample.overflows);
-        sample.overflows = pending.overflows;
     }
 }
 

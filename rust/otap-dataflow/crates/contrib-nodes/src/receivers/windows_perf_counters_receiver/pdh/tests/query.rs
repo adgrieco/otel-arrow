@@ -94,7 +94,7 @@ fn startup_prime_seeds_two_sample_histories() {
         sample.points[1].value,
         SampleValue::Value(Number::Double(3.0))
     ));
-    assert_eq!(sample.diagnostics.warmup_omissions, 2);
+    assert_eq!(sample.metadata.diagnostics.warmup_omissions, 2);
 }
 
 /// Scenario: A calculated counter is mapped to a cumulative non-monotonic Sum.
@@ -200,9 +200,9 @@ fn startup_prime_preserves_counter_failures() {
     state.borrow_mut().counters[0].formatted_error = false;
     let sample = query.collect().unwrap();
     assert_eq!(sample.points.len(), 1);
-    assert_eq!(sample.failures.len(), 1);
-    assert_eq!(sample.failures[0].counter_index, 0);
-    assert_eq!(sample.diagnostics.counter_read_failures, 1);
+    assert_eq!(sample.metadata.failures.len(), 1);
+    assert_eq!(sample.metadata.failures[0].counter_index, 0);
+    assert_eq!(sample.metadata.diagnostics.counter_read_failures, 1);
 }
 
 /// Scenario: One exact configured path names a duplicate process instance.
@@ -264,9 +264,9 @@ fn exact_instance_parse_failure_preserves_value() {
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.points[0].instance, None);
     assert!(!sample.points[0].emit_instance_attribute);
-    assert_eq!(sample.failures.len(), 1);
-    assert!(sample.failures[0].diagnostic_only);
-    assert_eq!(sample.diagnostics.counter_add_failures, 0);
+    assert_eq!(sample.metadata.failures.len(), 1);
+    assert!(sample.metadata.failures[0].diagnostic_only);
+    assert_eq!(sample.metadata.diagnostics.counter_add_failures, 0);
 }
 
 /// Scenario: Counter inspection fails and native cleanup also reports an error.
@@ -303,13 +303,17 @@ fn setup_diagnostic_preserves_cleanup_failure() {
     .unwrap();
 
     let sample = query.collect().unwrap();
-    assert_eq!(sample.failures.len(), 1);
+    assert_eq!(sample.metadata.failures.len(), 1);
     assert!(
-        sample.failures[0].error.contains("unsupported"),
+        sample.metadata.failures[0].error.contains("unsupported"),
         "{}",
-        sample.failures[0].error
+        sample.metadata.failures[0].error
     );
-    assert!(sample.failures[0].error.contains("PdhRemoveCounter"));
+    assert!(
+        sample.metadata.failures[0]
+            .error
+            .contains("PdhRemoveCounter")
+    );
     assert_eq!(state.borrow().removed, vec![0]);
 }
 

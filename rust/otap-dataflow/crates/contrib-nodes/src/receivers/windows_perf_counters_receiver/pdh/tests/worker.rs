@@ -116,7 +116,7 @@ fn recreated_queries_share_receiver_expansion_limit() {
     );
 
     let sample = collect_queries(&mut queries, Duration::from_secs(30), 4, &mut open).unwrap();
-    assert_eq!(sample.diagnostics.active_expanded_counters, 4);
+    assert_eq!(sample.metadata.diagnostics.active_expanded_counters, 4);
     assert_eq!(observed_limits.borrow().as_slice(), [4, 1, 3, 1]);
     assert_eq!(
         queries
@@ -262,12 +262,12 @@ fn isolated_query_failure_preserves_healthy_peer_output() {
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.points[0].counter_index, 0);
     assert_eq!(sample.points[0].start_time_unix_nano, Some(100));
-    assert_eq!(sample.failures.len(), 1);
-    assert_eq!(sample.failures[0].counter_index, 1);
-    assert_eq!(sample.failures[0].reason, "PdhCollectQueryData");
-    assert!(!sample.failures[0].diagnostic_only);
-    assert_eq!(sample.diagnostics.scrape_failures, 1);
-    assert_eq!(sample.diagnostics.query_recreation_attempts, 0);
+    assert_eq!(sample.metadata.failures.len(), 1);
+    assert_eq!(sample.metadata.failures[0].counter_index, 1);
+    assert_eq!(sample.metadata.failures[0].reason, "PdhCollectQueryData");
+    assert!(!sample.metadata.failures[0].diagnostic_only);
+    assert_eq!(sample.metadata.diagnostics.scrape_failures, 1);
+    assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 0);
     assert_eq!(open_calls.get(), 2);
 }
 
@@ -360,26 +360,26 @@ fn recreated_query_primes_before_swap_and_preserves_old_query_on_failure() {
             shared_start = current_shared_start;
         }
 
-        assert_eq!(sample.diagnostics.query_recreation_attempts, 1);
+        assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 1);
         match scrape_index {
             0 => {
-                assert_eq!(sample.diagnostics.query_recreation_failures, 1);
-                assert_eq!(sample.diagnostics.scrape_failures, 0);
-                assert_eq!(sample.failures.len(), 1);
-                assert_eq!(sample.failures[0].reason, "PdhOpenQueryW");
-                assert!(sample.failures[0].diagnostic_only);
+                assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 1);
+                assert_eq!(sample.metadata.diagnostics.scrape_failures, 0);
+                assert_eq!(sample.metadata.failures.len(), 1);
+                assert_eq!(sample.metadata.failures[0].reason, "PdhOpenQueryW");
+                assert!(sample.metadata.failures[0].diagnostic_only);
             }
             1 => {
-                assert_eq!(sample.diagnostics.query_recreation_failures, 1);
-                assert_eq!(sample.diagnostics.scrape_failures, 1);
-                assert_eq!(sample.failures.len(), 1);
-                assert_eq!(sample.failures[0].reason, "PdhCollectQueryData");
-                assert!(sample.failures[0].diagnostic_only);
+                assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 1);
+                assert_eq!(sample.metadata.diagnostics.scrape_failures, 1);
+                assert_eq!(sample.metadata.failures.len(), 1);
+                assert_eq!(sample.metadata.failures[0].reason, "PdhCollectQueryData");
+                assert!(sample.metadata.failures[0].diagnostic_only);
             }
             _ => {
-                assert_eq!(sample.diagnostics.query_recreation_failures, 0);
-                assert_eq!(sample.diagnostics.scrape_failures, 0);
-                assert!(sample.failures.is_empty());
+                assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 0);
+                assert_eq!(sample.metadata.diagnostics.scrape_failures, 0);
+                assert!(sample.metadata.failures.is_empty());
             }
         }
     }
@@ -415,14 +415,14 @@ async fn startup_prime_query_failure_starts_and_recovers() {
 
     let warming = worker.collect().await.unwrap();
     assert_eq!(warming.points[0].value, SampleValue::Warming);
-    assert_eq!(warming.failures.len(), 1);
-    assert_eq!(warming.failures[0].counter_index, 0);
-    assert_eq!(warming.failures[0].reason, "PdhCollectQueryData");
-    assert!(warming.failures[0].diagnostic_only);
-    assert_eq!(warming.diagnostics.counter_read_failures, 0);
-    assert_eq!(warming.diagnostics.scrape_failures, 1);
-    assert_eq!(warming.diagnostics.retry_attempts, 1);
-    assert_eq!(warming.diagnostics.retry_recoveries, 1);
+    assert_eq!(warming.metadata.failures.len(), 1);
+    assert_eq!(warming.metadata.failures[0].counter_index, 0);
+    assert_eq!(warming.metadata.failures[0].reason, "PdhCollectQueryData");
+    assert!(warming.metadata.failures[0].diagnostic_only);
+    assert_eq!(warming.metadata.diagnostics.counter_read_failures, 0);
+    assert_eq!(warming.metadata.diagnostics.scrape_failures, 1);
+    assert_eq!(warming.metadata.diagnostics.retry_attempts, 1);
+    assert_eq!(warming.metadata.diagnostics.retry_recoveries, 1);
 
     let recovered = worker.collect().await.unwrap();
     assert!(matches!(
@@ -486,9 +486,9 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
 
     assert!(rebuilt.points.is_empty());
     assert_eq!(rebuilt.timestamp_unix_nano, 110);
-    assert_eq!(rebuilt.diagnostics.query_rebuild_attempts, 1);
-    assert_eq!(rebuilt.diagnostics.query_rebuild_recoveries, 1);
-    assert_eq!(rebuilt.diagnostics.warmup_omissions, 2);
+    assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_attempts, 1);
+    assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
+    assert_eq!(rebuilt.metadata.diagnostics.warmup_omissions, 2);
 
     let recovered = query
         .collect(now, Duration::ZERO, 4_096, &mut open)
@@ -499,9 +499,9 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
     ));
     assert_eq!(recovered.points[0].timestamp_unix_nano, 120);
     assert_eq!(recovered.points[0].start_time_unix_nano, None);
-    assert_eq!(recovered.diagnostics.query_rebuild_attempts, 0);
-    assert_eq!(recovered.diagnostics.query_rebuild_recoveries, 0);
-    assert_eq!(recovered.diagnostics.warmup_omissions, 0);
+    assert_eq!(recovered.metadata.diagnostics.query_rebuild_attempts, 0);
+    assert_eq!(recovered.metadata.diagnostics.query_rebuild_recoveries, 0);
+    assert_eq!(recovered.metadata.diagnostics.warmup_omissions, 0);
     assert_eq!(open_calls.get(), 2);
 }
 
@@ -574,11 +574,11 @@ fn rebuild_prime_failure_is_counted_once() {
 
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.points[0].counter_index, 0);
-    assert_eq!(sample.diagnostics.scrape_failures, 1);
-    assert_eq!(sample.failures.len(), 1);
-    assert_eq!(sample.failures[0].counter_index, 1);
-    assert_eq!(sample.failures[0].reason, "PdhCollectQueryData");
-    assert!(!sample.failures[0].diagnostic_only);
+    assert_eq!(sample.metadata.diagnostics.scrape_failures, 1);
+    assert_eq!(sample.metadata.failures.len(), 1);
+    assert_eq!(sample.metadata.failures[0].counter_index, 1);
+    assert_eq!(sample.metadata.failures[0].reason, "PdhCollectQueryData");
+    assert!(!sample.metadata.failures[0].diagnostic_only);
     let rebuilt = queries[1].query.as_ref().unwrap();
     assert_eq!(rebuilt.pending.diagnostics.scrape_failures, 0);
     assert!(rebuilt.pending.failures.is_empty());
@@ -611,9 +611,7 @@ fn empty_sample() -> Sample {
     Sample {
         timestamp_unix_nano: 2,
         points: Vec::new(),
-        failures: Vec::new(),
-        overflows: Vec::new(),
-        diagnostics: SampleDiagnostics::default(),
+        metadata: PendingMetadata::default(),
     }
 }
 
@@ -808,10 +806,10 @@ fn sample_metadata_merge_preserves_pending_evidence() {
     assert_eq!(metadata.overflows[0].discovered, 5);
 }
 
-/// Scenario: Worker recovery metadata precedes metadata from the successful scrape that releases it.
-/// Guarantees: Bundling pending state preserves failure and overflow order while adding diagnostics.
+/// Scenario: Worker recovery metadata is released with metadata from a successful scrape.
+/// Guarantees: Sample metadata uses the same replacement merge rule as every pending bundle.
 #[test]
-fn pending_metadata_bundle_preserves_worker_merge_order() {
+fn sample_metadata_uses_pending_merge_rule() {
     let mut pending = PendingMetadata {
         diagnostics: SampleDiagnostics {
             retry_attempts: 1,
@@ -834,33 +832,35 @@ fn pending_metadata_bundle_preserves_worker_merge_order() {
     let mut sample = Sample {
         timestamp_unix_nano: 2,
         points: Vec::new(),
-        failures: vec![SampleFailure {
-            counter_index: 1,
-            reason: "current",
-            error: "current failure".to_owned(),
-            diagnostic_only: false,
-        }],
-        overflows: vec![ExpansionOverflow {
-            counter_index: 1,
-            reason: "receiver_total",
-            discovered: 4,
-            retained: 3,
-            omitted: 1,
-        }],
-        diagnostics: SampleDiagnostics {
-            retry_recoveries: 1,
-            ..Default::default()
+        metadata: PendingMetadata {
+            failures: vec![SampleFailure {
+                counter_index: 1,
+                reason: "current",
+                error: "current failure".to_owned(),
+                diagnostic_only: false,
+            }],
+            overflows: vec![ExpansionOverflow {
+                counter_index: 1,
+                reason: "receiver_total",
+                discovered: 4,
+                retained: 3,
+                omitted: 1,
+            }],
+            diagnostics: SampleDiagnostics {
+                retry_recoveries: 1,
+                ..Default::default()
+            },
         },
     };
 
-    pending.merge_into_sample(&mut sample);
+    sample.metadata.merge(std::mem::take(&mut pending));
 
-    assert_eq!(sample.diagnostics.retry_attempts, 1);
-    assert_eq!(sample.diagnostics.retry_recoveries, 1);
-    assert_eq!(sample.failures[0].reason, "pending");
-    assert_eq!(sample.failures[1].reason, "current");
-    assert_eq!(sample.overflows[0].reason, "per_wildcard");
-    assert_eq!(sample.overflows[1].reason, "receiver_total");
+    assert_eq!(sample.metadata.diagnostics.retry_attempts, 1);
+    assert_eq!(sample.metadata.diagnostics.retry_recoveries, 1);
+    assert_eq!(sample.metadata.failures[0].reason, "current");
+    assert_eq!(sample.metadata.failures[1].reason, "pending");
+    assert_eq!(sample.metadata.overflows[0].reason, "receiver_total");
+    assert_eq!(sample.metadata.overflows[1].reason, "per_wildcard");
     assert_eq!(pending.failures.len(), 0);
     assert_eq!(pending.overflows.len(), 0);
 }

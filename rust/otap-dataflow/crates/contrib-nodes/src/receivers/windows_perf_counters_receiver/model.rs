@@ -135,6 +135,38 @@ pub(super) struct SampleDiagnostics {
     pub(super) warmup_omissions: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(super) struct PendingMetadata {
+    pub(super) diagnostics: SampleDiagnostics,
+    pub(super) failures: Vec<SampleFailure>,
+    pub(super) overflows: Vec<ExpansionOverflow>,
+}
+
+impl PendingMetadata {
+    pub(super) fn merge(&mut self, delta: Self) {
+        merge_diagnostics(&mut self.diagnostics, delta.diagnostics);
+        for failure in delta.failures {
+            if let Some(existing) = self.failures.iter_mut().find(|existing| {
+                existing.counter_index == failure.counter_index && existing.reason == failure.reason
+            }) {
+                *existing = failure;
+            } else {
+                self.failures.push(failure);
+            }
+        }
+        for overflow in delta.overflows {
+            if let Some(existing) = self.overflows.iter_mut().find(|existing| {
+                existing.counter_index == overflow.counter_index
+                    && existing.reason == overflow.reason
+            }) {
+                *existing = overflow;
+            } else {
+                self.overflows.push(overflow);
+            }
+        }
+    }
+}
+
 /// A successful point-in-time PDH reading, independent of Windows handles.
 #[derive(Debug, Clone)]
 pub(super) struct Sample {
@@ -142,12 +174,8 @@ pub(super) struct Sample {
     pub(super) timestamp_unix_nano: i64,
     /// Exact and expanded points keyed by configured counter and concrete path.
     pub(super) points: Vec<SamplePoint>,
-    /// Counter-local failures that did not suppress healthy points.
-    pub(super) failures: Vec<SampleFailure>,
-    /// Explicit per-template and receiver-wide expansion overflows.
-    pub(super) overflows: Vec<ExpansionOverflow>,
-    /// Aggregate bounded diagnostics for this collection.
-    pub(super) diagnostics: SampleDiagnostics,
+    /// Diagnostics and bounded counter-local evidence for this collection.
+    pub(super) metadata: PendingMetadata,
 }
 
 impl Sample {
@@ -155,9 +183,7 @@ impl Sample {
         Self {
             timestamp_unix_nano,
             points: Vec::new(),
-            failures: Vec::new(),
-            overflows: Vec::new(),
-            diagnostics: SampleDiagnostics::default(),
+            metadata: PendingMetadata::default(),
         }
     }
 }

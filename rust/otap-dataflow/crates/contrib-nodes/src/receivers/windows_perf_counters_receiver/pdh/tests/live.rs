@@ -80,8 +80,8 @@ async fn live_pdh_recreates_and_primes_opted_in_query() {
         assert!(
             matches!(sample.points[1].value, SampleValue::Value(Number::Double(value)) if value.is_finite())
         );
-        assert_eq!(sample.diagnostics.query_recreation_attempts, 1);
-        assert_eq!(sample.diagnostics.query_recreation_failures, 0);
+        assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 1);
+        assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 0);
     }
     assert!(
         worker
@@ -250,7 +250,7 @@ async fn live_pdh_isolates_ineligible_monotonic_mapping_at_startup() {
     let sample = worker.collect().await.unwrap();
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.points[0].counter_index, 0);
-    assert!(sample.failures.iter().any(|failure| {
+    assert!(sample.metadata.failures.iter().any(|failure| {
         failure.counter_index == 1 && failure.reason == "invalid_metric_mapping"
     }));
     assert!(
@@ -344,7 +344,11 @@ async fn live_pdh_collects_common_calculated_disk_counters() {
     .unwrap();
     tokio::time::sleep(Duration::from_millis(250)).await;
     let sample = worker.collect().await.unwrap();
-    assert!(sample.failures.is_empty(), "{:?}", sample.failures);
+    assert!(
+        sample.metadata.failures.is_empty(),
+        "{:?}",
+        sample.metadata.failures
+    );
     assert_eq!(sample.points.len(), 2);
     assert!(
         sample.points.iter().all(|point| matches!(
@@ -392,10 +396,10 @@ async fn live_pdh_unavailable_exact_counter_retries_after_startup() {
             .iter()
             .any(|point| point.path == r"\Memory\Available Bytes")
     );
-    assert!(sample.failures.iter().any(|failure| {
+    assert!(sample.metadata.failures.iter().any(|failure| {
         failure.counter_index == 1 && failure.reason == "PdhAddEnglishCounterW"
     }));
-    assert_eq!(sample.diagnostics.counter_add_failures, 1);
+    assert_eq!(sample.metadata.diagnostics.counter_add_failures, 1);
     assert!(
         worker
             .shutdown(Instant::now() + Duration::from_secs(2))
@@ -427,8 +431,8 @@ async fn live_pdh_entirely_unavailable_counter_set_starts_empty() {
     .unwrap();
     let sample = worker.collect().await.unwrap();
     assert!(sample.points.is_empty());
-    assert_eq!(sample.failures.len(), 1);
-    assert_eq!(sample.diagnostics.counter_add_failures, 1);
+    assert_eq!(sample.metadata.failures.len(), 1);
+    assert_eq!(sample.metadata.diagnostics.counter_add_failures, 1);
     assert!(
         worker
             .shutdown(Instant::now() + Duration::from_secs(2))
@@ -546,7 +550,11 @@ async fn live_pdh_collects_parsed_instance_paths() {
     let counters = config.counters.clone();
     let mut query = open_live_query(counters.clone(), "parsed");
     let sample = query.collect().unwrap();
-    assert!(sample.failures.is_empty(), "{:?}", sample.failures);
+    assert!(
+        sample.metadata.failures.is_empty(),
+        "{:?}",
+        sample.metadata.failures
+    );
     assert_eq!(sample.points.len(), 2);
     let ids = sample
         .points
@@ -582,7 +590,11 @@ async fn live_pdh_collects_one_path_for_multiple_mappings() {
     let mut query = open_live_query(configs, "same-path-mappings");
 
     let sample = query.collect().unwrap();
-    assert!(sample.failures.is_empty(), "{:?}", sample.failures);
+    assert!(
+        sample.metadata.failures.is_empty(),
+        "{:?}",
+        sample.metadata.failures
+    );
     assert_eq!(
         sample
             .points
@@ -612,7 +624,11 @@ async fn live_pdh_direct_queries() {
     for _ in 0..3 {
         for query in [&mut first, &mut second] {
             let sample = query.collect().unwrap();
-            assert!(sample.failures.is_empty(), "{:?}", sample.failures);
+            assert!(
+                sample.metadata.failures.is_empty(),
+                "{:?}",
+                sample.metadata.failures
+            );
             assert!(
                 matches!(sample.points[0].value, SampleValue::Value(Number::Integer(value)) if value >= 0)
             );
@@ -621,7 +637,7 @@ async fn live_pdh_direct_queries() {
         assert_eq!(first.start_time_unix_nano, start);
     }
     drop(first);
-    assert!(second.collect().unwrap().failures.is_empty());
+    assert!(second.collect().unwrap().metadata.failures.is_empty());
 }
 
 /// Scenario: Live PDH reads exact rates, timers, queues, fractions, and averages.
@@ -654,13 +670,21 @@ async fn live_pdh_calculated_counters() {
     ];
     let mut query = open_live_query(configs.clone(), "calculated");
     let warming = query.collect().unwrap();
-    assert!(warming.failures.is_empty(), "{:?}", warming.failures);
+    assert!(
+        warming.metadata.failures.is_empty(),
+        "{:?}",
+        warming.metadata.failures
+    );
     for index in [0, 1, 2, 4] {
         assert_eq!(warming.points[index].value, SampleValue::Warming);
     }
     std::thread::sleep(Duration::from_millis(250));
     let sample = query.collect().unwrap();
-    assert!(sample.failures.is_empty(), "{:?}", sample.failures);
+    assert!(
+        sample.metadata.failures.is_empty(),
+        "{:?}",
+        sample.metadata.failures
+    );
     assert_eq!(sample.points.len(), configs.len());
     for point in &sample.points[..4] {
         assert!(matches!(
@@ -686,7 +710,11 @@ async fn live_pdh_elapsed_and_multi_timer_counters() {
     ];
     let mut query = open_live_query(configs.clone(), "elapsed-multi");
     let first = query.collect().unwrap();
-    assert!(first.failures.is_empty(), "{:?}", first.failures);
+    assert!(
+        first.metadata.failures.is_empty(),
+        "{:?}",
+        first.metadata.failures
+    );
     assert!(matches!(
         first.points[0].value,
         SampleValue::Value(Number::Double(value)) if value.is_finite() && value >= 0.0
@@ -695,7 +723,11 @@ async fn live_pdh_elapsed_and_multi_timer_counters() {
 
     std::thread::sleep(Duration::from_millis(250));
     let second = query.collect().unwrap();
-    assert!(second.failures.is_empty(), "{:?}", second.failures);
+    assert!(
+        second.metadata.failures.is_empty(),
+        "{:?}",
+        second.metadata.failures
+    );
     assert!(second.points.iter().all(|point| {
         matches!(
             point.value,
@@ -720,8 +752,8 @@ async fn live_pdh_invalid_counters_start_empty() {
     ];
     let mut query = open_live_query(configs.clone(), "invalid");
     let sample = query.collect().unwrap();
-    assert_eq!(sample.failures.len(), 1);
-    assert_eq!(sample.failures[0].counter_index, 1);
+    assert_eq!(sample.metadata.failures.len(), 1);
+    assert_eq!(sample.metadata.failures[0].counter_index, 1);
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.points[0].counter_index, 0);
     assert!(
@@ -732,6 +764,6 @@ async fn live_pdh_invalid_counters_start_empty() {
     let mut invalid = open_live_query(configs[1..].to_vec(), "all-invalid");
     let sample = invalid.collect().unwrap();
     assert!(sample.points.is_empty());
-    assert_eq!(sample.failures.len(), 1);
-    assert_eq!(sample.failures[0].counter_index, 0);
+    assert_eq!(sample.metadata.failures.len(), 1);
+    assert_eq!(sample.metadata.failures[0].counter_index, 0);
 }

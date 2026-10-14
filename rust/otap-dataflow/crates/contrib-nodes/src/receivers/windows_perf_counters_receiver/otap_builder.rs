@@ -293,7 +293,7 @@ pub(super) fn into_otap(
 #[cfg(test)]
 mod tests {
     use super::super::config::Config;
-    use super::super::model::{InstanceIdentity, SampleFailure};
+    use super::super::model::{InstanceIdentity, PendingMetadata, SampleFailure};
     use super::*;
     use arrow::array::{Array, Int64Array, UInt8Array};
     use arrow::util::display::array_value_to_string;
@@ -420,9 +420,7 @@ mod tests {
                     r"\Memory\Available Bytes",
                     SampleValue::Value(Number::Integer(42)),
                 )],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -478,9 +476,7 @@ mod tests {
                     native_path,
                     SampleValue::Value(Number::Integer(42)),
                 )],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -528,9 +524,7 @@ mod tests {
                         SampleValue::Value(Number::Integer(42)),
                     ),
                 ],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -610,9 +604,7 @@ mod tests {
             Sample {
                 timestamp_unix_nano: 115,
                 points: vec![point],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -656,9 +648,7 @@ mod tests {
                     5,
                     Number::Integer(42),
                 )],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -722,9 +712,7 @@ mod tests {
                     10,
                     Number::Integer(42),
                 )],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -787,9 +775,7 @@ mod tests {
                     r"\Custom Provider\Operations",
                     SampleValue::Value(Number::Integer(42)),
                 )],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         );
         assert!(matches!(
@@ -809,9 +795,7 @@ mod tests {
                             start,
                             Number::Integer(42),
                         )],
-                        failures: Vec::new(),
-                        overflows: Vec::new(),
-                        diagnostics: Default::default(),
+                        metadata: Default::default(),
                     },
                 ),
                 Err(ArrowError::InvalidArgumentError(message))
@@ -844,9 +828,7 @@ mod tests {
                             start,
                             Number::Integer(42),
                         )],
-                        failures: Vec::new(),
-                        overflows: Vec::new(),
-                        diagnostics: Default::default(),
+                        metadata: Default::default(),
                     },
                 ),
                 Err(ArrowError::InvalidArgumentError(message))
@@ -868,9 +850,7 @@ mod tests {
                             start,
                             Number::Integer(42),
                         )],
-                        failures: Vec::new(),
-                        overflows: Vec::new(),
-                        diagnostics: Default::default(),
+                        metadata: Default::default(),
                     },
                 )
                 .unwrap()
@@ -905,9 +885,7 @@ mod tests {
                     sum_point(0, r"\Provider\Delta A", 5, Number::Double(2.0)),
                     sum_point(1, r"\Provider\Delta B", 7, Number::Double(3.0)),
                 ],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -959,9 +937,7 @@ mod tests {
                     r"\Provider\Operations Delta",
                     SampleValue::Value(Number::Double(2.0)),
                 )],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         );
         assert!(matches!(
@@ -981,9 +957,7 @@ mod tests {
                             start,
                             Number::Double(2.0),
                         )],
-                        failures: Vec::new(),
-                        overflows: Vec::new(),
-                        diagnostics: Default::default(),
+                        metadata: Default::default(),
                     },
                 ),
                 Err(ArrowError::InvalidArgumentError(message))
@@ -1014,9 +988,7 @@ mod tests {
                         r"\Memory\Available Bytes",
                         SampleValue::Value(Number::Integer(42)),
                     )],
-                    failures: Vec::new(),
-                    overflows: Vec::new(),
-                    diagnostics: Default::default(),
+                    metadata: Default::default(),
                 }
             )
             .unwrap()
@@ -1052,9 +1024,7 @@ mod tests {
                         SampleValue::Warming,
                     ),
                 ],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -1087,9 +1057,7 @@ mod tests {
                         r"\Processor(_Total)\% Processor Time",
                         SampleValue::Warming,
                     )],
-                    failures: Vec::new(),
-                    overflows: Vec::new(),
-                    diagnostics: Default::default(),
+                    metadata: Default::default(),
                 }
             )
             .unwrap()
@@ -1135,9 +1103,7 @@ mod tests {
                         SampleValue::NoObservation,
                     ),
                 ],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -1173,14 +1139,15 @@ mod tests {
                     r"\Memory\Available Bytes",
                     SampleValue::Value(Number::Integer(42)),
                 )],
-                failures: vec![SampleFailure {
-                    counter_index: 1,
-                    reason: "PdhGetFormattedCounterValue",
-                    error: "PDH_INVALID_DATA".to_owned(),
-                    diagnostic_only: false,
-                }],
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: PendingMetadata {
+                    failures: vec![SampleFailure {
+                        counter_index: 1,
+                        reason: "PdhGetFormattedCounterValue",
+                        error: "PDH_INVALID_DATA".to_owned(),
+                        diagnostic_only: false,
+                    }],
+                    ..Default::default()
+                },
             },
         )
         .unwrap()
@@ -1212,9 +1179,7 @@ mod tests {
                     r"\Processor(_Total)\% Processor Time",
                     SampleValue::Value(Number::Double(12.5)),
                 )],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -1253,9 +1218,7 @@ mod tests {
                         r"\Memory\Available Bytes",
                         SampleValue::Value(Number::Integer(1)),
                     )],
-                    failures: Vec::new(),
-                    overflows: Vec::new(),
-                    diagnostics: Default::default(),
+                    metadata: Default::default(),
                 }
             )
             .is_err()
@@ -1271,9 +1234,7 @@ mod tests {
                             r"\Memory\Available Bytes",
                             SampleValue::Value(Number::Integer(1)),
                         )],
-                        failures: Vec::new(),
-                        overflows: Vec::new(),
-                        diagnostics: Default::default(),
+                        metadata: Default::default(),
                     }
                 ),
                 Err(ArrowError::InvalidArgumentError(message))
@@ -1290,9 +1251,7 @@ mod tests {
                         r"\Memory\Available Bytes",
                         SampleValue::Value(Number::Integer(-1)),
                     )],
-                    failures: Vec::new(),
-                    overflows: Vec::new(),
-                    diagnostics: Default::default(),
+                    metadata: Default::default(),
                 }
             )
             .is_ok()
@@ -1308,9 +1267,7 @@ mod tests {
                             r"\Memory\Available Bytes",
                             SampleValue::Value(Number::Double(value)),
                         )],
-                        failures: Vec::new(),
-                        overflows: Vec::new(),
-                        diagnostics: Default::default(),
+                        metadata: Default::default(),
                     }
                 ),
                 Err(ArrowError::InvalidArgumentError(message))
@@ -1366,9 +1323,7 @@ mod tests {
                         value: SampleValue::Value(Number::Integer(20)),
                     },
                 ],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -1442,9 +1397,7 @@ mod tests {
                         value: SampleValue::Value(Number::Integer(20)),
                     },
                 ],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -1512,9 +1465,7 @@ mod tests {
                         value: SampleValue::Value(Number::Integer(20)),
                     },
                 ],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()
@@ -1571,9 +1522,7 @@ mod tests {
                         SampleValue::Value(Number::Double(40.0)),
                     ),
                 ],
-                failures: Vec::new(),
-                overflows: Vec::new(),
-                diagnostics: Default::default(),
+                metadata: Default::default(),
             },
         )
         .unwrap()

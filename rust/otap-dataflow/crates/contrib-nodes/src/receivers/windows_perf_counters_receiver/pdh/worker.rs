@@ -4,10 +4,10 @@
 //! Bounded worker-thread query ownership, recovery, recreation, and command lifecycle.
 
 use super::super::config::CounterConfig;
-use super::super::model::{Sample, SampleDiagnostics, SampleFailure};
+use super::super::model::{PendingMetadata, Sample, SampleDiagnostics, SampleFailure};
 use super::PdhApi;
 use super::error::Error;
-use super::query::{PendingMetadata, Query, retry_delay};
+use super::query::{Query, retry_delay};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -328,7 +328,7 @@ impl<A: PdhApi> QuerySlot<A> {
         let mut result = self.collect_or_rebuild(now, max_expanded_counters, query_retry_cap, open);
         self.update_recovery_state(now, query_retry_cap, was_query_retry, &result);
         if let Ok(sample) = &mut result {
-            self.pending.merge_into_sample(sample);
+            sample.metadata.merge(std::mem::take(&mut self.pending));
         }
         result
     }
@@ -389,9 +389,7 @@ impl<A: PdhApi> QuerySlot<A> {
         }
         self.pending.diagnostics.query_rebuild_recoveries += 1;
         let mut sample = Sample::empty(rebuilt.previous_timestamp_unix_nano);
-        let mut metadata = PendingMetadata::default();
-        rebuilt.move_pending_metadata_to(&mut metadata);
-        metadata.merge_into_sample(&mut sample);
+        rebuilt.move_pending_metadata_to(&mut sample.metadata);
         self.query = Some(rebuilt);
         Ok(sample)
     }
@@ -495,10 +493,10 @@ impl<A: PdhApi> QuerySlot<A> {
         for point in &mut sample.points {
             point.counter_index = remap(point.counter_index)?;
         }
-        for failure in &mut sample.failures {
+        for failure in &mut sample.metadata.failures {
             failure.counter_index = remap(failure.counter_index)?;
         }
-        for overflow in &mut sample.overflows {
+        for overflow in &mut sample.metadata.overflows {
             overflow.counter_index = remap(overflow.counter_index)?;
         }
         Ok(sample)
@@ -514,12 +512,9 @@ pub(super) fn merge_query_samples(samples: Vec<Sample>) -> Result<Sample, Error>
     for sample in samples {
         if let Some(target) = &mut merged {
             target.timestamp_unix_nano = target.timestamp_unix_nano.max(sample.timestamp_unix_nano);
-            target.diagnostics.active_expanded_counters +=
-                sample.diagnostics.active_expanded_counters;
-            let mut metadata = PendingMetadata::take_from_sample(target);
-            let mut sample = sample;
-            metadata.merge(PendingMetadata::take_from_sample(&mut sample));
-            metadata.restore_to_sample(target);
+            target.metadata.diagnostics.active_expanded_counters +=
+                sample.metadata.diagnostics.active_expanded_counters;
+            target.metadata.merge(sample.metadata);
             target.points.extend(sample.points);
         } else {
             merged = Some(sample);
@@ -532,9 +527,11 @@ pub(super) fn merge_query_samples(samples: Vec<Sample>) -> Result<Sample, Error>
         (left.counter_index, &left.path).cmp(&(right.counter_index, &right.path))
     });
     merged
+        .metadata
         .failures
         .sort_by_key(|failure| (failure.counter_index, failure.reason));
     merged
+        .metadata
         .overflows
         .sort_by_key(|overflow| (overflow.counter_index, overflow.reason));
     Ok(merged)
@@ -579,8 +576,7 @@ where
     }
     let mut sample = merge_query_samples(samples)?;
     if !query_failures.is_empty() {
-        let mut metadata = PendingMetadata::take_from_sample(&mut sample);
-        metadata.merge(PendingMetadata {
+        sample.metadata.merge(PendingMetadata {
             diagnostics: SampleDiagnostics {
                 scrape_failures: 1,
                 ..Default::default()
@@ -588,7 +584,6 @@ where
             failures: query_failures,
             overflows: Vec::new(),
         });
-        metadata.restore_to_sample(&mut sample);
     }
     recreate_successful_queries(
         queries,
@@ -599,6 +594,7 @@ where
         &mut sample,
     );
     sample
+        .metadata
         .failures
         .sort_by_key(|failure| (failure.counter_index, failure.reason));
     Ok(sample)
@@ -653,8 +649,8 @@ fn recreate_successful_queries<A, F>(
             now,
             query_limit,
             open,
-            &mut sample.diagnostics,
-            &mut sample.failures,
+            &mut sample.metadata.diagnostics,
+            &mut sample.metadata.failures,
         );
     }
 }
