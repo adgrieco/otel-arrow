@@ -97,6 +97,47 @@ fn startup_prime_seeds_two_sample_histories() {
     assert_eq!(sample.diagnostics.warmup_omissions, 2);
 }
 
+/// Scenario: A calculated counter is mapped to a cumulative non-monotonic Sum.
+/// Guarantees: The emitted point receives the query start time directly from counter sampling.
+#[test]
+fn cumulative_non_monotonic_sum_uses_query_start_time() {
+    let path = r"\Process(_Total)\Private Bytes";
+    let config = CounterConfig {
+        metric_kind: MetricKind::Sum {
+            aggregation: Aggregation::Cumulative,
+            monotonic: false,
+        },
+        ..counter(path, "windows.process.private")
+    };
+    let (state, mut query) = fake_query(
+        vec![config],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x2041_0500,
+            raw: Some(10),
+            multi_count: 1,
+            formatted: Some(Number::Double(1.0)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+
+    query.prime().unwrap();
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 110;
+        state.counters[0].raw = Some(20);
+        state.counters[0].formatted = Some(Number::Double(2.0));
+    }
+
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points[0].start_time_unix_nano, Some(100));
+    assert!(matches!(
+        sample.points[0].value,
+        SampleValue::Value(Number::Double(2.0))
+    ));
+}
+
 /// Scenario: The native startup collection reports no data before a calculated counter becomes valid.
 /// Guarantees: Priming fabricates no readiness, so the first valid sample warms and the following sample emits.
 #[test]

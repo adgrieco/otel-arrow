@@ -707,7 +707,12 @@ impl<A: PdhApi> Query<A> {
         for counter in self.counters.values_mut() {
             let metric_kind = self.configs[counter.config_index].metric_kind;
             let result = if has_data {
-                counter.read(&mut self.api, metric_kind, timestamp_unix_nano)
+                counter.read(
+                    &mut self.api,
+                    metric_kind,
+                    start_time_unix_nano,
+                    timestamp_unix_nano,
+                )
             } else {
                 Ok((SampleValue::NoObservation, None))
             };
@@ -722,17 +727,6 @@ impl<A: PdhApi> Query<A> {
             if matches!(value, SampleValue::Warming) {
                 diagnostics.warmup_omissions += 1;
             }
-            let point_start_time = match (metric_kind, value, point_start_time) {
-                (
-                    MetricKind::Sum {
-                        aggregation: Aggregation::Cumulative,
-                        monotonic: false,
-                    },
-                    SampleValue::Value(_),
-                    None,
-                ) => Some(start_time_unix_nano),
-                (_, _, point_start_time) => point_start_time,
-            };
             points.push(SamplePoint {
                 counter_index: counter.config_index,
                 path: counter.path.clone(),
@@ -932,6 +926,7 @@ impl<C> CounterHandle<C> {
         &mut self,
         api: &mut impl PdhApi<Counter = C>,
         metric_kind: MetricKind,
+        query_start_time_unix_nano: i64,
         timestamp_unix_nano: i64,
     ) -> Result<(SampleValue, Option<i64>), Error> {
         if let Some(value) = self.prepare_raw_sample(api, timestamp_unix_nano)? {
@@ -953,8 +948,13 @@ impl<C> CounterHandle<C> {
             return Ok((SampleValue::NoObservation, None));
         }
         let scaled = self.scale_number(number)?;
-        let point_start_time =
-            self.point_start_time(metric_kind, number, delta_start_time, timestamp_unix_nano)?;
+        let point_start_time = self.point_start_time(
+            metric_kind,
+            number,
+            delta_start_time,
+            query_start_time_unix_nano,
+            timestamp_unix_nano,
+        )?;
         Ok((SampleValue::Value(scaled), point_start_time))
     }
 
@@ -1073,6 +1073,7 @@ impl<C> CounterHandle<C> {
         metric_kind: MetricKind,
         number: Number,
         delta_start_time: Option<i64>,
+        query_start_time_unix_nano: i64,
         timestamp_unix_nano: i64,
     ) -> Result<Option<i64>, Error> {
         Ok(match metric_kind {
@@ -1096,11 +1097,11 @@ impl<C> CounterHandle<C> {
                 aggregation: Aggregation::Delta,
                 ..
             } => delta_start_time,
-            MetricKind::Gauge
-            | MetricKind::Sum {
+            MetricKind::Sum {
                 aggregation: Aggregation::Cumulative,
                 monotonic: false,
-            } => None,
+            } => Some(query_start_time_unix_nano),
+            MetricKind::Gauge => None,
         })
     }
 }
