@@ -11,8 +11,8 @@ use super::super::model::{
 use super::counter_type::{CounterKind, classify_native_type, validate_metric_mapping};
 use super::error::{Error, sample_failure};
 use super::expansion::{
-    CounterKey, cleanup_aggregation_instances, expansion_allocation, instance_groups,
-    limit_expanded_paths, refresh_changes_with_group_resets,
+    CounterKey, ExpansionAllocation, cleanup_aggregation_instances, expansion_allocation,
+    instance_groups, limit_expanded_paths, refresh_changes_with_group_resets,
 };
 use super::native::NativePdh;
 use super::timing::{
@@ -271,7 +271,10 @@ impl<A: PdhApi> Query<A> {
             .collect::<Vec<_>>();
         wildcard_paths
             .into_iter()
-            .map(|(config_index, path)| (config_index, self.api.expand(&path)))
+            .map(|(config_index, path)| WildcardDiscovery {
+                config_index,
+                paths: self.api.expand(&path),
+            })
             .collect()
     }
 
@@ -285,72 +288,56 @@ impl<A: PdhApi> Query<A> {
         // Retain failed templates before admitting successful discoveries so
         // their live handles and retry identities reserve global capacity
         // independently of configuration order.
-        for (config_index, discovery) in discoveries {
-            let Err(error) = discovery else {
+        for discovery in discoveries {
+            let Err(error) = &discovery.paths else {
                 continue;
             };
             metadata.diagnostics.discovery_failures += 1;
-            metadata.failures.push(sample_failure(*config_index, error));
+            metadata
+                .failures
+                .push(sample_failure(discovery.config_index, error));
             let mut retained = self
                 .counters
                 .iter()
                 .filter_map(|(key, counter)| {
-                    (key.config_index == *config_index && counter.wildcard).then(|| {
+                    (key.config_index == discovery.config_index && counter.wildcard).then(|| {
                         counter.instance.clone().map(|instance| {
                             (
                                 key.clone(),
-                                DesiredCounter {
-                                    path: counter.path.clone(),
+                                DesiredCounter::new(
+                                    counter.path.clone(),
                                     instance,
-                                    emit_instance_attribute: counter.emit_instance_attribute,
-                                },
+                                    counter.emit_instance_attribute,
+                                ),
                             )
                         })
                     })?
                 })
                 .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                    (key.config_index == *config_index && state.target.localized).then(|| {
-                        state.target.instance.clone().map(|instance| {
-                            (
-                                key.clone(),
-                                DesiredCounter {
-                                    path: state.target.path.clone(),
-                                    instance,
-                                    emit_instance_attribute: state.target.emit_instance_attribute,
-                                },
-                            )
-                        })
-                    })?
+                    (key.config_index == discovery.config_index && state.target.localized).then(
+                        || {
+                            state.target.instance.clone().map(|instance| {
+                                (
+                                    key.clone(),
+                                    DesiredCounter::new(
+                                        state.target.path.clone(),
+                                        instance,
+                                        state.target.emit_instance_attribute,
+                                    ),
+                                )
+                            })
+                        },
+                    )?
                 }))
                 .collect::<BTreeMap<_, _>>();
             let discovered = retained.len();
-            let (allowed, per_wildcard_omitted, total_omitted) = expansion_allocation(
+            let allocation = expansion_allocation(
                 discovered,
                 self.max_instances_per_wildcard,
                 self.max_expanded_counters.saturating_sub(expanded_total),
             );
-            if per_wildcard_omitted > 0 {
-                metadata.overflows.push(ExpansionOverflow {
-                    counter_index: *config_index,
-                    reason: "per_wildcard",
-                    discovered,
-                    retained: discovered - per_wildcard_omitted,
-                    omitted: per_wildcard_omitted,
-                });
-            }
-            if total_omitted > 0 {
-                metadata.overflows.push(ExpansionOverflow {
-                    counter_index: *config_index,
-                    reason: "receiver_total",
-                    discovered: discovered - per_wildcard_omitted,
-                    retained: allowed,
-                    omitted: total_omitted,
-                });
-            }
-            metadata.diagnostics.instances_omitted_over_limit +=
-                u64::try_from(per_wildcard_omitted.saturating_add(total_omitted))
-                    .unwrap_or(u64::MAX);
-            while retained.len() > allowed {
+            metadata.record_expansion_overflows(discovery.config_index, discovered, allocation);
+            while retained.len() > allocation.retained {
                 let Some(key) = retained.keys().next_back().cloned() else {
                     break;
                 };
@@ -371,10 +358,11 @@ impl<A: PdhApi> Query<A> {
         mut expanded_total: usize,
         metadata: &mut PendingMetadata,
     ) {
-        for (config_index, discovery) in discoveries {
-            let Ok(mut paths) = discovery else {
+        for discovery in discoveries {
+            let Ok(mut paths) = discovery.paths else {
                 continue;
             };
+            let config_index = discovery.config_index;
             let aggregation_only = cleanup_aggregation_instances(
                 &mut paths,
                 self.configs[config_index]
@@ -401,32 +389,12 @@ impl<A: PdhApi> Query<A> {
             paths.sort_by_key(|path| path.to_lowercase());
             paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
             let discovered = paths.len();
-            let (per_wildcard_omitted, total_omitted) = limit_expanded_paths(
+            let allocation = limit_expanded_paths(
                 &mut paths,
                 self.max_instances_per_wildcard,
                 self.max_expanded_counters.saturating_sub(expanded_total),
             );
-            if per_wildcard_omitted > 0 {
-                metadata.overflows.push(ExpansionOverflow {
-                    counter_index: config_index,
-                    reason: "per_wildcard",
-                    discovered,
-                    retained: discovered - per_wildcard_omitted,
-                    omitted: per_wildcard_omitted,
-                });
-            }
-            if total_omitted > 0 {
-                metadata.overflows.push(ExpansionOverflow {
-                    counter_index: config_index,
-                    reason: "receiver_total",
-                    discovered: discovered - per_wildcard_omitted,
-                    retained: paths.len(),
-                    omitted: total_omitted,
-                });
-            }
-            metadata.diagnostics.instances_omitted_over_limit +=
-                u64::try_from(per_wildcard_omitted.saturating_add(total_omitted))
-                    .unwrap_or(u64::MAX);
+            metadata.record_expansion_overflows(config_index, discovered, allocation);
             expanded_total += paths.len();
             for path in paths {
                 let key = CounterKey::new(config_index, &path);
@@ -436,11 +404,7 @@ impl<A: PdhApi> Query<A> {
                             self.configs[config_index].emit_instance_attribute && !aggregation_only;
                         let _ = desired.insert(
                             key,
-                            DesiredCounter {
-                                path,
-                                instance,
-                                emit_instance_attribute,
-                            },
+                            DesiredCounter::new(path, instance, emit_instance_attribute),
                         );
                     }
                     Err(error) => {
@@ -757,8 +721,22 @@ struct DesiredCounter {
     emit_instance_attribute: bool,
 }
 
+impl DesiredCounter {
+    fn new(path: String, instance: InstanceIdentity, emit_instance_attribute: bool) -> Self {
+        Self {
+            path,
+            instance,
+            emit_instance_attribute,
+        }
+    }
+}
+
 type DesiredCounters = BTreeMap<CounterKey, DesiredCounter>;
-type WildcardDiscovery = (usize, Result<Vec<String>, Error>);
+
+struct WildcardDiscovery {
+    config_index: usize,
+    paths: Result<Vec<String>, Error>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ExactAddFailureDisposition {
@@ -823,6 +801,38 @@ pub(super) struct PendingMetadata {
 }
 
 impl PendingMetadata {
+    fn record_expansion_overflows(
+        &mut self,
+        counter_index: usize,
+        discovered: usize,
+        allocation: ExpansionAllocation,
+    ) {
+        if allocation.per_wildcard_omitted > 0 {
+            self.overflows.push(ExpansionOverflow {
+                counter_index,
+                reason: "per_wildcard",
+                discovered,
+                retained: discovered - allocation.per_wildcard_omitted,
+                omitted: allocation.per_wildcard_omitted,
+            });
+        }
+        if allocation.total_omitted > 0 {
+            self.overflows.push(ExpansionOverflow {
+                counter_index,
+                reason: "receiver_total",
+                discovered: discovered - allocation.per_wildcard_omitted,
+                retained: allocation.retained,
+                omitted: allocation.total_omitted,
+            });
+        }
+        self.diagnostics.instances_omitted_over_limit += u64::try_from(
+            allocation
+                .per_wildcard_omitted
+                .saturating_add(allocation.total_omitted),
+        )
+        .unwrap_or(u64::MAX);
+    }
+
     pub(super) fn take_from_sample(sample: &mut Sample) -> Self {
         Self {
             diagnostics: std::mem::take(&mut sample.diagnostics),

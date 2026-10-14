@@ -375,11 +375,25 @@ fn expansion_limits_are_deterministic_and_report_omissions() {
     let omitted = limit_expanded_paths(&mut paths, 2, 10);
 
     assert_eq!(paths, ["alpha", "bravo"]);
-    assert_eq!(omitted, (1, 0));
+    assert_eq!(
+        omitted,
+        ExpansionAllocation {
+            retained: 2,
+            per_wildcard_omitted: 1,
+            total_omitted: 0,
+        }
+    );
 
     let omitted = limit_expanded_paths(&mut paths, 2, 1);
     assert_eq!(paths, ["alpha"]);
-    assert_eq!(omitted, (0, 1));
+    assert_eq!(
+        omitted,
+        ExpansionAllocation {
+            retained: 1,
+            per_wildcard_omitted: 0,
+            total_omitted: 1,
+        }
+    );
 }
 
 /// Scenario: An earlier configured wildcard succeeds while a later wildcard's discovery fails with retained identities.
@@ -387,16 +401,26 @@ fn expansion_limits_are_deterministic_and_report_omissions() {
 #[test]
 fn failed_discovery_retention_reserves_global_capacity_first() {
     let total_limit = 4;
-    let (retained_failed, failed_per_omitted, failed_total_omitted) =
-        expansion_allocation(3, 10, total_limit);
-    let (retained_success, success_per_omitted, success_total_omitted) =
-        expansion_allocation(3, 10, total_limit - retained_failed);
+    let failed = expansion_allocation(3, 10, total_limit);
+    let success = expansion_allocation(3, 10, total_limit - failed.retained);
 
-    assert_eq!(retained_failed, 3);
-    assert_eq!((failed_per_omitted, failed_total_omitted), (0, 0));
-    assert_eq!(retained_success, 1);
-    assert_eq!((success_per_omitted, success_total_omitted), (0, 2));
-    assert_eq!(retained_failed + retained_success, total_limit);
+    assert_eq!(
+        failed,
+        ExpansionAllocation {
+            retained: 3,
+            per_wildcard_omitted: 0,
+            total_omitted: 0,
+        }
+    );
+    assert_eq!(
+        success,
+        ExpansionAllocation {
+            retained: 1,
+            per_wildcard_omitted: 0,
+            total_omitted: 2,
+        }
+    );
+    assert_eq!(failed.retained + success.retained, total_limit);
 }
 
 /// Scenario: Refresh returns the same duplicate-name membership in a different order.
@@ -583,8 +607,15 @@ fn filters_aggregation_before_expansion_limits() {
         r"\Process(worker)\Private Bytes".to_owned(),
     ];
     assert!(!cleanup_aggregation_instances(&mut paths, Some("_Total")));
-    let omitted = limit_expanded_paths(&mut paths, 1, 1);
-    assert_eq!(omitted, (0, 0));
+    let allocation = limit_expanded_paths(&mut paths, 1, 1);
+    assert_eq!(
+        allocation,
+        ExpansionAllocation {
+            retained: 1,
+            per_wildcard_omitted: 0,
+            total_omitted: 0,
+        }
+    );
     assert_eq!(paths, [r"\Process(worker)\Private Bytes"]);
 }
 

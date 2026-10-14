@@ -30,23 +30,33 @@ pub(super) fn limit_expanded_paths(
     paths: &mut Vec<String>,
     per_wildcard_limit: usize,
     total_remaining: usize,
-) -> (usize, usize) {
-    let (retained, per_wildcard_omitted, total_omitted) =
-        expansion_allocation(paths.len(), per_wildcard_limit, total_remaining);
-    paths.truncate(retained);
-    (per_wildcard_omitted, total_omitted)
+) -> ExpansionAllocation {
+    let allocation = expansion_allocation(paths.len(), per_wildcard_limit, total_remaining);
+    paths.truncate(allocation.retained);
+    allocation
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ExpansionAllocation {
+    pub(super) retained: usize,
+    pub(super) per_wildcard_omitted: usize,
+    pub(super) total_omitted: usize,
 }
 
 pub(super) fn expansion_allocation(
     discovered: usize,
     per_wildcard_limit: usize,
     total_remaining: usize,
-) -> (usize, usize, usize) {
+) -> ExpansionAllocation {
     let per_wildcard_retained = discovered.min(per_wildcard_limit);
     let per_wildcard_omitted = discovered - per_wildcard_retained;
     let retained = per_wildcard_retained.min(total_remaining);
     let total_omitted = per_wildcard_retained - retained;
-    (retained, per_wildcard_omitted, total_omitted)
+    ExpansionAllocation {
+        retained,
+        per_wildcard_omitted,
+        total_omitted,
+    }
 }
 
 pub(super) fn is_aggregation_instance(path: &str, aggregation_name: &str) -> bool {
