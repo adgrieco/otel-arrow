@@ -5,8 +5,8 @@
 
 use super::super::config::{Aggregation, CounterConfig, MetricKind};
 use super::super::model::{
-    ExpansionOverflow, InstanceIdentity, Number, PendingMetadata, Sample, SampleDiagnostics,
-    SampleFailure, SamplePoint, SampleValue, scale_double, scale_integer,
+    ExpansionOverflow, InstanceIdentity, Number, PendingMetadata, Sample, SampleFailure,
+    SamplePoint, SampleValue, scale_double, scale_integer,
 };
 use super::counter_type::{CounterKind, classify_native_type, validate_metric_mapping};
 use super::error::{Error, sample_failure};
@@ -207,8 +207,7 @@ impl<A: PdhApi> Query<A> {
         key: CounterKey,
         target: CounterTarget,
         now: Instant,
-        diagnostics: &mut SampleDiagnostics,
-        failures: &mut Vec<SampleFailure>,
+        metadata: &mut PendingMetadata,
     ) -> bool {
         match self.add_counter(
             target.config_index,
@@ -219,13 +218,15 @@ impl<A: PdhApi> Query<A> {
         ) {
             Ok(()) => {
                 if self.retry_states.remove(&key).is_some() {
-                    diagnostics.retry_recoveries += 1;
+                    metadata.diagnostics.retry_recoveries += 1;
                 }
                 true
             }
             Err(error) => {
-                diagnostics.counter_add_failures += 1;
-                failures.push(sample_failure(target.config_index, &error));
+                metadata.diagnostics.counter_add_failures += 1;
+                metadata
+                    .failures
+                    .push(sample_failure(target.config_index, &error));
                 if !error.is_permanent_counter_error() {
                     self.schedule_retry(key, target, now);
                 }
@@ -234,12 +235,7 @@ impl<A: PdhApi> Query<A> {
         }
     }
 
-    fn retry_counters(
-        &mut self,
-        now: Instant,
-        diagnostics: &mut SampleDiagnostics,
-        failures: &mut Vec<SampleFailure>,
-    ) {
+    fn retry_counters(&mut self, now: Instant, metadata: &mut PendingMetadata) {
         let due = self
             .retry_states
             .iter()
@@ -247,8 +243,8 @@ impl<A: PdhApi> Query<A> {
             .map(|(key, state)| (key.clone(), state.target.clone()))
             .collect::<Vec<_>>();
         for (key, target) in due {
-            diagnostics.retry_attempts += 1;
-            let _ = self.try_add_target(key, target, now, diagnostics, failures);
+            metadata.diagnostics.retry_attempts += 1;
+            let _ = self.try_add_target(key, target, now, metadata);
         }
     }
 
@@ -505,13 +501,8 @@ impl<A: PdhApi> Query<A> {
                 emit_instance_attribute,
             };
             let was_retry = self.retry_states.contains_key(&key);
-            if self.try_add_target(
-                key.clone(),
-                target,
-                now,
-                &mut metadata.diagnostics,
-                &mut metadata.failures,
-            ) && !live.contains(&key)
+            if self.try_add_target(key.clone(), target, now, metadata)
+                && !live.contains(&key)
                 && !was_retry
             {
                 metadata.diagnostics.instances_added += 1;
@@ -586,11 +577,7 @@ impl<A: PdhApi> Query<A> {
         {
             return Err(self.restore_collection_error(metadata, error));
         }
-        self.retry_counters(
-            Instant::now(),
-            &mut metadata.diagnostics,
-            &mut metadata.failures,
-        );
+        self.retry_counters(Instant::now(), &mut metadata);
         if self.counters.is_empty() {
             let timestamp_unix_nano = match self.api.timestamp().and_then(positive_timestamp) {
                 Ok(timestamp) => timestamp,
