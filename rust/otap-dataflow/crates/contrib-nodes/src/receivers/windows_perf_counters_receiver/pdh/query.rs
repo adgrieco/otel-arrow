@@ -80,7 +80,7 @@ impl<A: PdhApi> Query<A> {
             last_wildcard_refresh: Instant::now(),
         };
         for config_index in 0..query.configs.len() {
-            if !query.configs[config_index].path.contains('*') {
+            if !query.configs[config_index].instance_config.is_wildcard() {
                 let path = query.configs[config_index].path.clone();
                 let key = CounterKey::new(config_index, &path);
                 let instance = if query.configs[config_index].instance_config.has_instance() {
@@ -264,7 +264,7 @@ impl<A: PdhApi> Query<A> {
             .configs
             .iter()
             .enumerate()
-            .filter(|(_, config)| config.path.contains('*'))
+            .filter(|(_, config)| config.instance_config.is_wildcard())
             .map(|(config_index, config)| (config_index, config.path.clone()))
             .collect::<Vec<_>>();
         wildcard_paths

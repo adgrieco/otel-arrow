@@ -128,6 +128,10 @@ impl InstanceConfig {
         }
     }
 
+    pub(super) fn is_wildcard(&self) -> bool {
+        matches!(self, Self::Wildcard { .. })
+    }
+
     pub(super) fn excluded_aggregation(&self) -> Option<&str> {
         match self {
             Self::Wildcard {
