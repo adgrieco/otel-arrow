@@ -410,6 +410,58 @@ mod tests {
         assert!(display.contains("By"));
     }
 
+    /// Scenario: An implicit path metric uses a configured instance index with leading zeros.
+    /// Guarantees: OTAP uses the configured metric name while retaining the canonical native path attribute.
+    #[test]
+    fn projects_configured_instance_spelling_for_path_metric() {
+        let configured_name = r"\Process(app#001)\Private Bytes";
+        let native_path = r"\Process(app#1)\Private Bytes";
+        let config = Config::from_json(&serde_json::json!({
+            "metrics": {
+                configured_name: {
+                    "description": "Configured process memory.",
+                    "unit": "By",
+                    "gauge": {}
+                }
+            },
+            "perfcounters": [{
+                "object": "Process",
+                "instances": "app#001",
+                "counters": [{"name": "Private Bytes"}]
+            }]
+        }))
+        .unwrap();
+        let records = into_otap(
+            &config.counters,
+            Sample {
+                timestamp_unix_nano: 1,
+                points: vec![point(
+                    0,
+                    native_path,
+                    SampleValue::Value(Number::Integer(42)),
+                )],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let metrics = records.get(ArrowPayloadType::UnivariateMetrics).unwrap();
+        let display = arrow::util::pretty::pretty_format_batches(std::slice::from_ref(metrics))
+            .unwrap()
+            .to_string();
+        assert!(display.contains(configured_name));
+        assert!(display.contains("Configured process memory."));
+        assert!(display.contains("By"));
+        assert!(
+            string_attributes(&records)
+                .iter()
+                .any(|(_, key, value)| key == "windows.perf_counter.path" && value == native_path)
+        );
+    }
+
     /// Scenario: Multiple configured readings include an integer beyond f64's exact range.
     /// Guarantees: Gauge order, metadata, paths, timestamps, and exact i64 values are retained.
     #[test]
