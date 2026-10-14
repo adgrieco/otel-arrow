@@ -4,12 +4,10 @@
 //! Bounded worker-thread query ownership, recovery, recreation, and command lifecycle.
 
 use super::super::config::CounterConfig;
-use super::super::model::{Sample, SampleDiagnostics, SampleFailure};
+use super::super::model::{Sample, SampleDiagnostics, SampleFailure, merge_sample_metadata};
 use super::PdhApi;
 use super::error::Error;
-use super::query::{
-    PendingMetadata, Query, merge_sample_metadata, retry_delay, should_rebuild_query,
-};
+use super::query::{PendingMetadata, Query, retry_delay};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -17,6 +15,186 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const QUERY_REBUILD_AFTER_FAILURES: u32 = 3;
+
+pub(super) fn should_rebuild_query(consecutive_failures: u32) -> bool {
+    consecutive_failures >= QUERY_REBUILD_AFTER_FAILURES
+}
+
+/// Capacity-one command client for the thread that owns the persistent query.
+pub(in super::super) struct Worker {
+    pub(super) tx: mpsc::SyncSender<Command>,
+    pub(super) accepted: Arc<AtomicBool>,
+    pub(super) shutdown_requested: Arc<AtomicBool>,
+    pub(super) join: Option<JoinHandle<()>>,
+    pub(super) completion: Option<oneshot::Receiver<()>>,
+}
+
+impl Worker {
+    pub(in super::super) async fn start(
+        counters: Vec<CounterConfig>,
+        wildcard_refresh_interval: Duration,
+        max_instances_per_wildcard: usize,
+        max_expanded_counters: usize,
+        node: String,
+    ) -> Result<Self, Error> {
+        let settings = QuerySettings {
+            wildcard_refresh_interval,
+            max_instances_per_wildcard,
+            node,
+        };
+        Self::start_with(
+            counters,
+            wildcard_refresh_interval,
+            max_expanded_counters,
+            move |counters, query_limit| settings.open(counters, query_limit),
+        )
+        .await
+    }
+
+    pub(super) async fn start_with<A, F>(
+        counters: Vec<CounterConfig>,
+        query_retry_cap: Duration,
+        max_expanded_counters: usize,
+        mut open: F,
+    ) -> Result<Self, Error>
+    where
+        A: PdhApi + 'static,
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error> + Send + 'static,
+    {
+        let plans = query_plans(counters);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (init_tx, init_rx) = oneshot::channel();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let worker_accepted = Arc::clone(&accepted);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown_requested);
+        let join = std::thread::Builder::new()
+            .name("windowsperfcounters-pdh".to_owned())
+            .spawn(move || {
+                {
+                    let mut queries = Vec::with_capacity(plans.len());
+                    for plan in plans {
+                        let active_expanded = queries
+                            .iter()
+                            .map(QuerySlot::active_expanded_count)
+                            .sum::<usize>();
+                        let query_limit = max_expanded_counters.saturating_sub(active_expanded);
+                        match QuerySlot::open_initial(plan, query_limit, &mut open) {
+                            Ok(query) => queries.push(query),
+                            Err(error) => {
+                                let _ = init_tx.send(Err(error));
+                                return;
+                            }
+                        }
+                    }
+                    if init_tx.send(Ok(())).is_err() {
+                        return;
+                    }
+                    while !worker_shutdown.load(Ordering::Acquire) {
+                        match rx.recv() {
+                            Ok(Command::Collect(response)) => {
+                                let accepted =
+                                    AcceptedCollectGuard::new(Arc::clone(&worker_accepted));
+                                let result = collect_queries(
+                                    &mut queries,
+                                    query_retry_cap,
+                                    max_expanded_counters,
+                                    &mut open,
+                                );
+                                drop(accepted);
+                                let _ = response.send(result);
+                            }
+                            Ok(Command::Shutdown) | Err(_) => break,
+                        }
+                    }
+                }
+                let _ = completion_tx.send(());
+            })
+            .map_err(|err| Error::WorkerStart(err.to_string()))?;
+
+        match tokio::time::timeout(INIT_TIMEOUT, init_rx).await {
+            Ok(Ok(Ok(()))) => Ok(Self {
+                tx,
+                accepted,
+                shutdown_requested,
+                join: Some(join),
+                completion: Some(completion_rx),
+            }),
+            Ok(Ok(Err(error))) => {
+                let _ = join.join();
+                Err(error)
+            }
+            Err(_) => {
+                shutdown_requested.store(true, Ordering::Release);
+                drop(join);
+                Err(Error::WorkerInitTimeout)
+            }
+            Ok(Err(_)) => {
+                let _ = join.join();
+                Err(Error::WorkerInitStopped)
+            }
+        }
+    }
+
+    pub(in super::super) async fn collect(&self) -> Result<Sample, Error> {
+        if self
+            .accepted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(Error::WorkerBusy);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        match self.tx.try_send(Command::Collect(response_tx)) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.accepted.store(false, Ordering::Release);
+                return Err(Error::WorkerBusy);
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.accepted.store(false, Ordering::Release);
+                return Err(Error::WorkerStopped);
+            }
+        }
+        response_rx.await.map_err(|_| Error::WorkerStopped)?
+    }
+
+    /// Request shutdown and return `false` if the worker outlives the deadline.
+    pub(in super::super) async fn shutdown(&mut self, deadline: Instant) -> Result<bool, Error> {
+        self.shutdown_requested.store(true, Ordering::Release);
+        match self.tx.try_send(Command::Shutdown) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+            Err(mpsc::TrySendError::Disconnected(_)) => {}
+        }
+        let Some(join) = self.join.take() else {
+            return Ok(true);
+        };
+        let Some(completion) = self.completion.as_mut() else {
+            self.join = Some(join);
+            return Err(Error::WorkerStopped);
+        };
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), completion).await {
+            Ok(_) => {
+                self.completion = None;
+                join.join().map_err(|_| Error::WorkerPanicked)?;
+                Ok(true)
+            }
+            Err(_) => {
+                self.join = Some(join);
+                Ok(false)
+            }
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        let _ = self.tx.try_send(Command::Shutdown);
+    }
+}
 
 pub(super) enum Command {
     Collect(oneshot::Sender<Result<Sample, Error>>),
@@ -438,179 +616,4 @@ where
         .failures
         .sort_by_key(|failure| (failure.counter_index, failure.reason));
     Ok(sample)
-}
-
-/// Capacity-one command client for the thread that owns the persistent query.
-pub(in super::super) struct Worker {
-    pub(super) tx: mpsc::SyncSender<Command>,
-    pub(super) accepted: Arc<AtomicBool>,
-    pub(super) shutdown_requested: Arc<AtomicBool>,
-    pub(super) join: Option<JoinHandle<()>>,
-    pub(super) completion: Option<oneshot::Receiver<()>>,
-}
-
-impl Worker {
-    pub(in super::super) async fn start(
-        counters: Vec<CounterConfig>,
-        wildcard_refresh_interval: Duration,
-        max_instances_per_wildcard: usize,
-        max_expanded_counters: usize,
-        node: String,
-    ) -> Result<Self, Error> {
-        let settings = QuerySettings {
-            wildcard_refresh_interval,
-            max_instances_per_wildcard,
-            node,
-        };
-        Self::start_with(
-            counters,
-            wildcard_refresh_interval,
-            max_expanded_counters,
-            move |counters, query_limit| settings.open(counters, query_limit),
-        )
-        .await
-    }
-
-    pub(super) async fn start_with<A, F>(
-        counters: Vec<CounterConfig>,
-        query_retry_cap: Duration,
-        max_expanded_counters: usize,
-        mut open: F,
-    ) -> Result<Self, Error>
-    where
-        A: PdhApi + 'static,
-        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error> + Send + 'static,
-    {
-        let plans = query_plans(counters);
-        let (tx, rx) = mpsc::sync_channel(1);
-        let (init_tx, init_rx) = oneshot::channel();
-        let (completion_tx, completion_rx) = oneshot::channel();
-        let accepted = Arc::new(AtomicBool::new(false));
-        let worker_accepted = Arc::clone(&accepted);
-        let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let worker_shutdown = Arc::clone(&shutdown_requested);
-        let join = std::thread::Builder::new()
-            .name("windowsperfcounters-pdh".to_owned())
-            .spawn(move || {
-                {
-                    let mut queries = Vec::with_capacity(plans.len());
-                    for plan in plans {
-                        let active_expanded = queries
-                            .iter()
-                            .map(QuerySlot::active_expanded_count)
-                            .sum::<usize>();
-                        let query_limit = max_expanded_counters.saturating_sub(active_expanded);
-                        match QuerySlot::open_initial(plan, query_limit, &mut open) {
-                            Ok(query) => queries.push(query),
-                            Err(error) => {
-                                let _ = init_tx.send(Err(error));
-                                return;
-                            }
-                        }
-                    }
-                    if init_tx.send(Ok(())).is_err() {
-                        return;
-                    }
-                    while !worker_shutdown.load(Ordering::Acquire) {
-                        match rx.recv() {
-                            Ok(Command::Collect(response)) => {
-                                let accepted =
-                                    AcceptedCollectGuard::new(Arc::clone(&worker_accepted));
-                                let result = collect_queries(
-                                    &mut queries,
-                                    query_retry_cap,
-                                    max_expanded_counters,
-                                    &mut open,
-                                );
-                                drop(accepted);
-                                let _ = response.send(result);
-                            }
-                            Ok(Command::Shutdown) | Err(_) => break,
-                        }
-                    }
-                }
-                let _ = completion_tx.send(());
-            })
-            .map_err(|err| Error::WorkerStart(err.to_string()))?;
-
-        match tokio::time::timeout(INIT_TIMEOUT, init_rx).await {
-            Ok(Ok(Ok(()))) => Ok(Self {
-                tx,
-                accepted,
-                shutdown_requested,
-                join: Some(join),
-                completion: Some(completion_rx),
-            }),
-            Ok(Ok(Err(error))) => {
-                let _ = join.join();
-                Err(error)
-            }
-            Err(_) => {
-                shutdown_requested.store(true, Ordering::Release);
-                drop(join);
-                Err(Error::WorkerInitTimeout)
-            }
-            Ok(Err(_)) => {
-                let _ = join.join();
-                Err(Error::WorkerInitStopped)
-            }
-        }
-    }
-
-    pub(in super::super) async fn collect(&self) -> Result<Sample, Error> {
-        if self
-            .accepted
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(Error::WorkerBusy);
-        }
-        let (response_tx, response_rx) = oneshot::channel();
-        match self.tx.try_send(Command::Collect(response_tx)) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                self.accepted.store(false, Ordering::Release);
-                return Err(Error::WorkerBusy);
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                self.accepted.store(false, Ordering::Release);
-                return Err(Error::WorkerStopped);
-            }
-        }
-        response_rx.await.map_err(|_| Error::WorkerStopped)?
-    }
-
-    /// Request shutdown and return `false` if the worker outlives the deadline.
-    pub(in super::super) async fn shutdown(&mut self, deadline: Instant) -> Result<bool, Error> {
-        self.shutdown_requested.store(true, Ordering::Release);
-        match self.tx.try_send(Command::Shutdown) {
-            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-            Err(mpsc::TrySendError::Disconnected(_)) => {}
-        }
-        let Some(join) = self.join.take() else {
-            return Ok(true);
-        };
-        let Some(completion) = self.completion.as_mut() else {
-            self.join = Some(join);
-            return Err(Error::WorkerStopped);
-        };
-        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), completion).await {
-            Ok(_) => {
-                self.completion = None;
-                join.join().map_err(|_| Error::WorkerPanicked)?;
-                Ok(true)
-            }
-            Err(_) => {
-                self.join = Some(join);
-                Ok(false)
-            }
-        }
-    }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        self.shutdown_requested.store(true, Ordering::Release);
-        let _ = self.tx.try_send(Command::Shutdown);
-    }
 }

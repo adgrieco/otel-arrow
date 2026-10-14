@@ -1,7 +1,9 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Persistent synchronous PDH worker. Windows handles never leave its thread.
+//! Native PDH access, query-owned sampling state, discovery, and worker-thread lifecycle.
+//!
+//! Windows handles remain on the synchronous worker thread that owns them.
 
 use super::model::{InstanceIdentity, Number};
 mod counter_type;

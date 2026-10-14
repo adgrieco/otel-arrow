@@ -4,7 +4,7 @@
 use super::super::config::{Aggregation, CounterConfig, MetricKind};
 use super::super::model::{
     ExpansionOverflow, InstanceIdentity, Number, Sample, SampleDiagnostics, SampleFailure,
-    SampleValue, scale_integer,
+    SampleValue, merge_diagnostics, merge_sample_metadata, scale_integer,
 };
 use super::super::{config::Config, otap_builder::into_otap};
 use super::counter_type::*;

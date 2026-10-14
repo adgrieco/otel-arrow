@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::model::ScaleError;
+use super::super::model::{SampleFailure, ScaleError};
 use super::counter_type::UnsupportedNativeType;
 
 #[derive(Debug, thiserror::Error)]
@@ -127,9 +127,7 @@ impl Error {
             other => other.to_string(),
         }
     }
-}
 
-impl Error {
     pub(super) fn is_permanent_counter_error(&self) -> bool {
         matches!(
             self,
@@ -140,5 +138,14 @@ impl Error {
                     ..
                 }
         )
+    }
+}
+
+pub(super) fn sample_failure(counter_index: usize, error: &Error) -> SampleFailure {
+    SampleFailure {
+        counter_index,
+        reason: error.reason(),
+        error: error.bounded_detail(),
+        diagnostic_only: false,
     }
 }

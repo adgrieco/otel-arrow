@@ -6,10 +6,11 @@
 use super::super::config::{Aggregation, CounterConfig, MetricKind};
 use super::super::model::{
     ExpansionOverflow, InstanceIdentity, Number, Sample, SampleDiagnostics, SampleFailure,
-    SamplePoint, SampleValue, scale_double, scale_integer,
+    SamplePoint, SampleValue, merge_diagnostics, merge_sample_metadata, scale_double,
+    scale_integer,
 };
-use super::counter_type::{CounterKind, classify_native_type};
-use super::error::Error;
+use super::counter_type::{CounterKind, classify_native_type, validate_metric_mapping};
+use super::error::{Error, sample_failure};
 use super::expansion::{
     CounterKey, cleanup_aggregation_instances, expansion_allocation, instance_groups,
     limit_expanded_paths, refresh_changes_with_group_resets,
@@ -23,398 +24,6 @@ use super::{PdhApi, ValueFormat};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Performance::PDH_MAX_COUNTER_PATH;
-
-pub(super) const QUERY_REBUILD_AFTER_FAILURES: u32 = 3;
-
-fn setup_error_with_cleanup<A: PdhApi>(
-    api: &mut A,
-    counter: &A::Counter,
-    path: &str,
-    error: Error,
-) -> Error {
-    let permanent = error.is_permanent_counter_error();
-    match api.remove(counter, path) {
-        Ok(()) => error,
-        Err(cleanup) => Error::CounterSetup {
-            path: path.to_owned(),
-            message: format!("{error}; {cleanup}"),
-            permanent,
-        },
-    }
-}
-
-fn validate_positive_base(path: &str, base: i64) -> Result<(), Error> {
-    if base > 0 {
-        Ok(())
-    } else {
-        Err(Error::Calculation {
-            path: path.to_owned(),
-            message: format!("base denominator must be positive, got {base}"),
-        })
-    }
-}
-
-fn validate_positive_multi_base(path: &str, base: u32) -> Result<(), Error> {
-    if base > 0 {
-        Ok(())
-    } else {
-        Err(Error::Calculation {
-            path: path.to_owned(),
-            message: "multi-counter base denominator must be positive, got 0".to_owned(),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ExactAddFailureDisposition {
-    Diagnostic,
-    Retry,
-}
-
-pub(super) fn exact_add_failure_disposition(error: &Error) -> ExactAddFailureDisposition {
-    if error.is_permanent_counter_error() {
-        ExactAddFailureDisposition::Diagnostic
-    } else {
-        ExactAddFailureDisposition::Retry
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct CounterTarget {
-    pub(super) config_index: usize,
-    pub(super) path: String,
-    pub(super) localized: bool,
-    pub(super) instance: Option<InstanceIdentity>,
-    pub(super) emit_instance_attribute: bool,
-}
-
-#[derive(Clone)]
-pub(super) struct RetryState {
-    target: CounterTarget,
-    pub(super) attempts: u32,
-    pub(super) next_attempt: Instant,
-}
-
-pub(super) fn retry_delay(attempts: u32, cap: Duration) -> Duration {
-    let exponent = attempts.saturating_sub(1).min(20);
-    Duration::from_secs(1_u64 << exponent).min(cap)
-}
-
-pub(super) fn should_rebuild_query(consecutive_failures: u32) -> bool {
-    consecutive_failures >= QUERY_REBUILD_AFTER_FAILURES
-}
-
-pub(super) fn schedule_retry_state(
-    states: &mut BTreeMap<CounterKey, RetryState>,
-    key: CounterKey,
-    target: CounterTarget,
-    now: Instant,
-    cap: Duration,
-) {
-    let attempts = states
-        .get(&key)
-        .map_or(1, |state| state.attempts.saturating_add(1));
-    let _ = states.insert(
-        key,
-        RetryState {
-            target,
-            attempts,
-            next_attempt: now + retry_delay(attempts, cap),
-        },
-    );
-}
-
-pub(super) fn sample_failure(counter_index: usize, error: &Error) -> SampleFailure {
-    SampleFailure {
-        counter_index,
-        reason: error.reason(),
-        error: error.bounded_detail(),
-        diagnostic_only: false,
-    }
-}
-
-pub(super) fn validate_metric_mapping(
-    path: &str,
-    metric_kind: MetricKind,
-    counter_kind: CounterKind,
-) -> Result<(), Error> {
-    match metric_kind {
-        MetricKind::Sum {
-            aggregation: Aggregation::Delta,
-            ..
-        } if counter_kind != CounterKind::Delta => {
-            return Err(Error::InvalidMetricMapping {
-                path: path.to_owned(),
-                message: "delta Sum requires a native delta-count counter type \
-                          (PERF_COUNTER_DELTA / LARGE_DELTA)"
-                    .to_owned(),
-            });
-        }
-        MetricKind::Sum {
-            aggregation: Aggregation::Cumulative,
-            monotonic: true,
-        } if counter_kind != CounterKind::Direct => {
-            return Err(Error::InvalidMetricMapping {
-                path: path.to_owned(),
-                message: "monotonic Sum requires a direct raw-count counter type \
-                          (PERF_COUNTER_RAWCOUNT / LARGE_RAWCOUNT)"
-                    .to_owned(),
-            });
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-pub(super) fn merge_diagnostics(target: &mut SampleDiagnostics, delta: SampleDiagnostics) {
-    target.discovery_refreshes += delta.discovery_refreshes;
-    target.discovery_failures += delta.discovery_failures;
-    target.instances_added += delta.instances_added;
-    target.instances_removed += delta.instances_removed;
-    target.instances_omitted_over_limit += delta.instances_omitted_over_limit;
-    target.counter_add_failures += delta.counter_add_failures;
-    target.counter_read_failures += delta.counter_read_failures;
-    target.scrape_failures += delta.scrape_failures;
-    target.retry_attempts += delta.retry_attempts;
-    target.retry_recoveries += delta.retry_recoveries;
-    target.query_rebuild_attempts += delta.query_rebuild_attempts;
-    target.query_rebuild_recoveries += delta.query_rebuild_recoveries;
-    target.query_recreation_attempts += delta.query_recreation_attempts;
-    target.query_recreation_failures += delta.query_recreation_failures;
-    target.warmup_omissions += delta.warmup_omissions;
-}
-
-pub(super) fn merge_sample_metadata(
-    target_diagnostics: &mut SampleDiagnostics,
-    target_failures: &mut Vec<SampleFailure>,
-    target_overflows: &mut Vec<ExpansionOverflow>,
-    diagnostics: SampleDiagnostics,
-    failures: Vec<SampleFailure>,
-    overflows: Vec<ExpansionOverflow>,
-) {
-    merge_diagnostics(target_diagnostics, diagnostics);
-    for failure in failures {
-        if let Some(existing) = target_failures.iter_mut().find(|existing| {
-            existing.counter_index == failure.counter_index && existing.reason == failure.reason
-        }) {
-            *existing = failure;
-        } else {
-            target_failures.push(failure);
-        }
-    }
-    for overflow in overflows {
-        if let Some(existing) = target_overflows.iter_mut().find(|existing| {
-            existing.counter_index == overflow.counter_index && existing.reason == overflow.reason
-        }) {
-            *existing = overflow;
-        } else {
-            target_overflows.push(overflow);
-        }
-    }
-}
-
-#[derive(Default)]
-pub(super) struct PendingMetadata {
-    pub(super) diagnostics: SampleDiagnostics,
-    pub(super) failures: Vec<SampleFailure>,
-    pub(super) overflows: Vec<ExpansionOverflow>,
-}
-
-impl PendingMetadata {
-    fn merge(
-        &mut self,
-        diagnostics: SampleDiagnostics,
-        failures: Vec<SampleFailure>,
-        overflows: Vec<ExpansionOverflow>,
-    ) {
-        merge_sample_metadata(
-            &mut self.diagnostics,
-            &mut self.failures,
-            &mut self.overflows,
-            diagnostics,
-            failures,
-            overflows,
-        );
-    }
-
-    pub(super) fn merge_into_sample(&mut self, sample: &mut Sample) {
-        let mut pending = std::mem::take(self);
-        merge_diagnostics(&mut sample.diagnostics, pending.diagnostics);
-        pending.failures.append(&mut sample.failures);
-        sample.failures = pending.failures;
-        pending.overflows.append(&mut sample.overflows);
-        sample.overflows = pending.overflows;
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct CounterHistory {
-    previous_base: Option<i64>,
-    monotonic_sequence: MonotonicSequence,
-    delta_baseline_unix_nano: Option<i64>,
-}
-
-impl CounterHistory {
-    fn restart_pdh_sampling(&mut self) {
-        self.previous_base = None;
-        self.delta_baseline_unix_nano = None;
-    }
-}
-
-pub(super) fn restart_query_pdh_sampling<'a>(
-    histories: impl Iterator<Item = &'a mut CounterHistory>,
-) {
-    for history in histories {
-        history.restart_pdh_sampling();
-    }
-}
-
-pub(super) struct CounterHandle<C> {
-    config_index: usize,
-    path: String,
-    handle: C,
-    kind: CounterKind,
-    scale_power10: i32,
-    history: CounterHistory,
-    wildcard: bool,
-    instance: Option<InstanceIdentity>,
-    emit_instance_attribute: bool,
-}
-
-impl<C> CounterHandle<C> {
-    fn reset_readiness(&mut self) {
-        self.history.restart_pdh_sampling();
-    }
-
-    fn read(
-        &mut self,
-        api: &mut impl PdhApi<Counter = C>,
-        metric_kind: MetricKind,
-        timestamp_unix_nano: i64,
-    ) -> Result<(SampleValue, Option<i64>), Error> {
-        if !matches!(
-            self.kind,
-            CounterKind::Direct | CounterKind::FormattedSingleSample
-        ) {
-            let raw = match api.raw(&self.handle, &self.path) {
-                Ok(Some(raw)) => raw,
-                Ok(None) => {
-                    self.reset_readiness();
-                    return Ok((SampleValue::NoObservation, None));
-                }
-                Err(error) => {
-                    self.reset_readiness();
-                    return Err(error);
-                }
-            };
-            if self.kind == CounterKind::RawFraction {
-                validate_positive_base(&self.path, raw.second_value)?;
-            } else {
-                let previous = self.history.previous_base.replace(raw.second_value);
-                if self.kind == CounterKind::CalculatedTwoSampleWithMultiBase
-                    && let Err(error) = validate_positive_multi_base(&self.path, raw.multi_count)
-                {
-                    return Err(error);
-                }
-                let Some(previous) = previous else {
-                    if self.kind == CounterKind::Delta {
-                        self.history.delta_baseline_unix_nano = Some(timestamp_unix_nano);
-                    }
-                    return Ok((SampleValue::Warming, None));
-                };
-                if self.kind == CounterKind::CalculatedTwoSampleWithBase {
-                    match raw.second_value.cmp(&previous) {
-                        std::cmp::Ordering::Less => {
-                            self.reset_readiness();
-                            return Ok((SampleValue::NoObservation, None));
-                        }
-                        std::cmp::Ordering::Equal => {
-                            return Ok((SampleValue::NoObservation, None));
-                        }
-                        std::cmp::Ordering::Greater => {}
-                    }
-                }
-            }
-        }
-
-        let format = if self.kind == CounterKind::Direct {
-            ValueFormat::Integer
-        } else {
-            ValueFormat::Double
-        };
-        let number = match api.formatted(&self.handle, &self.path, format) {
-            Ok(Some(number)) => number,
-            Ok(None) => {
-                self.reset_readiness();
-                return Ok((SampleValue::NoObservation, None));
-            }
-            Err(error) => {
-                if self.kind == CounterKind::Delta || matches!(error, Error::CounterData { .. }) {
-                    self.reset_readiness();
-                }
-                return Err(error);
-            }
-        };
-        let direct_value = match number {
-            Number::Integer(value) => Some(value),
-            Number::Double(_) => None,
-        };
-        let delta_start_time = if let MetricKind::Sum {
-            aggregation: Aggregation::Delta,
-            monotonic,
-        } = metric_kind
-        {
-            match delta_interval_start(
-                &self.path,
-                &mut self.history.delta_baseline_unix_nano,
-                number,
-                monotonic,
-                timestamp_unix_nano,
-            )? {
-                Some(start_time) => Some(start_time),
-                None => return Ok((SampleValue::NoObservation, None)),
-            }
-        } else {
-            None
-        };
-        let scaled = match number {
-            Number::Integer(value) => scale_integer(value, self.scale_power10),
-            Number::Double(value) => scale_double(value, self.scale_power10),
-        }
-        .map_err(|source| Error::Scale {
-            path: self.path.clone(),
-            source,
-        })?;
-        let point_start_time = match metric_kind {
-            MetricKind::Sum {
-                aggregation: Aggregation::Cumulative,
-                monotonic: true,
-            } => {
-                let Some(direct_value) = direct_value else {
-                    return Err(Error::InvalidSample(
-                        "monotonic Sum was not backed by a direct formatted value",
-                    ));
-                };
-                Some(monotonic_start_time(
-                    &self.path,
-                    &mut self.history.monotonic_sequence,
-                    direct_value,
-                    timestamp_unix_nano,
-                )?)
-            }
-            MetricKind::Sum {
-                aggregation: Aggregation::Delta,
-                ..
-            } => delta_start_time,
-            MetricKind::Gauge
-            | MetricKind::Sum {
-                aggregation: Aggregation::Cumulative,
-                monotonic: false,
-            } => None,
-        };
-        Ok((SampleValue::Value(scaled), point_start_time))
-    }
-}
 
 /// The query owns every added counter; closing it releases all handles.
 pub(super) struct Query<A: PdhApi = NativePdh> {
@@ -1082,5 +691,302 @@ impl<A: PdhApi> Query<A> {
             overflows,
             diagnostics,
         })
+    }
+}
+
+fn setup_error_with_cleanup<A: PdhApi>(
+    api: &mut A,
+    counter: &A::Counter,
+    path: &str,
+    error: Error,
+) -> Error {
+    let permanent = error.is_permanent_counter_error();
+    match api.remove(counter, path) {
+        Ok(()) => error,
+        Err(cleanup) => Error::CounterSetup {
+            path: path.to_owned(),
+            message: format!("{error}; {cleanup}"),
+            permanent,
+        },
+    }
+}
+
+fn validate_positive_base(path: &str, base: i64) -> Result<(), Error> {
+    if base > 0 {
+        Ok(())
+    } else {
+        Err(Error::Calculation {
+            path: path.to_owned(),
+            message: format!("base denominator must be positive, got {base}"),
+        })
+    }
+}
+
+fn validate_positive_multi_base(path: &str, base: u32) -> Result<(), Error> {
+    if base > 0 {
+        Ok(())
+    } else {
+        Err(Error::Calculation {
+            path: path.to_owned(),
+            message: "multi-counter base denominator must be positive, got 0".to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExactAddFailureDisposition {
+    Diagnostic,
+    Retry,
+}
+
+pub(super) fn exact_add_failure_disposition(error: &Error) -> ExactAddFailureDisposition {
+    if error.is_permanent_counter_error() {
+        ExactAddFailureDisposition::Diagnostic
+    } else {
+        ExactAddFailureDisposition::Retry
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct CounterTarget {
+    pub(super) config_index: usize,
+    pub(super) path: String,
+    pub(super) localized: bool,
+    pub(super) instance: Option<InstanceIdentity>,
+    pub(super) emit_instance_attribute: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct RetryState {
+    target: CounterTarget,
+    pub(super) attempts: u32,
+    pub(super) next_attempt: Instant,
+}
+
+pub(super) fn retry_delay(attempts: u32, cap: Duration) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(20);
+    Duration::from_secs(1_u64 << exponent).min(cap)
+}
+
+pub(super) fn schedule_retry_state(
+    states: &mut BTreeMap<CounterKey, RetryState>,
+    key: CounterKey,
+    target: CounterTarget,
+    now: Instant,
+    cap: Duration,
+) {
+    let attempts = states
+        .get(&key)
+        .map_or(1, |state| state.attempts.saturating_add(1));
+    let _ = states.insert(
+        key,
+        RetryState {
+            target,
+            attempts,
+            next_attempt: now + retry_delay(attempts, cap),
+        },
+    );
+}
+
+#[derive(Default)]
+pub(super) struct PendingMetadata {
+    pub(super) diagnostics: SampleDiagnostics,
+    pub(super) failures: Vec<SampleFailure>,
+    pub(super) overflows: Vec<ExpansionOverflow>,
+}
+
+impl PendingMetadata {
+    fn merge(
+        &mut self,
+        diagnostics: SampleDiagnostics,
+        failures: Vec<SampleFailure>,
+        overflows: Vec<ExpansionOverflow>,
+    ) {
+        merge_sample_metadata(
+            &mut self.diagnostics,
+            &mut self.failures,
+            &mut self.overflows,
+            diagnostics,
+            failures,
+            overflows,
+        );
+    }
+
+    pub(super) fn merge_into_sample(&mut self, sample: &mut Sample) {
+        let mut pending = std::mem::take(self);
+        merge_diagnostics(&mut sample.diagnostics, pending.diagnostics);
+        pending.failures.append(&mut sample.failures);
+        sample.failures = pending.failures;
+        pending.overflows.append(&mut sample.overflows);
+        sample.overflows = pending.overflows;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CounterHistory {
+    previous_base: Option<i64>,
+    monotonic_sequence: MonotonicSequence,
+    delta_baseline_unix_nano: Option<i64>,
+}
+
+impl CounterHistory {
+    fn restart_pdh_sampling(&mut self) {
+        self.previous_base = None;
+        self.delta_baseline_unix_nano = None;
+    }
+}
+
+pub(super) fn restart_query_pdh_sampling<'a>(
+    histories: impl Iterator<Item = &'a mut CounterHistory>,
+) {
+    for history in histories {
+        history.restart_pdh_sampling();
+    }
+}
+
+pub(super) struct CounterHandle<C> {
+    config_index: usize,
+    path: String,
+    handle: C,
+    kind: CounterKind,
+    scale_power10: i32,
+    history: CounterHistory,
+    wildcard: bool,
+    instance: Option<InstanceIdentity>,
+    emit_instance_attribute: bool,
+}
+
+impl<C> CounterHandle<C> {
+    fn reset_readiness(&mut self) {
+        self.history.restart_pdh_sampling();
+    }
+
+    fn read(
+        &mut self,
+        api: &mut impl PdhApi<Counter = C>,
+        metric_kind: MetricKind,
+        timestamp_unix_nano: i64,
+    ) -> Result<(SampleValue, Option<i64>), Error> {
+        if !matches!(
+            self.kind,
+            CounterKind::Direct | CounterKind::FormattedSingleSample
+        ) {
+            let raw = match api.raw(&self.handle, &self.path) {
+                Ok(Some(raw)) => raw,
+                Ok(None) => {
+                    self.reset_readiness();
+                    return Ok((SampleValue::NoObservation, None));
+                }
+                Err(error) => {
+                    self.reset_readiness();
+                    return Err(error);
+                }
+            };
+            if self.kind == CounterKind::RawFraction {
+                validate_positive_base(&self.path, raw.second_value)?;
+            } else {
+                let previous = self.history.previous_base.replace(raw.second_value);
+                if self.kind == CounterKind::CalculatedTwoSampleWithMultiBase
+                    && let Err(error) = validate_positive_multi_base(&self.path, raw.multi_count)
+                {
+                    return Err(error);
+                }
+                let Some(previous) = previous else {
+                    if self.kind == CounterKind::Delta {
+                        self.history.delta_baseline_unix_nano = Some(timestamp_unix_nano);
+                    }
+                    return Ok((SampleValue::Warming, None));
+                };
+                if self.kind == CounterKind::CalculatedTwoSampleWithBase {
+                    match raw.second_value.cmp(&previous) {
+                        std::cmp::Ordering::Less => {
+                            self.reset_readiness();
+                            return Ok((SampleValue::NoObservation, None));
+                        }
+                        std::cmp::Ordering::Equal => {
+                            return Ok((SampleValue::NoObservation, None));
+                        }
+                        std::cmp::Ordering::Greater => {}
+                    }
+                }
+            }
+        }
+
+        let format = if self.kind == CounterKind::Direct {
+            ValueFormat::Integer
+        } else {
+            ValueFormat::Double
+        };
+        let number = match api.formatted(&self.handle, &self.path, format) {
+            Ok(Some(number)) => number,
+            Ok(None) => {
+                self.reset_readiness();
+                return Ok((SampleValue::NoObservation, None));
+            }
+            Err(error) => {
+                if self.kind == CounterKind::Delta || matches!(error, Error::CounterData { .. }) {
+                    self.reset_readiness();
+                }
+                return Err(error);
+            }
+        };
+        let direct_value = match number {
+            Number::Integer(value) => Some(value),
+            Number::Double(_) => None,
+        };
+        let delta_start_time = if let MetricKind::Sum {
+            aggregation: Aggregation::Delta,
+            monotonic,
+        } = metric_kind
+        {
+            match delta_interval_start(
+                &self.path,
+                &mut self.history.delta_baseline_unix_nano,
+                number,
+                monotonic,
+                timestamp_unix_nano,
+            )? {
+                Some(start_time) => Some(start_time),
+                None => return Ok((SampleValue::NoObservation, None)),
+            }
+        } else {
+            None
+        };
+        let scaled = match number {
+            Number::Integer(value) => scale_integer(value, self.scale_power10),
+            Number::Double(value) => scale_double(value, self.scale_power10),
+        }
+        .map_err(|source| Error::Scale {
+            path: self.path.clone(),
+            source,
+        })?;
+        let point_start_time = match metric_kind {
+            MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: true,
+            } => {
+                let Some(direct_value) = direct_value else {
+                    return Err(Error::InvalidSample(
+                        "monotonic Sum was not backed by a direct formatted value",
+                    ));
+                };
+                Some(monotonic_start_time(
+                    &self.path,
+                    &mut self.history.monotonic_sequence,
+                    direct_value,
+                    timestamp_unix_nano,
+                )?)
+            }
+            MetricKind::Sum {
+                aggregation: Aggregation::Delta,
+                ..
+            } => delta_start_time,
+            MetricKind::Gauge
+            | MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: false,
+            } => None,
+        };
+        Ok((SampleValue::Value(scaled), point_start_time))
     }
 }

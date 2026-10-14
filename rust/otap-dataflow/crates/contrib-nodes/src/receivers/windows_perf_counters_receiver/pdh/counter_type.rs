@@ -6,6 +6,8 @@
 //! Definitions follow Windows SDK 10.0.26100.0 `winperf.h`:
 //! <https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/winperf.h>.
 
+use super::super::config::{Aggregation, MetricKind};
+use super::error::Error;
 use windows_sys::Win32::System::Performance::{
     PERF_COUNTER_ELAPSED, PERF_COUNTER_FRACTION, PERF_COUNTER_PRECISION, PERF_COUNTER_QUEUELEN,
     PERF_COUNTER_RATE, PERF_DELTA_BASE, PERF_DELTA_COUNTER, PERF_DISPLAY_NO_SUFFIX,
@@ -172,6 +174,39 @@ pub(super) fn classify_native_type(
             native_type,
         }),
     }
+}
+
+pub(super) fn validate_metric_mapping(
+    path: &str,
+    metric_kind: MetricKind,
+    counter_kind: CounterKind,
+) -> Result<(), Error> {
+    match metric_kind {
+        MetricKind::Sum {
+            aggregation: Aggregation::Delta,
+            ..
+        } if counter_kind != CounterKind::Delta => {
+            return Err(Error::InvalidMetricMapping {
+                path: path.to_owned(),
+                message: "delta Sum requires a native delta-count counter type \
+                          (PERF_COUNTER_DELTA / LARGE_DELTA)"
+                    .to_owned(),
+            });
+        }
+        MetricKind::Sum {
+            aggregation: Aggregation::Cumulative,
+            monotonic: true,
+        } if counter_kind != CounterKind::Direct => {
+            return Err(Error::InvalidMetricMapping {
+                path: path.to_owned(),
+                message: "monotonic Sum requires a direct raw-count counter type \
+                          (PERF_COUNTER_RAWCOUNT / LARGE_RAWCOUNT)"
+                    .to_owned(),
+            });
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]

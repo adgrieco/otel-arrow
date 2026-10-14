@@ -150,6 +150,53 @@ pub(super) struct Sample {
     pub(super) diagnostics: SampleDiagnostics,
 }
 
+pub(super) fn merge_diagnostics(target: &mut SampleDiagnostics, delta: SampleDiagnostics) {
+    target.discovery_refreshes += delta.discovery_refreshes;
+    target.discovery_failures += delta.discovery_failures;
+    target.instances_added += delta.instances_added;
+    target.instances_removed += delta.instances_removed;
+    target.instances_omitted_over_limit += delta.instances_omitted_over_limit;
+    target.counter_add_failures += delta.counter_add_failures;
+    target.counter_read_failures += delta.counter_read_failures;
+    target.scrape_failures += delta.scrape_failures;
+    target.retry_attempts += delta.retry_attempts;
+    target.retry_recoveries += delta.retry_recoveries;
+    target.query_rebuild_attempts += delta.query_rebuild_attempts;
+    target.query_rebuild_recoveries += delta.query_rebuild_recoveries;
+    target.query_recreation_attempts += delta.query_recreation_attempts;
+    target.query_recreation_failures += delta.query_recreation_failures;
+    target.warmup_omissions += delta.warmup_omissions;
+}
+
+pub(super) fn merge_sample_metadata(
+    target_diagnostics: &mut SampleDiagnostics,
+    target_failures: &mut Vec<SampleFailure>,
+    target_overflows: &mut Vec<ExpansionOverflow>,
+    diagnostics: SampleDiagnostics,
+    failures: Vec<SampleFailure>,
+    overflows: Vec<ExpansionOverflow>,
+) {
+    merge_diagnostics(target_diagnostics, diagnostics);
+    for failure in failures {
+        if let Some(existing) = target_failures.iter_mut().find(|existing| {
+            existing.counter_index == failure.counter_index && existing.reason == failure.reason
+        }) {
+            *existing = failure;
+        } else {
+            target_failures.push(failure);
+        }
+    }
+    for overflow in overflows {
+        if let Some(existing) = target_overflows.iter_mut().find(|existing| {
+            existing.counter_index == overflow.counter_index && existing.reason == overflow.reason
+        }) {
+            *existing = overflow;
+        } else {
+            target_overflows.push(overflow);
+        }
+    }
+}
+
 /// Scales an integer by a power of ten.
 /// Zero scale preserves the integer.
 /// Nonzero scales return a double; magnitudes above 2^53 may round during conversion.

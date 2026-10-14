@@ -37,24 +37,7 @@ pub(super) struct Config {
     pub(super) max_expanded_counters: usize,
 }
 
-fn should_warn_instance_override(
-    instances: Option<&[String]>,
-    attributes: &BTreeMap<String, String>,
-) -> bool {
-    attributes.contains_key("instance")
-        && instances.is_some_and(|instances| {
-            instances.len() > 1 || instances.iter().any(|instance| instance.contains('*'))
-        })
-}
-
 impl Config {
-    /// Effective wildcard refresh interval.
-    #[must_use]
-    pub(super) fn wildcard_refresh_interval(&self) -> Duration {
-        self.wildcard_refresh_interval
-            .unwrap_or(self.collection_interval)
-    }
-
     /// Parse, validate, and normalize the public configuration contract.
     pub(super) fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
         let user: UserConfig =
@@ -310,6 +293,13 @@ impl Config {
             max_expanded_counters: user.max_expanded_counters,
         })
     }
+
+    /// Effective wildcard refresh interval.
+    #[must_use]
+    pub(super) fn wildcard_refresh_interval(&self) -> Duration {
+        self.wildcard_refresh_interval
+            .unwrap_or(self.collection_interval)
+    }
 }
 
 /// One normalized counter consumed by the existing PDH worker and OTAP builder.
@@ -409,6 +399,24 @@ struct SumConfig {
     monotonic: bool,
 }
 
+impl MetricConfig {
+    fn kind(&self, name: &str) -> Result<MetricKind, Error> {
+        if self.gauge.is_some() && self.sum.is_some() {
+            return Err(invalid(format!(
+                "metrics.{name} must not contain both gauge and sum"
+            )));
+        }
+        if let Some(sum) = &self.sum {
+            Ok(MetricKind::Sum {
+                aggregation: sum.aggregation,
+                monotonic: sum.monotonic,
+            })
+        } else {
+            Ok(MetricKind::Gauge)
+        }
+    }
+}
+
 fn present_sum<'de, D>(deserializer: D) -> Result<Option<SumConfig>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -429,24 +437,6 @@ where
     Ok(Some(
         Option::<EmptyConfig>::deserialize(deserializer)?.unwrap_or_default(),
     ))
-}
-
-impl MetricConfig {
-    fn kind(&self, name: &str) -> Result<MetricKind, Error> {
-        if self.gauge.is_some() && self.sum.is_some() {
-            return Err(invalid(format!(
-                "metrics.{name} must not contain both gauge and sum"
-            )));
-        }
-        if let Some(sum) = &self.sum {
-            Ok(MetricKind::Sum {
-                aggregation: sum.aggregation,
-                monotonic: sum.monotonic,
-            })
-        } else {
-            Ok(MetricKind::Gauge)
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -598,6 +588,16 @@ fn validate_metric_name(name: &str) -> Result<&str, Error> {
     let name = name.trim();
     require_name("metric name", name)?;
     Ok(name)
+}
+
+fn should_warn_instance_override(
+    instances: Option<&[String]>,
+    attributes: &BTreeMap<String, String>,
+) -> bool {
+    attributes.contains_key("instance")
+        && instances.is_some_and(|instances| {
+            instances.len() > 1 || instances.iter().any(|instance| instance.contains('*'))
+        })
 }
 
 fn normalize_attributes(

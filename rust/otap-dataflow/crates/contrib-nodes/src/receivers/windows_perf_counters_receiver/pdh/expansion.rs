@@ -6,6 +6,7 @@ use super::error::Error;
 use super::native::NativePdh;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Parses a counter path through handle-independent native PDH path processing.
 pub(super) fn parse_instance(path: &str) -> Result<InstanceIdentity, Error> {
     NativePdh::parse_instance_path(path)
 }
