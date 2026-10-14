@@ -13,6 +13,8 @@ pub(super) const MAX_SCALE_POWER10: i32 = 18;
 const MAX_CONFIGURED_COUNTER_PATHS: usize = 256;
 const MAX_INSTANCE_LIMIT: usize = 16_384;
 const MAX_COUNTER_PATH_LEN: usize = 2_047;
+const MAX_METRIC_NAME_LEN: usize = 255;
+const MAX_METRIC_UNIT_LEN: usize = 63;
 const DEFAULT_MAX_INSTANCES_PER_WILDCARD: usize = 256;
 const DEFAULT_MAX_EXPANDED_COUNTERS: usize = 4_096;
 const DEFAULT_AGGREGATION_NAME: &str = "_Total";
@@ -55,6 +57,11 @@ impl Config {
         if user.perfcounters.is_empty() {
             return Err(invalid("perfcounters must contain at least one entry"));
         }
+        if user.metrics.len() > MAX_CONFIGURED_COUNTER_PATHS {
+            return Err(invalid(format!(
+                "metrics must contain at most {MAX_CONFIGURED_COUNTER_PATHS} entries"
+            )));
+        }
         if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_instances_per_wildcard) {
             return Err(invalid(format!(
                 "max_instances_per_wildcard must be between 1 and {MAX_INSTANCE_LIMIT}"
@@ -75,15 +82,11 @@ impl Config {
         let mut metric_identities = HashSet::new();
         for (name, metric) in &user.metrics {
             let name = validate_metric_name(name)?;
-            if !metric_identities.insert(name.to_owned()) {
+            if !metric_identities.insert(name.to_ascii_lowercase()) {
                 return Err(invalid(format!("metrics contains duplicate {name:?}")));
             }
             let description = metric.description.trim();
-            let unit = if metric.unit.trim().is_empty() {
-                "1"
-            } else {
-                metric.unit.trim()
-            };
+            let unit = validate_metric_unit(name, &metric.unit)?;
             let _ = metrics.insert(
                 name.to_owned(),
                 NormalizedMetric {
@@ -123,17 +126,18 @@ impl Config {
                     let mut unique = HashSet::new();
                     let mut normalized = Vec::with_capacity(instances.len());
                     for instance in instances {
-                        let instance = if instance.trim() == "*" {
-                            validate_path_element(&field, &instance, true)?.to_owned()
+                        let configured = validate_path_element(&field, &instance, true)?;
+                        let native = if configured == "*" {
+                            configured.to_owned()
                         } else {
-                            normalize_instance(&field, &instance, instance.contains('*'))?
+                            normalize_instance(&field, configured, configured.contains('*'))?
                         };
-                        if !unique.insert(instance.to_lowercase()) {
+                        if !unique.insert(native.to_lowercase()) {
                             return Err(invalid(format!(
-                                "{object_field}.instances contains duplicate {instance:?}"
+                                "{object_field}.instances contains duplicate {configured:?}"
                             )));
                         }
-                        normalized.push(instance);
+                        normalized.push((native, configured.to_owned()));
                     }
                     Some(normalized)
                 }
@@ -143,11 +147,15 @@ impl Config {
                 let counter_field = format!("{object_field}.counters[{counter_index}]");
                 let counter_name =
                     validate_counter_name(&format!("{counter_field}.name"), &mapping.name)?;
-                let metric_name = mapping
-                    .metric
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty());
+                let metric_name = match &mapping.metric {
+                    None => None,
+                    Some(Some(name)) => Some(name.trim()).filter(|name| !name.is_empty()),
+                    Some(None) => {
+                        return Err(invalid(format!(
+                            "{counter_field}.metric must be a string when present; null metric is invalid"
+                        )));
+                    }
+                };
                 let explicit_metric = if let Some(metric_name) = metric_name {
                     let metric = metrics.get(metric_name).ok_or_else(|| {
                         invalid(format!(
@@ -156,7 +164,13 @@ impl Config {
                         ))
                     })?;
                     let attributes = normalize_attributes(&counter_field, &mapping.attributes)?;
-                    if should_warn_instance_override(instances.as_deref(), &attributes) {
+                    let configured_instances = instances.as_deref().map(|instances| {
+                        instances
+                            .iter()
+                            .map(|(_, configured)| configured.clone())
+                            .collect::<Vec<_>>()
+                    });
+                    if should_warn_instance_override(configured_instances.as_deref(), &attributes) {
                         otel_arrow_dfe_telemetry::otel_warn!(
                             "otelcol.node.windowsperfcounters.config.instance_override",
                             message = "a static instance attribute overrides generated instance \
@@ -179,15 +193,19 @@ impl Config {
                 let paths = match &instances {
                     None => vec![(
                         format!(r"\{object_name}\{counter_name}"),
+                        format!(r"\{object_name}\{counter_name}"),
                         None,
                         false,
                         false,
                     )],
-                    Some(instances) if instances.iter().any(|instance| instance == "*") => {
+                    Some(instances)
+                        if instances.iter().any(|(_, configured)| configured == "*") =>
+                    {
                         let include_aggregation = instances
                             .iter()
-                            .any(|instance| instance == &aggregation_name);
+                            .any(|(native, _)| native == &aggregation_name);
                         vec![(
+                            format!(r"\{object_name}(*)\{counter_name}"),
                             format!(r"\{object_name}(*)\{counter_name}"),
                             (!include_aggregation).then(|| aggregation_name.clone()),
                             true,
@@ -196,20 +214,26 @@ impl Config {
                     }
                     Some(instances) => instances
                         .iter()
-                        .map(|instance| {
+                        .map(|(native, configured)| {
                             let is_exact_aggregation =
-                                !instance.contains('*') && instance == &aggregation_name;
+                                !native.contains('*') && native == &aggregation_name;
                             (
-                                format!(r"\{object_name}({instance})\{counter_name}"),
-                                instance.contains('*').then(|| aggregation_name.clone()),
+                                format!(r"\{object_name}({native})\{counter_name}"),
+                                format!(r"\{object_name}({configured})\{counter_name}"),
+                                native.contains('*').then(|| aggregation_name.clone()),
                                 true,
                                 !is_exact_aggregation,
                             )
                         })
                         .collect(),
                 };
-                for (path, excluded_aggregation_instance, has_instance, emit_instance_attribute) in
-                    paths
+                for (
+                    path,
+                    configured_path,
+                    excluded_aggregation_instance,
+                    has_instance,
+                    emit_instance_attribute,
+                ) in paths
                 {
                     let (name, unit, description, metric_kind, attributes) =
                         if let Some((name, unit, description, metric_kind, attributes)) =
@@ -223,9 +247,9 @@ impl Config {
                                 Arc::clone(attributes),
                             )
                         } else {
-                            if let Some(metric) = metrics.get(&path) {
+                            if let Some(metric) = metrics.get(&configured_path) {
                                 (
-                                    path.clone(),
+                                    configured_path.clone(),
                                     metric.unit.clone(),
                                     Arc::clone(&metric.description),
                                     metric.kind,
@@ -233,7 +257,7 @@ impl Config {
                                 )
                             } else {
                                 (
-                                    path.clone(),
+                                    configured_path,
                                     "1".to_owned(),
                                     Arc::from(""),
                                     MetricKind::Gauge,
@@ -477,14 +501,22 @@ impl OneOrMany {
 #[serde(deny_unknown_fields)]
 struct CounterMapping {
     name: String,
-    #[serde(default)]
-    metric: Option<String>,
+    // Preserve presence so a null reference can identify the exact invalid mapping.
+    #[serde(default, deserialize_with = "present_metric")]
+    metric: Option<Option<String>>,
     #[serde(default)]
     recreate_query: bool,
     #[serde(default)]
     attributes: BTreeMap<String, String>,
     #[serde(default)]
     scale_power10: i32,
+}
+
+fn present_metric<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 fn default_interval() -> Duration {
@@ -587,7 +619,64 @@ fn validate_counter_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Err
 fn validate_metric_name(name: &str) -> Result<&str, Error> {
     let name = name.trim();
     require_name("metric name", name)?;
+    if let Some(path) = name.strip_prefix('\\') {
+        let field = format!("metric name {name:?}");
+        let invalid_padding = || {
+            invalid(format!(
+                "{field} segments must not have surrounding whitespace"
+            ))
+        };
+        let (object, counter) = path
+            .split_once('\\')
+            .ok_or_else(|| invalid(format!("{field} must be a full counter path")))?;
+        let object = if let Some((object, instance)) = object.split_once('(') {
+            let instance = instance
+                .strip_suffix(')')
+                .ok_or_else(|| invalid(format!("{field} must close its instance parentheses")))?;
+            if validate_path_element(&field, instance, true)? != instance {
+                return Err(invalid_padding());
+            }
+            if !instance.contains('*') {
+                let _ = normalize_instance(&field, instance, false)?;
+            }
+            object
+        } else {
+            object
+        };
+        let checked_object = validate_path_element(&field, object, false)?;
+        let checked_counter = validate_counter_name(&field, counter)?;
+        if checked_object != object || checked_counter != counter {
+            return Err(invalid_padding());
+        }
+        validate_path_length(name)?;
+        return Ok(name);
+    }
+    let mut chars = name.chars();
+    let valid = name.len() <= MAX_METRIC_NAME_LEN
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '/'));
+    if !valid {
+        return Err(invalid(format!(
+            "metric name {name:?} must start with an ASCII letter, contain only ASCII \
+             letters, digits, '_', '.', '-', or '/', and be at most {MAX_METRIC_NAME_LEN} characters"
+        )));
+    }
     Ok(name)
+}
+
+fn validate_metric_unit<'a>(name: &str, unit: &'a str) -> Result<&'a str, Error> {
+    let unit = unit.trim();
+    let field = format!("metrics.{name}.unit");
+    if unit.is_empty() {
+        return Ok("1");
+    }
+    if unit.len() > MAX_METRIC_UNIT_LEN || !unit.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+    {
+        return Err(invalid(format!(
+            "{field} must be printable ASCII and at most {MAX_METRIC_UNIT_LEN} characters"
+        )));
+    }
+    Ok(unit)
 }
 
 fn should_warn_instance_override(
@@ -659,12 +748,22 @@ struct NormalizedMetric {
     kind: MetricKind,
 }
 
-fn validate_counter(counter: &CounterConfig, index: usize) -> Result<(), Error> {
-    if counter.path.encode_utf16().count() > MAX_COUNTER_PATH_LEN {
+fn validate_path_length(path: &str) -> Result<(), Error> {
+    if path.encode_utf16().count() > MAX_COUNTER_PATH_LEN {
         return Err(invalid(format!(
-            "normalized counter {index} path must contain at most {MAX_COUNTER_PATH_LEN} UTF-16 code units"
+            "counter path {:?} must contain at most {MAX_COUNTER_PATH_LEN} UTF-16 code units",
+            path
         )));
     }
+    Ok(())
+}
+
+fn validate_counter(counter: &CounterConfig, index: usize) -> Result<(), Error> {
+    validate_path_length(&counter.path).map_err(|_| {
+        invalid(format!(
+            "normalized counter {index} path must contain at most {MAX_COUNTER_PATH_LEN} UTF-16 code units"
+        ))
+    })?;
     if !(MIN_SCALE_POWER10..=MAX_SCALE_POWER10).contains(&counter.scale_power10) {
         return Err(invalid(format!(
             "normalized counter {index} scale_power10 must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}"
@@ -931,7 +1030,7 @@ mod tests {
         let config = Config::from_json(&json!({
             "perfcounters": [{
                 "object": "Process",
-                "instances": "*",
+                "instances": "app#001",
                 "counters": [{
                     "name": "Private Bytes",
                     "attributes": {
@@ -944,8 +1043,8 @@ mod tests {
         .unwrap();
 
         let counter = &config.counters[0];
-        assert_eq!(counter.path, r"\Process(*)\Private Bytes");
-        assert_eq!(counter.name, counter.path);
+        assert_eq!(counter.path, r"\Process(app#1)\Private Bytes");
+        assert_eq!(counter.name, r"\Process(app#001)\Private Bytes");
         assert_eq!(counter.unit, "1");
         assert!(counter.description.is_empty());
         assert_eq!(counter.metric_kind, MetricKind::Gauge);
@@ -991,6 +1090,33 @@ mod tests {
         assert!(counter.attributes.is_empty());
     }
 
+    /// Scenario: Implicit exact and wildcard paths match definitions using configured spelling.
+    /// Guarantees: Metric lookup preserves configured instance indexes while native exact paths are canonical.
+    #[test]
+    fn resolves_configured_path_spelling_to_metric_definitions() {
+        let config = Config::from_json(&json!({
+            "metrics": {
+                r"\Process(app#001)\Private Bytes": {"unit": "By"},
+                r"\Process(worker*)\Working Set": {"unit": "KiBy"}
+            },
+            "perfcounters": [{
+                "object": "Process",
+                "instances": ["app#001", "worker*"],
+                "counters": [
+                    {"name": "Private Bytes"},
+                    {"name": "Working Set"}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(config.counters[0].path, r"\Process(app#1)\Private Bytes");
+        assert_eq!(config.counters[0].name, r"\Process(app#001)\Private Bytes");
+        assert_eq!(config.counters[0].unit, "By");
+        assert_eq!(config.counters[3].name, r"\Process(worker*)\Working Set");
+        assert_eq!(config.counters[3].unit, "KiBy");
+    }
+
     /// Scenario: Metric metadata fields are omitted and another definition is unused.
     /// Guarantees: Referenced metadata receives Go-compatible defaults and unused definitions are allowed.
     #[test]
@@ -1027,6 +1153,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.counters[0].name, r"\Memory\Available Bytes");
+    }
+
+    /// Scenario: A counter mapping explicitly sets its metric reference to null.
+    /// Guarantees: Null is rejected at the indexed mapping instead of selecting path fallback.
+    #[test]
+    fn rejects_null_metric_reference() {
+        assert_config_error(
+            json!({
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": null}]
+                }]
+            }),
+            "perfcounters[0].counters[0].metric must be a string when present; null metric is invalid",
+        );
     }
 
     /// Scenario: Mappings explicitly disable or enable query recreation across expanded paths.
@@ -1254,10 +1395,10 @@ mod tests {
         );
     }
 
-    /// Scenario: Metric names use PDH paths or Unicode and units exceed SDK instrument guidance.
-    /// Guarantees: OTLP stream identity accepts arbitrary non-empty names and unit strings.
+    /// Scenario: Metric names use instrument syntax or exact and wildcard PDH path syntax.
+    /// Guarantees: Valid names are retained while malformed paths and invalid instrument names fail.
     #[test]
-    fn accepts_otlp_metric_names_and_units() {
+    fn validates_metric_names() {
         let config = |name: &str, unit: &str| {
             json!({
                 "metrics": {name: {"description": "Value.", "unit": unit, "gauge": {}}},
@@ -1267,40 +1408,86 @@ mod tests {
                 }]
             })
         };
-        let long_name = format!("metric {}", "x".repeat(512));
-        let long_unit = format!("{{{}}}", "u".repeat(128));
+        let at_limit = format!("a{}", "b".repeat(MAX_METRIC_NAME_LEN - 1));
         for (name, unit) in [
             (r"\Memory\Available Bytes", "By"),
-            ("1 value", "\u{b5}s"),
-            (long_name.as_str(), long_unit.as_str()),
+            (r"\Process(app#001)\Private Bytes", "By"),
+            (r"\Process(worker*)\Private Bytes", "By"),
+            ("system.memory_usage-1/s", "By"),
+            (at_limit.as_str(), "By"),
         ] {
             let normalized = Config::from_json(&config(name, unit)).unwrap();
             assert_eq!(normalized.counters[0].name, name);
             assert_eq!(normalized.counters[0].unit, unit);
         }
-        assert_config_error(config(" ", "By"), "metric name must not be empty");
+        let too_long = format!("a{}", "b".repeat(MAX_METRIC_NAME_LEN));
+        for name in [
+            "1available",
+            "avail able",
+            "\u{e9}",
+            too_long.as_str(),
+            r"\Memory",
+            r"\Memory(*)\X\Y",
+            r"\Memory(#0)\X",
+            r"\Process( app )\X",
+        ] {
+            assert_config_error(config(name, "By"), "metric name");
+        }
     }
 
-    /// Scenario: More than 256 metric definitions are configured but only one is referenced.
-    /// Guarantees: Unused metadata definitions do not consume the configured PDH path budget.
+    /// Scenario: Metric units are blank, valid, non-ASCII, control-containing, or overlong.
+    /// Guarantees: Blank defaults to "1" and invalid OpenTelemetry unit syntax is rejected.
     #[test]
-    fn allows_metric_definitions_beyond_counter_path_limit() {
+    fn validates_metric_units() {
+        let config = |unit: &str| {
+            json!({
+                "metrics": {"test": {"unit": unit}},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "test"}]
+                }]
+            })
+        };
+        for unit in ["", " \t "] {
+            assert_eq!(
+                Config::from_json(&config(unit)).unwrap().counters[0].unit,
+                "1"
+            );
+        }
+        let at_limit = "a".repeat(MAX_METRIC_UNIT_LEN);
+        for unit in ["By", "{packets}/s", "1", at_limit.as_str()] {
+            assert_eq!(
+                Config::from_json(&config(unit)).unwrap().counters[0].unit,
+                unit
+            );
+        }
+        let too_long = "a".repeat(MAX_METRIC_UNIT_LEN + 1);
+        for unit in ["\u{b5}s", "B\ty", too_long.as_str()] {
+            assert_config_error(config(unit), "metrics.test.unit must be printable ASCII");
+        }
+    }
+
+    /// Scenario: Metric definitions exceed the bounded configuration size.
+    /// Guarantees: Unused metadata cannot bypass the definition limit.
+    #[test]
+    fn rejects_too_many_metric_definitions() {
         let metrics = (0..=MAX_CONFIGURED_COUNTER_PATHS)
             .map(|index| (format!("m{index}"), metric()))
             .collect::<serde_json::Map<_, _>>();
-        let config = Config::from_json(&json!({
-            "metrics": metrics,
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": "m0"}]
-            }]
-        }))
-        .unwrap();
-        assert_eq!(config.counters.len(), 1);
+        assert_config_error(
+            json!({
+                "metrics": metrics,
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": "Available Bytes", "metric": "m0"}]
+                }]
+            }),
+            "metrics must contain at most 256 entries",
+        );
     }
 
     /// Scenario: Normalized metric names or attribute keys collide.
-    /// Guarantees: Exact post-trim duplicates fail while case-distinct OTel stream names remain distinct.
+    /// Guarantees: Post-trim and case-folded metric identities and post-trim attribute identities fail.
     #[test]
     fn rejects_normalized_identity_collisions() {
         let definition = json!({"description": "Value.", "unit": "By", "gauge": {}});
@@ -1330,27 +1517,26 @@ mod tests {
         );
     }
 
-    /// Scenario: Metric names differ only by ASCII case and are referenced independently.
-    /// Guarantees: OTel's case-sensitive stream identity is preserved during normalization.
+    /// Scenario: Metric names differ only by ASCII case.
+    /// Guarantees: Definitions reject ambiguity even though references resolve with exact casing.
     #[test]
-    fn accepts_case_distinct_metric_names() {
-        let config = Config::from_json(&json!({
-            "metrics": {
-                "cpu": {"unit": "1"},
-                "CPU": {"unit": "%"}
-            },
-            "perfcounters": [{
-                "object": "Processor",
-                "counters": [
-                    {"name": "% Processor Time", "metric": "cpu"},
-                    {"name": "% Idle Time", "metric": "CPU"}
-                ]
-            }]
-        }))
-        .unwrap();
-
-        assert_eq!(config.counters[0].name, "cpu");
-        assert_eq!(config.counters[1].name, "CPU");
+    fn rejects_case_distinct_metric_names() {
+        assert_config_error(
+            json!({
+                "metrics": {
+                    "cpu": {"unit": "1"},
+                    "CPU": {"unit": "%"}
+                },
+                "perfcounters": [{
+                    "object": "Processor",
+                    "counters": [
+                        {"name": "% Processor Time", "metric": "cpu"},
+                        {"name": "% Idle Time", "metric": "CPU"}
+                    ]
+                }]
+            }),
+            "metrics contains duplicate",
+        );
     }
 
     /// Scenario: Instances are empty, use a partial wildcard, or combine full wildcard with explicit names.
