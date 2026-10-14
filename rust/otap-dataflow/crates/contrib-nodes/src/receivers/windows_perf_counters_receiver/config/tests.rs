@@ -747,24 +747,45 @@ fn rejects_normalized_identity_collisions() {
 }
 
 /// Scenario: Metric names differ only by ASCII case.
-/// Guarantees: Definitions reject ambiguity even though references resolve with exact casing.
+/// Guarantees: Exact references preserve both case-sensitive OTel stream identities.
 #[test]
-fn rejects_case_distinct_metric_names() {
-    assert_config_error(
-        json!({
-            "metrics": {
-                "cpu": {"unit": "1"},
-                "CPU": {"unit": "%"}
-            },
-            "perfcounters": [{
-                "object": "Processor",
-                "counters": [
-                    {"name": "% Processor Time", "metric": "cpu"},
-                    {"name": "% Idle Time", "metric": "CPU"}
-                ]
-            }]
-        }),
-        "metrics contains duplicate",
+fn accepts_case_distinct_metric_names() {
+    let config = Config::from_json(&json!({
+        "metrics": {
+            "cpu": {"unit": "1"},
+            "CPU": {"unit": "%"}
+        },
+        "perfcounters": [{
+            "object": "Processor",
+            "counters": [
+                {"name": "% Processor Time", "metric": "cpu"},
+                {"name": "% Idle Time", "metric": "CPU"}
+            ]
+        }]
+    }))
+    .unwrap();
+
+    assert_eq!(config.counters[0].name, "cpu");
+    assert_eq!(config.counters[0].unit, "1");
+    assert_eq!(config.counters[1].name, "CPU");
+    assert_eq!(config.counters[1].unit, "%");
+}
+
+/// Scenario: Ordinary and path-shaped metric definitions differ only by ASCII case.
+/// Guarantees: Only one warning candidate is produced for each path-shaped identity.
+#[test]
+fn warns_once_only_for_case_distinct_path_metric_definitions() {
+    let names = [
+        "cpu".to_owned(),
+        "CPU".to_owned(),
+        r"\Memory\Available Bytes".to_owned(),
+        r"\memory\available bytes".to_owned(),
+        r"\MEMORY\AVAILABLE BYTES".to_owned(),
+    ];
+
+    assert_eq!(
+        case_distinct_path_metric_definitions(names.iter().map(String::as_str)),
+        [(names[2].as_str(), names[3].as_str())]
     );
 }
 

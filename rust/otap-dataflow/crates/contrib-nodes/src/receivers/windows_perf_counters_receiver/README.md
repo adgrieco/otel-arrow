@@ -98,8 +98,11 @@ defaults to `false`. Empty and null Sum configurations are rejected. Metrics
 that configure both Gauge and Sum are also rejected. Gauge may use YAML
 shorthand such as `gauge:`. Metric names must be non-empty after trimming but
 are otherwise OTLP stream names rather than SDK instrument names, so names
-such as `\Memory\Available Bytes` are accepted. Units are trimmed but have no
-receiver-specific character or length restriction.
+such as `\Memory\Available Bytes` are accepted. Metric identity and lookup are
+case-sensitive, so definitions such as `cpu` and `CPU` remain distinct.
+Path-shaped definitions that differ only by case are also accepted, but emit
+one configuration warning because they are likely a typo. Units are trimmed
+but have no receiver-specific character or length restriction.
 Multiple counter mappings may reference one metric and contribute points
 distinguished by their configured attributes. Gauges have point-in-time
 semantics and no start timestamp. Cumulative monotonic Sums are limited to

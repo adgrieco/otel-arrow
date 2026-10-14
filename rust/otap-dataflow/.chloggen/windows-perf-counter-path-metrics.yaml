@@ -2,4 +2,4 @@ change_type: bug_fix
 component: pipeline
 note: "Preserve configured instance spelling in path-named Windows performance counter metrics and validate metric metadata consistently."
 issues: [4344]
-subtext: "Path-based definitions now support exact and wildcard instance paths. Null metric references, ambiguous case-only definitions, and invalid metric names or units are rejected."
+subtext: "Path-based definitions support exact and wildcard instance paths. Metric lookup stays exact and case-sensitive; case-only path definitions are accepted with a warning. Null references and invalid names or units are rejected."

@@ -633,7 +633,7 @@ fn normalize_metrics(
     let mut identities = HashSet::new();
     for (name, metric) in configured {
         let name = validate_metric_name(name)?;
-        if !identities.insert(name.to_ascii_lowercase()) {
+        if !identities.insert(name.to_owned()) {
             return Err(invalid(format!("metrics contains duplicate {name:?}")));
         }
         let _ = metrics.insert(
@@ -645,7 +645,39 @@ fn normalize_metrics(
             },
         );
     }
+    for (first, second) in case_distinct_path_metric_definitions(metrics.keys().map(String::as_str))
+    {
+        otel_arrow_dfe_telemetry::otel_warn!(
+            "otelcol.node.windowsperfcounters.config.path_metric_case_collision",
+            message = "path-shaped metric definitions differ only by case; exact lookup keeps \
+                       them distinct, but this may be a configuration typo",
+            first = first,
+            second = second
+        );
+    }
     Ok(metrics)
+}
+
+fn case_distinct_path_metric_definitions<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut first_by_identity = BTreeMap::new();
+    let mut warned = HashSet::new();
+    let mut collisions = Vec::new();
+    for name in names {
+        if !name.starts_with('\\') {
+            continue;
+        }
+        let identity = name.to_ascii_lowercase();
+        if let Some(first) = first_by_identity.get(&identity) {
+            if warned.insert(identity) {
+                collisions.push((*first, name));
+            }
+        } else {
+            let _ = first_by_identity.insert(identity, name);
+        }
+    }
+    collisions
 }
 
 fn normalize_counters(
