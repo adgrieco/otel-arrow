@@ -325,7 +325,25 @@ impl<A: PdhApi> QuerySlot<A> {
         if was_query_retry {
             self.pending.diagnostics.retry_attempts += 1;
         }
-        let mut result = if let Some(active_query) = self.query.as_mut() {
+        let mut result = self.collect_or_rebuild(now, max_expanded_counters, query_retry_cap, open);
+        self.update_recovery_state(now, query_retry_cap, was_query_retry, &result);
+        if let Ok(sample) = &mut result {
+            self.pending.merge_into_sample(sample);
+        }
+        result
+    }
+
+    fn collect_or_rebuild<F>(
+        &mut self,
+        now: Instant,
+        max_expanded_counters: usize,
+        query_retry_cap: Duration,
+        open: &mut F,
+    ) -> Result<Sample, Error>
+    where
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+    {
+        if let Some(active_query) = self.query.as_mut() {
             active_query.set_max_expanded_counters(max_expanded_counters);
             if now < self.next_query_retry {
                 Err(Error::QueryRecoveryPending {
@@ -339,43 +357,60 @@ impl<A: PdhApi> QuerySlot<A> {
                 retry_after_ms: self.next_rebuild.duration_since(now).as_millis(),
             })
         } else {
-            self.pending.diagnostics.query_rebuild_attempts += 1;
-            match open(self.plan.configs.clone(), max_expanded_counters) {
-                Ok(mut rebuilt) => {
-                    self.rebuild_attempts = 0;
-                    self.query_failure_attempts = 0;
-                    self.next_query_retry = now;
-                    match rebuilt.prime() {
-                        Ok(()) => {
-                            self.pending.diagnostics.query_rebuild_recoveries += 1;
-                            let mut sample = Sample {
-                                timestamp_unix_nano: rebuilt.previous_timestamp_unix_nano,
-                                points: Vec::new(),
-                                failures: Vec::new(),
-                                overflows: Vec::new(),
-                                diagnostics: SampleDiagnostics::default(),
-                            };
-                            rebuilt.move_pending_metadata_to(
-                                &mut sample.diagnostics,
-                                &mut sample.failures,
-                                &mut sample.overflows,
-                            );
-                            self.query = Some(rebuilt);
-                            Ok(sample)
-                        }
-                        Err(error) => {
-                            self.query = Some(rebuilt);
-                            Err(error)
-                        }
-                    }
-                }
-                Err(error) => {
-                    self.rebuild_attempts = self.rebuild_attempts.saturating_add(1);
-                    self.next_rebuild = now + retry_delay(self.rebuild_attempts, query_retry_cap);
-                    Err(error)
-                }
+            self.rebuild(now, max_expanded_counters, query_retry_cap, open)
+        }
+    }
+
+    fn rebuild<F>(
+        &mut self,
+        now: Instant,
+        max_expanded_counters: usize,
+        query_retry_cap: Duration,
+        open: &mut F,
+    ) -> Result<Sample, Error>
+    where
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+    {
+        self.pending.diagnostics.query_rebuild_attempts += 1;
+        let mut rebuilt = match open(self.plan.configs.clone(), max_expanded_counters) {
+            Ok(rebuilt) => rebuilt,
+            Err(error) => {
+                self.rebuild_attempts = self.rebuild_attempts.saturating_add(1);
+                self.next_rebuild = now + retry_delay(self.rebuild_attempts, query_retry_cap);
+                return Err(error);
             }
         };
+        self.rebuild_attempts = 0;
+        self.query_failure_attempts = 0;
+        self.next_query_retry = now;
+        if let Err(error) = rebuilt.prime() {
+            self.query = Some(rebuilt);
+            return Err(error);
+        }
+        self.pending.diagnostics.query_rebuild_recoveries += 1;
+        let mut sample = Sample {
+            timestamp_unix_nano: rebuilt.previous_timestamp_unix_nano,
+            points: Vec::new(),
+            failures: Vec::new(),
+            overflows: Vec::new(),
+            diagnostics: SampleDiagnostics::default(),
+        };
+        rebuilt.move_pending_metadata_to(
+            &mut sample.diagnostics,
+            &mut sample.failures,
+            &mut sample.overflows,
+        );
+        self.query = Some(rebuilt);
+        Ok(sample)
+    }
+
+    fn update_recovery_state(
+        &mut self,
+        now: Instant,
+        query_retry_cap: Duration,
+        was_query_retry: bool,
+        result: &Result<Sample, Error>,
+    ) {
         if result
             .as_ref()
             .is_err_and(Error::is_query_collection_failure)
@@ -383,13 +418,7 @@ impl<A: PdhApi> QuerySlot<A> {
             self.query_failure_attempts = self.query_failure_attempts.saturating_add(1);
             self.next_query_retry = now + retry_delay(self.query_failure_attempts, query_retry_cap);
             if should_rebuild_query(self.query_failure_attempts) {
-                if let Some(active_query) = self.query.as_mut() {
-                    active_query.move_pending_metadata_to(
-                        &mut self.pending.diagnostics,
-                        &mut self.pending.failures,
-                        &mut self.pending.overflows,
-                    );
-                }
+                self.move_query_metadata_to_pending();
                 self.query = None;
                 self.rebuild_attempts = 0;
                 self.next_rebuild = self.next_query_retry;
@@ -398,13 +427,7 @@ impl<A: PdhApi> QuerySlot<A> {
             .as_ref()
             .is_err_and(Error::requires_immediate_query_rebuild)
         {
-            if let Some(active_query) = self.query.as_mut() {
-                active_query.move_pending_metadata_to(
-                    &mut self.pending.diagnostics,
-                    &mut self.pending.failures,
-                    &mut self.pending.overflows,
-                );
-            }
+            self.move_query_metadata_to_pending();
             self.query = None;
             self.rebuild_attempts = 0;
             self.next_rebuild = now + retry_delay(1, query_retry_cap);
@@ -415,10 +438,16 @@ impl<A: PdhApi> QuerySlot<A> {
             self.query_failure_attempts = 0;
             self.next_query_retry = now;
         }
-        if let Ok(sample) = &mut result {
-            self.pending.merge_into_sample(sample);
+    }
+
+    fn move_query_metadata_to_pending(&mut self) {
+        if let Some(active_query) = self.query.as_mut() {
+            active_query.move_pending_metadata_to(
+                &mut self.pending.diagnostics,
+                &mut self.pending.failures,
+                &mut self.pending.overflows,
+            );
         }
-        result
     }
 
     fn recreate<F>(
@@ -543,13 +572,7 @@ where
     let mut first_collection_error = None;
     let mut query_failures = Vec::new();
     for query_index in 0..queries.len() {
-        let other_active = queries
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != query_index)
-            .map(|(_, query)| query.active_expanded_count())
-            .sum::<usize>();
-        let query_limit = max_expanded_counters.saturating_sub(other_active);
+        let query_limit = query_expansion_limit(queries, query_index, max_expanded_counters);
         let query = &mut queries[query_index];
         match query.collect(now, query_retry_cap, query_limit, open) {
             Ok(sample) => {
@@ -557,16 +580,7 @@ where
                 samples.push(query.remap_sample(sample)?);
             }
             Err(error) if error.is_collection_failure() => {
-                let reason = error.reason();
-                let detail = error.bounded_detail();
-                query_failures.extend(query.plan.global_indices.iter().map(|&counter_index| {
-                    SampleFailure {
-                        counter_index,
-                        reason,
-                        error: detail.clone(),
-                        diagnostic_only: false,
-                    }
-                }));
+                append_query_failures(&mut query_failures, &query.plan, &error);
                 if first_collection_error.is_none() {
                     first_collection_error = Some(error);
                 }
@@ -593,17 +607,65 @@ where
             Vec::new(),
         );
     }
+    recreate_successful_queries(
+        queries,
+        &collection_succeeded,
+        now,
+        max_expanded_counters,
+        open,
+        &mut sample,
+    );
+    sample
+        .failures
+        .sort_by_key(|failure| (failure.counter_index, failure.reason));
+    Ok(sample)
+}
+
+fn query_expansion_limit<A: PdhApi>(
+    queries: &[QuerySlot<A>],
+    query_index: usize,
+    max_expanded_counters: usize,
+) -> usize {
+    let other_active = queries
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != query_index)
+        .map(|(_, query)| query.active_expanded_count())
+        .sum::<usize>();
+    max_expanded_counters.saturating_sub(other_active)
+}
+
+fn append_query_failures(failures: &mut Vec<SampleFailure>, plan: &QueryPlan, error: &Error) {
+    let reason = error.reason();
+    let detail = error.bounded_detail();
+    failures.extend(
+        plan.global_indices
+            .iter()
+            .map(|&counter_index| SampleFailure {
+                counter_index,
+                reason,
+                error: detail.clone(),
+                diagnostic_only: false,
+            }),
+    );
+}
+
+fn recreate_successful_queries<A, F>(
+    queries: &mut [QuerySlot<A>],
+    collection_succeeded: &[bool],
+    now: Instant,
+    max_expanded_counters: usize,
+    open: &mut F,
+    sample: &mut Sample,
+) where
+    A: PdhApi,
+    F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+{
     for query_index in 0..queries.len() {
         if !collection_succeeded[query_index] {
             continue;
         }
-        let other_active = queries
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != query_index)
-            .map(|(_, query)| query.active_expanded_count())
-            .sum::<usize>();
-        let query_limit = max_expanded_counters.saturating_sub(other_active);
+        let query_limit = query_expansion_limit(queries, query_index, max_expanded_counters);
         queries[query_index].recreate(
             now,
             query_limit,
@@ -612,8 +674,4 @@ where
             &mut sample.failures,
         );
     }
-    sample
-        .failures
-        .sort_by_key(|failure| (failure.counter_index, failure.reason));
-    Ok(sample)
 }

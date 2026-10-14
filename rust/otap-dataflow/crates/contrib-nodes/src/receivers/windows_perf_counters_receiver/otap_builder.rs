@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::config::{Aggregation, CounterConfig, MetricKind};
-#[cfg(test)]
-use super::model::SamplePoint;
-use super::model::{InstanceIdentity, Number, Sample, SampleValue};
+use super::model::{InstanceIdentity, Number, Sample, SamplePoint, SampleValue};
 use arrow::error::ArrowError;
 use otel_arrow_dfe_pdata::encode::record::attributes::StrKeysAttributesRecordBatchBuilder;
 use otel_arrow_dfe_pdata::encode::record::metrics::{
@@ -37,6 +35,242 @@ fn instance_attribute_value(instance: &InstanceIdentity) -> String {
     }
 }
 
+struct ProjectionBuilder {
+    metrics: MetricsRecordBatchBuilder,
+    points: NumberDataPointsRecordBatchBuilder,
+    attributes: StrKeysAttributesRecordBatchBuilder<u32>,
+    metric_ids: BTreeMap<String, u16>,
+}
+
+impl ProjectionBuilder {
+    fn new() -> Self {
+        Self {
+            metrics: MetricsRecordBatchBuilder::new(),
+            points: NumberDataPointsRecordBatchBuilder::new(),
+            attributes: StrKeysAttributesRecordBatchBuilder::<u32>::new(),
+            metric_ids: BTreeMap::new(),
+        }
+    }
+
+    fn append_point(
+        &mut self,
+        counters: &[CounterConfig],
+        point_id: u32,
+        point: SamplePoint,
+        value: Number,
+    ) -> Result<(), ArrowError> {
+        validate_point_timestamp(&point)?;
+        let counter = counters.get(point.counter_index).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!(
+                "sample references missing configured counter {}",
+                point.counter_index
+            ))
+        })?;
+        let start_time = point_start_time(counter, &point)?;
+        let metric_id = self.metric_id(counter)?;
+        self.points.append_id(point_id);
+        self.points.append_parent_id(metric_id);
+        self.points.append_start_time_unix_nano(start_time);
+        self.points.append_time_unix_nano(point.timestamp_unix_nano);
+        append_number(&mut self.points, &point.path, value)?;
+        self.points.append_flags(0);
+        append_attributes(&mut self.attributes, point_id, counter, &point);
+        Ok(())
+    }
+
+    fn metric_id(&mut self, counter: &CounterConfig) -> Result<u16, ArrowError> {
+        if let Some(metric_id) = self.metric_ids.get(&counter.name) {
+            return Ok(*metric_id);
+        }
+        let metric_id = u16::try_from(self.metric_ids.len()).map_err(|_| {
+            ArrowError::InvalidArgumentError("too many configured metrics".to_owned())
+        })?;
+        self.metrics.append_id(metric_id);
+        self.metrics.append_metric_type(match counter.metric_kind {
+            MetricKind::Gauge => MetricType::Gauge as u8,
+            MetricKind::Sum { .. } => MetricType::Sum as u8,
+        });
+        self.metrics.append_name(counter.name.as_bytes());
+        self.metrics
+            .append_description(counter.description.as_bytes());
+        self.metrics.append_unit(counter.unit.as_bytes());
+        match counter.metric_kind {
+            MetricKind::Gauge => {
+                self.metrics.append_aggregation_temporality(None);
+                self.metrics.append_is_monotonic(None);
+            }
+            MetricKind::Sum {
+                aggregation,
+                monotonic,
+            } => {
+                self.metrics
+                    .append_aggregation_temporality(Some(match aggregation {
+                        Aggregation::Cumulative => AGGREGATION_TEMPORALITY_CUMULATIVE,
+                        Aggregation::Delta => AGGREGATION_TEMPORALITY_DELTA,
+                    }));
+                self.metrics.append_is_monotonic(Some(monotonic));
+            }
+        }
+        let _ = self.metric_ids.insert(counter.name.clone(), metric_id);
+        Ok(metric_id)
+    }
+
+    fn finish(mut self) -> Result<OtapArrowRecords, ArrowError> {
+        let metric_count = self.metric_ids.len();
+        self.metrics.resource.append_id_n(0, metric_count);
+        self.metrics
+            .resource
+            .append_schema_url_n(None, metric_count);
+        self.metrics
+            .resource
+            .append_dropped_attributes_count_n(0, metric_count);
+        self.metrics.scope.append_id_n(0, metric_count);
+        self.metrics.scope.append_name_n(
+            Some(b"otel-arrow-dfe-contrib-nodes/windows_perf_counters"),
+            metric_count,
+        );
+        self.metrics
+            .scope
+            .append_version_n(Some(env!("CARGO_PKG_VERSION").as_bytes()), metric_count);
+        self.metrics
+            .scope
+            .append_dropped_attributes_count_n(0, metric_count);
+        self.metrics.append_scope_schema_url_n(b"", metric_count);
+
+        let mut resource = StrKeysAttributesRecordBatchBuilder::<u16>::new();
+        resource.append_parent_id(&0);
+        resource.append_key("os.type");
+        resource.any_values_builder.append_str(b"windows");
+
+        let mut records = OtapArrowRecords::Metrics(Metrics::default());
+        for (kind, batch) in [
+            (ArrowPayloadType::UnivariateMetrics, self.metrics.finish()?),
+            (ArrowPayloadType::NumberDataPoints, self.points.finish()?),
+            (ArrowPayloadType::NumberDpAttrs, self.attributes.finish()?),
+            (ArrowPayloadType::ResourceAttrs, resource.finish()?),
+        ] {
+            records
+                .set(kind, batch)
+                .map_err(|err| ArrowError::ExternalError(Box::new(err)))?;
+        }
+        Ok(records)
+    }
+}
+
+fn validate_point_timestamp(point: &SamplePoint) -> Result<(), ArrowError> {
+    if point.timestamp_unix_nano <= 0 {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "counter {} has non-positive timestamp {}",
+            point.path, point.timestamp_unix_nano
+        )));
+    }
+    Ok(())
+}
+
+fn point_start_time(
+    counter: &CounterConfig,
+    point: &SamplePoint,
+) -> Result<Option<i64>, ArrowError> {
+    let start_time = match counter.metric_kind {
+        MetricKind::Gauge => None,
+        MetricKind::Sum {
+            aggregation,
+            monotonic,
+        } => Some(point.start_time_unix_nano.ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!(
+                "{} {} ({}) is missing its start time",
+                sum_kind(aggregation, monotonic),
+                counter.name,
+                point.path
+            ))
+        })?),
+    };
+    if let Some(start_time) = start_time
+        && (start_time <= 0
+            || start_time > point.timestamp_unix_nano
+            || matches!(
+                counter.metric_kind,
+                MetricKind::Sum {
+                    aggregation: Aggregation::Delta,
+                    ..
+                }
+            ) && start_time == point.timestamp_unix_nano)
+    {
+        let MetricKind::Sum {
+            aggregation,
+            monotonic,
+        } = counter.metric_kind
+        else {
+            unreachable!("Gauge points do not have start times");
+        };
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "{} {} ({}) has invalid start time {} for timestamp {}",
+            sum_kind(aggregation, monotonic),
+            counter.name,
+            point.path,
+            start_time,
+            point.timestamp_unix_nano
+        )));
+    }
+    Ok(start_time)
+}
+
+fn append_number(
+    points: &mut NumberDataPointsRecordBatchBuilder,
+    path: &str,
+    value: Number,
+) -> Result<(), ArrowError> {
+    match value {
+        Number::Integer(value) => {
+            points.append_int_value(Some(value));
+            points.append_double_value(None);
+        }
+        Number::Double(value) if value.is_finite() => {
+            points.append_int_value(None);
+            points.append_double_value(Some(value));
+        }
+        Number::Double(value) => {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "counter {path} has non-finite double value {value}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn append_attributes(
+    attributes: &mut StrKeysAttributesRecordBatchBuilder<u32>,
+    point_id: u32,
+    counter: &CounterConfig,
+    point: &SamplePoint,
+) {
+    let mut append = |key: &str, value: &str| {
+        attributes.append_parent_id(&point_id);
+        attributes.append_key(key);
+        attributes.any_values_builder.append_str(value.as_bytes());
+    };
+    for (key, value) in counter.attributes.iter() {
+        append(key, value);
+    }
+    append("windows.perf_counter.path", &point.path);
+    if point.path != counter.path {
+        append("windows.perf_counter.path_template", &counter.path);
+    }
+    if let Some(instance) = &point.instance {
+        if point.emit_instance_attribute && !counter.attributes.contains_key("instance") {
+            append("instance", &instance_attribute_value(instance));
+        }
+        append("windows.perf_counter.instance", &instance.name);
+        if let Some(parent) = &instance.parent {
+            append("windows.perf_counter.parent_instance", parent);
+        }
+        append(
+            "windows.perf_counter.instance_index",
+            &instance.index.to_string(),
+        );
+    }
+}
+
 /// Project the ready values from one scrape directly into OTAP metric streams.
 pub(super) fn into_otap(
     counters: &[CounterConfig],
@@ -48,10 +282,7 @@ pub(super) fn into_otap(
             sample.timestamp_unix_nano
         )));
     }
-    let mut metrics = MetricsRecordBatchBuilder::new();
-    let mut points = NumberDataPointsRecordBatchBuilder::new();
-    let mut attrs = StrKeysAttributesRecordBatchBuilder::<u32>::new();
-    let mut metric_ids = BTreeMap::new();
+    let mut builder = ProjectionBuilder::new();
     let ready = sample
         .points
         .into_iter()
@@ -59,195 +290,15 @@ pub(super) fn into_otap(
             SampleValue::Value(value) => Some((point, value)),
             SampleValue::Warming | SampleValue::NoObservation => None,
         });
-    let mut point_count = 0;
     for (index, (point, value)) in ready.enumerate() {
-        if point.timestamp_unix_nano <= 0 {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "counter {} has non-positive timestamp {}",
-                point.path, point.timestamp_unix_nano
-            )));
-        }
-        let counter = counters.get(point.counter_index).ok_or_else(|| {
-            ArrowError::InvalidArgumentError(format!(
-                "sample references missing configured counter {}",
-                point.counter_index
-            ))
-        })?;
-        let point_start_time = match counter.metric_kind {
-            MetricKind::Gauge => None,
-            MetricKind::Sum {
-                aggregation,
-                monotonic,
-            } => Some(point.start_time_unix_nano.ok_or_else(|| {
-                ArrowError::InvalidArgumentError(format!(
-                    "{} {} ({}) is missing its start time",
-                    sum_kind(aggregation, monotonic),
-                    counter.name,
-                    point.path
-                ))
-            })?),
-        };
-        if let Some(start_time) = point_start_time
-            && (start_time <= 0
-                || start_time > point.timestamp_unix_nano
-                || matches!(
-                    counter.metric_kind,
-                    MetricKind::Sum {
-                        aggregation: Aggregation::Delta,
-                        ..
-                    }
-                ) && start_time == point.timestamp_unix_nano)
-        {
-            let kind = match counter.metric_kind {
-                MetricKind::Sum {
-                    aggregation,
-                    monotonic,
-                } => sum_kind(aggregation, monotonic),
-                MetricKind::Gauge => unreachable!("Gauge points do not have start times"),
-            };
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "{kind} {} ({}) has invalid start time {} for timestamp {}",
-                counter.name, point.path, start_time, point.timestamp_unix_nano
-            )));
-        }
-        let metric_id = if let Some(metric_id) = metric_ids.get(&counter.name) {
-            *metric_id
-        } else {
-            let metric_id = u16::try_from(metric_ids.len()).map_err(|_| {
-                ArrowError::InvalidArgumentError("too many configured metrics".to_owned())
-            })?;
-            metrics.append_id(metric_id);
-            let metric_type = match counter.metric_kind {
-                MetricKind::Gauge => MetricType::Gauge,
-                MetricKind::Sum { .. } => MetricType::Sum,
-            };
-            metrics.append_metric_type(metric_type as u8);
-            metrics.append_name(counter.name.as_bytes());
-            metrics.append_description(counter.description.as_bytes());
-            metrics.append_unit(counter.unit.as_bytes());
-            match counter.metric_kind {
-                MetricKind::Gauge => {
-                    metrics.append_aggregation_temporality(None);
-                    metrics.append_is_monotonic(None);
-                }
-                MetricKind::Sum {
-                    aggregation,
-                    monotonic,
-                } => {
-                    let temporality = match aggregation {
-                        Aggregation::Cumulative => AGGREGATION_TEMPORALITY_CUMULATIVE,
-                        Aggregation::Delta => AGGREGATION_TEMPORALITY_DELTA,
-                    };
-                    metrics.append_aggregation_temporality(Some(temporality));
-                    metrics.append_is_monotonic(Some(monotonic));
-                }
-            }
-            let _ = metric_ids.insert(counter.name.clone(), metric_id);
-            metric_id
-        };
         let point_id = u32::try_from(index)
             .map_err(|_| ArrowError::InvalidArgumentError("too many counter values".to_owned()))?;
-
-        points.append_id(point_id);
-        points.append_parent_id(metric_id);
-        points.append_start_time_unix_nano(point_start_time);
-        points.append_time_unix_nano(point.timestamp_unix_nano);
-        match value {
-            Number::Integer(value) => {
-                points.append_int_value(Some(value));
-                points.append_double_value(None);
-            }
-            Number::Double(value) if value.is_finite() => {
-                points.append_int_value(None);
-                points.append_double_value(Some(value));
-            }
-            Number::Double(value) => {
-                return Err(ArrowError::InvalidArgumentError(format!(
-                    "counter {} has non-finite double value {value}",
-                    point.path
-                )));
-            }
-        }
-        points.append_flags(0);
-
-        for (key, value) in counter.attributes.iter() {
-            attrs.append_parent_id(&point_id);
-            attrs.append_key(key);
-            attrs.any_values_builder.append_str(value.as_bytes());
-        }
-        attrs.append_parent_id(&point_id);
-        attrs.append_key("windows.perf_counter.path");
-        attrs.any_values_builder.append_str(point.path.as_bytes());
-        if point.path != counter.path {
-            attrs.append_parent_id(&point_id);
-            attrs.append_key("windows.perf_counter.path_template");
-            attrs.any_values_builder.append_str(counter.path.as_bytes());
-        }
-        if let Some(instance) = point.instance {
-            if point.emit_instance_attribute && !counter.attributes.contains_key("instance") {
-                attrs.append_parent_id(&point_id);
-                attrs.append_key("instance");
-                attrs
-                    .any_values_builder
-                    .append_str(instance_attribute_value(&instance).as_bytes());
-            }
-            attrs.append_parent_id(&point_id);
-            attrs.append_key("windows.perf_counter.instance");
-            attrs
-                .any_values_builder
-                .append_str(instance.name.as_bytes());
-            if let Some(parent) = instance.parent {
-                attrs.append_parent_id(&point_id);
-                attrs.append_key("windows.perf_counter.parent_instance");
-                attrs.any_values_builder.append_str(parent.as_bytes());
-            }
-            attrs.append_parent_id(&point_id);
-            attrs.append_key("windows.perf_counter.instance_index");
-            attrs
-                .any_values_builder
-                .append_str(instance.index.to_string().as_bytes());
-        }
-        point_count += 1;
+        builder.append_point(counters, point_id, point, value)?;
     }
-    if point_count == 0 {
+    if builder.metric_ids.is_empty() {
         return Ok(None);
     }
-    let metric_count = metric_ids.len();
-    metrics.resource.append_id_n(0, metric_count);
-    metrics.resource.append_schema_url_n(None, metric_count);
-    metrics
-        .resource
-        .append_dropped_attributes_count_n(0, metric_count);
-    metrics.scope.append_id_n(0, metric_count);
-    metrics.scope.append_name_n(
-        Some(b"otel-arrow-dfe-contrib-nodes/windows_perf_counters"),
-        metric_count,
-    );
-    metrics
-        .scope
-        .append_version_n(Some(env!("CARGO_PKG_VERSION").as_bytes()), metric_count);
-    metrics
-        .scope
-        .append_dropped_attributes_count_n(0, metric_count);
-    metrics.append_scope_schema_url_n(b"", metric_count);
-
-    let mut resource = StrKeysAttributesRecordBatchBuilder::<u16>::new();
-    resource.append_parent_id(&0);
-    resource.append_key("os.type");
-    resource.any_values_builder.append_str(b"windows");
-
-    let mut records = OtapArrowRecords::Metrics(Metrics::default());
-    for (kind, batch) in [
-        (ArrowPayloadType::UnivariateMetrics, metrics.finish()?),
-        (ArrowPayloadType::NumberDataPoints, points.finish()?),
-        (ArrowPayloadType::NumberDpAttrs, attrs.finish()?),
-        (ArrowPayloadType::ResourceAttrs, resource.finish()?),
-    ] {
-        records
-            .set(kind, batch)
-            .map_err(|err| ArrowError::ExternalError(Box::new(err)))?;
-    }
-    Ok(Some(records))
+    Ok(Some(builder.finish()?))
 }
 
 #[cfg(test)]
