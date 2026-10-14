@@ -71,7 +71,7 @@ impl Worker {
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown_requested);
         let join = std::thread::Builder::new()
-            .name("windowsperfcounters-pdh".to_owned())
+            .name("windows-perf-counters-pdh".to_owned())
             .spawn(move || {
                 {
                     let mut queries = Vec::with_capacity(plans.len());

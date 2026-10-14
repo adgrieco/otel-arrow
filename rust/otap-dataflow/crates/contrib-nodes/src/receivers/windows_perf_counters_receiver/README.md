@@ -344,19 +344,19 @@ start time.
 From `rust\otap-dataflow`:
 
 ```powershell
-cargo run --features windows-perf-counters --bin df_engine -- -c configs\windowsperfcounters-console.yaml
+cargo run --features windows-perf-counters --bin df_engine -- -c configs\windows-perf-counters-console.yaml
 ```
 
 The basic
-[`windowsperfcounters-console.yaml`](../../../../../configs/windowsperfcounters-console.yaml)
+[`windows-perf-counters-console.yaml`](../../../../../configs/windows-perf-counters-console.yaml)
 example contains Available Bytes and total Processor utilization.
 
 The
-[`windowsperfcounters-calculations-console.yaml`](../../../../../configs/windowsperfcounters-calculations-console.yaml)
+[`windows-perf-counters-calculations-console.yaml`](../../../../../configs/windows-perf-counters-calculations-console.yaml)
 example demonstrates rates, fractions, and averages.
 
 The focused
-[`windowsperfcounters-wildcard-console.yaml`](../../../../../configs/windowsperfcounters-wildcard-console.yaml)
+[`windows-perf-counters-wildcard-console.yaml`](../../../../../configs/windows-perf-counters-wildcard-console.yaml)
 example combines an exact Memory counter with
 `\Process(*)\Private Bytes` and refreshes discovery every five seconds. It
 uses only built-in Windows performance counters and demonstrates bounded
@@ -365,7 +365,7 @@ per-process expansion without requiring a separate test executable.
 To check the configuration structure without starting collection:
 
 ```powershell
-.\df_engine.exe --validate-and-exit -c .\windowsperfcounters-calculations-console.yaml
+.\df_engine.exe --validate-and-exit -c .\windows-perf-counters-calculations-console.yaml
 ```
 
 Provider availability and native types are checked when the receiver starts,
