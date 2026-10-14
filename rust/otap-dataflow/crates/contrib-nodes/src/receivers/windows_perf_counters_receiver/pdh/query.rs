@@ -100,19 +100,14 @@ impl<A: PdhApi> Query<A> {
                     config_index,
                     path,
                     localized: false,
+                    origin: CounterOrigin::Exact,
                     instance: instance.clone(),
                     emit_instance_attribute: query.configs[config_index]
                         .instance_config
                         .emit_attribute()
                         && instance.is_some(),
                 };
-                match query.add_counter(
-                    target.config_index,
-                    target.path.clone(),
-                    target.localized,
-                    instance,
-                    target.emit_instance_attribute,
-                ) {
+                match query.add_counter(target.clone()) {
                     Ok(()) => {}
                     Err(error) => match exact_add_failure_disposition(&error) {
                         ExactAddFailureDisposition::Diagnostic => {
@@ -140,53 +135,49 @@ impl<A: PdhApi> Query<A> {
         Ok(query)
     }
 
-    fn add_counter(
-        &mut self,
-        config_index: usize,
-        path: String,
-        localized: bool,
-        instance: Option<InstanceIdentity>,
-        emit_instance_attribute: bool,
-    ) -> Result<(), Error> {
-        let counter = self.api.add(&path, localized)?;
+    fn add_counter(&mut self, target: CounterTarget) -> Result<(), Error> {
+        let counter = self.api.add(&target.path, target.localized)?;
         let kind = match self
             .api
-            .counter_type(&counter, &path)
-            .and_then(|native_type| classify_native_type(&path, native_type).map_err(Error::from))
-        {
+            .counter_type(&counter, &target.path)
+            .and_then(|native_type| {
+                classify_native_type(&target.path, native_type).map_err(Error::from)
+            }) {
             Ok(kind) => kind,
             Err(error) => {
                 return Err(setup_error_with_cleanup(
                     &mut self.api,
                     &counter,
-                    &path,
+                    &target.path,
                     error,
                 ));
             }
         };
-        if let Err(error) =
-            validate_metric_mapping(&path, self.configs[config_index].metric_kind, kind)
-        {
+        if let Err(error) = validate_metric_mapping(
+            &target.path,
+            self.configs[target.config_index].metric_kind,
+            kind,
+        ) {
             return Err(setup_error_with_cleanup(
                 &mut self.api,
                 &counter,
-                &path,
+                &target.path,
                 error,
             ));
         }
-        let key = CounterKey::new(config_index, &path);
+        let key = CounterKey::new(target.config_index, &target.path);
         let _ = self.counters.insert(
             key,
             CounterHandle {
-                config_index,
-                path,
+                config_index: target.config_index,
+                path: target.path,
                 handle: counter,
                 kind,
-                scale_power10: self.configs[config_index].scale_power10,
+                scale_power10: self.configs[target.config_index].scale_power10,
                 history: CounterHistory::default(),
-                wildcard: localized,
-                instance,
-                emit_instance_attribute,
+                origin: target.origin,
+                instance: target.instance,
+                emit_instance_attribute: target.emit_instance_attribute,
             },
         );
         Ok(())
@@ -209,13 +200,7 @@ impl<A: PdhApi> Query<A> {
         now: Instant,
         metadata: &mut PendingMetadata,
     ) -> bool {
-        match self.add_counter(
-            target.config_index,
-            target.path.clone(),
-            target.localized,
-            target.instance.clone(),
-            target.emit_instance_attribute,
-        ) {
+        match self.add_counter(target.clone()) {
             Ok(()) => {
                 if self.retry_states.remove(&key).is_some() {
                     metadata.diagnostics.retry_recoveries += 1;
@@ -298,34 +283,35 @@ impl<A: PdhApi> Query<A> {
                 .counters
                 .iter()
                 .filter_map(|(key, counter)| {
-                    (key.config_index == discovery.config_index && counter.wildcard).then(|| {
-                        counter.instance.clone().map(|instance| {
+                    (key.config_index == discovery.config_index && counter.origin.is_wildcard())
+                        .then(|| {
+                            counter.instance.clone().map(|instance| {
+                                (
+                                    key.clone(),
+                                    DesiredCounter::new(
+                                        counter.path.clone(),
+                                        instance,
+                                        counter.emit_instance_attribute,
+                                    ),
+                                )
+                            })
+                        })?
+                })
+                .chain(self.retry_states.iter().filter_map(|(key, state)| {
+                    (key.config_index == discovery.config_index
+                        && state.target.origin.is_wildcard())
+                    .then(|| {
+                        state.target.instance.clone().map(|instance| {
                             (
                                 key.clone(),
                                 DesiredCounter::new(
-                                    counter.path.clone(),
+                                    state.target.path.clone(),
                                     instance,
-                                    counter.emit_instance_attribute,
+                                    state.target.emit_instance_attribute,
                                 ),
                             )
                         })
                     })?
-                })
-                .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                    (key.config_index == discovery.config_index && state.target.localized).then(
-                        || {
-                            state.target.instance.clone().map(|instance| {
-                                (
-                                    key.clone(),
-                                    DesiredCounter::new(
-                                        state.target.path.clone(),
-                                        instance,
-                                        state.target.emit_instance_attribute,
-                                    ),
-                                )
-                            })
-                        },
-                    )?
                 }))
                 .collect::<BTreeMap<_, _>>();
             let discovered = retained.len();
@@ -423,18 +409,18 @@ impl<A: PdhApi> Query<A> {
         let live = self
             .counters
             .iter()
-            .filter_map(|(key, counter)| counter.wildcard.then_some(key.clone()))
+            .filter_map(|(key, counter)| counter.origin.is_wildcard().then_some(key.clone()))
             .collect::<BTreeSet<_>>();
         let retrying = self
             .retry_states
             .iter()
-            .filter_map(|(key, state)| state.target.localized.then_some(key.clone()))
+            .filter_map(|(key, state)| state.target.origin.is_wildcard().then_some(key.clone()))
             .collect::<BTreeSet<_>>();
         let wanted = desired.keys().cloned().collect::<BTreeSet<_>>();
         let removed_retry_instances = self
             .retry_states
             .iter()
-            .filter(|(key, state)| state.target.localized && !wanted.contains(*key))
+            .filter(|(key, state)| state.target.origin.is_wildcard() && !wanted.contains(*key))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         metadata.diagnostics.instances_removed +=
@@ -497,6 +483,7 @@ impl<A: PdhApi> Query<A> {
                 config_index: key.config_index,
                 path,
                 localized: true,
+                origin: CounterOrigin::Wildcard,
                 instance: Some(instance),
                 emit_instance_attribute,
             };
@@ -544,7 +531,7 @@ impl<A: PdhApi> Query<A> {
     pub(super) fn active_expanded_count(&self) -> usize {
         self.counters
             .values()
-            .filter(|counter| counter.wildcard)
+            .filter(|counter| counter.origin.is_wildcard())
             .count()
     }
 
@@ -746,8 +733,21 @@ struct CounterTarget {
     config_index: usize,
     path: String,
     localized: bool,
+    origin: CounterOrigin,
     instance: Option<InstanceIdentity>,
     emit_instance_attribute: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CounterOrigin {
+    Exact,
+    Wildcard,
+}
+
+impl CounterOrigin {
+    fn is_wildcard(self) -> bool {
+        matches!(self, Self::Wildcard)
+    }
 }
 
 #[derive(Clone)]
@@ -843,7 +843,7 @@ struct CounterHandle<C> {
     kind: CounterKind,
     scale_power10: i32,
     history: CounterHistory,
-    wildcard: bool,
+    origin: CounterOrigin,
     instance: Option<InstanceIdentity>,
     emit_instance_attribute: bool,
 }
@@ -1050,6 +1050,7 @@ mod tests {
             config_index: 0,
             path: r"\Process(worker)\Private Bytes".to_owned(),
             localized: true,
+            origin: CounterOrigin::Wildcard,
             instance: Some(InstanceIdentity {
                 name: "worker".to_owned(),
                 parent: None,
