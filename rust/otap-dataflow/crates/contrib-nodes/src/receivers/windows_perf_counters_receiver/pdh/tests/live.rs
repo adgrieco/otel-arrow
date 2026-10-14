@@ -267,9 +267,13 @@ async fn live_pdh_isolates_ineligible_monotonic_mapping_at_startup() {
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_collects_exact_and_wildcard_counters() {
     let _serial = TEST_PDH_LOCK.lock().await;
+    let mut wildcard = counter(r"\Process(*)\Private Bytes", "windows.process.private");
+    wildcard.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
     let counters = vec![
         counter(r"\Memory\Available Bytes", "windows.memory.available"),
-        counter(r"\Process(*)\Private Bytes", "windows.process.private"),
+        wildcard,
     ];
     let mut worker = Worker::start(
         counters,
