@@ -934,105 +934,153 @@ impl<C> CounterHandle<C> {
         metric_kind: MetricKind,
         timestamp_unix_nano: i64,
     ) -> Result<(SampleValue, Option<i64>), Error> {
-        if !matches!(
+        if let Some(value) = self.prepare_raw_sample(api, timestamp_unix_nano)? {
+            return Ok((value, None));
+        }
+
+        let Some(number) = self.read_formatted_number(api)? else {
+            return Ok((SampleValue::NoObservation, None));
+        };
+        let delta_start_time = self.delta_start_time(metric_kind, number, timestamp_unix_nano)?;
+        if matches!(
+            metric_kind,
+            MetricKind::Sum {
+                aggregation: Aggregation::Delta,
+                ..
+            }
+        ) && delta_start_time.is_none()
+        {
+            return Ok((SampleValue::NoObservation, None));
+        }
+        let scaled = self.scale_number(number)?;
+        let point_start_time =
+            self.point_start_time(metric_kind, number, delta_start_time, timestamp_unix_nano)?;
+        Ok((SampleValue::Value(scaled), point_start_time))
+    }
+
+    fn prepare_raw_sample(
+        &mut self,
+        api: &mut impl PdhApi<Counter = C>,
+        timestamp_unix_nano: i64,
+    ) -> Result<Option<SampleValue>, Error> {
+        if matches!(
             self.kind,
             CounterKind::Direct | CounterKind::FormattedSingleSample
         ) {
-            let raw = match api.raw(&self.handle, &self.path) {
-                Ok(Some(raw)) => raw,
-                Ok(None) => {
-                    self.reset_readiness();
-                    return Ok((SampleValue::NoObservation, None));
-                }
-                Err(error) => {
-                    self.reset_readiness();
-                    return Err(error);
-                }
-            };
-            if self.kind == CounterKind::RawFraction {
-                validate_positive_base(&self.path, raw.second_value)?;
-            } else {
-                let previous = self.history.previous_base.replace(raw.second_value);
-                if self.kind == CounterKind::CalculatedTwoSampleWithMultiBase
-                    && let Err(error) = validate_positive_multi_base(&self.path, raw.multi_count)
-                {
-                    return Err(error);
-                }
-                let Some(previous) = previous else {
-                    if self.kind == CounterKind::Delta {
-                        self.history.delta_baseline_unix_nano = Some(timestamp_unix_nano);
-                    }
-                    return Ok((SampleValue::Warming, None));
-                };
-                if self.kind == CounterKind::CalculatedTwoSampleWithBase {
-                    match raw.second_value.cmp(&previous) {
-                        std::cmp::Ordering::Less => {
-                            self.reset_readiness();
-                            return Ok((SampleValue::NoObservation, None));
-                        }
-                        std::cmp::Ordering::Equal => {
-                            return Ok((SampleValue::NoObservation, None));
-                        }
-                        std::cmp::Ordering::Greater => {}
-                    }
-                }
+            return Ok(None);
+        }
+        let raw = match api.raw(&self.handle, &self.path) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                self.reset_readiness();
+                return Ok(Some(SampleValue::NoObservation));
             }
+            Err(error) => {
+                self.reset_readiness();
+                return Err(error);
+            }
+        };
+        if self.kind == CounterKind::RawFraction {
+            validate_positive_base(&self.path, raw.second_value)?;
+            return Ok(None);
         }
 
+        let previous = self.history.previous_base.replace(raw.second_value);
+        if self.kind == CounterKind::CalculatedTwoSampleWithMultiBase {
+            validate_positive_multi_base(&self.path, raw.multi_count)?;
+        }
+        let Some(previous) = previous else {
+            if self.kind == CounterKind::Delta {
+                self.history.delta_baseline_unix_nano = Some(timestamp_unix_nano);
+            }
+            return Ok(Some(SampleValue::Warming));
+        };
+        if self.kind == CounterKind::CalculatedTwoSampleWithBase {
+            match raw.second_value.cmp(&previous) {
+                std::cmp::Ordering::Less => {
+                    self.reset_readiness();
+                    return Ok(Some(SampleValue::NoObservation));
+                }
+                std::cmp::Ordering::Equal => {
+                    return Ok(Some(SampleValue::NoObservation));
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_formatted_number(
+        &mut self,
+        api: &mut impl PdhApi<Counter = C>,
+    ) -> Result<Option<Number>, Error> {
         let format = if self.kind == CounterKind::Direct {
             ValueFormat::Integer
         } else {
             ValueFormat::Double
         };
-        let number = match api.formatted(&self.handle, &self.path, format) {
-            Ok(Some(number)) => number,
+        match api.formatted(&self.handle, &self.path, format) {
+            Ok(Some(number)) => Ok(Some(number)),
             Ok(None) => {
                 self.reset_readiness();
-                return Ok((SampleValue::NoObservation, None));
+                Ok(None)
             }
             Err(error) => {
                 if self.kind == CounterKind::Delta || matches!(error, Error::CounterData { .. }) {
                     self.reset_readiness();
                 }
-                return Err(error);
+                Err(error)
             }
-        };
-        let direct_value = match number {
-            Number::Integer(value) => Some(value),
-            Number::Double(_) => None,
-        };
-        let delta_start_time = if let MetricKind::Sum {
+        }
+    }
+
+    fn delta_start_time(
+        &mut self,
+        metric_kind: MetricKind,
+        number: Number,
+        timestamp_unix_nano: i64,
+    ) -> Result<Option<i64>, Error> {
+        if let MetricKind::Sum {
             aggregation: Aggregation::Delta,
             monotonic,
         } = metric_kind
         {
-            match delta_interval_start(
+            delta_interval_start(
                 &self.path,
                 &mut self.history.delta_baseline_unix_nano,
                 number,
                 monotonic,
                 timestamp_unix_nano,
-            )? {
-                Some(start_time) => Some(start_time),
-                None => return Ok((SampleValue::NoObservation, None)),
-            }
+            )
         } else {
-            None
-        };
-        let scaled = match number {
+            Ok(None)
+        }
+    }
+
+    fn scale_number(&self, number: Number) -> Result<Number, Error> {
+        match number {
             Number::Integer(value) => scale_integer(value, self.scale_power10),
             Number::Double(value) => scale_double(value, self.scale_power10),
         }
         .map_err(|source| Error::Scale {
             path: self.path.clone(),
             source,
-        })?;
-        let point_start_time = match metric_kind {
+        })
+    }
+
+    fn point_start_time(
+        &mut self,
+        metric_kind: MetricKind,
+        number: Number,
+        delta_start_time: Option<i64>,
+        timestamp_unix_nano: i64,
+    ) -> Result<Option<i64>, Error> {
+        Ok(match metric_kind {
             MetricKind::Sum {
                 aggregation: Aggregation::Cumulative,
                 monotonic: true,
             } => {
-                let Some(direct_value) = direct_value else {
+                let Number::Integer(direct_value) = number else {
                     return Err(Error::InvalidSample(
                         "monotonic Sum was not backed by a direct formatted value",
                     ));
@@ -1053,8 +1101,7 @@ impl<C> CounterHandle<C> {
                 aggregation: Aggregation::Cumulative,
                 monotonic: false,
             } => None,
-        };
-        Ok((SampleValue::Value(scaled), point_start_time))
+        })
     }
 }
 
