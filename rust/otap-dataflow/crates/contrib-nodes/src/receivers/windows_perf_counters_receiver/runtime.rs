@@ -93,14 +93,14 @@ pub static WINDOWSPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFa
             config
                 .counters
                 .iter()
-                .filter(|counter| !counter.path.contains('*'))
+                .filter(|counter| !counter.instance_config.is_wildcard())
                 .count() as u64,
         );
         metrics.health.configured_wildcard.set(
             config
                 .counters
                 .iter()
-                .filter(|counter| counter.path.contains('*'))
+                .filter(|counter| counter.instance_config.is_wildcard())
                 .count() as u64,
         );
         let receiver = WindowsPerfCountersReceiver {

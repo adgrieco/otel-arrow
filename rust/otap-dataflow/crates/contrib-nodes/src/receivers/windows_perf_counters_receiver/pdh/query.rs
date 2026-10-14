@@ -79,60 +79,54 @@ impl<A: PdhApi> Query<A> {
             max_expanded_counters,
             last_wildcard_refresh: Instant::now(),
         };
-        for config_index in 0..query.configs.len() {
-            if !query.configs[config_index].instance_config.is_wildcard() {
-                let path = query.configs[config_index].path.clone();
-                let key = CounterKey::new(config_index, &path);
-                let instance = if query.configs[config_index].instance_config.has_instance() {
-                    match query.api.parse_instance(&path) {
-                        Ok(instance) => Some(instance),
-                        Err(error) => {
-                            let mut failure = sample_failure(config_index, &error);
-                            failure.diagnostic_only = true;
-                            query.pending.failures.push(failure);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let target = CounterTarget {
-                    config_index,
-                    path,
-                    localized: false,
-                    origin: CounterOrigin::Exact,
-                    instance: instance.clone(),
-                    emit_instance_attribute: query.configs[config_index]
-                        .instance_config
-                        .emit_attribute()
-                        && instance.is_some(),
-                };
-                match query.add_counter(target.clone()) {
-                    Ok(()) => {}
-                    Err(error) => match exact_add_failure_disposition(&error) {
-                        ExactAddFailureDisposition::Diagnostic => {
-                            query.pending.diagnostics.counter_add_failures += 1;
-                            query
-                                .pending
-                                .failures
-                                .push(sample_failure(config_index, &error));
-                        }
-                        ExactAddFailureDisposition::Retry => {
-                            query.pending.diagnostics.counter_add_failures += 1;
-                            query
-                                .pending
-                                .failures
-                                .push(sample_failure(config_index, &error));
-                            query.schedule_retry(key, target, Instant::now());
-                        }
-                    },
-                }
-            }
-        }
+        query.initialize_exact_counters();
         let mut metadata = PendingMetadata::default();
         query.refresh_wildcards(&mut metadata)?;
         query.pending.merge(metadata);
         Ok(query)
+    }
+
+    fn initialize_exact_counters(&mut self) {
+        for config_index in 0..self.configs.len() {
+            if self.configs[config_index].instance_config.is_wildcard() {
+                continue;
+            }
+            let path = self.configs[config_index].path.clone();
+            let key = CounterKey::new(config_index, &path);
+            let instance = if self.configs[config_index].instance_config.has_instance() {
+                match self.api.parse_instance(&path) {
+                    Ok(instance) => Some(instance),
+                    Err(error) => {
+                        let mut failure = sample_failure(config_index, &error);
+                        failure.diagnostic_only = true;
+                        self.pending.failures.push(failure);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let target = CounterTarget {
+                config_index,
+                path,
+                localized: false,
+                origin: CounterOrigin::Exact,
+                instance: instance.clone(),
+                emit_instance_attribute: self.configs[config_index]
+                    .instance_config
+                    .emit_attribute()
+                    && instance.is_some(),
+            };
+            if let Err(error) = self.add_counter(target.clone()) {
+                self.pending.diagnostics.counter_add_failures += 1;
+                self.pending
+                    .failures
+                    .push(sample_failure(config_index, &error));
+                if exact_add_failure_disposition(&error) == ExactAddFailureDisposition::Retry {
+                    self.schedule_retry(key, target, Instant::now());
+                }
+            }
+        }
     }
 
     fn add_counter(&mut self, target: CounterTarget) -> Result<(), Error> {
@@ -397,6 +391,14 @@ impl<A: PdhApi> Query<A> {
         mut desired: DesiredCounters,
         metadata: &mut PendingMetadata,
     ) -> Result<(), Error> {
+        let changes = self.plan_wildcard_reconciliation(&desired);
+        self.discard_unwanted_wildcard_retries(&changes.wanted, metadata);
+        self.remove_wildcard_counters(&changes.removed, &changes.wanted, metadata)?;
+        self.add_wildcard_counters(&changes.added, &changes.live, &mut desired, metadata);
+        Ok(())
+    }
+
+    fn plan_wildcard_reconciliation(&self, desired: &DesiredCounters) -> WildcardReconciliation {
         let live = self
             .counters
             .iter()
@@ -408,17 +410,6 @@ impl<A: PdhApi> Query<A> {
             .filter_map(|(key, state)| state.target.origin.is_wildcard().then_some(key.clone()))
             .collect::<BTreeSet<_>>();
         let wanted = desired.keys().cloned().collect::<BTreeSet<_>>();
-        let removed_retry_instances = self
-            .retry_states
-            .iter()
-            .filter(|(key, state)| state.target.origin.is_wildcard() && !wanted.contains(*key))
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        metadata.diagnostics.instances_removed +=
-            u64::try_from(removed_retry_instances.len()).unwrap_or(u64::MAX);
-        for key in removed_retry_instances {
-            let _ = self.retry_states.remove(&key);
-        }
         let known_groups = instance_groups(
             self.counters
                 .iter()
@@ -445,9 +436,41 @@ impl<A: PdhApi> Query<A> {
             &known_groups,
             &wanted_groups,
         );
-        for key in removed {
+        WildcardReconciliation {
+            live,
+            wanted,
+            removed,
+            added,
+        }
+    }
+
+    fn discard_unwanted_wildcard_retries(
+        &mut self,
+        wanted: &BTreeSet<CounterKey>,
+        metadata: &mut PendingMetadata,
+    ) {
+        let removed_retry_instances = self
+            .retry_states
+            .iter()
+            .filter(|(key, state)| state.target.origin.is_wildcard() && !wanted.contains(*key))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        metadata.diagnostics.instances_removed +=
+            u64::try_from(removed_retry_instances.len()).unwrap_or(u64::MAX);
+        for key in removed_retry_instances {
             let _ = self.retry_states.remove(&key);
-            let counter = self.counters.remove(&key).ok_or(Error::InvalidSample(
+        }
+    }
+
+    fn remove_wildcard_counters(
+        &mut self,
+        removed: &[CounterKey],
+        wanted: &BTreeSet<CounterKey>,
+        metadata: &mut PendingMetadata,
+    ) -> Result<(), Error> {
+        for key in removed {
+            let _ = self.retry_states.remove(key);
+            let counter = self.counters.remove(key).ok_or(Error::InvalidSample(
                 "wildcard refresh lost an existing counter",
             ));
             let Ok(counter) = counter else {
@@ -455,17 +478,27 @@ impl<A: PdhApi> Query<A> {
                 continue;
             };
             self.api.remove(&counter.handle, &counter.path)?;
-            if !wanted.contains(&key) {
+            if !wanted.contains(key) {
                 metadata.diagnostics.instances_removed += 1;
             }
         }
+        Ok(())
+    }
+
+    fn add_wildcard_counters(
+        &mut self,
+        added: &[CounterKey],
+        live: &BTreeSet<CounterKey>,
+        desired: &mut DesiredCounters,
+        metadata: &mut PendingMetadata,
+    ) {
         let now = Instant::now();
         for key in added {
             let Some(DesiredCounter {
                 path,
                 instance,
                 emit_instance_attribute,
-            }) = desired.remove(&key)
+            }) = desired.remove(key)
             else {
                 metadata.diagnostics.discovery_failures += 1;
                 continue;
@@ -478,15 +511,14 @@ impl<A: PdhApi> Query<A> {
                 instance: Some(instance),
                 emit_instance_attribute,
             };
-            let was_retry = self.retry_states.contains_key(&key);
+            let was_retry = self.retry_states.contains_key(key);
             if self.try_add_target(key.clone(), target, now, metadata)
-                && !live.contains(&key)
+                && !live.contains(key)
                 && !was_retry
             {
                 metadata.diagnostics.instances_added += 1;
             }
         }
-        Ok(())
     }
 
     fn restore_pending_metadata(&mut self, metadata: PendingMetadata) {
@@ -598,6 +630,27 @@ impl<A: PdhApi> Query<A> {
                 .values_mut()
                 .map(|counter| &mut counter.history.monotonic_sequence),
         );
+        let points = self.collect_points(
+            has_data,
+            start_time_unix_nano,
+            timestamp_unix_nano,
+            &mut metadata,
+        );
+        metadata.diagnostics.active_expanded_counters = self.active_expanded_count();
+        Ok(Sample {
+            timestamp_unix_nano,
+            points,
+            metadata,
+        })
+    }
+
+    fn collect_points(
+        &mut self,
+        has_data: bool,
+        start_time_unix_nano: i64,
+        timestamp_unix_nano: i64,
+        metadata: &mut PendingMetadata,
+    ) -> Vec<SamplePoint> {
         let mut points = Vec::with_capacity(self.counters.len());
         for counter in self.counters.values_mut() {
             let metric_kind = self.configs[counter.config_index].metric_kind;
@@ -634,12 +687,7 @@ impl<A: PdhApi> Query<A> {
                 value,
             });
         }
-        metadata.diagnostics.active_expanded_counters = self.active_expanded_count();
-        Ok(Sample {
-            timestamp_unix_nano,
-            points,
-            metadata,
-        })
+        points
     }
 }
 
@@ -699,6 +747,13 @@ impl DesiredCounter {
 }
 
 type DesiredCounters = BTreeMap<CounterKey, DesiredCounter>;
+
+struct WildcardReconciliation {
+    live: BTreeSet<CounterKey>,
+    wanted: BTreeSet<CounterKey>,
+    removed: Vec<CounterKey>,
+    added: Vec<CounterKey>,
+}
 
 struct WildcardDiscovery {
     config_index: usize,

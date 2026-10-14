@@ -441,15 +441,14 @@ impl<A: PdhApi> QuerySlot<A> {
         now: Instant,
         max_expanded_counters: usize,
         open: &mut F,
-        diagnostics: &mut SampleDiagnostics,
-        failures: &mut Vec<SampleFailure>,
+        metadata: &mut PendingMetadata,
     ) where
         F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
     {
         if !self.plan.recreate_query {
             return;
         }
-        diagnostics.query_recreation_attempts += 1;
+        metadata.diagnostics.query_recreation_attempts += 1;
         let replacement =
             open(self.plan.configs.clone(), max_expanded_counters).and_then(|mut query| {
                 query.prime()?;
@@ -464,18 +463,23 @@ impl<A: PdhApi> QuerySlot<A> {
                 self.next_rebuild = now;
             }
             Err(error) => {
-                diagnostics.query_recreation_failures += 1;
+                metadata.diagnostics.query_recreation_failures += 1;
                 if error.is_query_collection_failure() {
-                    diagnostics.scrape_failures += 1;
+                    metadata.diagnostics.scrape_failures += 1;
                 }
-                failures.extend(self.plan.global_indices.iter().map(|&counter_index| {
-                    SampleFailure {
-                        counter_index,
-                        reason: error.reason(),
-                        error: error.bounded_detail(),
-                        diagnostic_only: true,
-                    }
-                }));
+                metadata
+                    .failures
+                    .extend(
+                        self.plan
+                            .global_indices
+                            .iter()
+                            .map(|&counter_index| SampleFailure {
+                                counter_index,
+                                reason: error.reason(),
+                                error: error.bounded_detail(),
+                                diagnostic_only: true,
+                            }),
+                    );
             }
         }
     }
@@ -645,12 +649,6 @@ fn recreate_successful_queries<A, F>(
             continue;
         }
         let query_limit = query_expansion_limit(queries, query_index, max_expanded_counters);
-        queries[query_index].recreate(
-            now,
-            query_limit,
-            open,
-            &mut sample.metadata.diagnostics,
-            &mut sample.metadata.failures,
-        );
+        queries[query_index].recreate(now, query_limit, open, &mut sample.metadata);
     }
 }
