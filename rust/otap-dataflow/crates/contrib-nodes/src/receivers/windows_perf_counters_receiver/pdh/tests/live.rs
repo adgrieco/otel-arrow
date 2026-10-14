@@ -277,14 +277,21 @@ async fn live_pdh_collects_exact_and_wildcard_counters() {
     ];
     let mut worker = Worker::start(
         counters,
-        Duration::from_secs(1),
+        Duration::from_millis(100),
         256,
         4_096,
         "test".to_owned(),
     )
     .await
     .unwrap();
-    let sample = worker.collect().await.unwrap();
+    let mut sample = worker.collect().await.unwrap();
+    for _ in 0..3 {
+        if sample.points.iter().any(|point| point.counter_index == 1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        sample = worker.collect().await.unwrap();
+    }
     let exact = sample
         .points
         .iter()
