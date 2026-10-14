@@ -13,8 +13,6 @@ pub(super) const MAX_SCALE_POWER10: i32 = 18;
 const MAX_CONFIGURED_COUNTER_PATHS: usize = 256;
 const MAX_INSTANCE_LIMIT: usize = 16_384;
 const MAX_COUNTER_PATH_LEN: usize = 2_047;
-const MAX_METRIC_NAME_LEN: usize = 255;
-const MAX_METRIC_UNIT_LEN: usize = 63;
 const DEFAULT_MAX_INSTANCES_PER_WILDCARD: usize = 256;
 const DEFAULT_MAX_EXPANDED_COUNTERS: usize = 4_096;
 const DEFAULT_AGGREGATION_NAME: &str = "_Total";
@@ -414,16 +412,6 @@ fn validate_metric_name(name: &str) -> Result<&str, Error> {
         validate_path_metric_name(name)?;
         return Ok(name);
     }
-    let mut chars = name.chars();
-    let valid = name.len() <= MAX_METRIC_NAME_LEN
-        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '/'));
-    if !valid {
-        return Err(invalid(format!(
-            "metric name {name:?} must start with an ASCII letter, contain only ASCII \
-             letters, digits, '_', '.', '-', or '/', and be at most {MAX_METRIC_NAME_LEN} characters"
-        )));
-    }
     Ok(name)
 }
 
@@ -461,22 +449,12 @@ fn validate_path_metric_name(name: &str) -> Result<(), Error> {
     if checked_object != object || checked_counter != counter {
         return Err(invalid_padding());
     }
-    validate_path_length("metric name", name)
+    Ok(())
 }
 
-fn validate_metric_unit<'a>(name: &str, unit: &'a str) -> Result<&'a str, Error> {
+fn normalize_metric_unit(unit: &str) -> &str {
     let unit = unit.trim();
-    let field = format!("metrics.{name}.unit");
-    if unit.is_empty() {
-        return Ok("1");
-    }
-    if unit.len() > MAX_METRIC_UNIT_LEN || !unit.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
-    {
-        return Err(invalid(format!(
-            "{field} must be printable ASCII and at most {MAX_METRIC_UNIT_LEN} characters"
-        )));
-    }
-    Ok(unit)
+    if unit.is_empty() { "1" } else { unit }
 }
 
 fn should_warn_instance_override(
@@ -603,11 +581,6 @@ fn validate_user_config(user: &UserConfig) -> Result<(), Error> {
     if user.perfcounters.is_empty() {
         return Err(invalid("perfcounters must contain at least one entry"));
     }
-    if user.metrics.len() > MAX_CONFIGURED_COUNTER_PATHS {
-        return Err(invalid(format!(
-            "metrics must contain at most {MAX_CONFIGURED_COUNTER_PATHS} entries"
-        )));
-    }
     if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_instances_per_wildcard) {
         return Err(invalid(format!(
             "max_instances_per_wildcard must be between 1 and {MAX_INSTANCE_LIMIT}"
@@ -640,7 +613,7 @@ fn normalize_metrics(
             name.to_owned(),
             NormalizedMetric {
                 description: Arc::from(metric.description.trim()),
-                unit: validate_metric_unit(name, &metric.unit)?.to_owned(),
+                unit: normalize_metric_unit(&metric.unit).to_owned(),
                 kind: metric.kind(name)?,
             },
         );

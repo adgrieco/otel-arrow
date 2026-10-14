@@ -624,10 +624,10 @@ fn trims_metric_metadata_attributes_and_paths() {
     );
 }
 
-/// Scenario: Metric names use instrument syntax or exact and wildcard PDH path syntax.
-/// Guarantees: Valid names are retained while malformed paths and invalid instrument names fail.
+/// Scenario: Metric names and units use arbitrary OTLP strings or path-shaped names.
+/// Guarantees: Every non-empty name and unit survives normalization without SDK-style limits.
 #[test]
-fn validates_metric_names() {
+fn accepts_otlp_metric_names_and_units() {
     let config = |name: &str, unit: &str| {
         json!({
             "metrics": {name: {"description": "Value.", "unit": unit, "gauge": {}}},
@@ -637,37 +637,60 @@ fn validates_metric_names() {
             }]
         })
     };
-    let at_limit = format!("a{}", "b".repeat(MAX_METRIC_NAME_LEN - 1));
+    let long_name = format!("metric {}", "x".repeat(512));
+    let long_path_name = format!(r"\Memory\{}", "x".repeat(3_000));
+    let long_unit = format!("{{{}}}", "u".repeat(128));
     for (name, unit) in [
         (r"\Memory\Available Bytes", "By"),
-        (r"\Process(app#001)\Private Bytes", "By"),
-        (r"\Process(worker*)\Private Bytes", "By"),
-        ("system.memory_usage-1/s", "By"),
-        (at_limit.as_str(), "By"),
+        ("1 value", "\u{b5}s"),
+        ("\u{e9}", "B\ty"),
+        (long_name.as_str(), long_unit.as_str()),
+        (long_path_name.as_str(), "By"),
     ] {
         let normalized = Config::from_json(&config(name, unit)).unwrap();
         assert_eq!(normalized.counters[0].name, name);
         assert_eq!(normalized.counters[0].unit, unit);
     }
-    let too_long = format!("a{}", "b".repeat(MAX_METRIC_NAME_LEN));
+    assert_config_error(config(" ", "By"), "metric name must not be empty");
+}
+
+/// Scenario: Path-shaped metric names contain exact, wildcard, malformed, or padded segments.
+/// Guarantees: Native path syntax and configured spelling are validated without instrument-name rules.
+#[test]
+fn validates_path_metric_names() {
+    let config = |name: &str| {
+        json!({
+            "metrics": {name: {"description": "Value.", "unit": "By"}},
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{"name": "Available Bytes", "metric": name}]
+            }]
+        })
+    };
     for name in [
-        "1available",
-        "avail able",
-        "\u{e9}",
-        too_long.as_str(),
+        r"\Memory\Available Bytes",
+        r"\Process(app#001)\Private Bytes",
+        r"\Process(worker*)\Private Bytes",
+    ] {
+        assert_eq!(
+            Config::from_json(&config(name)).unwrap().counters[0].name,
+            name
+        );
+    }
+    for name in [
         r"\Memory",
         r"\Memory(*)\X\Y",
         r"\Memory(#0)\X",
         r"\Process( app )\X",
     ] {
-        assert_config_error(config(name, "By"), "metric name");
+        assert_config_error(config(name), "metric name");
     }
 }
 
-/// Scenario: Metric units are blank, valid, non-ASCII, control-containing, or overlong.
-/// Guarantees: Blank defaults to "1" and invalid OpenTelemetry unit syntax is rejected.
+/// Scenario: Metric units are blank or contain arbitrary OTLP unit text.
+/// Guarantees: Blank defaults to "1"; non-empty values are trimmed but otherwise unrestricted.
 #[test]
-fn validates_metric_units() {
+fn normalizes_unrestricted_metric_units() {
     let config = |unit: &str| {
         json!({
             "metrics": {"test": {"unit": unit}},
@@ -683,40 +706,36 @@ fn validates_metric_units() {
             "1"
         );
     }
-    let at_limit = "a".repeat(MAX_METRIC_UNIT_LEN);
-    for unit in ["By", "{packets}/s", "1", at_limit.as_str()] {
+    let long_unit = format!("{{{}}}", "u".repeat(128));
+    for unit in ["By", "{packets}/s", "\u{b5}s", "B\ty", long_unit.as_str()] {
         assert_eq!(
             Config::from_json(&config(unit)).unwrap().counters[0].unit,
             unit
         );
     }
-    let too_long = "a".repeat(MAX_METRIC_UNIT_LEN + 1);
-    for unit in ["\u{b5}s", "B\ty", too_long.as_str()] {
-        assert_config_error(config(unit), "metrics.test.unit must be printable ASCII");
-    }
 }
 
-/// Scenario: Metric definitions exceed the bounded configuration size.
-/// Guarantees: Unused metadata cannot bypass the definition limit.
+/// Scenario: More than 256 metric definitions are configured but only one is referenced.
+/// Guarantees: Unused metadata definitions do not consume the configured PDH path budget.
 #[test]
-fn rejects_too_many_metric_definitions() {
+fn allows_metric_definitions_beyond_counter_path_limit() {
     let metrics = (0..=MAX_CONFIGURED_COUNTER_PATHS)
         .map(|index| (format!("m{index}"), metric()))
         .collect::<serde_json::Map<_, _>>();
-    assert_config_error(
-        json!({
-            "metrics": metrics,
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": "m0"}]
-            }]
-        }),
-        "metrics must contain at most 256 entries",
-    );
+    let config = Config::from_json(&json!({
+        "metrics": metrics,
+        "perfcounters": [{
+            "object": "Memory",
+            "counters": [{"name": "Available Bytes", "metric": "m0"}]
+        }]
+    }))
+    .unwrap();
+
+    assert_eq!(config.counters.len(), 1);
 }
 
 /// Scenario: Normalized metric names or attribute keys collide.
-/// Guarantees: Post-trim and case-folded metric identities and post-trim attribute identities fail.
+/// Guarantees: Exact post-trim metric and attribute identities fail instead of silently merging.
 #[test]
 fn rejects_normalized_identity_collisions() {
     let definition = json!({"description": "Value.", "unit": "By", "gauge": {}});
