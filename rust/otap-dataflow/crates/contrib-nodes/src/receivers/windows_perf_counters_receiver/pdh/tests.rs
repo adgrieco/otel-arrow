@@ -951,10 +951,10 @@ async fn startup_prime_query_failure_starts_and_recovers() {
     );
 }
 
-/// Scenario: A calculated query reaches the failure threshold and is rebuilt.
-/// Guarantees: The rebuilt query is primed before the recovery collection, so that collection emits instead of warming.
+/// Scenario: A calculated query reaches the failure threshold and is rebuilt during a scrape.
+/// Guarantees: The rebuild scrape is empty after priming, and the following scrape emits over the full post-prime interval.
 #[test]
-fn rebuilt_query_primes_before_recovery_collection() {
+fn rebuilt_query_defers_values_until_the_next_scrape() {
     let path = r"\Processor(_Total)\% Processor Time";
     let first_query_failure = Arc::new(AtomicBool::new(false));
     let factory_first_query_failure = Arc::clone(&first_query_failure);
@@ -994,19 +994,108 @@ fn rebuilt_query_primes_before_recovery_collection() {
         ));
     }
 
-    let recovered = query
+    let rebuilt = query
         .collect(now, Duration::ZERO, 4_096, &mut open)
         .unwrap();
 
+    assert!(rebuilt.points.is_empty());
+    assert_eq!(rebuilt.timestamp_unix_nano, 110);
+    assert_eq!(rebuilt.diagnostics.query_rebuild_attempts, 1);
+    assert_eq!(rebuilt.diagnostics.query_rebuild_recoveries, 1);
+    assert_eq!(rebuilt.diagnostics.warmup_omissions, 2);
+
+    let recovered = query
+        .collect(now, Duration::ZERO, 4_096, &mut open)
+        .unwrap();
     assert!(matches!(
         recovered.points[0].value,
         SampleValue::Value(Number::Double(2.0))
     ));
     assert_eq!(recovered.points[0].timestamp_unix_nano, 120);
-    assert_eq!(recovered.diagnostics.query_rebuild_attempts, 1);
-    assert_eq!(recovered.diagnostics.query_rebuild_recoveries, 1);
-    assert_eq!(recovered.diagnostics.warmup_omissions, 2);
+    assert_eq!(recovered.points[0].start_time_unix_nano, None);
+    assert_eq!(recovered.diagnostics.query_rebuild_attempts, 0);
+    assert_eq!(recovered.diagnostics.query_rebuild_recoveries, 0);
+    assert_eq!(recovered.diagnostics.warmup_omissions, 0);
     assert_eq!(open_calls.get(), 2);
+}
+
+/// Scenario: Rebuild priming fails while another query succeeds in the same scrape.
+/// Guarantees: The partial scrape counts one query failure and the rebuilt query carries no duplicate pending prime failure.
+#[test]
+fn rebuild_prime_failure_is_counted_once() {
+    let healthy_path = r"\Processor(_Total)\% Processor Time";
+    let rebuilding_path = r"\Processor(0)\% Processor Time";
+    let first_rebuilding_failure = Arc::new(AtomicBool::new(false));
+    let factory_first_rebuilding_failure = Arc::clone(&first_rebuilding_failure);
+    let rebuild_prime_failure = Arc::new(AtomicBool::new(true));
+    let factory_rebuild_prime_failure = Arc::clone(&rebuild_prime_failure);
+    let open_counts = Rc::new(RefCell::new(BTreeMap::<String, usize>::new()));
+    let factory_open_counts = Rc::clone(&open_counts);
+    let mut open = move |configs: Vec<CounterConfig>, max_expanded_counters: usize| {
+        let path = configs[0].path.clone();
+        let open_index = {
+            let mut counts = factory_open_counts.borrow_mut();
+            let count = counts.entry(path.clone()).or_default();
+            let open_index = *count;
+            *count += 1;
+            open_index
+        };
+        let fail_collect = if path == rebuilding_path {
+            if open_index == 0 {
+                Arc::clone(&factory_first_rebuilding_failure)
+            } else {
+                Arc::clone(&factory_rebuild_prime_failure)
+            }
+        } else {
+            Arc::new(AtomicBool::new(false))
+        };
+        Query::open_with(
+            RebuildPrimePdh {
+                fail_collect,
+                collect_calls: 0,
+            },
+            configs,
+            Duration::from_secs(30),
+            256,
+            max_expanded_counters,
+        )
+    };
+    let healthy_plan = QueryPlan {
+        configs: vec![counter(healthy_path, "system.cpu.total")],
+        global_indices: vec![0],
+        recreate_query: false,
+    };
+    let rebuilding_plan = QueryPlan {
+        configs: vec![counter(rebuilding_path, "system.cpu.core")],
+        global_indices: vec![1],
+        recreate_query: false,
+    };
+    let mut queries = vec![
+        QuerySlot::open_initial(healthy_plan, 4_096, &mut open).unwrap(),
+        QuerySlot::open_initial(rebuilding_plan, 4_096, &mut open).unwrap(),
+    ];
+    first_rebuilding_failure.store(true, Ordering::Relaxed);
+    let now = Instant::now();
+    for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
+        assert!(
+            queries[1]
+                .collect(now, Duration::ZERO, 4_096, &mut open)
+                .is_err()
+        );
+    }
+
+    let sample = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
+
+    assert_eq!(sample.points.len(), 1);
+    assert_eq!(sample.points[0].counter_index, 0);
+    assert_eq!(sample.diagnostics.scrape_failures, 1);
+    assert_eq!(sample.failures.len(), 1);
+    assert_eq!(sample.failures[0].counter_index, 1);
+    assert_eq!(sample.failures[0].reason, "PdhCollectQueryData");
+    assert!(!sample.failures[0].diagnostic_only);
+    let rebuilt = queries[1].query.as_ref().unwrap();
+    assert_eq!(rebuilt.pending.diagnostics.scrape_failures, 0);
+    assert!(rebuilt.pending.failures.is_empty());
 }
 
 /// Scenario: One exact configured path names a duplicate process instance.

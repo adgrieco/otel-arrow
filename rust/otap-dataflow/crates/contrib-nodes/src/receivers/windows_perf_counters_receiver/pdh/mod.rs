@@ -1632,22 +1632,28 @@ impl<A: PdhApi> QuerySlot<A> {
                     self.rebuild_attempts = 0;
                     self.query_failure_attempts = 0;
                     self.next_query_retry = now;
-                    let prime_error = rebuilt.prime().err();
-                    if let Some(error) = &prime_error {
-                        rebuilt.record_prime_failure(error);
-                    } else {
-                        self.pending.diagnostics.query_rebuild_recoveries += 1;
-                    }
-                    self.query = Some(rebuilt);
-                    if let Some(error) = prime_error {
-                        Err(error)
-                    } else {
-                        self.query
-                            .as_mut()
-                            .ok_or(Error::InvalidSample(
-                                "rebuilt query was not retained after priming",
-                            ))?
-                            .collect()
+                    match rebuilt.prime() {
+                        Ok(()) => {
+                            self.pending.diagnostics.query_rebuild_recoveries += 1;
+                            let mut sample = Sample {
+                                timestamp_unix_nano: rebuilt.previous_timestamp_unix_nano,
+                                points: Vec::new(),
+                                failures: Vec::new(),
+                                overflows: Vec::new(),
+                                diagnostics: SampleDiagnostics::default(),
+                            };
+                            rebuilt.move_pending_metadata_to(
+                                &mut sample.diagnostics,
+                                &mut sample.failures,
+                                &mut sample.overflows,
+                            );
+                            self.query = Some(rebuilt);
+                            Ok(sample)
+                        }
+                        Err(error) => {
+                            self.query = Some(rebuilt);
+                            Err(error)
+                        }
                     }
                 }
                 Err(error) => {
