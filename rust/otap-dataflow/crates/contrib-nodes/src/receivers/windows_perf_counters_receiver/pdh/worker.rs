@@ -4,7 +4,7 @@
 //! Bounded worker-thread query ownership, recovery, recreation, and command lifecycle.
 
 use super::super::config::CounterConfig;
-use super::super::model::{Sample, SampleDiagnostics, SampleFailure, merge_sample_metadata};
+use super::super::model::{Sample, SampleDiagnostics, SampleFailure};
 use super::PdhApi;
 use super::error::Error;
 use super::query::{PendingMetadata, Query, retry_delay};
@@ -395,11 +395,9 @@ impl<A: PdhApi> QuerySlot<A> {
             overflows: Vec::new(),
             diagnostics: SampleDiagnostics::default(),
         };
-        rebuilt.move_pending_metadata_to(
-            &mut sample.diagnostics,
-            &mut sample.failures,
-            &mut sample.overflows,
-        );
+        let mut metadata = PendingMetadata::default();
+        rebuilt.move_pending_metadata_to(&mut metadata);
+        metadata.merge_into_sample(&mut sample);
         self.query = Some(rebuilt);
         Ok(sample)
     }
@@ -442,11 +440,7 @@ impl<A: PdhApi> QuerySlot<A> {
 
     fn move_query_metadata_to_pending(&mut self) {
         if let Some(active_query) = self.query.as_mut() {
-            active_query.move_pending_metadata_to(
-                &mut self.pending.diagnostics,
-                &mut self.pending.failures,
-                &mut self.pending.overflows,
-            );
+            active_query.move_pending_metadata_to(&mut self.pending);
         }
     }
 
@@ -528,14 +522,10 @@ pub(super) fn merge_query_samples(samples: Vec<Sample>) -> Result<Sample, Error>
             target.timestamp_unix_nano = target.timestamp_unix_nano.max(sample.timestamp_unix_nano);
             target.diagnostics.active_expanded_counters +=
                 sample.diagnostics.active_expanded_counters;
-            merge_sample_metadata(
-                &mut target.diagnostics,
-                &mut target.failures,
-                &mut target.overflows,
-                sample.diagnostics,
-                sample.failures,
-                sample.overflows,
-            );
+            let mut metadata = PendingMetadata::take_from_sample(target);
+            let mut sample = sample;
+            metadata.merge(PendingMetadata::take_from_sample(&mut sample));
+            metadata.restore_to_sample(target);
             target.points.extend(sample.points);
         } else {
             merged = Some(sample);
@@ -595,17 +585,16 @@ where
     }
     let mut sample = merge_query_samples(samples)?;
     if !query_failures.is_empty() {
-        merge_sample_metadata(
-            &mut sample.diagnostics,
-            &mut sample.failures,
-            &mut sample.overflows,
-            SampleDiagnostics {
+        let mut metadata = PendingMetadata::take_from_sample(&mut sample);
+        metadata.merge(PendingMetadata {
+            diagnostics: SampleDiagnostics {
                 scrape_failures: 1,
                 ..Default::default()
             },
-            query_failures,
-            Vec::new(),
-        );
+            failures: query_failures,
+            overflows: Vec::new(),
+        });
+        metadata.restore_to_sample(&mut sample);
     }
     recreate_successful_queries(
         queries,

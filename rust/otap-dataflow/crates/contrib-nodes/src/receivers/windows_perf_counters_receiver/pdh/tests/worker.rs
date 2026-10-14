@@ -732,80 +732,76 @@ fn diagnostic_merge_preserves_current_active_count() {
 /// Guarantees: Diagnostic counts, counter failures, and expansion overflows remain ordered and observable.
 #[test]
 fn sample_metadata_merge_preserves_pending_evidence() {
-    let mut diagnostics = SampleDiagnostics {
-        counter_add_failures: 1,
-        ..Default::default()
+    let mut metadata = PendingMetadata {
+        diagnostics: SampleDiagnostics {
+            counter_add_failures: 1,
+            ..Default::default()
+        },
+        failures: vec![SampleFailure {
+            counter_index: 0,
+            reason: "initial",
+            error: "initial failure".to_owned(),
+            diagnostic_only: false,
+        }],
+        overflows: vec![ExpansionOverflow {
+            counter_index: 0,
+            reason: "per_wildcard",
+            discovered: 3,
+            retained: 2,
+            omitted: 1,
+        }],
     };
-    let mut failures = vec![SampleFailure {
-        counter_index: 0,
-        reason: "initial",
-        error: "initial failure".to_owned(),
-        diagnostic_only: false,
-    }];
-    let mut overflows = vec![ExpansionOverflow {
-        counter_index: 0,
-        reason: "per_wildcard",
-        discovered: 3,
-        retained: 2,
-        omitted: 1,
-    }];
 
-    merge_sample_metadata(
-        &mut diagnostics,
-        &mut failures,
-        &mut overflows,
-        SampleDiagnostics {
+    metadata.merge(PendingMetadata {
+        diagnostics: SampleDiagnostics {
             retry_recoveries: 1,
             ..Default::default()
         },
-        vec![SampleFailure {
+        failures: vec![SampleFailure {
             counter_index: 1,
             reason: "recovery",
             error: "recovery failure".to_owned(),
             diagnostic_only: false,
         }],
-        vec![ExpansionOverflow {
+        overflows: vec![ExpansionOverflow {
             counter_index: 1,
             reason: "receiver_total",
             discovered: 4,
             retained: 3,
             omitted: 1,
         }],
-    );
+    });
 
-    assert_eq!(diagnostics.counter_add_failures, 1);
-    assert_eq!(diagnostics.retry_recoveries, 1);
-    assert_eq!(failures.len(), 2);
-    assert_eq!(failures[0].reason, "initial");
-    assert_eq!(failures[1].reason, "recovery");
-    assert_eq!(overflows.len(), 2);
-    assert_eq!(overflows[0].reason, "per_wildcard");
-    assert_eq!(overflows[1].reason, "receiver_total");
+    assert_eq!(metadata.diagnostics.counter_add_failures, 1);
+    assert_eq!(metadata.diagnostics.retry_recoveries, 1);
+    assert_eq!(metadata.failures.len(), 2);
+    assert_eq!(metadata.failures[0].reason, "initial");
+    assert_eq!(metadata.failures[1].reason, "recovery");
+    assert_eq!(metadata.overflows.len(), 2);
+    assert_eq!(metadata.overflows[0].reason, "per_wildcard");
+    assert_eq!(metadata.overflows[1].reason, "receiver_total");
 
-    merge_sample_metadata(
-        &mut diagnostics,
-        &mut failures,
-        &mut overflows,
-        SampleDiagnostics::default(),
-        vec![SampleFailure {
+    metadata.merge(PendingMetadata {
+        diagnostics: SampleDiagnostics::default(),
+        failures: vec![SampleFailure {
             counter_index: 0,
             reason: "initial",
             error: "latest failure".to_owned(),
             diagnostic_only: false,
         }],
-        vec![ExpansionOverflow {
+        overflows: vec![ExpansionOverflow {
             counter_index: 0,
             reason: "per_wildcard",
             discovered: 5,
             retained: 2,
             omitted: 3,
         }],
-    );
+    });
 
-    assert_eq!(failures.len(), 2);
-    assert_eq!(failures[0].error, "latest failure");
-    assert_eq!(overflows.len(), 2);
-    assert_eq!(overflows[0].discovered, 5);
+    assert_eq!(metadata.failures.len(), 2);
+    assert_eq!(metadata.failures[0].error, "latest failure");
+    assert_eq!(metadata.overflows.len(), 2);
+    assert_eq!(metadata.overflows[0].discovered, 5);
 }
 
 /// Scenario: Worker recovery metadata precedes metadata from the successful scrape that releases it.

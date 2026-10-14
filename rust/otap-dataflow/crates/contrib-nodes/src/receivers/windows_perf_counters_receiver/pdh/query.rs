@@ -6,8 +6,7 @@
 use super::super::config::{Aggregation, CounterConfig, MetricKind};
 use super::super::model::{
     ExpansionOverflow, InstanceIdentity, Number, Sample, SampleDiagnostics, SampleFailure,
-    SamplePoint, SampleValue, merge_diagnostics, merge_sample_metadata, scale_double,
-    scale_integer,
+    SamplePoint, SampleValue, merge_diagnostics, scale_double, scale_integer,
 };
 use super::counter_type::{CounterKind, classify_native_type, validate_metric_mapping};
 use super::error::{Error, sample_failure};
@@ -133,11 +132,9 @@ impl<A: PdhApi> Query<A> {
                 }
             }
         }
-        let mut diagnostics = SampleDiagnostics::default();
-        let mut failures = Vec::new();
-        let mut overflows = Vec::new();
-        query.refresh_wildcards(&mut diagnostics, &mut failures, &mut overflows)?;
-        query.pending.merge(diagnostics, failures, overflows);
+        let mut metadata = PendingMetadata::default();
+        query.refresh_wildcards(&mut metadata)?;
+        query.pending.merge(metadata);
         Ok(query)
     }
 
@@ -253,31 +250,13 @@ impl<A: PdhApi> Query<A> {
         }
     }
 
-    fn refresh_wildcards(
-        &mut self,
-        diagnostics: &mut SampleDiagnostics,
-        failures: &mut Vec<SampleFailure>,
-        overflows: &mut Vec<ExpansionOverflow>,
-    ) -> Result<(), Error> {
-        diagnostics.discovery_refreshes += 1;
+    fn refresh_wildcards(&mut self, metadata: &mut PendingMetadata) -> Result<(), Error> {
+        metadata.diagnostics.discovery_refreshes += 1;
         let discoveries = self.discover_wildcards();
         let mut desired = BTreeMap::new();
-        let expanded_total = self.reserve_failed_discoveries(
-            &discoveries,
-            &mut desired,
-            diagnostics,
-            failures,
-            overflows,
-        );
-        self.prepare_successful_discoveries(
-            discoveries,
-            &mut desired,
-            expanded_total,
-            diagnostics,
-            failures,
-            overflows,
-        );
-        self.reconcile_wildcards(desired, diagnostics, failures)?;
+        let expanded_total = self.reserve_failed_discoveries(&discoveries, &mut desired, metadata);
+        self.prepare_successful_discoveries(discoveries, &mut desired, expanded_total, metadata);
+        self.reconcile_wildcards(desired, metadata)?;
         self.last_wildcard_refresh = Instant::now();
         Ok(())
     }
@@ -300,9 +279,7 @@ impl<A: PdhApi> Query<A> {
         &self,
         discoveries: &[WildcardDiscovery],
         desired: &mut DesiredCounters,
-        diagnostics: &mut SampleDiagnostics,
-        failures: &mut Vec<SampleFailure>,
-        overflows: &mut Vec<ExpansionOverflow>,
+        metadata: &mut PendingMetadata,
     ) -> usize {
         let mut expanded_total = 0;
         // Retain failed templates before admitting successful discoveries so
@@ -312,8 +289,8 @@ impl<A: PdhApi> Query<A> {
             let Err(error) = discovery else {
                 continue;
             };
-            diagnostics.discovery_failures += 1;
-            failures.push(sample_failure(*config_index, error));
+            metadata.diagnostics.discovery_failures += 1;
+            metadata.failures.push(sample_failure(*config_index, error));
             let mut retained = self
                 .counters
                 .iter()
@@ -353,7 +330,7 @@ impl<A: PdhApi> Query<A> {
                 self.max_expanded_counters.saturating_sub(expanded_total),
             );
             if per_wildcard_omitted > 0 {
-                overflows.push(ExpansionOverflow {
+                metadata.overflows.push(ExpansionOverflow {
                     counter_index: *config_index,
                     reason: "per_wildcard",
                     discovered,
@@ -362,7 +339,7 @@ impl<A: PdhApi> Query<A> {
                 });
             }
             if total_omitted > 0 {
-                overflows.push(ExpansionOverflow {
+                metadata.overflows.push(ExpansionOverflow {
                     counter_index: *config_index,
                     reason: "receiver_total",
                     discovered: discovered - per_wildcard_omitted,
@@ -370,7 +347,7 @@ impl<A: PdhApi> Query<A> {
                     omitted: total_omitted,
                 });
             }
-            diagnostics.instances_omitted_over_limit +=
+            metadata.diagnostics.instances_omitted_over_limit +=
                 u64::try_from(per_wildcard_omitted.saturating_add(total_omitted))
                     .unwrap_or(u64::MAX);
             while retained.len() > allowed {
@@ -392,9 +369,7 @@ impl<A: PdhApi> Query<A> {
         discoveries: Vec<WildcardDiscovery>,
         desired: &mut DesiredCounters,
         mut expanded_total: usize,
-        diagnostics: &mut SampleDiagnostics,
-        failures: &mut Vec<SampleFailure>,
-        overflows: &mut Vec<ExpansionOverflow>,
+        metadata: &mut PendingMetadata,
     ) {
         for (config_index, discovery) in discoveries {
             let Ok(mut paths) = discovery else {
@@ -411,8 +386,9 @@ impl<A: PdhApi> Query<A> {
                 .filter(|path| path.encode_utf16().count() >= PDH_MAX_COUNTER_PATH as usize)
                 .count();
             if oversized > 0 {
-                diagnostics.counter_add_failures += u64::try_from(oversized).unwrap_or(u64::MAX);
-                failures.push(SampleFailure {
+                metadata.diagnostics.counter_add_failures +=
+                    u64::try_from(oversized).unwrap_or(u64::MAX);
+                metadata.failures.push(SampleFailure {
                     counter_index: config_index,
                     reason: "expanded_path_too_long",
                     error: format!(
@@ -431,7 +407,7 @@ impl<A: PdhApi> Query<A> {
                 self.max_expanded_counters.saturating_sub(expanded_total),
             );
             if per_wildcard_omitted > 0 {
-                overflows.push(ExpansionOverflow {
+                metadata.overflows.push(ExpansionOverflow {
                     counter_index: config_index,
                     reason: "per_wildcard",
                     discovered,
@@ -440,7 +416,7 @@ impl<A: PdhApi> Query<A> {
                 });
             }
             if total_omitted > 0 {
-                overflows.push(ExpansionOverflow {
+                metadata.overflows.push(ExpansionOverflow {
                     counter_index: config_index,
                     reason: "receiver_total",
                     discovered: discovered - per_wildcard_omitted,
@@ -448,7 +424,7 @@ impl<A: PdhApi> Query<A> {
                     omitted: total_omitted,
                 });
             }
-            diagnostics.instances_omitted_over_limit +=
+            metadata.diagnostics.instances_omitted_over_limit +=
                 u64::try_from(per_wildcard_omitted.saturating_add(total_omitted))
                     .unwrap_or(u64::MAX);
             expanded_total += paths.len();
@@ -468,8 +444,8 @@ impl<A: PdhApi> Query<A> {
                         );
                     }
                     Err(error) => {
-                        diagnostics.counter_add_failures += 1;
-                        failures.push(sample_failure(config_index, &error));
+                        metadata.diagnostics.counter_add_failures += 1;
+                        metadata.failures.push(sample_failure(config_index, &error));
                     }
                 }
             }
@@ -479,8 +455,7 @@ impl<A: PdhApi> Query<A> {
     fn reconcile_wildcards(
         &mut self,
         mut desired: DesiredCounters,
-        diagnostics: &mut SampleDiagnostics,
-        failures: &mut Vec<SampleFailure>,
+        metadata: &mut PendingMetadata,
     ) -> Result<(), Error> {
         let live = self
             .counters
@@ -499,7 +474,7 @@ impl<A: PdhApi> Query<A> {
             .filter(|(key, state)| state.target.localized && !wanted.contains(*key))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
-        diagnostics.instances_removed +=
+        metadata.diagnostics.instances_removed +=
             u64::try_from(removed_retry_instances.len()).unwrap_or(u64::MAX);
         for key in removed_retry_instances {
             let _ = self.retry_states.remove(&key);
@@ -536,12 +511,12 @@ impl<A: PdhApi> Query<A> {
                 "wildcard refresh lost an existing counter",
             ));
             let Ok(counter) = counter else {
-                diagnostics.discovery_failures += 1;
+                metadata.diagnostics.discovery_failures += 1;
                 continue;
             };
             self.api.remove(&counter.handle, &counter.path)?;
             if !wanted.contains(&key) {
-                diagnostics.instances_removed += 1;
+                metadata.diagnostics.instances_removed += 1;
             }
         }
         let now = Instant::now();
@@ -552,7 +527,7 @@ impl<A: PdhApi> Query<A> {
                 emit_instance_attribute,
             }) = desired.remove(&key)
             else {
-                diagnostics.discovery_failures += 1;
+                metadata.diagnostics.discovery_failures += 1;
                 continue;
             };
             let target = CounterTarget {
@@ -563,40 +538,27 @@ impl<A: PdhApi> Query<A> {
                 emit_instance_attribute,
             };
             let was_retry = self.retry_states.contains_key(&key);
-            if self.try_add_target(key.clone(), target, now, diagnostics, failures)
-                && !live.contains(&key)
+            if self.try_add_target(
+                key.clone(),
+                target,
+                now,
+                &mut metadata.diagnostics,
+                &mut metadata.failures,
+            ) && !live.contains(&key)
                 && !was_retry
             {
-                diagnostics.instances_added += 1;
+                metadata.diagnostics.instances_added += 1;
             }
         }
         Ok(())
     }
 
-    fn restore_pending_metadata(
-        &mut self,
-        diagnostics: SampleDiagnostics,
-        failures: Vec<SampleFailure>,
-        overflows: Vec<ExpansionOverflow>,
-    ) {
-        self.pending.merge(diagnostics, failures, overflows);
+    fn restore_pending_metadata(&mut self, metadata: PendingMetadata) {
+        self.pending.merge(metadata);
     }
 
-    pub(super) fn move_pending_metadata_to(
-        &mut self,
-        diagnostics: &mut SampleDiagnostics,
-        failures: &mut Vec<SampleFailure>,
-        overflows: &mut Vec<ExpansionOverflow>,
-    ) {
-        let pending = std::mem::take(&mut self.pending);
-        merge_sample_metadata(
-            diagnostics,
-            failures,
-            overflows,
-            pending.diagnostics,
-            pending.failures,
-            pending.overflows,
-        );
+    pub(super) fn move_pending_metadata_to(&mut self, target: &mut PendingMetadata) {
+        target.merge(std::mem::take(&mut self.pending));
     }
 
     pub(super) fn active_expanded_count(&self) -> usize {
@@ -611,9 +573,9 @@ impl<A: PdhApi> Query<A> {
     }
 
     pub(super) fn prime(&mut self) -> Result<(), Error> {
-        let sample = self.collect()?;
+        let mut sample = self.collect()?;
         self.pending
-            .merge(sample.diagnostics, sample.failures, sample.overflows);
+            .merge(PendingMetadata::take_from_sample(&mut sample));
         Ok(())
     }
 
@@ -630,23 +592,23 @@ impl<A: PdhApi> Query<A> {
     }
 
     pub(super) fn collect(&mut self) -> Result<Sample, Error> {
-        let pending = std::mem::take(&mut self.pending);
-        let mut diagnostics = pending.diagnostics;
-        let mut failures = pending.failures;
-        let mut overflows = pending.overflows;
+        let mut metadata = std::mem::take(&mut self.pending);
         if self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval
-            && let Err(error) =
-                self.refresh_wildcards(&mut diagnostics, &mut failures, &mut overflows)
+            && let Err(error) = self.refresh_wildcards(&mut metadata)
         {
-            self.restore_pending_metadata(diagnostics, failures, overflows);
+            self.restore_pending_metadata(metadata);
             return Err(error);
         }
-        self.retry_counters(Instant::now(), &mut diagnostics, &mut failures);
+        self.retry_counters(
+            Instant::now(),
+            &mut metadata.diagnostics,
+            &mut metadata.failures,
+        );
         if self.counters.is_empty() {
             let timestamp_unix_nano = match self.api.timestamp().and_then(positive_timestamp) {
                 Ok(timestamp) => timestamp,
                 Err(error) => {
-                    self.restore_pending_metadata(diagnostics, failures, overflows);
+                    self.restore_pending_metadata(metadata);
                     return Err(error);
                 }
             };
@@ -659,9 +621,9 @@ impl<A: PdhApi> Query<A> {
             return Ok(Sample {
                 timestamp_unix_nano,
                 points: Vec::new(),
-                failures,
-                overflows,
-                diagnostics,
+                failures: metadata.failures,
+                overflows: metadata.overflows,
+                diagnostics: metadata.diagnostics,
             });
         }
         let has_data = match self.api.collect() {
@@ -672,7 +634,7 @@ impl<A: PdhApi> Query<A> {
                         .values_mut()
                         .map(|counter| &mut counter.history),
                 );
-                self.restore_pending_metadata(diagnostics, failures, overflows);
+                self.restore_pending_metadata(metadata);
                 return Err(error);
             }
         };
@@ -691,7 +653,7 @@ impl<A: PdhApi> Query<A> {
                         .values_mut()
                         .map(|counter| &mut counter.history),
                 );
-                self.restore_pending_metadata(diagnostics, failures, overflows);
+                self.restore_pending_metadata(metadata);
                 return Err(error);
             }
         };
@@ -719,13 +681,15 @@ impl<A: PdhApi> Query<A> {
             let (value, point_start_time) = match result {
                 Ok(result) => result,
                 Err(error) => {
-                    failures.push(sample_failure(counter.config_index, &error));
-                    diagnostics.counter_read_failures += 1;
+                    metadata
+                        .failures
+                        .push(sample_failure(counter.config_index, &error));
+                    metadata.diagnostics.counter_read_failures += 1;
                     continue;
                 }
             };
             if matches!(value, SampleValue::Warming) {
-                diagnostics.warmup_omissions += 1;
+                metadata.diagnostics.warmup_omissions += 1;
             }
             points.push(SamplePoint {
                 counter_index: counter.config_index,
@@ -737,13 +701,13 @@ impl<A: PdhApi> Query<A> {
                 value,
             });
         }
-        diagnostics.active_expanded_counters = self.active_expanded_count();
+        metadata.diagnostics.active_expanded_counters = self.active_expanded_count();
         Ok(Sample {
             timestamp_unix_nano,
             points,
-            failures,
-            overflows,
-            diagnostics,
+            failures: metadata.failures,
+            overflows: metadata.overflows,
+            diagnostics: metadata.diagnostics,
         })
     }
 }
@@ -859,20 +823,41 @@ pub(super) struct PendingMetadata {
 }
 
 impl PendingMetadata {
-    fn merge(
-        &mut self,
-        diagnostics: SampleDiagnostics,
-        failures: Vec<SampleFailure>,
-        overflows: Vec<ExpansionOverflow>,
-    ) {
-        merge_sample_metadata(
-            &mut self.diagnostics,
-            &mut self.failures,
-            &mut self.overflows,
-            diagnostics,
-            failures,
-            overflows,
-        );
+    pub(super) fn take_from_sample(sample: &mut Sample) -> Self {
+        Self {
+            diagnostics: std::mem::take(&mut sample.diagnostics),
+            failures: std::mem::take(&mut sample.failures),
+            overflows: std::mem::take(&mut sample.overflows),
+        }
+    }
+
+    pub(super) fn merge(&mut self, delta: Self) {
+        merge_diagnostics(&mut self.diagnostics, delta.diagnostics);
+        for failure in delta.failures {
+            if let Some(existing) = self.failures.iter_mut().find(|existing| {
+                existing.counter_index == failure.counter_index && existing.reason == failure.reason
+            }) {
+                *existing = failure;
+            } else {
+                self.failures.push(failure);
+            }
+        }
+        for overflow in delta.overflows {
+            if let Some(existing) = self.overflows.iter_mut().find(|existing| {
+                existing.counter_index == overflow.counter_index
+                    && existing.reason == overflow.reason
+            }) {
+                *existing = overflow;
+            } else {
+                self.overflows.push(overflow);
+            }
+        }
+    }
+
+    pub(super) fn restore_to_sample(self, sample: &mut Sample) {
+        sample.diagnostics = self.diagnostics;
+        sample.failures = self.failures;
+        sample.overflows = self.overflows;
     }
 
     pub(super) fn merge_into_sample(&mut self, sample: &mut Sample) {

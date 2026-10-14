@@ -168,35 +168,6 @@ pub(super) fn merge_diagnostics(target: &mut SampleDiagnostics, delta: SampleDia
     target.warmup_omissions += delta.warmup_omissions;
 }
 
-pub(super) fn merge_sample_metadata(
-    target_diagnostics: &mut SampleDiagnostics,
-    target_failures: &mut Vec<SampleFailure>,
-    target_overflows: &mut Vec<ExpansionOverflow>,
-    diagnostics: SampleDiagnostics,
-    failures: Vec<SampleFailure>,
-    overflows: Vec<ExpansionOverflow>,
-) {
-    merge_diagnostics(target_diagnostics, diagnostics);
-    for failure in failures {
-        if let Some(existing) = target_failures.iter_mut().find(|existing| {
-            existing.counter_index == failure.counter_index && existing.reason == failure.reason
-        }) {
-            *existing = failure;
-        } else {
-            target_failures.push(failure);
-        }
-    }
-    for overflow in overflows {
-        if let Some(existing) = target_overflows.iter_mut().find(|existing| {
-            existing.counter_index == overflow.counter_index && existing.reason == overflow.reason
-        }) {
-            *existing = overflow;
-        } else {
-            target_overflows.push(overflow);
-        }
-    }
-}
-
 /// Scales an integer by a power of ten.
 /// Zero scale preserves the integer.
 /// Nonzero scales return a double; magnitudes above 2^53 may round during conversion.
