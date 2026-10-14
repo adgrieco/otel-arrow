@@ -892,46 +892,6 @@ fn query_rebuild_waits_for_bounded_retries() {
     assert!(should_rebuild_query(u32::MAX));
 }
 
-/// Scenario: The same failed counter is scheduled repeatedly before it recovers.
-/// Guarantees: One stable identity owns one retry entry and repeated failures advance its bounded backoff.
-#[test]
-fn retry_state_is_unique_per_stable_identity() {
-    let key = CounterKey::new(0, r"\Process(worker)\Private Bytes");
-    let target = CounterTarget {
-        config_index: 0,
-        path: r"\Process(worker)\Private Bytes".to_owned(),
-        localized: true,
-        instance: Some(InstanceIdentity {
-            name: "worker".to_owned(),
-            parent: None,
-            index: 0,
-        }),
-        emit_instance_attribute: true,
-    };
-    let now = Instant::now();
-    let mut states = BTreeMap::new();
-
-    schedule_retry_state(
-        &mut states,
-        key.clone(),
-        target.clone(),
-        now,
-        Duration::from_secs(30),
-    );
-    schedule_retry_state(
-        &mut states,
-        key.clone(),
-        target,
-        now,
-        Duration::from_secs(30),
-    );
-
-    assert_eq!(states.len(), 1);
-    let state = states.get(&key).unwrap();
-    assert_eq!(state.attempts, 2);
-    assert_eq!(state.next_attempt, now + Duration::from_secs(2));
-}
-
 /// Scenario: A simulated PDH call remains blocked past the shutdown deadline.
 /// Guarantees: Shutdown returns at the deadline, cleanup occurs later on the worker,
 /// and worker-owned resources remain alive until that cleanup completes.

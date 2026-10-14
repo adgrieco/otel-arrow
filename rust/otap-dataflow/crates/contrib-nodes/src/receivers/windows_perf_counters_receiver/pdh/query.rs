@@ -322,11 +322,11 @@ impl<A: PdhApi> Query<A> {
                         counter.instance.clone().map(|instance| {
                             (
                                 key.clone(),
-                                (
-                                    counter.path.clone(),
+                                DesiredCounter {
+                                    path: counter.path.clone(),
                                     instance,
-                                    counter.emit_instance_attribute,
-                                ),
+                                    emit_instance_attribute: counter.emit_instance_attribute,
+                                },
                             )
                         })
                     })?
@@ -336,11 +336,11 @@ impl<A: PdhApi> Query<A> {
                         state.target.instance.clone().map(|instance| {
                             (
                                 key.clone(),
-                                (
-                                    state.target.path.clone(),
+                                DesiredCounter {
+                                    path: state.target.path.clone(),
                                     instance,
-                                    state.target.emit_instance_attribute,
-                                ),
+                                    emit_instance_attribute: state.target.emit_instance_attribute,
+                                },
                             )
                         })
                     })?
@@ -380,8 +380,8 @@ impl<A: PdhApi> Query<A> {
                 let _ = retained.remove(&key);
             }
             expanded_total += retained.len();
-            for (key, (path, instance, emit_instance_attribute)) in retained {
-                let _ = desired.insert(key, (path, instance, emit_instance_attribute));
+            for (key, counter) in retained {
+                let _ = desired.insert(key, counter);
             }
         }
         expanded_total
@@ -458,7 +458,14 @@ impl<A: PdhApi> Query<A> {
                     Ok(instance) => {
                         let emit_instance_attribute =
                             self.configs[config_index].emit_instance_attribute && !aggregation_only;
-                        let _ = desired.insert(key, (path, instance, emit_instance_attribute));
+                        let _ = desired.insert(
+                            key,
+                            DesiredCounter {
+                                path,
+                                instance,
+                                emit_instance_attribute,
+                            },
+                        );
                     }
                     Err(error) => {
                         diagnostics.counter_add_failures += 1;
@@ -514,7 +521,7 @@ impl<A: PdhApi> Query<A> {
         let wanted_groups = instance_groups(
             desired
                 .iter()
-                .map(|(key, (_, instance, _))| (key, instance)),
+                .map(|(key, counter)| (key, &counter.instance)),
         );
         let (removed, added) = refresh_changes_with_group_resets(
             &live,
@@ -539,7 +546,12 @@ impl<A: PdhApi> Query<A> {
         }
         let now = Instant::now();
         for key in added {
-            let Some((path, instance, emit_instance_attribute)) = desired.remove(&key) else {
+            let Some(DesiredCounter {
+                path,
+                instance,
+                emit_instance_attribute,
+            }) = desired.remove(&key)
+            else {
                 diagnostics.discovery_failures += 1;
                 continue;
             };
@@ -781,7 +793,12 @@ fn validate_positive_multi_base(path: &str, base: u32) -> Result<(), Error> {
     }
 }
 
-type DesiredCounter = (String, InstanceIdentity, bool);
+struct DesiredCounter {
+    path: String,
+    instance: InstanceIdentity,
+    emit_instance_attribute: bool,
+}
+
 type DesiredCounters = BTreeMap<CounterKey, DesiredCounter>;
 type WildcardDiscovery = (usize, Result<Vec<String>, Error>);
 
@@ -800,19 +817,19 @@ pub(super) fn exact_add_failure_disposition(error: &Error) -> ExactAddFailureDis
 }
 
 #[derive(Clone)]
-pub(super) struct CounterTarget {
-    pub(super) config_index: usize,
-    pub(super) path: String,
-    pub(super) localized: bool,
-    pub(super) instance: Option<InstanceIdentity>,
-    pub(super) emit_instance_attribute: bool,
+struct CounterTarget {
+    config_index: usize,
+    path: String,
+    localized: bool,
+    instance: Option<InstanceIdentity>,
+    emit_instance_attribute: bool,
 }
 
 #[derive(Clone)]
-pub(super) struct RetryState {
+struct RetryState {
     target: CounterTarget,
-    pub(super) attempts: u32,
-    pub(super) next_attempt: Instant,
+    attempts: u32,
+    next_attempt: Instant,
 }
 
 pub(super) fn retry_delay(attempts: u32, cap: Duration) -> Duration {
@@ -820,7 +837,7 @@ pub(super) fn retry_delay(attempts: u32, cap: Duration) -> Duration {
     Duration::from_secs(1_u64 << exponent).min(cap)
 }
 
-pub(super) fn schedule_retry_state(
+fn schedule_retry_state(
     states: &mut BTreeMap<CounterKey, RetryState>,
     key: CounterKey,
     target: CounterTarget,
@@ -875,7 +892,7 @@ impl PendingMetadata {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct CounterHistory {
+struct CounterHistory {
     previous_base: Option<i64>,
     monotonic_sequence: MonotonicSequence,
     delta_baseline_unix_nano: Option<i64>,
@@ -888,15 +905,13 @@ impl CounterHistory {
     }
 }
 
-pub(super) fn restart_query_pdh_sampling<'a>(
-    histories: impl Iterator<Item = &'a mut CounterHistory>,
-) {
+fn restart_query_pdh_sampling<'a>(histories: impl Iterator<Item = &'a mut CounterHistory>) {
     for history in histories {
         history.restart_pdh_sampling();
     }
 }
 
-pub(super) struct CounterHandle<C> {
+struct CounterHandle<C> {
     config_index: usize,
     path: String,
     handle: C,
@@ -1040,5 +1055,50 @@ impl<C> CounterHandle<C> {
             } => None,
         };
         Ok((SampleValue::Value(scaled), point_start_time))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: The same failed counter is scheduled repeatedly before it recovers.
+    /// Guarantees: One stable identity owns one retry entry and repeated failures advance its bounded backoff.
+    #[test]
+    fn retry_state_is_unique_per_stable_identity() {
+        let key = CounterKey::new(0, r"\Process(worker)\Private Bytes");
+        let target = CounterTarget {
+            config_index: 0,
+            path: r"\Process(worker)\Private Bytes".to_owned(),
+            localized: true,
+            instance: Some(InstanceIdentity {
+                name: "worker".to_owned(),
+                parent: None,
+                index: 0,
+            }),
+            emit_instance_attribute: true,
+        };
+        let now = Instant::now();
+        let mut states = BTreeMap::new();
+
+        schedule_retry_state(
+            &mut states,
+            key.clone(),
+            target.clone(),
+            now,
+            Duration::from_secs(30),
+        );
+        schedule_retry_state(
+            &mut states,
+            key.clone(),
+            target,
+            now,
+            Duration::from_secs(30),
+        );
+
+        assert_eq!(states.len(), 1);
+        let state = states.get(&key).unwrap();
+        assert_eq!(state.attempts, 2);
+        assert_eq!(state.next_attempt, now + Duration::from_secs(2));
     }
 }
