@@ -73,44 +73,17 @@ impl Worker {
         let join = std::thread::Builder::new()
             .name("windows-perf-counters-pdh".to_owned())
             .spawn(move || {
-                {
-                    let mut queries = Vec::with_capacity(plans.len());
-                    for plan in plans {
-                        let active_expanded = queries
-                            .iter()
-                            .map(QuerySlot::active_expanded_count)
-                            .sum::<usize>();
-                        let query_limit = max_expanded_counters.saturating_sub(active_expanded);
-                        match QuerySlot::open_initial(plan, query_limit, &mut open) {
-                            Ok(query) => queries.push(query),
-                            Err(error) => {
-                                let _ = init_tx.send(Err(error));
-                                return;
-                            }
-                        }
-                    }
-                    if init_tx.send(Ok(())).is_err() {
-                        return;
-                    }
-                    while !worker_shutdown.load(Ordering::Acquire) {
-                        match rx.recv() {
-                            Ok(Command::Collect(response)) => {
-                                let accepted =
-                                    AcceptedCollectGuard::new(Arc::clone(&worker_accepted));
-                                let result = collect_queries(
-                                    &mut queries,
-                                    query_retry_cap,
-                                    max_expanded_counters,
-                                    &mut open,
-                                );
-                                drop(accepted);
-                                let _ = response.send(result);
-                            }
-                            Ok(Command::Shutdown) | Err(_) => break,
-                        }
-                    }
-                }
-                let _ = completion_tx.send(());
+                run_worker_thread(
+                    plans,
+                    query_retry_cap,
+                    max_expanded_counters,
+                    &mut open,
+                    rx,
+                    init_tx,
+                    completion_tx,
+                    worker_accepted,
+                    worker_shutdown,
+                );
             })
             .map_err(|err| Error::WorkerStart(err.to_string()))?;
 
@@ -185,6 +158,88 @@ impl Worker {
                 self.join = Some(join);
                 Ok(false)
             }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_worker_thread<A, F>(
+    plans: Vec<QueryPlan>,
+    query_retry_cap: Duration,
+    max_expanded_counters: usize,
+    open: &mut F,
+    rx: mpsc::Receiver<Command>,
+    init_tx: oneshot::Sender<Result<(), Error>>,
+    completion_tx: oneshot::Sender<()>,
+    accepted: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
+) where
+    A: PdhApi,
+    F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+{
+    let mut queries = match open_initial_queries(plans, max_expanded_counters, open) {
+        Ok(queries) => queries,
+        Err(error) => {
+            let _ = init_tx.send(Err(error));
+            return;
+        }
+    };
+    if init_tx.send(Ok(())).is_err() {
+        return;
+    }
+    run_command_loop(
+        &mut queries,
+        query_retry_cap,
+        max_expanded_counters,
+        open,
+        &rx,
+        &accepted,
+        &shutdown_requested,
+    );
+    let _ = completion_tx.send(());
+}
+
+fn open_initial_queries<A, F>(
+    plans: Vec<QueryPlan>,
+    max_expanded_counters: usize,
+    open: &mut F,
+) -> Result<Vec<QuerySlot<A>>, Error>
+where
+    A: PdhApi,
+    F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+{
+    let mut queries = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let query_limit = remaining_expansion_capacity(
+            max_expanded_counters,
+            queries.iter().map(QuerySlot::active_expanded_count),
+        );
+        queries.push(QuerySlot::open_initial(plan, query_limit, open)?);
+    }
+    Ok(queries)
+}
+
+fn run_command_loop<A, F>(
+    queries: &mut [QuerySlot<A>],
+    query_retry_cap: Duration,
+    max_expanded_counters: usize,
+    open: &mut F,
+    rx: &mpsc::Receiver<Command>,
+    accepted: &Arc<AtomicBool>,
+    shutdown_requested: &Arc<AtomicBool>,
+) where
+    A: PdhApi,
+    F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+{
+    while !shutdown_requested.load(Ordering::Acquire) {
+        match rx.recv() {
+            Ok(Command::Collect(response)) => {
+                let accepted = AcceptedCollectGuard::new(Arc::clone(accepted));
+                let result = collect_queries(queries, query_retry_cap, max_expanded_counters, open);
+                drop(accepted);
+                let _ = response.send(result);
+            }
+            Ok(Command::Shutdown) | Err(_) => break,
         }
     }
 }
@@ -609,13 +664,21 @@ fn query_expansion_limit<A: PdhApi>(
     query_index: usize,
     max_expanded_counters: usize,
 ) -> usize {
-    let other_active = queries
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != query_index)
-        .map(|(_, query)| query.active_expanded_count())
-        .sum::<usize>();
-    max_expanded_counters.saturating_sub(other_active)
+    remaining_expansion_capacity(
+        max_expanded_counters,
+        queries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != query_index)
+            .map(|(_, query)| query.active_expanded_count()),
+    )
+}
+
+fn remaining_expansion_capacity(
+    max_expanded_counters: usize,
+    active_counts: impl Iterator<Item = usize>,
+) -> usize {
+    max_expanded_counters.saturating_sub(active_counts.sum())
 }
 
 fn append_query_failures(failures: &mut Vec<SampleFailure>, plan: &QueryPlan, error: &Error) {

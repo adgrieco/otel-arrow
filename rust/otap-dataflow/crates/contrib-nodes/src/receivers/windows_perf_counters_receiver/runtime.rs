@@ -5,7 +5,7 @@
 
 use super::config::Config;
 use super::metrics::WindowsPerfCountersReceiverMetrics;
-use super::model::SampleFailure;
+use super::model::{Sample, SampleFailure};
 use super::otap_builder::into_otap;
 use super::pdh;
 use async_trait::async_trait;
@@ -40,6 +40,92 @@ fn failed_counter_value_count(failures: &[SampleFailure]) -> u64 {
             .count(),
     )
     .unwrap_or(u64::MAX)
+}
+
+fn receiver_error(
+    effect_handler: &local::EffectHandler<OtapPdata>,
+    error: impl Into<String>,
+    source_detail: impl Into<String>,
+) -> Error {
+    Error::ReceiverError {
+        receiver: effect_handler.receiver_id(),
+        kind: ReceiverErrorKind::Other,
+        error: error.into(),
+        source_detail: source_detail.into(),
+    }
+}
+
+#[derive(Default)]
+struct FailureLogState {
+    scrape_failed: bool,
+    active_counter_failures: BTreeSet<(usize, &'static str)>,
+}
+
+impl FailureLogState {
+    fn record_success(&mut self) {
+        self.scrape_failed = false;
+    }
+
+    fn log_scrape_failure(&mut self, node: &str, error: &pdh::Error) {
+        if !self.scrape_failed {
+            otel_arrow_dfe_telemetry::otel_warn!(
+                "otelcol.node.windowsperfcounters.scrape.fail",
+                node = node,
+                error = %error
+            );
+            self.scrape_failed = true;
+        }
+    }
+
+    fn log_scrape_timeout(&mut self, node: &str, timeout: Duration) {
+        if !self.scrape_failed {
+            otel_arrow_dfe_telemetry::otel_warn!(
+                "otelcol.node.windowsperfcounters.scrape.timeout",
+                node = node,
+                timeout_seconds = timeout.as_secs_f64()
+            );
+            self.scrape_failed = true;
+        }
+    }
+
+    fn log_counter_failures(
+        &mut self,
+        receiver: &WindowsPerfCountersReceiver,
+        sample: &Sample,
+        effect_handler: &local::EffectHandler<OtapPdata>,
+    ) -> Result<(), Error> {
+        let mut current = BTreeSet::new();
+        for failure in &sample.metadata.failures {
+            let Some(counter) = receiver.config.counters.get(failure.counter_index) else {
+                return Err(receiver_error(
+                    effect_handler,
+                    format!(
+                        "sample failure references missing configured counter {}",
+                        failure.counter_index
+                    ),
+                    "",
+                ));
+            };
+            let key = (failure.counter_index, failure.reason);
+            if !self.active_counter_failures.contains(&key) {
+                otel_arrow_dfe_telemetry::otel_warn!(
+                    "otelcol.node.windowsperfcounters.counter.fail",
+                    node = receiver.node.as_str(),
+                    path_template = counter.path.as_str(),
+                    reason = failure.reason,
+                    error = failure.error.as_str()
+                );
+            }
+            let _ = current.insert(key);
+        }
+        self.active_counter_failures = current;
+        Ok(())
+    }
+}
+
+struct ControlExit {
+    deadline: Instant,
+    drained: bool,
 }
 
 struct WindowsPerfCountersReceiver {
@@ -121,156 +207,138 @@ pub static WINDOWSPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFa
 };
 
 impl WindowsPerfCountersReceiver {
+    fn record_completed_scrape(&self, scrape_start: Instant, succeeded: bool, overrun: bool) {
+        let mut metrics = self.metrics.borrow_mut();
+        metrics.record_scrape(if succeeded {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        });
+        if succeeded {
+            metrics.health.scrapes.add(1);
+        } else {
+            metrics.health.scrape_failures.add(1);
+        }
+        if overrun {
+            metrics.health.scrape_overruns.inc();
+        }
+        metrics
+            .health
+            .scrape_duration
+            .record(scrape_start.elapsed().as_secs_f64());
+    }
+
+    fn record_successful_sample(&self, scrape_start: Instant, sample: &Sample) {
+        self.record_completed_scrape(scrape_start, true, false);
+        let mut metrics = self.metrics.borrow_mut();
+        metrics.health.apply(&sample.metadata.diagnostics);
+        metrics
+            .health
+            .failed_counter_values
+            .add(failed_counter_value_count(&sample.metadata.failures));
+    }
+
+    fn log_sample_events(&self, sample: &Sample) {
+        for overflow in &sample.metadata.overflows {
+            let path_template = &self.config.counters[overflow.counter_index].path;
+            otel_arrow_dfe_telemetry::otel_warn!(
+                "otelcol.node.windowsperfcounters.instance_limit.exceeded",
+                node = self.node.as_str(),
+                path_template = path_template,
+                reason = overflow.reason,
+                discovered = overflow.discovered as u64,
+                retained = overflow.retained as u64,
+                omitted = overflow.omitted as u64
+            );
+        }
+        if sample.metadata.diagnostics.instances_added > 0
+            || sample.metadata.diagnostics.instances_removed > 0
+        {
+            otel_arrow_dfe_telemetry::otel_info!(
+                "otelcol.node.windowsperfcounters.instances.change",
+                node = self.node.as_str(),
+                added = sample.metadata.diagnostics.instances_added,
+                removed = sample.metadata.diagnostics.instances_removed,
+                active = sample.metadata.diagnostics.active_expanded_counters as u64
+            );
+        }
+        if sample.metadata.diagnostics.retry_attempts > 0
+            || sample.metadata.diagnostics.retry_recoveries > 0
+            || sample.metadata.diagnostics.query_rebuild_attempts > 0
+            || sample.metadata.diagnostics.query_recreation_failures > 0
+        {
+            otel_arrow_dfe_telemetry::otel_info!(
+                "otelcol.node.windowsperfcounters.recovery",
+                node = self.node.as_str(),
+                retry_attempts = sample.metadata.diagnostics.retry_attempts,
+                retry_recoveries = sample.metadata.diagnostics.retry_recoveries,
+                query_rebuild_attempts = sample.metadata.diagnostics.query_rebuild_attempts,
+                query_rebuild_recoveries = sample.metadata.diagnostics.query_rebuild_recoveries,
+                query_recreation_attempts = sample.metadata.diagnostics.query_recreation_attempts,
+                query_recreation_failures = sample.metadata.diagnostics.query_recreation_failures
+            );
+        }
+    }
+
+    fn handle_control_message(&self, message: NodeControlMsg<OtapPdata>) -> Option<ControlExit> {
+        match message {
+            NodeControlMsg::CollectTelemetry {
+                mut metrics_reporter,
+            } => {
+                let mut metrics = self.metrics.borrow_mut();
+                let _ = metrics.report(&mut metrics_reporter);
+                None
+            }
+            NodeControlMsg::DrainIngress { deadline, .. } => Some(ControlExit {
+                deadline,
+                drained: true,
+            }),
+            NodeControlMsg::Shutdown { deadline, .. } => Some(ControlExit {
+                deadline,
+                drained: false,
+            }),
+            _ => None,
+        }
+    }
+
     async fn collect_and_send(
         &self,
         worker: &pdh::Worker,
         effect_handler: &local::EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
-        let failure = |error: String| Error::ReceiverError {
-            receiver: effect_handler.receiver_id(),
-            kind: ReceiverErrorKind::Other,
-            error,
-            source_detail: String::new(),
-        };
         wait_initial_delay(self.config.initial_delay).await;
         let mut interval = tokio::time::interval(self.config.collection_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut scrape_failed = false;
-        let mut active_counter_failures = BTreeSet::new();
+        let mut failure_logs = FailureLogState::default();
         loop {
             let _ = interval.tick().await;
             let scrape_start = Instant::now();
             let sample = match with_optional_timeout(self.config.timeout, worker.collect()).await {
                 Ok(Ok(sample)) => {
-                    let mut metrics = self.metrics.borrow_mut();
-                    metrics.record_scrape(Outcome::Success);
-                    metrics.health.scrapes.add(1);
-                    metrics
-                        .health
-                        .scrape_duration
-                        .record(scrape_start.elapsed().as_secs_f64());
-                    metrics.health.apply(&sample.metadata.diagnostics);
-                    metrics
-                        .health
-                        .failed_counter_values
-                        .add(failed_counter_value_count(&sample.metadata.failures));
-                    drop(metrics);
-                    scrape_failed = false;
-                    for overflow in &sample.metadata.overflows {
-                        let path_template = &self.config.counters[overflow.counter_index].path;
-                        otel_arrow_dfe_telemetry::otel_warn!(
-                            "otelcol.node.windowsperfcounters.instance_limit.exceeded",
-                            node = self.node.as_str(),
-                            path_template = path_template,
-                            reason = overflow.reason,
-                            discovered = overflow.discovered as u64,
-                            retained = overflow.retained as u64,
-                            omitted = overflow.omitted as u64
-                        );
-                    }
-                    if sample.metadata.diagnostics.instances_added > 0
-                        || sample.metadata.diagnostics.instances_removed > 0
-                    {
-                        otel_arrow_dfe_telemetry::otel_info!(
-                            "otelcol.node.windowsperfcounters.instances.change",
-                            node = self.node.as_str(),
-                            added = sample.metadata.diagnostics.instances_added,
-                            removed = sample.metadata.diagnostics.instances_removed,
-                            active = sample.metadata.diagnostics.active_expanded_counters as u64
-                        );
-                    }
-                    if sample.metadata.diagnostics.retry_attempts > 0
-                        || sample.metadata.diagnostics.retry_recoveries > 0
-                        || sample.metadata.diagnostics.query_rebuild_attempts > 0
-                        || sample.metadata.diagnostics.query_recreation_failures > 0
-                    {
-                        otel_arrow_dfe_telemetry::otel_info!(
-                            "otelcol.node.windowsperfcounters.recovery",
-                            node = self.node.as_str(),
-                            retry_attempts = sample.metadata.diagnostics.retry_attempts,
-                            retry_recoveries = sample.metadata.diagnostics.retry_recoveries,
-                            query_rebuild_attempts =
-                                sample.metadata.diagnostics.query_rebuild_attempts,
-                            query_rebuild_recoveries =
-                                sample.metadata.diagnostics.query_rebuild_recoveries,
-                            query_recreation_attempts =
-                                sample.metadata.diagnostics.query_recreation_attempts,
-                            query_recreation_failures =
-                                sample.metadata.diagnostics.query_recreation_failures
-                        );
-                    }
+                    self.record_successful_sample(scrape_start, &sample);
+                    failure_logs.record_success();
                     sample
                 }
                 Ok(Err(err)) if err.is_collection_failure() => {
-                    let mut metrics = self.metrics.borrow_mut();
-                    metrics.record_scrape(Outcome::Failure);
-                    metrics.health.scrape_failures.add(1);
-                    metrics
-                        .health
-                        .scrape_duration
-                        .record(scrape_start.elapsed().as_secs_f64());
-                    if err.is_overrun() {
-                        metrics.health.scrape_overruns.inc();
-                    }
-                    drop(metrics);
-                    if !scrape_failed {
-                        otel_arrow_dfe_telemetry::otel_warn!(
-                            "otelcol.node.windowsperfcounters.scrape.fail",
-                            node = self.node.as_str(),
-                            error = %err
-                        );
-                        scrape_failed = true;
-                    }
+                    self.record_completed_scrape(scrape_start, false, err.is_overrun());
+                    failure_logs.log_scrape_failure(&self.node, &err);
                     continue;
                 }
                 Ok(Err(err)) => {
                     self.metrics.borrow_mut().record_scrape(Outcome::Failure);
-                    return Err(failure(err.to_string()));
+                    return Err(receiver_error(effect_handler, err.to_string(), ""));
                 }
                 Err(_) => {
-                    let mut metrics = self.metrics.borrow_mut();
-                    metrics.record_scrape(Outcome::Failure);
-                    metrics.health.scrape_failures.inc();
-                    metrics.health.scrape_overruns.inc();
-                    metrics
-                        .health
-                        .scrape_duration
-                        .record(scrape_start.elapsed().as_secs_f64());
-                    drop(metrics);
-                    if !scrape_failed {
-                        otel_arrow_dfe_telemetry::otel_warn!(
-                            "otelcol.node.windowsperfcounters.scrape.timeout",
-                            node = self.node.as_str(),
-                            timeout_seconds = self.config.timeout.unwrap_or_default().as_secs_f64()
-                        );
-                        scrape_failed = true;
-                    }
+                    self.record_completed_scrape(scrape_start, false, true);
+                    failure_logs
+                        .log_scrape_timeout(&self.node, self.config.timeout.unwrap_or_default());
                     continue;
                 }
             };
-            let mut current_counter_failures = BTreeSet::new();
-            for counter_failure in &sample.metadata.failures {
-                let Some(counter) = self.config.counters.get(counter_failure.counter_index) else {
-                    return Err(failure(format!(
-                        "sample failure references missing configured counter {}",
-                        counter_failure.counter_index
-                    )));
-                };
-                let key = (counter_failure.counter_index, counter_failure.reason);
-                if !active_counter_failures.contains(&key) {
-                    otel_arrow_dfe_telemetry::otel_warn!(
-                        "otelcol.node.windowsperfcounters.counter.fail",
-                        node = self.node.as_str(),
-                        path_template = counter.path.as_str(),
-                        reason = counter_failure.reason,
-                        error = counter_failure.error.as_str()
-                    );
-                }
-                let _ = current_counter_failures.insert(key);
-            }
-            active_counter_failures = current_counter_failures;
-            let Some(records) =
-                into_otap(&self.config.counters, sample).map_err(|err| failure(err.to_string()))?
+            self.log_sample_events(&sample);
+            failure_logs.log_counter_failures(self, &sample, effect_handler)?;
+            let Some(records) = into_otap(&self.config.counters, sample)
+                .map_err(|err| receiver_error(effect_handler, err.to_string(), ""))?
             else {
                 continue;
             };
@@ -291,7 +359,7 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
         effect_handler: local::EffectHandler<OtapPdata>,
     ) -> Result<TerminalState, Error> {
         enum Exit {
-            Control { deadline: Instant, drained: bool },
+            Control(ControlExit),
             Collection(Result<TerminalState, Error>),
         }
 
@@ -306,28 +374,22 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
         let mut worker = loop {
             tokio::select! {
                 biased;
-                msg = ctrl_msg_recv.recv() => match msg {
-                    Ok(NodeControlMsg::CollectTelemetry { mut metrics_reporter }) => {
-                        let mut metrics = self.metrics.borrow_mut();
-                        let _ = metrics.report(&mut metrics_reporter);
-                    }
-                    Ok(NodeControlMsg::DrainIngress { deadline, .. }) => {
-                        effect_handler.notify_receiver_drained().await?;
+                msg = ctrl_msg_recv.recv() => {
+                    let message = msg.map_err(Error::ChannelRecvError)?;
+                    if let Some(exit) = self.handle_control_message(message) {
+                        if exit.drained {
+                            effect_handler.notify_receiver_drained().await?;
+                        }
                         let snapshots = self.metrics.borrow_mut().terminal_snapshots();
-                        return Ok(TerminalState::new(deadline, snapshots));
+                        return Ok(TerminalState::new(exit.deadline, snapshots));
                     }
-                    Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
-                        let snapshots = self.metrics.borrow_mut().terminal_snapshots();
-                        return Ok(TerminalState::new(deadline, snapshots));
-                    }
-                    Err(err) => return Err(Error::ChannelRecvError(err)),
-                    _ => {}
                 },
-                result = &mut worker_start => break result.map_err(|err| Error::ReceiverError {
-                    receiver: effect_handler.receiver_id(),
-                    kind: ReceiverErrorKind::Other,
-                    error: "failed to initialize the Windows PDH query".to_owned(),
-                    source_detail: err.to_string(),
+                result = &mut worker_start => break result.map_err(|err| {
+                    receiver_error(
+                        &effect_handler,
+                        "failed to initialize the Windows PDH query",
+                        err.to_string(),
+                    )
                 })?,
             }
         };
@@ -337,21 +399,17 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
             loop {
                 tokio::select! {
                     biased;
-                    msg = ctrl_msg_recv.recv() => match msg {
-                        Ok(NodeControlMsg::DrainIngress { deadline, .. }) => {
-                            break Exit::Control { deadline, drained: true };
+                    msg = ctrl_msg_recv.recv() => {
+                        match msg {
+                            Ok(message) => {
+                                if let Some(exit) = self.handle_control_message(message) {
+                                    break Exit::Control(exit);
+                                }
+                            }
+                            Err(err) => {
+                                break Exit::Collection(Err(Error::ChannelRecvError(err)));
+                            }
                         }
-                        Ok(NodeControlMsg::Shutdown { deadline, .. }) => {
-                            break Exit::Control { deadline, drained: false };
-                        }
-                        Ok(NodeControlMsg::CollectTelemetry { mut metrics_reporter }) => {
-                            let mut metrics = self.metrics.borrow_mut();
-                            let _ = metrics.report(&mut metrics_reporter);
-                        }
-                        Err(err) => {
-                            break Exit::Collection(Err(Error::ChannelRecvError(err)));
-                        }
-                        _ => {}
                     },
                     result = &mut collect_and_send => break Exit::Collection(result),
                 }
@@ -359,7 +417,7 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
         };
 
         let (deadline, drained, collection_result) = match exit {
-            Exit::Control { deadline, drained } => (deadline, drained, None),
+            Exit::Control(exit) => (exit.deadline, exit.drained, None),
             Exit::Collection(result) => {
                 (Instant::now() + Duration::from_secs(5), false, Some(result))
             }
@@ -374,12 +432,7 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
                 );
             }
             Err(err) => {
-                return Err(Error::ReceiverError {
-                    receiver: effect_handler.receiver_id(),
-                    kind: ReceiverErrorKind::Other,
-                    error: err.to_string(),
-                    source_detail: String::new(),
-                });
+                return Err(receiver_error(&effect_handler, err.to_string(), ""));
             }
         }
         if let Some(result) = collection_result {
