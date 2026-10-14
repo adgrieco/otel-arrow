@@ -279,40 +279,36 @@ impl<A: PdhApi> Query<A> {
             metadata
                 .failures
                 .push(sample_failure(discovery.config_index, error));
-            let mut retained = self
+            let retained = self
                 .counters
                 .iter()
                 .filter_map(|(key, counter)| {
                     (key.config_index == discovery.config_index && counter.origin.is_wildcard())
-                        .then(|| {
-                            counter.instance.clone().map(|instance| {
-                                (
-                                    key.clone(),
-                                    DesiredCounter::new(
-                                        counter.path.clone(),
-                                        instance,
-                                        counter.emit_instance_attribute,
-                                    ),
-                                )
-                            })
-                        })?
+                        .then_some((
+                            key,
+                            &counter.path,
+                            &counter.instance,
+                            counter.emit_instance_attribute,
+                        ))
                 })
                 .chain(self.retry_states.iter().filter_map(|(key, state)| {
                     (key.config_index == discovery.config_index
                         && state.target.origin.is_wildcard())
-                    .then(|| {
-                        state.target.instance.clone().map(|instance| {
-                            (
-                                key.clone(),
-                                DesiredCounter::new(
-                                    state.target.path.clone(),
-                                    instance,
-                                    state.target.emit_instance_attribute,
-                                ),
-                            )
-                        })
-                    })?
+                    .then_some((
+                        key,
+                        &state.target.path,
+                        &state.target.instance,
+                        state.target.emit_instance_attribute,
+                    ))
                 }))
+                .filter_map(|(key, path, instance, emit_instance_attribute)| {
+                    instance.clone().map(|instance| {
+                        (
+                            key.clone(),
+                            DesiredCounter::new(path.clone(), instance, emit_instance_attribute),
+                        )
+                    })
+                })
                 .collect::<BTreeMap<_, _>>();
             let discovered = retained.len();
             let allocation = expansion_allocation(
@@ -321,15 +317,10 @@ impl<A: PdhApi> Query<A> {
                 self.max_expanded_counters.saturating_sub(expanded_total),
             );
             metadata.record_expansion_overflows(discovery.config_index, discovered, allocation);
-            while retained.len() > allocation.retained {
-                let Some(key) = retained.keys().next_back().cloned() else {
-                    break;
-                };
-                let _ = retained.remove(&key);
-            }
-            expanded_total += retained.len();
+            let retained = retained.into_iter().take(allocation.retained);
             for (key, counter) in retained {
                 let _ = desired.insert(key, counter);
+                expanded_total += 1;
             }
         }
         expanded_total
