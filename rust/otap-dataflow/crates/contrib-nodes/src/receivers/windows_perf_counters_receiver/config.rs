@@ -20,6 +20,10 @@ const DEFAULT_MAX_EXPANDED_COUNTERS: usize = 4_096;
 const DEFAULT_AGGREGATION_NAME: &str = "_Total";
 const RECEIVER_ATTRIBUTE_PREFIX: &str = "windows.perf_counter.";
 
+const OBJECT_INSTANCE_RESERVED: &[char] = &['\\', '(', ')', '*', '?', '\0'];
+const INSTANCE_PATTERN_RESERVED: &[char] = &['\\', '(', ')', '?', '\0'];
+const COUNTER_RESERVED: &[char] = &['\\', '*', '?', '\0'];
+
 /// Configuration normalized for Windows performance-counter collection.
 #[derive(Debug, Clone)]
 pub(super) struct Config {
@@ -44,264 +48,11 @@ impl Config {
     pub(super) fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
         let user: UserConfig =
             serde_json::from_value(value.clone()).map_err(|err| invalid(err.to_string()))?;
-        if user.collection_interval.is_zero() {
-            return Err(invalid("collection_interval must be greater than zero"));
-        }
-        if let Some(refresh_interval) = user.wildcard_refresh_interval
-            && refresh_interval < user.collection_interval
-        {
-            return Err(invalid(
-                "wildcard_refresh_interval must be at least collection_interval",
-            ));
-        }
-        if user.perfcounters.is_empty() {
-            return Err(invalid("perfcounters must contain at least one entry"));
-        }
-        if user.metrics.len() > MAX_CONFIGURED_COUNTER_PATHS {
-            return Err(invalid(format!(
-                "metrics must contain at most {MAX_CONFIGURED_COUNTER_PATHS} entries"
-            )));
-        }
-        if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_instances_per_wildcard) {
-            return Err(invalid(format!(
-                "max_instances_per_wildcard must be between 1 and {MAX_INSTANCE_LIMIT}"
-            )));
-        }
-        if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_expanded_counters) {
-            return Err(invalid(format!(
-                "max_expanded_counters must be between 1 and {MAX_INSTANCE_LIMIT}"
-            )));
-        }
-        if user.max_instances_per_wildcard > user.max_expanded_counters {
-            return Err(invalid(
-                "max_instances_per_wildcard must not exceed max_expanded_counters",
-            ));
-        }
-
-        let mut metrics = BTreeMap::new();
-        let mut metric_identities = HashSet::new();
-        for (name, metric) in &user.metrics {
-            let name = validate_metric_name(name)?;
-            if !metric_identities.insert(name.to_ascii_lowercase()) {
-                return Err(invalid(format!("metrics contains duplicate {name:?}")));
-            }
-            let description = metric.description.trim();
-            let unit = validate_metric_unit(name, &metric.unit)?;
-            let _ = metrics.insert(
-                name.to_owned(),
-                NormalizedMetric {
-                    description: Arc::from(description),
-                    unit: unit.to_owned(),
-                    kind: metric.kind(name)?,
-                },
-            );
-        }
-
+        validate_user_config(&user)?;
+        let metrics = normalize_metrics(&user.metrics)?;
         let expanded_count = expanded_counter_count(&user.perfcounters)?;
-        let mut counters = Vec::with_capacity(expanded_count);
-        let mut source_mapping_index = 0;
-        for (object_index, object) in user.perfcounters.into_iter().enumerate() {
-            let object_field = format!("perfcounters[{object_index}]");
-            let object_name =
-                validate_path_element(&format!("{object_field}.object"), &object.object, false)?;
-            if object.counters.is_empty() {
-                return Err(invalid(format!(
-                    "{object_field}.counters must contain at least one entry"
-                )));
-            }
-            let aggregation_name = object
-                .aggregation_name
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_AGGREGATION_NAME.to_owned());
-            let aggregation_name = normalize_instance(
-                &format!("{object_field}.aggregation_name"),
-                &aggregation_name,
-                false,
-            )?;
-            let instances = match object.instances.map(OneOrMany::into_vec) {
-                None => None,
-                Some(instances) if instances.is_empty() => None,
-                Some(instances) => {
-                    let field = format!("{object_field}.instances");
-                    let mut unique = HashSet::new();
-                    let mut normalized = Vec::with_capacity(instances.len());
-                    for instance in instances {
-                        let configured = validate_path_element(&field, &instance, true)?;
-                        let native = if configured == "*" {
-                            configured.to_owned()
-                        } else {
-                            normalize_instance(&field, configured, configured.contains('*'))?
-                        };
-                        if !unique.insert(native.to_lowercase()) {
-                            return Err(invalid(format!(
-                                "{object_field}.instances contains duplicate {configured:?}"
-                            )));
-                        }
-                        normalized.push((native, configured.to_owned()));
-                    }
-                    Some(normalized)
-                }
-            };
-
-            for (counter_index, mapping) in object.counters.into_iter().enumerate() {
-                let counter_field = format!("{object_field}.counters[{counter_index}]");
-                let counter_name =
-                    validate_counter_name(&format!("{counter_field}.name"), &mapping.name)?;
-                let metric_name = match &mapping.metric {
-                    None => None,
-                    Some(Some(name)) => Some(name.trim()).filter(|name| !name.is_empty()),
-                    Some(None) => {
-                        return Err(invalid(format!(
-                            "{counter_field}.metric must be a string when present; null metric is invalid"
-                        )));
-                    }
-                };
-                let explicit_metric = if let Some(metric_name) = metric_name {
-                    let metric = metrics.get(metric_name).ok_or_else(|| {
-                        invalid(format!(
-                            "{counter_field}.metric references undefined metric {:?}",
-                            metric_name
-                        ))
-                    })?;
-                    let attributes = normalize_attributes(&counter_field, &mapping.attributes)?;
-                    let configured_instances = instances.as_deref().map(|instances| {
-                        instances
-                            .iter()
-                            .map(|(_, configured)| configured.clone())
-                            .collect::<Vec<_>>()
-                    });
-                    if should_warn_instance_override(configured_instances.as_deref(), &attributes) {
-                        otel_arrow_dfe_telemetry::otel_warn!(
-                            "otelcol.node.windowsperfcounters.config.instance_override",
-                            message = "a static instance attribute overrides generated instance \
-                                       identity for multiple or wildcard instances and may merge \
-                                       distinct series",
-                            object_index = object_index,
-                            counter_index = counter_index
-                        );
-                    }
-                    Some((
-                        metric_name.to_owned(),
-                        metric.unit.clone(),
-                        Arc::clone(&metric.description),
-                        metric.kind,
-                        Arc::new(attributes),
-                    ))
-                } else {
-                    None
-                };
-                let paths = match &instances {
-                    None => vec![(
-                        format!(r"\{object_name}\{counter_name}"),
-                        format!(r"\{object_name}\{counter_name}"),
-                        None,
-                        false,
-                        false,
-                    )],
-                    Some(instances)
-                        if instances.iter().any(|(_, configured)| configured == "*") =>
-                    {
-                        let include_aggregation = instances
-                            .iter()
-                            .any(|(native, _)| native == &aggregation_name);
-                        vec![(
-                            format!(r"\{object_name}(*)\{counter_name}"),
-                            format!(r"\{object_name}(*)\{counter_name}"),
-                            (!include_aggregation).then(|| aggregation_name.clone()),
-                            true,
-                            true,
-                        )]
-                    }
-                    Some(instances) => instances
-                        .iter()
-                        .map(|(native, configured)| {
-                            let is_exact_aggregation =
-                                !native.contains('*') && native == &aggregation_name;
-                            (
-                                format!(r"\{object_name}({native})\{counter_name}"),
-                                format!(r"\{object_name}({configured})\{counter_name}"),
-                                native.contains('*').then(|| aggregation_name.clone()),
-                                true,
-                                !is_exact_aggregation,
-                            )
-                        })
-                        .collect(),
-                };
-                for (
-                    path,
-                    configured_path,
-                    excluded_aggregation_instance,
-                    has_instance,
-                    emit_instance_attribute,
-                ) in paths
-                {
-                    let (name, unit, description, metric_kind, attributes) =
-                        if let Some((name, unit, description, metric_kind, attributes)) =
-                            &explicit_metric
-                        {
-                            (
-                                name.clone(),
-                                unit.clone(),
-                                Arc::clone(description),
-                                *metric_kind,
-                                Arc::clone(attributes),
-                            )
-                        } else {
-                            if let Some(metric) = metrics.get(&configured_path) {
-                                (
-                                    configured_path.clone(),
-                                    metric.unit.clone(),
-                                    Arc::clone(&metric.description),
-                                    metric.kind,
-                                    Arc::new(BTreeMap::new()),
-                                )
-                            } else {
-                                (
-                                    configured_path,
-                                    "1".to_owned(),
-                                    Arc::from(""),
-                                    MetricKind::Gauge,
-                                    Arc::new(BTreeMap::new()),
-                                )
-                            }
-                        };
-                    counters.push(CounterConfig {
-                        path,
-                        name,
-                        unit,
-                        description,
-                        metric_kind,
-                        attributes,
-                        has_instance,
-                        emit_instance_attribute,
-                        excluded_aggregation_instance,
-                        scale_power10: mapping.scale_power10,
-                        recreate_query: mapping.recreate_query,
-                        source_mapping_index,
-                    });
-                }
-                source_mapping_index += 1;
-            }
-        }
-        let mut output_identities = HashSet::with_capacity(counters.len());
-        for (index, counter) in counters.iter().enumerate() {
-            validate_counter(counter, index)?;
-            let identity = (
-                counter.path.to_lowercase(),
-                counter.name.clone(),
-                counter
-                    .attributes
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect::<Vec<_>>(),
-            );
-            if !output_identities.insert(identity) {
-                return Err(invalid(format!(
-                    "duplicate counter output mapping for path {} and metric {}",
-                    counter.path, counter.name
-                )));
-            }
-        }
+        let counters = normalize_counters(user.perfcounters, &metrics, expanded_count)?;
+        validate_counter_outputs(&counters)?;
 
         Ok(Self {
             counters,
@@ -562,20 +313,14 @@ fn require_name(field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_path_element<'a>(
+fn validate_path_segment<'a>(
     field: &str,
     value: &'a str,
-    allow_star: bool,
+    reserved: &[char],
 ) -> Result<&'a str, Error> {
     let value = value.trim();
     require_name(field, value)?;
-    if value.contains('\\')
-        || value.contains('(')
-        || value.contains(')')
-        || value.contains('?')
-        || value.contains('\0')
-        || (!allow_star && value.contains('*'))
-    {
+    if value.contains(reserved) {
         return Err(invalid(format!(
             "{field} contains a reserved performance-counter path character"
         )));
@@ -583,37 +328,47 @@ fn validate_path_element<'a>(
     Ok(value)
 }
 
-/// Canonicalizes PDH's decimal instance index, where the first occurrence omits `#0`.
-fn normalize_instance(field: &str, value: &str, allow_star: bool) -> Result<String, Error> {
-    let value = validate_path_element(field, value, allow_star)?;
-    let Some((name, index)) = value.rsplit_once('#') else {
-        return Ok(value.to_owned());
-    };
-    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Ok(value.to_owned());
-    }
-    if name.is_empty() {
+fn validate_object<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
+    validate_path_segment(field, value, OBJECT_INSTANCE_RESERVED)
+}
+
+/// Splits a PDH duplicate-instance suffix, such as `app#2`, into name and index.
+fn instance_index(value: &str) -> Option<(&str, &str)> {
+    value
+        .rsplit_once('#')
+        .filter(|(_, index)| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn validate_instance<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
+    let value = validate_path_segment(field, value, OBJECT_INSTANCE_RESERVED)?;
+    if instance_index(value).is_some_and(|(name, _)| name.is_empty()) {
         return Err(invalid(format!(
             "{field} must include an instance name before its index"
         )));
     }
-    let index = index.trim_start_matches('0');
-    if index.is_empty() {
-        Ok(name.to_owned())
-    } else {
-        Ok(format!("{name}#{index}"))
-    }
+    Ok(value)
+}
+
+fn validate_instance_pattern<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
+    validate_path_segment(field, value, INSTANCE_PATTERN_RESERVED)
+}
+
+/// Canonicalizes PDH's decimal instance index, where the first occurrence omits `#0`.
+/// Returns `(canonical, configured)`.
+fn normalize_instance<'a>(field: &str, value: &'a str) -> Result<(String, &'a str), Error> {
+    let value = validate_instance(field, value)?;
+    let canonical = match instance_index(value) {
+        Some((name, index)) => match index.trim_start_matches('0') {
+            "" => name.to_owned(),
+            index => format!("{name}#{index}"),
+        },
+        None => value.to_owned(),
+    };
+    Ok((canonical, value))
 }
 
 fn validate_counter_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
-    let value = value.trim();
-    require_name(field, value)?;
-    if value.contains(['\\', '*', '?', '\0']) {
-        return Err(invalid(format!(
-            "{field} contains a reserved performance-counter path character"
-        )));
-    }
-    Ok(value)
+    validate_path_segment(field, value, COUNTER_RESERVED)
 }
 
 fn validate_metric_name(name: &str) -> Result<&str, Error> {
@@ -633,22 +388,24 @@ fn validate_metric_name(name: &str) -> Result<&str, Error> {
             let instance = instance
                 .strip_suffix(')')
                 .ok_or_else(|| invalid(format!("{field} must close its instance parentheses")))?;
-            if validate_path_element(&field, instance, true)? != instance {
+            let checked_instance = if instance.contains('*') {
+                validate_instance_pattern(&field, instance)?
+            } else {
+                validate_instance(&field, instance)?
+            };
+            if checked_instance != instance {
                 return Err(invalid_padding());
-            }
-            if !instance.contains('*') {
-                let _ = normalize_instance(&field, instance, false)?;
             }
             object
         } else {
             object
         };
-        let checked_object = validate_path_element(&field, object, false)?;
+        let checked_object = validate_object(&field, object)?;
         let checked_counter = validate_counter_name(&field, counter)?;
         if checked_object != object || checked_counter != counter {
             return Err(invalid_padding());
         }
-        validate_path_length(name)?;
+        validate_path_length("metric name", name)?;
         return Ok(name);
     }
     let mut chars = name.chars();
@@ -680,13 +437,10 @@ fn validate_metric_unit<'a>(name: &str, unit: &'a str) -> Result<&'a str, Error>
 }
 
 fn should_warn_instance_override(
-    instances: Option<&[String]>,
+    has_multiple_or_wildcard_instances: bool,
     attributes: &BTreeMap<String, String>,
 ) -> bool {
-    attributes.contains_key("instance")
-        && instances.is_some_and(|instances| {
-            instances.len() > 1 || instances.iter().any(|instance| instance.contains('*'))
-        })
+    attributes.contains_key("instance") && has_multiple_or_wildcard_instances
 }
 
 fn normalize_attributes(
@@ -748,25 +502,455 @@ struct NormalizedMetric {
     kind: MetricKind,
 }
 
-fn validate_path_length(path: &str) -> Result<(), Error> {
+fn default_metric() -> NormalizedMetric {
+    NormalizedMetric {
+        description: Arc::from(""),
+        unit: "1".to_owned(),
+        kind: MetricKind::Gauge,
+    }
+}
+
+struct ExplicitMetric {
+    name: String,
+    unit: String,
+    description: Arc<str>,
+    kind: MetricKind,
+    attributes: Arc<BTreeMap<String, String>>,
+}
+
+struct ResolvedMetric {
+    name: String,
+    unit: String,
+    description: Arc<str>,
+    kind: MetricKind,
+    attributes: Arc<BTreeMap<String, String>>,
+}
+
+enum NormalizedInstances {
+    None,
+    All { include_aggregation: bool },
+    Selected(Vec<InstanceSegment>),
+}
+
+enum InstanceSegment {
+    Exact { native: String, configured: String },
+    Wildcard(String),
+}
+
+struct ExpandedPath {
+    native: String,
+    configured: String,
+    excluded_aggregation_instance: Option<String>,
+    emit_instance_attribute: bool,
+}
+
+struct ObjectNormalizer<'a> {
+    object_index: usize,
+    object_name: &'a str,
+    aggregation_name: &'a str,
+    instances: &'a NormalizedInstances,
+    metrics: &'a BTreeMap<String, NormalizedMetric>,
+}
+
+fn validate_user_config(user: &UserConfig) -> Result<(), Error> {
+    if user.collection_interval.is_zero() {
+        return Err(invalid("collection_interval must be greater than zero"));
+    }
+    if let Some(refresh_interval) = user.wildcard_refresh_interval
+        && refresh_interval < user.collection_interval
+    {
+        return Err(invalid(
+            "wildcard_refresh_interval must be at least collection_interval",
+        ));
+    }
+    if user.perfcounters.is_empty() {
+        return Err(invalid("perfcounters must contain at least one entry"));
+    }
+    if user.metrics.len() > MAX_CONFIGURED_COUNTER_PATHS {
+        return Err(invalid(format!(
+            "metrics must contain at most {MAX_CONFIGURED_COUNTER_PATHS} entries"
+        )));
+    }
+    if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_instances_per_wildcard) {
+        return Err(invalid(format!(
+            "max_instances_per_wildcard must be between 1 and {MAX_INSTANCE_LIMIT}"
+        )));
+    }
+    if !(1..=MAX_INSTANCE_LIMIT).contains(&user.max_expanded_counters) {
+        return Err(invalid(format!(
+            "max_expanded_counters must be between 1 and {MAX_INSTANCE_LIMIT}"
+        )));
+    }
+    if user.max_instances_per_wildcard > user.max_expanded_counters {
+        return Err(invalid(
+            "max_instances_per_wildcard must not exceed max_expanded_counters",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_metrics(
+    configured: &BTreeMap<String, MetricConfig>,
+) -> Result<BTreeMap<String, NormalizedMetric>, Error> {
+    let mut metrics = BTreeMap::new();
+    let mut identities = HashSet::new();
+    for (name, metric) in configured {
+        let name = validate_metric_name(name)?;
+        if !identities.insert(name.to_ascii_lowercase()) {
+            return Err(invalid(format!("metrics contains duplicate {name:?}")));
+        }
+        let _ = metrics.insert(
+            name.to_owned(),
+            NormalizedMetric {
+                description: Arc::from(metric.description.trim()),
+                unit: validate_metric_unit(name, &metric.unit)?.to_owned(),
+                kind: metric.kind(name)?,
+            },
+        );
+    }
+    Ok(metrics)
+}
+
+fn normalize_counters(
+    objects: Vec<ObjectConfig>,
+    metrics: &BTreeMap<String, NormalizedMetric>,
+    capacity: usize,
+) -> Result<Vec<CounterConfig>, Error> {
+    let mut counters = Vec::with_capacity(capacity);
+    let mut source_mapping_index = 0;
+    for (object_index, object) in objects.into_iter().enumerate() {
+        normalize_object(
+            object_index,
+            object,
+            metrics,
+            &mut counters,
+            &mut source_mapping_index,
+        )?;
+    }
+    Ok(counters)
+}
+
+fn normalize_object(
+    object_index: usize,
+    object: ObjectConfig,
+    metrics: &BTreeMap<String, NormalizedMetric>,
+    output: &mut Vec<CounterConfig>,
+    source_mapping_index: &mut usize,
+) -> Result<(), Error> {
+    let object_field = format!("perfcounters[{object_index}]");
+    let object_name = validate_object(&format!("{object_field}.object"), &object.object)?;
+    if object.counters.is_empty() {
+        return Err(invalid(format!(
+            "{object_field}.counters must contain at least one entry"
+        )));
+    }
+    let aggregation_name = normalize_aggregation_name(&object_field, object.aggregation_name)?;
+    let instances =
+        NormalizedInstances::from_config(&object_field, object.instances, &aggregation_name)?;
+    let normalizer = ObjectNormalizer {
+        object_index,
+        object_name,
+        aggregation_name: &aggregation_name,
+        instances: &instances,
+        metrics,
+    };
+    for (counter_index, mapping) in object.counters.into_iter().enumerate() {
+        normalizer.normalize_mapping(counter_index, mapping, *source_mapping_index, output)?;
+        *source_mapping_index += 1;
+    }
+    Ok(())
+}
+
+fn normalize_aggregation_name(
+    object_field: &str,
+    configured: Option<String>,
+) -> Result<String, Error> {
+    let configured = configured
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_AGGREGATION_NAME.to_owned());
+    normalize_instance(&format!("{object_field}.aggregation_name"), &configured)
+        .map(|(canonical, _)| canonical)
+}
+
+impl ObjectNormalizer<'_> {
+    fn normalize_mapping(
+        &self,
+        counter_index: usize,
+        mapping: CounterMapping,
+        source_mapping_index: usize,
+        output: &mut Vec<CounterConfig>,
+    ) -> Result<(), Error> {
+        let counter_field = format!(
+            "perfcounters[{}].counters[{counter_index}]",
+            self.object_index
+        );
+        let counter_name = validate_counter_name(&format!("{counter_field}.name"), &mapping.name)?;
+        let metric_name = normalize_metric_reference(&counter_field, &mapping.metric)?;
+        let explicit_metric = self.normalize_explicit_metric(
+            counter_index,
+            &counter_field,
+            metric_name,
+            &mapping.attributes,
+        )?;
+        for expanded in self
+            .instances
+            .expand(self.object_name, counter_name, self.aggregation_name)
+        {
+            let metric = self.resolve_metric(&expanded.configured, explicit_metric.as_ref());
+            output.push(CounterConfig {
+                path: expanded.native,
+                name: metric.name,
+                unit: metric.unit,
+                description: metric.description,
+                metric_kind: metric.kind,
+                attributes: metric.attributes,
+                has_instance: !matches!(self.instances, NormalizedInstances::None),
+                emit_instance_attribute: expanded.emit_instance_attribute,
+                excluded_aggregation_instance: expanded.excluded_aggregation_instance,
+                scale_power10: mapping.scale_power10,
+                recreate_query: mapping.recreate_query,
+                source_mapping_index,
+            });
+        }
+        Ok(())
+    }
+
+    fn resolve_metric(
+        &self,
+        configured_path: &str,
+        explicit: Option<&ExplicitMetric>,
+    ) -> ResolvedMetric {
+        if let Some(explicit) = explicit {
+            return ResolvedMetric {
+                name: explicit.name.clone(),
+                unit: explicit.unit.clone(),
+                description: Arc::clone(&explicit.description),
+                kind: explicit.kind,
+                attributes: Arc::clone(&explicit.attributes),
+            };
+        }
+        let default_metric = default_metric();
+        let metric = self.metrics.get(configured_path).unwrap_or(&default_metric);
+        ResolvedMetric {
+            name: configured_path.to_owned(),
+            unit: metric.unit.clone(),
+            description: Arc::clone(&metric.description),
+            kind: metric.kind,
+            attributes: Arc::new(BTreeMap::new()),
+        }
+    }
+
+    fn normalize_explicit_metric(
+        &self,
+        counter_index: usize,
+        counter_field: &str,
+        metric_name: Option<&str>,
+        configured_attributes: &BTreeMap<String, String>,
+    ) -> Result<Option<ExplicitMetric>, Error> {
+        let Some(name) = metric_name else {
+            return Ok(None);
+        };
+        let metric = self.metrics.get(name).ok_or_else(|| {
+            invalid(format!(
+                "{counter_field}.metric references undefined metric {name:?}"
+            ))
+        })?;
+        let attributes = normalize_attributes(counter_field, configured_attributes)?;
+        if should_warn_instance_override(self.instances.has_multiple_or_wildcard(), &attributes) {
+            otel_arrow_dfe_telemetry::otel_warn!(
+                "otelcol.node.windowsperfcounters.config.instance_override",
+                message = "a static instance attribute overrides generated instance identity for \
+                           multiple or wildcard instances and may merge distinct series",
+                object_index = self.object_index,
+                counter_index = counter_index
+            );
+        }
+        Ok(Some(ExplicitMetric {
+            name: name.to_owned(),
+            unit: metric.unit.clone(),
+            description: Arc::clone(&metric.description),
+            kind: metric.kind,
+            attributes: Arc::new(attributes),
+        }))
+    }
+}
+
+fn normalize_metric_reference<'a>(
+    counter_field: &str,
+    configured: &'a Option<Option<String>>,
+) -> Result<Option<&'a str>, Error> {
+    match configured {
+        None => Ok(None),
+        Some(Some(name)) => Ok(Some(name.trim()).filter(|name| !name.is_empty())),
+        Some(None) => Err(invalid(format!(
+            "{counter_field}.metric must be a string when present; null metric is invalid"
+        ))),
+    }
+}
+
+impl NormalizedInstances {
+    fn from_config(
+        object_field: &str,
+        configured: Option<OneOrMany>,
+        aggregation_name: &str,
+    ) -> Result<Self, Error> {
+        let Some(configured) = configured.map(OneOrMany::into_vec) else {
+            return Ok(Self::None);
+        };
+        if configured.is_empty() {
+            return Ok(Self::None);
+        }
+        let field = format!("{object_field}.instances");
+        let mut identities = HashSet::new();
+        let mut segments = Vec::with_capacity(configured.len());
+        for configured in configured {
+            let segment = InstanceSegment::from_config(&field, configured)?;
+            if !identities.insert(segment.native().to_lowercase()) {
+                return Err(invalid(format!(
+                    "{object_field}.instances contains duplicate {:?}",
+                    segment.configured()
+                )));
+            }
+            segments.push(segment);
+        }
+        if segments.iter().any(InstanceSegment::selects_all) {
+            return Ok(Self::All {
+                include_aggregation: segments
+                    .iter()
+                    .any(|segment| segment.is_exact(aggregation_name)),
+            });
+        }
+        Ok(Self::Selected(segments))
+    }
+
+    fn has_multiple_or_wildcard(&self) -> bool {
+        match self {
+            Self::None => false,
+            Self::All { .. } => true,
+            Self::Selected(segments) => {
+                segments.len() > 1 || segments.iter().any(InstanceSegment::is_wildcard)
+            }
+        }
+    }
+
+    fn expand(&self, object: &str, counter: &str, aggregation_name: &str) -> Vec<ExpandedPath> {
+        match self {
+            Self::None => vec![ExpandedPath {
+                native: counter_path(object, None, counter),
+                configured: counter_path(object, None, counter),
+                excluded_aggregation_instance: None,
+                emit_instance_attribute: false,
+            }],
+            Self::All {
+                include_aggregation,
+            } => vec![ExpandedPath {
+                native: counter_path(object, Some("*"), counter),
+                configured: counter_path(object, Some("*"), counter),
+                excluded_aggregation_instance: (!include_aggregation)
+                    .then(|| aggregation_name.to_owned()),
+                emit_instance_attribute: true,
+            }],
+            Self::Selected(segments) => segments
+                .iter()
+                .map(|segment| ExpandedPath {
+                    native: counter_path(object, Some(segment.native()), counter),
+                    configured: counter_path(object, Some(segment.configured()), counter),
+                    excluded_aggregation_instance: segment
+                        .is_wildcard()
+                        .then(|| aggregation_name.to_owned()),
+                    emit_instance_attribute: !segment.is_exact(aggregation_name),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl InstanceSegment {
+    fn from_config(field: &str, configured: String) -> Result<Self, Error> {
+        if configured.contains('*') {
+            Ok(Self::Wildcard(
+                validate_instance_pattern(field, &configured)?.to_owned(),
+            ))
+        } else {
+            let (native, configured) = normalize_instance(field, &configured)?;
+            Ok(Self::Exact {
+                native,
+                configured: configured.to_owned(),
+            })
+        }
+    }
+
+    fn native(&self) -> &str {
+        match self {
+            Self::Exact { native, .. } => native,
+            Self::Wildcard(configured) => configured,
+        }
+    }
+
+    fn configured(&self) -> &str {
+        match self {
+            Self::Exact { configured, .. } | Self::Wildcard(configured) => configured,
+        }
+    }
+
+    fn is_wildcard(&self) -> bool {
+        matches!(self, Self::Wildcard(_))
+    }
+
+    fn selects_all(&self) -> bool {
+        matches!(self, Self::Wildcard(configured) if configured == "*")
+    }
+
+    fn is_exact(&self, expected: &str) -> bool {
+        matches!(self, Self::Exact { native, .. } if native == expected)
+    }
+}
+
+fn counter_path(object: &str, instance: Option<&str>, counter: &str) -> String {
+    match instance {
+        Some(instance) => format!(r"\{object}({instance})\{counter}"),
+        None => format!(r"\{object}\{counter}"),
+    }
+}
+
+fn validate_counter_outputs(counters: &[CounterConfig]) -> Result<(), Error> {
+    let mut output_identities = HashSet::with_capacity(counters.len());
+    for counter in counters {
+        validate_counter(counter)?;
+        let identity = (
+            counter.path.to_lowercase(),
+            counter.name.clone(),
+            counter
+                .attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>(),
+        );
+        if !output_identities.insert(identity) {
+            return Err(invalid(format!(
+                "duplicate counter output mapping for path {} and metric {}",
+                counter.path, counter.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_path_length(field: &str, path: &str) -> Result<(), Error> {
     if path.encode_utf16().count() > MAX_COUNTER_PATH_LEN {
         return Err(invalid(format!(
-            "counter path {:?} must contain at most {MAX_COUNTER_PATH_LEN} UTF-16 code units",
-            path
+            "{field} {path:?} must contain at most {MAX_COUNTER_PATH_LEN} UTF-16 code units"
         )));
     }
     Ok(())
 }
 
-fn validate_counter(counter: &CounterConfig, index: usize) -> Result<(), Error> {
-    validate_path_length(&counter.path).map_err(|_| {
-        invalid(format!(
-            "normalized counter {index} path must contain at most {MAX_COUNTER_PATH_LEN} UTF-16 code units"
-        ))
-    })?;
+fn validate_counter(counter: &CounterConfig) -> Result<(), Error> {
+    validate_path_length("counter path", &counter.path)?;
     if !(MIN_SCALE_POWER10..=MAX_SCALE_POWER10).contains(&counter.scale_power10) {
         return Err(invalid(format!(
-            "normalized counter {index} scale_power10 must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}"
+            "counter path {:?} scale_power10 must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}",
+            counter.path
         )));
     }
     Ok(())
@@ -1331,22 +1515,10 @@ mod tests {
         let override_attributes = BTreeMap::from([("instance".to_owned(), "fixed".to_owned())]);
         let ignored_attributes = BTreeMap::new();
 
-        assert!(!should_warn_instance_override(
-            Some(&["worker".to_owned()]),
-            &override_attributes
-        ));
-        assert!(should_warn_instance_override(
-            Some(&["worker".to_owned(), "service".to_owned()]),
-            &override_attributes
-        ));
-        assert!(should_warn_instance_override(
-            Some(&["worker*".to_owned()]),
-            &override_attributes
-        ));
-        assert!(!should_warn_instance_override(
-            Some(&["*".to_owned()]),
-            &ignored_attributes
-        ));
+        assert!(!should_warn_instance_override(false, &override_attributes));
+        assert!(should_warn_instance_override(true, &override_attributes));
+        assert!(should_warn_instance_override(true, &override_attributes));
+        assert!(!should_warn_instance_override(true, &ignored_attributes));
     }
 
     /// Scenario: A canonical Windows counter name contains parentheses.
