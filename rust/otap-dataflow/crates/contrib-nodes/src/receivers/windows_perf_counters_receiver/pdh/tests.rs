@@ -1130,6 +1130,36 @@ fn exact_instance_path_preserves_identity() {
     );
 }
 
+/// Scenario: An exact configured instance path cannot be parsed for optional identity attributes.
+/// Guarantees: The native counter still emits its value and reports only diagnostic identity evidence.
+#[test]
+fn exact_instance_parse_failure_preserves_value() {
+    let path = r"\Object\Counter";
+    let mut config = counter(path, "object.counter");
+    config.has_instance = true;
+    config.emit_instance_attribute = true;
+    let (_, mut query) = fake_query(
+        vec![config],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x0001_0100,
+            raw: None,
+            multi_count: 1,
+            formatted: Some(Number::Integer(42)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points.len(), 1);
+    assert_eq!(sample.points[0].instance, None);
+    assert!(!sample.points[0].emit_instance_attribute);
+    assert_eq!(sample.failures.len(), 1);
+    assert!(sample.failures[0].diagnostic_only);
+    assert_eq!(sample.diagnostics.counter_add_failures, 0);
+}
+
 /// Scenario: Counter inspection fails and native cleanup also reports an error.
 /// Guarantees: The counter-local diagnostic preserves both failures instead of silently dropping cleanup evidence.
 #[test]
@@ -3089,6 +3119,7 @@ fn retry_state_is_unique_per_stable_identity() {
             parent: None,
             index: 0,
         }),
+        emit_instance_attribute: true,
     };
     let now = Instant::now();
     let mut states = BTreeMap::new();
@@ -3271,15 +3302,15 @@ fn duplicate_group_churn_recreates_retained_paths() {
     assert!(!added.contains(&unrelated));
 }
 
-/// Scenario: A wildcard expansion contains aggregate and concrete provider instances.
-/// Guarantees: Aggregate matching is case-insensitive and does not confuse concrete instances.
+/// Scenario: A wildcard expansion contains exact-case, case-distinct, and concrete instances.
+/// Guarantees: Aggregate matching is case-sensitive and does not confuse other provider instances.
 #[test]
 fn identifies_provider_aggregation_instances() {
     assert!(is_aggregation_instance(
         r"\Process(_Total)\Private Bytes",
         "_Total"
     ));
-    assert!(is_aggregation_instance(
+    assert!(!is_aggregation_instance(
         r"\Custom(_GLOBAL_)\Counter",
         "_Global_"
     ));
@@ -3297,10 +3328,50 @@ fn filters_aggregation_before_expansion_limits() {
         r"\Process(_Total)\Private Bytes".to_owned(),
         r"\Process(worker)\Private Bytes".to_owned(),
     ];
-    remove_aggregation_instances(&mut paths, Some("_Total"));
+    assert!(!cleanup_aggregation_instances(&mut paths, Some("_Total")));
     let omitted = limit_expanded_paths(&mut paths, 1, 1);
     assert_eq!(omitted, (0, 0));
     assert_eq!(paths, [r"\Process(worker)\Private Bytes"]);
+}
+
+/// Scenario: A wildcard discovery returns only the configured aggregate instance.
+/// Guarantees: The aggregate value is retained while its Go-compatible `instance` label is omitted.
+#[test]
+fn retains_wildcard_only_aggregation_without_instance_label() {
+    let template = r"\Process(*)\Private Bytes";
+    let aggregate = r"\Process(_Total)\Private Bytes";
+    let mut config = counter(template, "windows.process.private");
+    config.has_instance = true;
+    config.emit_instance_attribute = true;
+    config.excluded_aggregation_instance = Some("_Total".to_owned());
+    let (state, mut query) = fake_query(
+        vec![config],
+        vec![FakeCounter {
+            path: aggregate.to_owned(),
+            native_type: 0x0001_0100,
+            raw: None,
+            multi_count: 1,
+            formatted: Some(Number::Integer(42)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(template.to_owned(), vec![aggregate.to_owned()]);
+    query.last_wildcard_refresh = Instant::now() - Duration::from_secs(31);
+
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points.len(), 1);
+    assert_eq!(
+        sample.points[0]
+            .instance
+            .as_ref()
+            .map(|value| value.name.as_str()),
+        Some("_Total")
+    );
+    assert!(!sample.points[0].emit_instance_attribute);
 }
 
 /// Scenario: A simulated PDH call remains blocked past the shutdown deadline.

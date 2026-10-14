@@ -184,7 +184,7 @@ pub(super) fn into_otap(
             attrs.any_values_builder.append_str(counter.path.as_bytes());
         }
         if let Some(instance) = point.instance {
-            if counter.emit_instance_attribute && !counter.attributes.contains_key("instance") {
+            if point.emit_instance_attribute && !counter.attributes.contains_key("instance") {
                 attrs.append_parent_id(&point_id);
                 attrs.append_key("instance");
                 attrs
@@ -252,6 +252,7 @@ pub(super) fn into_otap(
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::Config;
     use super::super::model::{InstanceIdentity, SampleFailure};
     use super::*;
     use arrow::array::{Array, Int64Array, UInt8Array};
@@ -318,6 +319,7 @@ mod tests {
             counter_index,
             path: path.to_owned(),
             instance: None,
+            emit_instance_attribute: false,
             timestamp_unix_nano,
             start_time_unix_nano: None,
             value,
@@ -351,6 +353,61 @@ mod tests {
             start_time_unix_nano: Some(start_time_unix_nano),
             ..point(counter_index, path, SampleValue::Value(value))
         }
+    }
+
+    /// Scenario: An implicit path-named mapping matches a configured metric definition.
+    /// Guarantees: Decoded OTAP output uses the matching definition's name, description, unit, and kind.
+    #[test]
+    fn projects_implicit_path_named_metric_definition() {
+        let config = Config::from_json(&serde_json::json!({
+            "metrics": {
+                r"\Memory\Available Bytes": {
+                    "description": "Available physical memory.",
+                    "unit": "By",
+                    "gauge": {}
+                }
+            },
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{"name": "Available Bytes"}]
+            }]
+        }))
+        .unwrap();
+        let records = into_otap(
+            &config.counters,
+            Sample {
+                timestamp_unix_nano: 1,
+                points: vec![point(
+                    0,
+                    r"\Memory\Available Bytes",
+                    SampleValue::Value(Number::Integer(42)),
+                )],
+                failures: Vec::new(),
+                overflows: Vec::new(),
+                diagnostics: Default::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        let metrics = records.get(ArrowPayloadType::UnivariateMetrics).unwrap();
+        assert_eq!(metrics.num_rows(), 1);
+        assert_eq!(
+            metrics
+                .column_by_name("metric_type")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .value(0),
+            MetricType::Gauge as u8
+        );
+        let display = arrow::util::pretty::pretty_format_batches(std::slice::from_ref(metrics))
+            .unwrap()
+            .to_string();
+        assert!(display.contains(r"\Memory\Available Bytes"));
+        assert!(display.contains("Available physical memory."));
+        assert!(display.contains("By"));
     }
 
     /// Scenario: Multiple configured readings include an integer beyond f64's exact range.
@@ -1199,6 +1256,7 @@ mod tests {
                             parent: None,
                             index: 0,
                         }),
+                        emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(10)),
@@ -1211,6 +1269,7 @@ mod tests {
                             parent: Some("service".to_owned()),
                             index: 1,
                         }),
+                        emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(20)),
@@ -1275,6 +1334,7 @@ mod tests {
                         counter_index: 0,
                         path: r"\Processor(_Total)\Counter".to_owned(),
                         instance: Some(aggregate.clone()),
+                        emit_instance_attribute: false,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(10)),
@@ -1283,6 +1343,7 @@ mod tests {
                         counter_index: 1,
                         path: r"\Processor(_Total)\Counter".to_owned(),
                         instance: Some(aggregate),
+                        emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(20)),
@@ -1338,6 +1399,7 @@ mod tests {
                             parent: None,
                             index: 0,
                         }),
+                        emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(10)),
@@ -1350,6 +1412,7 @@ mod tests {
                             parent: None,
                             index: 0,
                         }),
+                        emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
                         value: SampleValue::Value(Number::Integer(20)),

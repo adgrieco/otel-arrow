@@ -203,7 +203,7 @@ impl Config {
                     Some(instances) if instances.iter().any(|instance| instance == "*") => {
                         let include_aggregation = instances
                             .iter()
-                            .any(|instance| instance.eq_ignore_ascii_case(&aggregation_name));
+                            .any(|instance| instance == &aggregation_name);
                         vec![(
                             format!(r"\{object_name}(*)\{counter_name}"),
                             (!include_aggregation).then(|| aggregation_name.clone()),
@@ -214,8 +214,8 @@ impl Config {
                     Some(instances) => instances
                         .iter()
                         .map(|instance| {
-                            let is_exact_aggregation = !instance.contains('*')
-                                && instance.eq_ignore_ascii_case(&aggregation_name);
+                            let is_exact_aggregation =
+                                !instance.contains('*') && instance == &aggregation_name;
                             (
                                 format!(r"\{object_name}({instance})\{counter_name}"),
                                 instance.contains('*').then(|| aggregation_name.clone()),
@@ -240,19 +240,23 @@ impl Config {
                                 Arc::clone(attributes),
                             )
                         } else {
-                            if metrics.contains_key(&path) {
-                                return Err(invalid(format!(
-                                    "{counter_field} implicit path-named Gauge {path:?} conflicts \
-                                     with an explicitly defined metric of the same name"
-                                )));
+                            if let Some(metric) = metrics.get(&path) {
+                                (
+                                    path.clone(),
+                                    metric.unit.clone(),
+                                    Arc::clone(&metric.description),
+                                    metric.kind,
+                                    Arc::new(BTreeMap::new()),
+                                )
+                            } else {
+                                (
+                                    path.clone(),
+                                    "1".to_owned(),
+                                    Arc::from(""),
+                                    MetricKind::Gauge,
+                                    Arc::new(BTreeMap::new()),
+                                )
                             }
-                            (
-                                path.clone(),
-                                "1".to_owned(),
-                                Arc::from(""),
-                                MetricKind::Gauge,
-                                Arc::new(BTreeMap::new()),
-                            )
                         };
                     counters.push(CounterConfig {
                         path,
@@ -948,6 +952,45 @@ mod tests {
         assert!(counter.attributes.is_empty());
     }
 
+    /// Scenario: An implicit path name exactly matches a configured metric definition.
+    /// Guarantees: The mapping uses that definition's metadata and kind while ignoring mapping attributes.
+    #[test]
+    fn resolves_implicit_path_name_to_metric_definition() {
+        let config = Config::from_json(&json!({
+            "metrics": {
+                r"\Memory\Available Bytes": {
+                    "description": "Available physical memory.",
+                    "unit": "By",
+                    "sum": {
+                        "aggregation": "cumulative",
+                        "monotonic": false
+                    }
+                }
+            },
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{
+                    "name": "Available Bytes",
+                    "attributes": {"state": "ignored"}
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let counter = &config.counters[0];
+        assert_eq!(counter.name, r"\Memory\Available Bytes");
+        assert_eq!(counter.unit, "By");
+        assert_eq!(counter.description.as_ref(), "Available physical memory.");
+        assert_eq!(
+            counter.metric_kind,
+            MetricKind::Sum {
+                aggregation: Aggregation::Cumulative,
+                monotonic: false,
+            }
+        );
+        assert!(counter.attributes.is_empty());
+    }
+
     /// Scenario: Metric metadata fields are omitted and another definition is unused.
     /// Guarantees: Referenced metadata receives Go-compatible defaults and unused definitions are allowed.
     #[test]
@@ -1053,6 +1096,23 @@ mod tests {
         .unwrap();
         assert_eq!(included.counters[0].excluded_aggregation_instance, None);
         assert!(included.counters[0].emit_instance_attribute);
+
+        let case_distinct = Config::from_json(&json!({
+            "metrics": {"test": metric()},
+            "perfcounters": [{
+                "object": "Custom Object",
+                "instances": ["*", "_GLOBAL_"],
+                "aggregation_name": "_Global_",
+                "counters": [{"name": "Counter", "metric": "test"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            case_distinct.counters[0]
+                .excluded_aggregation_instance
+                .as_deref(),
+            Some("_Global_")
+        );
 
         let aggregate_alone = Config::from_json(&json!({
             "metrics": {"test": metric()},
@@ -1267,18 +1327,6 @@ mod tests {
                 }]
             }),
             "contains duplicate attribute key",
-        );
-        assert_config_error(
-            json!({
-                "metrics": {
-                    r"\Memory\Available Bytes": {"unit": "By"}
-                },
-                "perfcounters": [{
-                    "object": "Memory",
-                    "counters": [{"name": "Available Bytes"}]
-                }]
-            }),
-            "implicit path-named Gauge",
         );
     }
 

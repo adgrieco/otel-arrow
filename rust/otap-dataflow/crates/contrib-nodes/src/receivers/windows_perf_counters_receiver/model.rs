@@ -60,6 +60,8 @@ pub(super) struct SamplePoint {
     pub(super) path: String,
     /// Parsed identity for an expanded wildcard instance.
     pub(super) instance: Option<InstanceIdentity>,
+    /// Whether to emit the Go-compatible `instance` attribute for this point.
+    pub(super) emit_instance_attribute: bool,
     /// End of this point's observation or delta interval.
     pub(super) timestamp_unix_nano: i64,
     /// Start of this point's cumulative sequence or delta interval.

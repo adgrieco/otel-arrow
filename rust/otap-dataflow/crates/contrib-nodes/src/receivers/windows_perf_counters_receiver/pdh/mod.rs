@@ -283,6 +283,7 @@ struct CounterTarget {
     path: String,
     localized: bool,
     instance: Option<InstanceIdentity>,
+    emit_instance_attribute: bool,
 }
 
 #[derive(Clone)]
@@ -502,13 +503,17 @@ fn delta_interval_start(
 }
 
 fn is_aggregation_instance(path: &str, aggregation_name: &str) -> bool {
-    parse_instance(path).is_ok_and(|instance| instance.name.eq_ignore_ascii_case(aggregation_name))
+    parse_instance(path).is_ok_and(|instance| instance.name == aggregation_name)
 }
 
-fn remove_aggregation_instances(paths: &mut Vec<String>, aggregation_name: Option<&str>) {
+fn cleanup_aggregation_instances(paths: &mut Vec<String>, aggregation_name: Option<&str>) -> bool {
     if let Some(aggregation_name) = aggregation_name {
+        if paths.len() == 1 && is_aggregation_instance(&paths[0], aggregation_name) {
+            return true;
+        }
         paths.retain(|path| !is_aggregation_instance(path, aggregation_name));
     }
+    false
 }
 
 fn merge_diagnostics(target: &mut SampleDiagnostics, delta: SampleDiagnostics) {
@@ -699,6 +704,7 @@ struct CounterHandle<C> {
     history: CounterHistory,
     wildcard: bool,
     instance: Option<InstanceIdentity>,
+    emit_instance_attribute: bool,
 }
 
 impl<C> CounterHandle<C> {
@@ -899,12 +905,10 @@ impl<A: PdhApi> Query<A> {
                     match query.api.parse_instance(&path) {
                         Ok(instance) => Some(instance),
                         Err(error) => {
-                            query.pending.diagnostics.counter_add_failures += 1;
-                            query
-                                .pending
-                                .failures
-                                .push(sample_failure(config_index, &error));
-                            continue;
+                            let mut failure = sample_failure(config_index, &error);
+                            failure.diagnostic_only = true;
+                            query.pending.failures.push(failure);
+                            None
                         }
                     }
                 } else {
@@ -915,12 +919,15 @@ impl<A: PdhApi> Query<A> {
                     path,
                     localized: false,
                     instance: instance.clone(),
+                    emit_instance_attribute: query.configs[config_index].emit_instance_attribute
+                        && instance.is_some(),
                 };
                 match query.add_counter(
                     target.config_index,
                     target.path.clone(),
                     target.localized,
                     instance,
+                    target.emit_instance_attribute,
                 ) {
                     Ok(()) => {}
                     Err(error) => match exact_add_failure_disposition(&error) {
@@ -957,6 +964,7 @@ impl<A: PdhApi> Query<A> {
         path: String,
         localized: bool,
         instance: Option<InstanceIdentity>,
+        emit_instance_attribute: bool,
     ) -> Result<(), Error> {
         let counter = self.api.add(&path, localized)?;
         let kind = match self
@@ -996,6 +1004,7 @@ impl<A: PdhApi> Query<A> {
                 history: CounterHistory::default(),
                 wildcard: localized,
                 instance,
+                emit_instance_attribute,
             },
         );
         Ok(())
@@ -1024,6 +1033,7 @@ impl<A: PdhApi> Query<A> {
             target.path.clone(),
             target.localized,
             target.instance.clone(),
+            target.emit_instance_attribute,
         ) {
             Ok(()) => {
                 if self.retry_states.remove(&key).is_some() {
@@ -1095,19 +1105,30 @@ impl<A: PdhApi> Query<A> {
                 .iter()
                 .filter_map(|(key, counter)| {
                     (key.config_index == *config_index && counter.wildcard).then(|| {
-                        counter
-                            .instance
-                            .clone()
-                            .map(|instance| (key.clone(), (counter.path.clone(), instance)))
+                        counter.instance.clone().map(|instance| {
+                            (
+                                key.clone(),
+                                (
+                                    counter.path.clone(),
+                                    instance,
+                                    counter.emit_instance_attribute,
+                                ),
+                            )
+                        })
                     })?
                 })
                 .chain(self.retry_states.iter().filter_map(|(key, state)| {
                     (key.config_index == *config_index && state.target.localized).then(|| {
-                        state
-                            .target
-                            .instance
-                            .clone()
-                            .map(|instance| (key.clone(), (state.target.path.clone(), instance)))
+                        state.target.instance.clone().map(|instance| {
+                            (
+                                key.clone(),
+                                (
+                                    state.target.path.clone(),
+                                    instance,
+                                    state.target.emit_instance_attribute,
+                                ),
+                            )
+                        })
                     })?
                 }))
                 .collect::<BTreeMap<_, _>>();
@@ -1145,8 +1166,8 @@ impl<A: PdhApi> Query<A> {
                 let _ = retained.remove(&key);
             }
             expanded_total += retained.len();
-            for (key, (path, instance)) in retained {
-                let _ = desired.insert(key, (path, instance));
+            for (key, (path, instance, emit_instance_attribute)) in retained {
+                let _ = desired.insert(key, (path, instance, emit_instance_attribute));
             }
         }
 
@@ -1154,7 +1175,7 @@ impl<A: PdhApi> Query<A> {
             let Ok(mut paths) = discovery else {
                 continue;
             };
-            remove_aggregation_instances(
+            let aggregation_only = cleanup_aggregation_instances(
                 &mut paths,
                 self.configs[config_index]
                     .excluded_aggregation_instance
@@ -1210,7 +1231,9 @@ impl<A: PdhApi> Query<A> {
                 let key = CounterKey::new(config_index, &path);
                 match self.api.parse_instance(&path) {
                     Ok(instance) => {
-                        let _ = desired.insert(key, (path, instance));
+                        let emit_instance_attribute =
+                            self.configs[config_index].emit_instance_attribute && !aggregation_only;
+                        let _ = desired.insert(key, (path, instance, emit_instance_attribute));
                     }
                     Err(error) => {
                         diagnostics.counter_add_failures += 1;
@@ -1256,8 +1279,11 @@ impl<A: PdhApi> Query<A> {
                         .map(|instance| (key, instance))
                 })),
         );
-        let wanted_groups =
-            instance_groups(desired.iter().map(|(key, (_, instance))| (key, instance)));
+        let wanted_groups = instance_groups(
+            desired
+                .iter()
+                .map(|(key, (_, instance, _))| (key, instance)),
+        );
         let (removed, added) = refresh_changes_with_group_resets(
             &live,
             &retrying,
@@ -1281,7 +1307,7 @@ impl<A: PdhApi> Query<A> {
         }
         let now = Instant::now();
         for key in added {
-            let Some((path, instance)) = desired.remove(&key) else {
+            let Some((path, instance, emit_instance_attribute)) = desired.remove(&key) else {
                 diagnostics.discovery_failures += 1;
                 continue;
             };
@@ -1290,6 +1316,7 @@ impl<A: PdhApi> Query<A> {
                 path,
                 localized: true,
                 instance: Some(instance),
+                emit_instance_attribute,
             };
             let was_retry = self.retry_states.contains_key(&key);
             if self.try_add_target(key.clone(), target, now, diagnostics, failures)
@@ -1467,6 +1494,7 @@ impl<A: PdhApi> Query<A> {
                 counter_index: counter.config_index,
                 path: counter.path.clone(),
                 instance: counter.instance.clone(),
+                emit_instance_attribute: counter.emit_instance_attribute,
                 timestamp_unix_nano,
                 start_time_unix_nano: point_start_time,
                 value,

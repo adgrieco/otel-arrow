@@ -13,7 +13,7 @@
 ## Overview
 
 Reads configured exact or instance-wildcard Windows performance-counter paths
-through PDH and emits OTel Gauges or cumulative Sums. Each data point includes
+through PDH and emits OTel Gauges or cumulative or delta Sums. Each data point includes
 the configured metric identity and concrete `windows.perf_counter.path`
 attribute. Instance points emit Go-compatible `instance` identity plus
 extended `windows.perf_counter.*` identity attributes. Wildcard points also
@@ -128,11 +128,11 @@ windows.operations:
 | `counters` | Yes | None | Counter mappings for the object |
 
 Each counter mapping requires `name`; `metric` is optional. Without `metric`,
-the receiver emits a Gauge named from the full configured PDH path, including
-its instance pattern, with unit `"1"` and an empty description. Mapping
-`attributes` are ignored in this mode. An implicit path-named Gauge is rejected
-if its name exactly matches an explicitly defined metric name, avoiding
-incompatible metadata or kinds under one output stream.
+the receiver uses the full configured PDH path, including its instance pattern,
+as the metric name. If that exact, case-sensitive name matches a metric
+definition, the receiver uses its metadata and Gauge or Sum kind. Otherwise it
+emits a Gauge with unit `"1"` and an empty description. Mapping `attributes`
+are ignored in either implicit mode.
 
 For mappings that reference a metric, optional `attributes` contains static
 string key/value pairs added to each emitted point. The `instance` key is
@@ -175,10 +175,10 @@ one name or a list for exact instances. Partial patterns such as `"worker*"` are
 expanded independently. If a list contains `"*"`, Go-compatible selection uses
 the full wildcard and ignores other explicit non-aggregate names. Specify
 `["*", "_Total"]` to retain `_Total`, or select `"_Total"` alone to collect only
-that exact instance. Empty `aggregation_name` uses `_Total`; set another value
-when a provider uses a name such as `_Global_`. Filtering occurs before
-expansion limits, and explicit wildcard inclusion does not create a duplicate
-aggregate query.
+that exact instance. Aggregate names are matched case-sensitively. Empty
+`aggregation_name` uses `_Total`; set another value when a provider uses a name
+such as `_Global_`. Filtering occurs before expansion limits, and explicit
+wildcard inclusion does not create a duplicate aggregate query.
 
 Points for named instances emit `instance=<name>`. Duplicate PDH instances use
 the canonical suffix, such as `instance=process#1`; index zero omits `#0`.
@@ -193,9 +193,10 @@ Explicit PDH duplicate-instance indexes are canonicalized before path and
 duplicate checks: the first occurrence omits `#0`, and leading zeroes are
 removed from later indexes.
 
-Unknown fields, empty metadata, undefined or unused metrics, duplicate
-instances, duplicate normalized paths, invalid intervals, and unsupported
-scales are configuration errors. Surrounding whitespace is removed from metric
+Unknown fields, explicit references to undefined metrics, duplicate instances,
+duplicate normalized paths, invalid intervals, and unsupported scales are
+configuration errors. Optional metadata may be empty and metric definitions
+may be unused. Surrounding whitespace is removed from metric
 identities, metadata, path segments, references, and attribute keys before
 duplicate detection. Embedded NUL characters are rejected. Metric definitions
 have no receiver-specific count limit. At most 256 normalized configured exact
