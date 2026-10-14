@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::config::{Aggregation, CounterConfig, MetricKind};
+use super::super::config::{Aggregation, CounterConfig, InstanceConfig, MetricKind};
 use super::super::model::{
     ExpansionOverflow, InstanceIdentity, Number, Sample, SampleDiagnostics, SampleFailure,
     SampleValue, merge_diagnostics, scale_integer,
@@ -33,9 +33,7 @@ fn counter(path: &str, name: &str) -> CounterConfig {
         description: Arc::from(format!("Description for {name}.")),
         metric_kind: MetricKind::Gauge,
         attributes: Arc::new(BTreeMap::new()),
-        has_instance: false,
-        emit_instance_attribute: false,
-        excluded_aggregation_instance: None,
+        instance_config: InstanceConfig::None,
         scale_power10: 0,
         recreate_query: false,
         source_mapping_index: 0,

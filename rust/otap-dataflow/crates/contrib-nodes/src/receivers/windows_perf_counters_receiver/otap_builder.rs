@@ -1,6 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(test)]
+use super::config::InstanceConfig;
 use super::config::{Aggregation, CounterConfig, MetricKind};
 use super::model::{InstanceIdentity, Number, Sample, SamplePoint, SampleValue};
 use arrow::error::ArrowError;
@@ -304,9 +306,7 @@ mod tests {
             description: Arc::from(format!("Description for {name}.")),
             metric_kind: MetricKind::Gauge,
             attributes: Arc::new(BTreeMap::new()),
-            has_instance: false,
-            emit_instance_attribute: false,
-            excluded_aggregation_instance: None,
+            instance_config: InstanceConfig::None,
             scale_power10: 0,
             recreate_query: false,
             source_mapping_index: 0,
@@ -1330,8 +1330,9 @@ mod tests {
             "windows.process.private",
             "By",
         );
-        wildcard.has_instance = true;
-        wildcard.emit_instance_attribute = true;
+        wildcard.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
         let counters = [wildcard];
         let records = into_otap(
             &counters,
@@ -1405,11 +1406,13 @@ mod tests {
     #[test]
     fn projects_aggregate_instance_selection() {
         let mut aggregate_alone = counter(r"\Processor(_Total)\Counter", "aggregate.alone", "1");
-        aggregate_alone.has_instance = true;
-        aggregate_alone.emit_instance_attribute = false;
+        aggregate_alone.instance_config = InstanceConfig::Exact {
+            emit_attribute: false,
+        };
         let mut explicitly_included = counter(r"\Processor(*)\Counter", "aggregate.included", "1");
-        explicitly_included.has_instance = true;
-        explicitly_included.emit_instance_attribute = true;
+        explicitly_included.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
         let aggregate = InstanceIdentity {
             name: "_Total".to_owned(),
             parent: None,
@@ -1470,8 +1473,9 @@ mod tests {
     #[test]
     fn static_instance_override_preserves_distinct_points() {
         let mut wildcard = counter(r"\Process(*)\Private Bytes", "process.private", "By");
-        wildcard.has_instance = true;
-        wildcard.emit_instance_attribute = true;
+        wildcard.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
         wildcard.attributes = Arc::new(BTreeMap::from([(
             "instance".to_owned(),
             "fixed".to_owned(),

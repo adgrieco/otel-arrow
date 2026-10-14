@@ -92,18 +92,50 @@ pub(super) struct CounterConfig {
     pub(super) metric_kind: MetricKind,
     /// Static attributes shared by paths expanded from one counter mapping.
     pub(super) attributes: Arc<BTreeMap<String, String>>,
-    /// Whether the configured PDH path contains an instance segment.
-    pub(super) has_instance: bool,
-    /// Whether to emit Go's `instance` attribute for parsed instance identity.
-    pub(super) emit_instance_attribute: bool,
-    /// Provider aggregation instance omitted from this wildcard, when any.
-    pub(super) excluded_aggregation_instance: Option<String>,
+    /// Instance parsing, attribute, and wildcard aggregation behavior.
+    pub(super) instance_config: InstanceConfig,
     /// Base-10 scaling applied after PDH calculates the native value.
     pub(super) scale_power10: i32,
     /// Whether this configured mapping receives a fresh, primed query after each scrape.
     pub(super) recreate_query: bool,
     /// Identity shared by normalized paths expanded from one configured mapping.
     pub(super) source_mapping_index: usize,
+}
+
+/// Valid instance behavior for one normalized counter path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum InstanceConfig {
+    /// The path has no instance segment.
+    None,
+    /// The path selects one exact instance.
+    Exact { emit_attribute: bool },
+    /// The path discovers instances and may exclude one provider aggregate.
+    Wildcard {
+        excluded_aggregation: Option<String>,
+    },
+}
+
+impl InstanceConfig {
+    pub(super) fn has_instance(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub(super) fn emit_attribute(&self) -> bool {
+        match self {
+            Self::None => false,
+            Self::Exact { emit_attribute } => *emit_attribute,
+            Self::Wildcard { .. } => true,
+        }
+    }
+
+    pub(super) fn excluded_aggregation(&self) -> Option<&str> {
+        match self {
+            Self::Wildcard {
+                excluded_aggregation,
+            } => excluded_aggregation.as_deref(),
+            Self::None | Self::Exact { .. } => None,
+        }
+    }
 }
 
 /// Supported OTel metric stream kinds.
@@ -542,8 +574,7 @@ enum InstanceSegment {
 struct ExpandedPath {
     native: String,
     configured: String,
-    excluded_aggregation_instance: Option<String>,
-    emit_instance_attribute: bool,
+    instance_config: InstanceConfig,
 }
 
 struct ObjectNormalizer<'a> {
@@ -706,9 +737,7 @@ impl ObjectNormalizer<'_> {
                 description: metric.description,
                 metric_kind: metric.kind,
                 attributes: metric.attributes,
-                has_instance: !matches!(self.instances, NormalizedInstances::None),
-                emit_instance_attribute: expanded.emit_instance_attribute,
-                excluded_aggregation_instance: expanded.excluded_aggregation_instance,
+                instance_config: expanded.instance_config,
                 scale_power10: mapping.scale_power10,
                 recreate_query: mapping.recreate_query,
                 source_mapping_index,
@@ -833,27 +862,32 @@ impl NormalizedInstances {
             Self::None => vec![ExpandedPath {
                 native: counter_path(object, None, counter),
                 configured: counter_path(object, None, counter),
-                excluded_aggregation_instance: None,
-                emit_instance_attribute: false,
+                instance_config: InstanceConfig::None,
             }],
             Self::All {
                 include_aggregation,
             } => vec![ExpandedPath {
                 native: counter_path(object, Some("*"), counter),
                 configured: counter_path(object, Some("*"), counter),
-                excluded_aggregation_instance: (!include_aggregation)
-                    .then(|| aggregation_name.to_owned()),
-                emit_instance_attribute: true,
+                instance_config: InstanceConfig::Wildcard {
+                    excluded_aggregation: (!include_aggregation)
+                        .then(|| aggregation_name.to_owned()),
+                },
             }],
             Self::Selected(segments) => segments
                 .iter()
                 .map(|segment| ExpandedPath {
                     native: counter_path(object, Some(segment.native()), counter),
                     configured: counter_path(object, Some(segment.configured()), counter),
-                    excluded_aggregation_instance: segment
-                        .is_wildcard()
-                        .then(|| aggregation_name.to_owned()),
-                    emit_instance_attribute: !segment.is_exact(aggregation_name),
+                    instance_config: if segment.is_wildcard() {
+                        InstanceConfig::Wildcard {
+                            excluded_aggregation: Some(aggregation_name.to_owned()),
+                        }
+                    } else {
+                        InstanceConfig::Exact {
+                            emit_attribute: !segment.is_exact(aggregation_name),
+                        }
+                    },
                 })
                 .collect(),
         }
@@ -1040,11 +1074,14 @@ mod tests {
         assert_eq!(config.counters[1].metric_kind, MetricKind::Gauge);
         assert_eq!(config.counters[1].attributes["state"], "active");
         assert_eq!(config.counters[2].attributes["state"], "idle");
-        assert!(!config.counters[0].has_instance);
-        assert!(!config.counters[0].emit_instance_attribute);
-        assert!(config.counters[1].has_instance);
-        assert!(config.counters[1].emit_instance_attribute);
-        assert_eq!(config.counters[1].excluded_aggregation_instance, None);
+        assert!(!config.counters[0].instance_config.has_instance());
+        assert!(!config.counters[0].instance_config.emit_attribute());
+        assert!(config.counters[1].instance_config.has_instance());
+        assert!(config.counters[1].instance_config.emit_attribute());
+        assert_eq!(
+            config.counters[1].instance_config.excluded_aggregation(),
+            None
+        );
         assert_eq!(config.collection_interval, Duration::from_secs(60));
         assert_eq!(config.initial_delay, Duration::from_secs(1));
         assert_eq!(config.timeout, Some(Duration::from_secs(60)));
@@ -1399,9 +1436,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            excluded.counters[0]
-                .excluded_aggregation_instance
-                .as_deref(),
+            excluded.counters[0].instance_config.excluded_aggregation(),
             Some("_Global_")
         );
         let included = Config::from_json(&json!({
@@ -1414,8 +1449,11 @@ mod tests {
             }]
         }))
         .unwrap();
-        assert_eq!(included.counters[0].excluded_aggregation_instance, None);
-        assert!(included.counters[0].emit_instance_attribute);
+        assert_eq!(
+            included.counters[0].instance_config.excluded_aggregation(),
+            None
+        );
+        assert!(included.counters[0].instance_config.emit_attribute());
 
         let case_distinct = Config::from_json(&json!({
             "metrics": {"test": metric()},
@@ -1429,8 +1467,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             case_distinct.counters[0]
-                .excluded_aggregation_instance
-                .as_deref(),
+                .instance_config
+                .excluded_aggregation(),
             Some("_Global_")
         );
 
@@ -1444,8 +1482,8 @@ mod tests {
             }]
         }))
         .unwrap();
-        assert!(aggregate_alone.counters[0].has_instance);
-        assert!(!aggregate_alone.counters[0].emit_instance_attribute);
+        assert!(aggregate_alone.counters[0].instance_config.has_instance());
+        assert!(!aggregate_alone.counters[0].instance_config.emit_attribute());
 
         let aggregate_with_peer = Config::from_json(&json!({
             "metrics": {"test": metric()},
@@ -1460,7 +1498,12 @@ mod tests {
             aggregate_with_peer
                 .counters
                 .iter()
-                .map(|counter| (counter.path.as_str(), counter.emit_instance_attribute))
+                .map(|counter| {
+                    (
+                        counter.path.as_str(),
+                        counter.instance_config.emit_attribute(),
+                    )
+                })
                 .collect::<Vec<_>>(),
             [
                 (r"\Processor(_Total)\Counter", false),
@@ -1494,12 +1537,17 @@ mod tests {
             ]
         );
         assert!(config.counters.iter().all(|counter| counter.name == "test"));
-        assert!(config.counters.iter().all(|counter| counter.has_instance));
         assert!(
             config
                 .counters
                 .iter()
-                .all(|counter| counter.emit_instance_attribute)
+                .all(|counter| counter.instance_config.has_instance())
+        );
+        assert!(
+            config
+                .counters
+                .iter()
+                .all(|counter| counter.instance_config.emit_attribute())
         );
     }
 
@@ -1741,7 +1789,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            partial.counters[0].excluded_aggregation_instance.as_deref(),
+            partial.counters[0].instance_config.excluded_aggregation(),
             Some("_Total")
         );
 

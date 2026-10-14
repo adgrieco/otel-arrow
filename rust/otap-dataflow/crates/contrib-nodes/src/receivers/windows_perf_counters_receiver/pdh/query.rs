@@ -83,7 +83,7 @@ impl<A: PdhApi> Query<A> {
             if !query.configs[config_index].path.contains('*') {
                 let path = query.configs[config_index].path.clone();
                 let key = CounterKey::new(config_index, &path);
-                let instance = if query.configs[config_index].has_instance {
+                let instance = if query.configs[config_index].instance_config.has_instance() {
                     match query.api.parse_instance(&path) {
                         Ok(instance) => Some(instance),
                         Err(error) => {
@@ -101,7 +101,9 @@ impl<A: PdhApi> Query<A> {
                     path,
                     localized: false,
                     instance: instance.clone(),
-                    emit_instance_attribute: query.configs[config_index].emit_instance_attribute
+                    emit_instance_attribute: query.configs[config_index]
+                        .instance_config
+                        .emit_attribute()
                         && instance.is_some(),
                 };
                 match query.add_counter(
@@ -366,8 +368,8 @@ impl<A: PdhApi> Query<A> {
             let aggregation_only = cleanup_aggregation_instances(
                 &mut paths,
                 self.configs[config_index]
-                    .excluded_aggregation_instance
-                    .as_deref(),
+                    .instance_config
+                    .excluded_aggregation(),
             );
             let oversized = paths
                 .iter()
@@ -401,7 +403,8 @@ impl<A: PdhApi> Query<A> {
                 match self.api.parse_instance(&path) {
                     Ok(instance) => {
                         let emit_instance_attribute =
-                            self.configs[config_index].emit_instance_attribute && !aggregation_only;
+                            self.configs[config_index].instance_config.emit_attribute()
+                                && !aggregation_only;
                         let _ = desired.insert(
                             key,
                             DesiredCounter::new(path, instance, emit_instance_attribute),

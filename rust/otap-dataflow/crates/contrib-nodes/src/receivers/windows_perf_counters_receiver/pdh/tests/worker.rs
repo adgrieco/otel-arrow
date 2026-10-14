@@ -43,11 +43,15 @@ fn query_plans_isolate_recreated_source_mappings() {
 #[test]
 fn recreated_queries_share_receiver_expansion_limit() {
     let mut first = counter(r"\Process(first*)\Private Bytes", "process.first");
-    first.has_instance = true;
+    first.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
     first.recreate_query = true;
     first.source_mapping_index = 0;
     let mut second = counter(r"\Process(second*)\Private Bytes", "process.second");
-    second.has_instance = true;
+    second.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
     second.recreate_query = true;
     second.source_mapping_index = 1;
 

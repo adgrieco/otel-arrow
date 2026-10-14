@@ -211,8 +211,9 @@ fn startup_prime_preserves_counter_failures() {
 fn exact_instance_path_preserves_identity() {
     let path = r"\Process(worker#1)\Private Bytes";
     let mut config = counter(path, "windows.process.private");
-    config.has_instance = true;
-    config.emit_instance_attribute = true;
+    config.instance_config = InstanceConfig::Exact {
+        emit_attribute: true,
+    };
     let (_, mut query) = fake_query(
         vec![config],
         vec![FakeCounter {
@@ -243,8 +244,9 @@ fn exact_instance_path_preserves_identity() {
 fn exact_instance_parse_failure_preserves_value() {
     let path = r"\Object\Counter";
     let mut config = counter(path, "object.counter");
-    config.has_instance = true;
-    config.emit_instance_attribute = true;
+    config.instance_config = InstanceConfig::Exact {
+        emit_attribute: true,
+    };
     let (_, mut query) = fake_query(
         vec![config],
         vec![FakeCounter {
@@ -626,9 +628,9 @@ fn retains_wildcard_only_aggregation_without_instance_label() {
     let template = r"\Process(*)\Private Bytes";
     let aggregate = r"\Process(_Total)\Private Bytes";
     let mut config = counter(template, "windows.process.private");
-    config.has_instance = true;
-    config.emit_instance_attribute = true;
-    config.excluded_aggregation_instance = Some("_Total".to_owned());
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: Some("_Total".to_owned()),
+    };
     let (state, mut query) = fake_query(
         vec![config],
         vec![FakeCounter {
