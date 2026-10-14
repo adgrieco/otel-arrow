@@ -260,8 +260,29 @@ impl<A: PdhApi> Query<A> {
         overflows: &mut Vec<ExpansionOverflow>,
     ) -> Result<(), Error> {
         diagnostics.discovery_refreshes += 1;
+        let discoveries = self.discover_wildcards();
         let mut desired = BTreeMap::new();
-        let mut expanded_total = 0;
+        let expanded_total = self.reserve_failed_discoveries(
+            &discoveries,
+            &mut desired,
+            diagnostics,
+            failures,
+            overflows,
+        );
+        self.prepare_successful_discoveries(
+            discoveries,
+            &mut desired,
+            expanded_total,
+            diagnostics,
+            failures,
+            overflows,
+        );
+        self.reconcile_wildcards(desired, diagnostics, failures)?;
+        self.last_wildcard_refresh = Instant::now();
+        Ok(())
+    }
+
+    fn discover_wildcards(&mut self) -> Vec<WildcardDiscovery> {
         let wildcard_paths = self
             .configs
             .iter()
@@ -269,15 +290,25 @@ impl<A: PdhApi> Query<A> {
             .filter(|(_, config)| config.path.contains('*'))
             .map(|(config_index, config)| (config_index, config.path.clone()))
             .collect::<Vec<_>>();
-        let discoveries = wildcard_paths
+        wildcard_paths
             .into_iter()
             .map(|(config_index, path)| (config_index, self.api.expand(&path)))
-            .collect::<Vec<_>>();
+            .collect()
+    }
 
+    fn reserve_failed_discoveries(
+        &self,
+        discoveries: &[WildcardDiscovery],
+        desired: &mut DesiredCounters,
+        diagnostics: &mut SampleDiagnostics,
+        failures: &mut Vec<SampleFailure>,
+        overflows: &mut Vec<ExpansionOverflow>,
+    ) -> usize {
+        let mut expanded_total = 0;
         // Retain failed templates before admitting successful discoveries so
         // their live handles and retry identities reserve global capacity
         // independently of configuration order.
-        for (config_index, discovery) in &discoveries {
+        for (config_index, discovery) in discoveries {
             let Err(error) = discovery else {
                 continue;
             };
@@ -353,7 +384,18 @@ impl<A: PdhApi> Query<A> {
                 let _ = desired.insert(key, (path, instance, emit_instance_attribute));
             }
         }
+        expanded_total
+    }
 
+    fn prepare_successful_discoveries(
+        &mut self,
+        discoveries: Vec<WildcardDiscovery>,
+        desired: &mut DesiredCounters,
+        mut expanded_total: usize,
+        diagnostics: &mut SampleDiagnostics,
+        failures: &mut Vec<SampleFailure>,
+        overflows: &mut Vec<ExpansionOverflow>,
+    ) {
         for (config_index, discovery) in discoveries {
             let Ok(mut paths) = discovery else {
                 continue;
@@ -425,7 +467,14 @@ impl<A: PdhApi> Query<A> {
                 }
             }
         }
+    }
 
+    fn reconcile_wildcards(
+        &mut self,
+        mut desired: DesiredCounters,
+        diagnostics: &mut SampleDiagnostics,
+        failures: &mut Vec<SampleFailure>,
+    ) -> Result<(), Error> {
         let live = self
             .counters
             .iter()
@@ -509,7 +558,6 @@ impl<A: PdhApi> Query<A> {
                 diagnostics.instances_added += 1;
             }
         }
-        self.last_wildcard_refresh = Instant::now();
         Ok(())
     }
 
@@ -732,6 +780,10 @@ fn validate_positive_multi_base(path: &str, base: u32) -> Result<(), Error> {
         })
     }
 }
+
+type DesiredCounter = (String, InstanceIdentity, bool);
+type DesiredCounters = BTreeMap<CounterKey, DesiredCounter>;
+type WildcardDiscovery = (usize, Result<Vec<String>, Error>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ExactAddFailureDisposition {
