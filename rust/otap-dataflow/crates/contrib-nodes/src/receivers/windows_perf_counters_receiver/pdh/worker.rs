@@ -1,0 +1,616 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Bounded worker-thread query ownership, recovery, recreation, and command lifecycle.
+
+use super::super::config::CounterConfig;
+use super::super::model::{Sample, SampleDiagnostics, SampleFailure};
+use super::PdhApi;
+use super::error::Error;
+use super::query::{
+    PendingMetadata, Query, merge_sample_metadata, retry_delay, should_rebuild_query,
+};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
+
+const INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(super) enum Command {
+    Collect(oneshot::Sender<Result<Sample, Error>>),
+    Shutdown,
+}
+
+pub(super) struct AcceptedCollectGuard {
+    accepted: Arc<AtomicBool>,
+}
+
+impl AcceptedCollectGuard {
+    pub(super) fn new(accepted: Arc<AtomicBool>) -> Self {
+        Self { accepted }
+    }
+}
+
+impl Drop for AcceptedCollectGuard {
+    fn drop(&mut self) {
+        self.accepted.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct QuerySettings {
+    wildcard_refresh_interval: Duration,
+    max_instances_per_wildcard: usize,
+    node: String,
+}
+
+impl QuerySettings {
+    fn open(
+        &self,
+        counters: Vec<CounterConfig>,
+        max_expanded_counters: usize,
+    ) -> Result<Query, Error> {
+        Query::open(
+            counters,
+            self.wildcard_refresh_interval,
+            self.max_instances_per_wildcard,
+            max_expanded_counters,
+            self.node.clone(),
+        )
+    }
+}
+
+pub(super) struct QueryPlan {
+    pub(super) configs: Vec<CounterConfig>,
+    pub(super) global_indices: Vec<usize>,
+    pub(super) recreate_query: bool,
+}
+
+pub(super) fn query_plans(counters: Vec<CounterConfig>) -> Vec<QueryPlan> {
+    let mut plans = Vec::new();
+    for (global_index, counter) in counters.into_iter().enumerate() {
+        let append_to_current = plans.last().is_some_and(|plan: &QueryPlan| {
+            if counter.recreate_query {
+                plan.recreate_query
+                    && plan.configs[0].source_mapping_index == counter.source_mapping_index
+            } else {
+                !plan.recreate_query
+            }
+        });
+        if append_to_current && let Some(plan) = plans.last_mut() {
+            plan.configs.push(counter);
+            plan.global_indices.push(global_index);
+            continue;
+        }
+        plans.push(QueryPlan {
+            recreate_query: counter.recreate_query,
+            configs: vec![counter],
+            global_indices: vec![global_index],
+        });
+    }
+    plans
+}
+
+pub(super) struct QuerySlot<A: PdhApi> {
+    pub(super) plan: QueryPlan,
+    pub(super) query: Option<Query<A>>,
+    query_failure_attempts: u32,
+    next_query_retry: Instant,
+    rebuild_attempts: u32,
+    next_rebuild: Instant,
+    pending: PendingMetadata,
+}
+
+impl<A: PdhApi> QuerySlot<A> {
+    pub(super) fn open_initial<F>(
+        plan: QueryPlan,
+        max_expanded_counters: usize,
+        open: &mut F,
+    ) -> Result<Self, Error>
+    where
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+    {
+        let mut query = open(plan.configs.clone(), max_expanded_counters)?;
+        let prime_error = query.prime().err();
+        if let Some(error) = &prime_error {
+            query.record_prime_failure(error);
+        }
+        Ok(Self {
+            plan,
+            query: Some(query),
+            query_failure_attempts: u32::from(
+                prime_error
+                    .as_ref()
+                    .is_some_and(Error::is_query_collection_failure),
+            ),
+            next_query_retry: Instant::now(),
+            rebuild_attempts: 0,
+            next_rebuild: Instant::now(),
+            pending: PendingMetadata::default(),
+        })
+    }
+
+    pub(super) fn collect<F>(
+        &mut self,
+        now: Instant,
+        query_retry_cap: Duration,
+        max_expanded_counters: usize,
+        open: &mut F,
+    ) -> Result<Sample, Error>
+    where
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+    {
+        let was_query_retry =
+            self.query.is_some() && self.query_failure_attempts > 0 && now >= self.next_query_retry;
+        if was_query_retry {
+            self.pending.diagnostics.retry_attempts += 1;
+        }
+        let mut result = if let Some(active_query) = self.query.as_mut() {
+            active_query.set_max_expanded_counters(max_expanded_counters);
+            if now < self.next_query_retry {
+                Err(Error::QueryRecoveryPending {
+                    retry_after_ms: self.next_query_retry.duration_since(now).as_millis(),
+                })
+            } else {
+                active_query.collect()
+            }
+        } else if now < self.next_rebuild {
+            Err(Error::QueryRecoveryPending {
+                retry_after_ms: self.next_rebuild.duration_since(now).as_millis(),
+            })
+        } else {
+            self.pending.diagnostics.query_rebuild_attempts += 1;
+            match open(self.plan.configs.clone(), max_expanded_counters) {
+                Ok(mut rebuilt) => {
+                    self.rebuild_attempts = 0;
+                    self.query_failure_attempts = 0;
+                    self.next_query_retry = now;
+                    match rebuilt.prime() {
+                        Ok(()) => {
+                            self.pending.diagnostics.query_rebuild_recoveries += 1;
+                            let mut sample = Sample {
+                                timestamp_unix_nano: rebuilt.previous_timestamp_unix_nano,
+                                points: Vec::new(),
+                                failures: Vec::new(),
+                                overflows: Vec::new(),
+                                diagnostics: SampleDiagnostics::default(),
+                            };
+                            rebuilt.move_pending_metadata_to(
+                                &mut sample.diagnostics,
+                                &mut sample.failures,
+                                &mut sample.overflows,
+                            );
+                            self.query = Some(rebuilt);
+                            Ok(sample)
+                        }
+                        Err(error) => {
+                            self.query = Some(rebuilt);
+                            Err(error)
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.rebuild_attempts = self.rebuild_attempts.saturating_add(1);
+                    self.next_rebuild = now + retry_delay(self.rebuild_attempts, query_retry_cap);
+                    Err(error)
+                }
+            }
+        };
+        if result
+            .as_ref()
+            .is_err_and(Error::is_query_collection_failure)
+        {
+            self.query_failure_attempts = self.query_failure_attempts.saturating_add(1);
+            self.next_query_retry = now + retry_delay(self.query_failure_attempts, query_retry_cap);
+            if should_rebuild_query(self.query_failure_attempts) {
+                if let Some(active_query) = self.query.as_mut() {
+                    active_query.move_pending_metadata_to(
+                        &mut self.pending.diagnostics,
+                        &mut self.pending.failures,
+                        &mut self.pending.overflows,
+                    );
+                }
+                self.query = None;
+                self.rebuild_attempts = 0;
+                self.next_rebuild = self.next_query_retry;
+            }
+        } else if result
+            .as_ref()
+            .is_err_and(Error::requires_immediate_query_rebuild)
+        {
+            if let Some(active_query) = self.query.as_mut() {
+                active_query.move_pending_metadata_to(
+                    &mut self.pending.diagnostics,
+                    &mut self.pending.failures,
+                    &mut self.pending.overflows,
+                );
+            }
+            self.query = None;
+            self.rebuild_attempts = 0;
+            self.next_rebuild = now + retry_delay(1, query_retry_cap);
+        } else if result.is_ok() {
+            if was_query_retry {
+                self.pending.diagnostics.retry_recoveries += 1;
+            }
+            self.query_failure_attempts = 0;
+            self.next_query_retry = now;
+        }
+        if let Ok(sample) = &mut result {
+            self.pending.merge_into_sample(sample);
+        }
+        result
+    }
+
+    fn recreate<F>(
+        &mut self,
+        now: Instant,
+        max_expanded_counters: usize,
+        open: &mut F,
+        diagnostics: &mut SampleDiagnostics,
+        failures: &mut Vec<SampleFailure>,
+    ) where
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+    {
+        if !self.plan.recreate_query {
+            return;
+        }
+        diagnostics.query_recreation_attempts += 1;
+        let replacement =
+            open(self.plan.configs.clone(), max_expanded_counters).and_then(|mut query| {
+                query.prime()?;
+                Ok(query)
+            });
+        match replacement {
+            Ok(query) => {
+                self.query = Some(query);
+                self.query_failure_attempts = 0;
+                self.next_query_retry = now;
+                self.rebuild_attempts = 0;
+                self.next_rebuild = now;
+            }
+            Err(error) => {
+                diagnostics.query_recreation_failures += 1;
+                if error.is_query_collection_failure() {
+                    diagnostics.scrape_failures += 1;
+                }
+                failures.extend(self.plan.global_indices.iter().map(|&counter_index| {
+                    SampleFailure {
+                        counter_index,
+                        reason: error.reason(),
+                        error: error.bounded_detail(),
+                        diagnostic_only: true,
+                    }
+                }));
+            }
+        }
+    }
+
+    pub(super) fn remap_sample(&self, mut sample: Sample) -> Result<Sample, Error> {
+        let remap = |local_index: usize| {
+            self.plan
+                .global_indices
+                .get(local_index)
+                .copied()
+                .ok_or(Error::InvalidSample(
+                    "query returned an unknown local counter index",
+                ))
+        };
+        for point in &mut sample.points {
+            point.counter_index = remap(point.counter_index)?;
+        }
+        for failure in &mut sample.failures {
+            failure.counter_index = remap(failure.counter_index)?;
+        }
+        for overflow in &mut sample.overflows {
+            overflow.counter_index = remap(overflow.counter_index)?;
+        }
+        Ok(sample)
+    }
+
+    pub(super) fn active_expanded_count(&self) -> usize {
+        self.query.as_ref().map_or(0, Query::active_expanded_count)
+    }
+}
+
+pub(super) fn merge_query_samples(samples: Vec<Sample>) -> Result<Sample, Error> {
+    let mut merged = None::<Sample>;
+    for sample in samples {
+        if let Some(target) = &mut merged {
+            target.timestamp_unix_nano = target.timestamp_unix_nano.max(sample.timestamp_unix_nano);
+            target.diagnostics.active_expanded_counters +=
+                sample.diagnostics.active_expanded_counters;
+            merge_sample_metadata(
+                &mut target.diagnostics,
+                &mut target.failures,
+                &mut target.overflows,
+                sample.diagnostics,
+                sample.failures,
+                sample.overflows,
+            );
+            target.points.extend(sample.points);
+        } else {
+            merged = Some(sample);
+        }
+    }
+    let mut merged = merged.ok_or(Error::InvalidSample(
+        "worker has no performance-counter query",
+    ))?;
+    merged.points.sort_by(|left, right| {
+        (left.counter_index, &left.path).cmp(&(right.counter_index, &right.path))
+    });
+    merged
+        .failures
+        .sort_by_key(|failure| (failure.counter_index, failure.reason));
+    merged
+        .overflows
+        .sort_by_key(|overflow| (overflow.counter_index, overflow.reason));
+    Ok(merged)
+}
+
+pub(super) fn collect_queries<A, F>(
+    queries: &mut [QuerySlot<A>],
+    query_retry_cap: Duration,
+    max_expanded_counters: usize,
+    open: &mut F,
+) -> Result<Sample, Error>
+where
+    A: PdhApi,
+    F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+{
+    let now = Instant::now();
+    let mut samples = Vec::with_capacity(queries.len());
+    let mut collection_succeeded = vec![false; queries.len()];
+    let mut first_collection_error = None;
+    let mut query_failures = Vec::new();
+    for query_index in 0..queries.len() {
+        let other_active = queries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != query_index)
+            .map(|(_, query)| query.active_expanded_count())
+            .sum::<usize>();
+        let query_limit = max_expanded_counters.saturating_sub(other_active);
+        let query = &mut queries[query_index];
+        match query.collect(now, query_retry_cap, query_limit, open) {
+            Ok(sample) => {
+                collection_succeeded[query_index] = true;
+                samples.push(query.remap_sample(sample)?);
+            }
+            Err(error) if error.is_collection_failure() => {
+                let reason = error.reason();
+                let detail = error.bounded_detail();
+                query_failures.extend(query.plan.global_indices.iter().map(|&counter_index| {
+                    SampleFailure {
+                        counter_index,
+                        reason,
+                        error: detail.clone(),
+                        diagnostic_only: false,
+                    }
+                }));
+                if first_collection_error.is_none() {
+                    first_collection_error = Some(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if samples.is_empty() {
+        return Err(first_collection_error.unwrap_or(Error::InvalidSample(
+            "worker has no successful performance-counter query",
+        )));
+    }
+    let mut sample = merge_query_samples(samples)?;
+    if !query_failures.is_empty() {
+        merge_sample_metadata(
+            &mut sample.diagnostics,
+            &mut sample.failures,
+            &mut sample.overflows,
+            SampleDiagnostics {
+                scrape_failures: 1,
+                ..Default::default()
+            },
+            query_failures,
+            Vec::new(),
+        );
+    }
+    for query_index in 0..queries.len() {
+        if !collection_succeeded[query_index] {
+            continue;
+        }
+        let other_active = queries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != query_index)
+            .map(|(_, query)| query.active_expanded_count())
+            .sum::<usize>();
+        let query_limit = max_expanded_counters.saturating_sub(other_active);
+        queries[query_index].recreate(
+            now,
+            query_limit,
+            open,
+            &mut sample.diagnostics,
+            &mut sample.failures,
+        );
+    }
+    sample
+        .failures
+        .sort_by_key(|failure| (failure.counter_index, failure.reason));
+    Ok(sample)
+}
+
+/// Capacity-one command client for the thread that owns the persistent query.
+pub(in super::super) struct Worker {
+    pub(super) tx: mpsc::SyncSender<Command>,
+    pub(super) accepted: Arc<AtomicBool>,
+    pub(super) shutdown_requested: Arc<AtomicBool>,
+    pub(super) join: Option<JoinHandle<()>>,
+    pub(super) completion: Option<oneshot::Receiver<()>>,
+}
+
+impl Worker {
+    pub(in super::super) async fn start(
+        counters: Vec<CounterConfig>,
+        wildcard_refresh_interval: Duration,
+        max_instances_per_wildcard: usize,
+        max_expanded_counters: usize,
+        node: String,
+    ) -> Result<Self, Error> {
+        let settings = QuerySettings {
+            wildcard_refresh_interval,
+            max_instances_per_wildcard,
+            node,
+        };
+        Self::start_with(
+            counters,
+            wildcard_refresh_interval,
+            max_expanded_counters,
+            move |counters, query_limit| settings.open(counters, query_limit),
+        )
+        .await
+    }
+
+    pub(super) async fn start_with<A, F>(
+        counters: Vec<CounterConfig>,
+        query_retry_cap: Duration,
+        max_expanded_counters: usize,
+        mut open: F,
+    ) -> Result<Self, Error>
+    where
+        A: PdhApi + 'static,
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error> + Send + 'static,
+    {
+        let plans = query_plans(counters);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (init_tx, init_rx) = oneshot::channel();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let worker_accepted = Arc::clone(&accepted);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown_requested);
+        let join = std::thread::Builder::new()
+            .name("windowsperfcounters-pdh".to_owned())
+            .spawn(move || {
+                {
+                    let mut queries = Vec::with_capacity(plans.len());
+                    for plan in plans {
+                        let active_expanded = queries
+                            .iter()
+                            .map(QuerySlot::active_expanded_count)
+                            .sum::<usize>();
+                        let query_limit = max_expanded_counters.saturating_sub(active_expanded);
+                        match QuerySlot::open_initial(plan, query_limit, &mut open) {
+                            Ok(query) => queries.push(query),
+                            Err(error) => {
+                                let _ = init_tx.send(Err(error));
+                                return;
+                            }
+                        }
+                    }
+                    if init_tx.send(Ok(())).is_err() {
+                        return;
+                    }
+                    while !worker_shutdown.load(Ordering::Acquire) {
+                        match rx.recv() {
+                            Ok(Command::Collect(response)) => {
+                                let accepted =
+                                    AcceptedCollectGuard::new(Arc::clone(&worker_accepted));
+                                let result = collect_queries(
+                                    &mut queries,
+                                    query_retry_cap,
+                                    max_expanded_counters,
+                                    &mut open,
+                                );
+                                drop(accepted);
+                                let _ = response.send(result);
+                            }
+                            Ok(Command::Shutdown) | Err(_) => break,
+                        }
+                    }
+                }
+                let _ = completion_tx.send(());
+            })
+            .map_err(|err| Error::WorkerStart(err.to_string()))?;
+
+        match tokio::time::timeout(INIT_TIMEOUT, init_rx).await {
+            Ok(Ok(Ok(()))) => Ok(Self {
+                tx,
+                accepted,
+                shutdown_requested,
+                join: Some(join),
+                completion: Some(completion_rx),
+            }),
+            Ok(Ok(Err(error))) => {
+                let _ = join.join();
+                Err(error)
+            }
+            Err(_) => {
+                shutdown_requested.store(true, Ordering::Release);
+                drop(join);
+                Err(Error::WorkerInitTimeout)
+            }
+            Ok(Err(_)) => {
+                let _ = join.join();
+                Err(Error::WorkerInitStopped)
+            }
+        }
+    }
+
+    pub(in super::super) async fn collect(&self) -> Result<Sample, Error> {
+        if self
+            .accepted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(Error::WorkerBusy);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        match self.tx.try_send(Command::Collect(response_tx)) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.accepted.store(false, Ordering::Release);
+                return Err(Error::WorkerBusy);
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.accepted.store(false, Ordering::Release);
+                return Err(Error::WorkerStopped);
+            }
+        }
+        response_rx.await.map_err(|_| Error::WorkerStopped)?
+    }
+
+    /// Request shutdown and return `false` if the worker outlives the deadline.
+    pub(in super::super) async fn shutdown(&mut self, deadline: Instant) -> Result<bool, Error> {
+        self.shutdown_requested.store(true, Ordering::Release);
+        match self.tx.try_send(Command::Shutdown) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+            Err(mpsc::TrySendError::Disconnected(_)) => {}
+        }
+        let Some(join) = self.join.take() else {
+            return Ok(true);
+        };
+        let Some(completion) = self.completion.as_mut() else {
+            self.join = Some(join);
+            return Err(Error::WorkerStopped);
+        };
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), completion).await {
+            Ok(_) => {
+                self.completion = None;
+                join.join().map_err(|_| Error::WorkerPanicked)?;
+                Ok(true)
+            }
+            Err(_) => {
+                self.join = Some(join);
+                Ok(false)
+            }
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        let _ = self.tx.try_send(Command::Shutdown);
+    }
+}

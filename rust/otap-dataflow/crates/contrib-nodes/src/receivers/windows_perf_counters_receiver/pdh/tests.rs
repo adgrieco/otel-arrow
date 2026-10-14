@@ -1,15 +1,29 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::config::MetricKind;
-use super::super::model::Number;
+use super::super::config::{Aggregation, CounterConfig, MetricKind};
+use super::super::model::{
+    ExpansionOverflow, InstanceIdentity, Number, Sample, SampleDiagnostics, SampleFailure,
+    SampleValue, scale_integer,
+};
 use super::super::{config::Config, otap_builder::into_otap};
+use super::counter_type::*;
+use super::expansion::*;
+use super::native::NativePdh;
+use super::query::*;
+use super::timing::*;
+use super::worker::*;
 use super::*;
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command as ProcessCommand, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 fn counter(path: &str, name: &str) -> CounterConfig {
     CounterConfig {
