@@ -281,6 +281,50 @@ fn defaults_metricless_mapping_to_path_named_gauge() {
     assert!(counter.attributes.is_empty());
 }
 
+/// Scenario: Metric definitions are omitted or empty and references are omitted or blank.
+/// Guarantees: Every form produces path-named Gauges with configured spelling and canonical native paths.
+#[test]
+fn defaults_path_metrics_without_definitions_or_references() {
+    for definitions in [None, Some(json!({}))] {
+        let mut value = json!({
+            "perfcounters": [{
+                "object": " Process ",
+                "instances": [" app#00 ", "worker#001"],
+                "counters": [{"name": " Private Bytes ", "scale_power10": -3}]
+            }]
+        });
+        if let Some(definitions) = definitions {
+            value["metrics"] = definitions;
+        }
+        for reference in [None, Some(""), Some(" \t ")] {
+            if let Some(reference) = reference {
+                value["perfcounters"][0]["counters"][0]["metric"] = json!(reference);
+            }
+            let config = Config::from_json(&value).unwrap();
+            for (counter, name, path) in [
+                (
+                    &config.counters[0],
+                    r"\Process(app#00)\Private Bytes",
+                    r"\Process(app)\Private Bytes",
+                ),
+                (
+                    &config.counters[1],
+                    r"\Process(worker#001)\Private Bytes",
+                    r"\Process(worker#1)\Private Bytes",
+                ),
+            ] {
+                assert_eq!(counter.name, name);
+                assert_eq!(counter.path, path);
+                assert_eq!(counter.metric_kind, MetricKind::Gauge);
+                assert_eq!(counter.unit, "1");
+                assert!(counter.description.is_empty());
+                assert!(counter.attributes.is_empty());
+                assert_eq!(counter.scale_power10, -3);
+            }
+        }
+    }
+}
+
 /// Scenario: An implicit path name exactly matches a configured metric definition.
 /// Guarantees: The mapping uses that definition's metadata and kind while ignoring mapping attributes.
 #[test]
@@ -397,6 +441,52 @@ fn rejects_null_metric_reference() {
             }]
         }),
         "perfcounters[0].counters[0].metric must be a string when present; null metric is invalid",
+    );
+}
+
+/// Scenario: Null metric references appear at each object/counter position or replace the definitions map.
+/// Guarantees: Every null reference reports its exact location and a null definitions map is rejected.
+#[test]
+fn rejects_null_metric_forms_at_each_location() {
+    for (object_index, counter_index) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+        let mut value = json!({
+            "perfcounters": [
+                {
+                    "object": "Memory",
+                    "counters": [
+                        {"name": "Available Bytes"},
+                        {"name": "Committed Bytes"}
+                    ]
+                },
+                {
+                    "object": "Process",
+                    "instances": "worker",
+                    "counters": [
+                        {"name": "Private Bytes"},
+                        {"name": "Working Set"}
+                    ]
+                }
+            ]
+        });
+        value["perfcounters"][object_index]["counters"][counter_index]["metric"] = json!(null);
+        assert_config_error(
+            value,
+            &format!(
+                "perfcounters[{object_index}].counters[{counter_index}].metric must be a string \
+                 when present; null metric is invalid"
+            ),
+        );
+    }
+
+    assert_config_error(
+        json!({
+            "metrics": null,
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{"name": "Available Bytes"}]
+            }]
+        }),
+        "expected a map",
     );
 }
 
