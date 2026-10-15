@@ -196,6 +196,7 @@ fn run_worker_thread<A, F>(
         &accepted,
         &shutdown_requested,
     );
+    drop(queries);
     let _ = completion_tx.send(());
 }
 
@@ -383,7 +384,9 @@ impl<A: PdhApi> QuerySlot<A> {
         let mut result = self.collect_or_rebuild(now, max_expanded_counters, query_retry_cap, open);
         self.update_recovery_state(now, query_retry_cap, was_query_retry, &result);
         if let Ok(sample) = &mut result {
-            sample.metadata.merge(std::mem::take(&mut self.pending));
+            sample
+                .metadata
+                .merge_older(std::mem::take(&mut self.pending));
         }
         result
     }

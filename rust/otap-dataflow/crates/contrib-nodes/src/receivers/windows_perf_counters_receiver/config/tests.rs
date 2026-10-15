@@ -654,16 +654,19 @@ fn accepts_otlp_metric_names_and_units() {
     assert_config_error(config(" ", "By"), "metric name must not be empty");
 }
 
-/// Scenario: Path-shaped metric names contain exact, wildcard, malformed, or padded segments.
-/// Guarantees: Native path syntax and configured spelling are validated without instrument-name rules.
+/// Scenario: Path-shaped metric definitions contain exact, wildcard, malformed, or padded segments.
+/// Guarantees: Every definition loads, while each malformed definition produces one warning candidate.
 #[test]
-fn validates_path_metric_names() {
-    let config = |name: &str| {
+fn warns_for_malformed_path_metric_definitions() {
+    let config = |name: &str, reference: &str| {
         json!({
-            "metrics": {name: {"description": "Value.", "unit": "By"}},
+            "metrics": {
+                "selected": {"description": "Value.", "unit": "By"},
+                name: {"description": "Unused.", "unit": "1"}
+            },
             "perfcounters": [{
                 "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": name}]
+                "counters": [{"name": "Available Bytes", "metric": reference}]
             }]
         })
     };
@@ -673,9 +676,10 @@ fn validates_path_metric_names() {
         r"\Process(worker*)\Private Bytes",
     ] {
         assert_eq!(
-            Config::from_json(&config(name)).unwrap().counters[0].name,
-            name
+            Config::from_json(&config(name, name)).unwrap().counters[0].name,
+            name,
         );
+        assert_eq!(path_metric_definition_warning(name), None);
     }
     for name in [
         r"\Memory",
@@ -683,8 +687,12 @@ fn validates_path_metric_names() {
         r"\Memory(#0)\X",
         r"\Process( app )\X",
     ] {
-        assert_config_error(config(name), "metric name");
+        let normalized = Config::from_json(&config(name, "selected")).unwrap();
+        assert_eq!(normalized.counters[0].name, "selected");
+        assert!(path_metric_definition_warning(name).is_some());
+        assert_config_error(config(name, name), "metric name");
     }
+    assert_eq!(path_metric_definition_warning("ordinary metric"), None);
 }
 
 /// Scenario: Metric units are blank or contain arbitrary OTLP unit text.
@@ -791,7 +799,7 @@ fn accepts_case_distinct_metric_names() {
 }
 
 /// Scenario: Ordinary and path-shaped metric definitions differ only by ASCII case.
-/// Guarantees: Only one warning candidate is produced for each path-shaped identity.
+/// Guarantees: Only valid path-shaped identities produce one case-collision warning candidate.
 #[test]
 fn warns_once_only_for_case_distinct_path_metric_definitions() {
     let names = [
@@ -800,6 +808,8 @@ fn warns_once_only_for_case_distinct_path_metric_definitions() {
         r"\Memory\Available Bytes".to_owned(),
         r"\memory\available bytes".to_owned(),
         r"\MEMORY\AVAILABLE BYTES".to_owned(),
+        r"\Malformed".to_owned(),
+        r"\MALFORMED".to_owned(),
     ];
 
     assert_eq!(

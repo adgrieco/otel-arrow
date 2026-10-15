@@ -408,10 +408,6 @@ fn validate_counter_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Err
 fn validate_metric_name(name: &str) -> Result<&str, Error> {
     let name = name.trim();
     require_name("metric name", name)?;
-    if name.starts_with('\\') {
-        validate_path_metric_name(name)?;
-        return Ok(name);
-    }
     Ok(name)
 }
 
@@ -450,6 +446,13 @@ fn validate_path_metric_name(name: &str) -> Result<(), Error> {
         return Err(invalid_padding());
     }
     Ok(())
+}
+
+fn path_metric_definition_warning(name: &str) -> Option<String> {
+    name.starts_with('\\')
+        .then(|| validate_path_metric_name(name).err())
+        .flatten()
+        .map(|error| error.to_string())
 }
 
 fn normalize_metric_unit(unit: &str) -> &str {
@@ -609,6 +612,15 @@ fn normalize_metrics(
         if !identities.insert(name.to_owned()) {
             return Err(invalid(format!("metrics contains duplicate {name:?}")));
         }
+        if let Some(reason) = path_metric_definition_warning(name) {
+            otel_arrow_dfe_telemetry::otel_warn!(
+                "otelcol.node.windowsperfcounters.config.path_metric_invalid_definition",
+                message = "path-shaped metric definition is malformed; it is retained for Go \
+                           parity but cannot match a generated counter path",
+                definition = name,
+                reason = reason
+            );
+        }
         let _ = metrics.insert(
             name.to_owned(),
             NormalizedMetric {
@@ -638,7 +650,7 @@ fn case_distinct_path_metric_definitions<'a>(
     let mut warned = HashSet::new();
     let mut collisions = Vec::new();
     for name in names {
-        if !name.starts_with('\\') {
+        if !name.starts_with('\\') || validate_path_metric_name(name).is_err() {
             continue;
         }
         let identity = name.to_ascii_lowercase();
@@ -814,7 +826,15 @@ fn normalize_metric_reference<'a>(
 ) -> Result<Option<&'a str>, Error> {
     match configured {
         None => Ok(None),
-        Some(Some(name)) => Ok(Some(name.trim()).filter(|name| !name.is_empty())),
+        Some(Some(name)) => {
+            let Some(name) = Some(name.trim()).filter(|name| !name.is_empty()) else {
+                return Ok(None);
+            };
+            if name.starts_with('\\') {
+                validate_path_metric_name(name)?;
+            }
+            Ok(Some(name))
+        }
         Some(None) => Err(invalid(format!(
             "{counter_field}.metric must be a string when present; null metric is invalid"
         ))),

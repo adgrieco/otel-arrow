@@ -806,10 +806,10 @@ fn sample_metadata_merge_preserves_pending_evidence() {
     assert_eq!(metadata.overflows[0].discovered, 5);
 }
 
-/// Scenario: Worker recovery metadata is released with metadata from a successful scrape.
-/// Guarantees: Sample metadata uses the same replacement merge rule as every pending bundle.
+/// Scenario: Older slot metadata and the current scrape report the same counter failure identity.
+/// Guarantees: Diagnostic evidence accumulates while the newer scrape failure replaces the older detail.
 #[test]
-fn sample_metadata_uses_pending_merge_rule() {
+fn slot_metadata_merge_keeps_newer_failure() {
     let mut pending = PendingMetadata {
         diagnostics: SampleDiagnostics {
             retry_attempts: 1,
@@ -817,7 +817,7 @@ fn sample_metadata_uses_pending_merge_rule() {
         },
         failures: vec![SampleFailure {
             counter_index: 0,
-            reason: "pending",
+            reason: "counter read",
             error: "pending failure".to_owned(),
             diagnostic_only: false,
         }],
@@ -834,8 +834,8 @@ fn sample_metadata_uses_pending_merge_rule() {
         points: Vec::new(),
         metadata: PendingMetadata {
             failures: vec![SampleFailure {
-                counter_index: 1,
-                reason: "current",
+                counter_index: 0,
+                reason: "counter read",
                 error: "current failure".to_owned(),
                 diagnostic_only: false,
             }],
@@ -847,18 +847,20 @@ fn sample_metadata_uses_pending_merge_rule() {
                 omitted: 1,
             }],
             diagnostics: SampleDiagnostics {
+                active_expanded_counters: 2,
                 retry_recoveries: 1,
                 ..Default::default()
             },
         },
     };
 
-    sample.metadata.merge(std::mem::take(&mut pending));
+    sample.metadata.merge_older(std::mem::take(&mut pending));
 
+    assert_eq!(sample.metadata.diagnostics.active_expanded_counters, 2);
     assert_eq!(sample.metadata.diagnostics.retry_attempts, 1);
     assert_eq!(sample.metadata.diagnostics.retry_recoveries, 1);
-    assert_eq!(sample.metadata.failures[0].reason, "current");
-    assert_eq!(sample.metadata.failures[1].reason, "pending");
+    assert_eq!(sample.metadata.failures.len(), 1);
+    assert_eq!(sample.metadata.failures[0].error, "current failure");
     assert_eq!(sample.metadata.overflows[0].reason, "receiver_total");
     assert_eq!(sample.metadata.overflows[1].reason, "per_wildcard");
     assert_eq!(pending.failures.len(), 0);

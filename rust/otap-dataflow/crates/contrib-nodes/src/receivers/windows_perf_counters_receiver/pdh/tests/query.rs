@@ -523,6 +523,45 @@ fn retrying_duplicate_does_not_reset_healthy_peer() {
     assert!(added.is_empty());
 }
 
+/// Scenario: A retrying duplicate-name sibling disappears while its peer still has a live handle.
+/// Guarantees: The live peer is recreated so calculated history cannot cross a possible PDH renumbering.
+#[test]
+fn disappearing_retrying_duplicate_resets_healthy_peer() {
+    let live_worker = CounterKey::new(0, r"\Process(worker)\% Processor Time");
+    let retrying_worker = CounterKey::new(0, r"\Process(worker#1)\% Processor Time");
+    let live_instance = InstanceIdentity {
+        name: "worker".to_owned(),
+        parent: None,
+        index: 0,
+    };
+    let retrying_instance = InstanceIdentity {
+        name: "worker".to_owned(),
+        parent: None,
+        index: 1,
+    };
+    let live = [live_worker.clone()].into_iter().collect::<BTreeSet<_>>();
+    let retrying = [retrying_worker.clone()]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let wanted = [live_worker.clone()].into_iter().collect::<BTreeSet<_>>();
+    let known_groups = instance_groups(
+        [
+            (&live_worker, &live_instance),
+            (&retrying_worker, &retrying_instance),
+        ]
+        .into_iter(),
+    );
+    let wanted_groups = instance_groups([(&live_worker, &live_instance)].into_iter());
+
+    let (removed, added) =
+        refresh_changes_with_group_resets(&live, &retrying, &wanted, &known_groups, &wanted_groups);
+
+    assert_eq!(removed.as_slice(), std::slice::from_ref(&live_worker));
+    assert_eq!(added.as_slice(), std::slice::from_ref(&live_worker));
+    assert!(!removed.contains(&retrying_worker));
+    assert!(!added.contains(&retrying_worker));
+}
+
 /// Scenario: One of two duplicate-name processes exits and PDH renumbers the survivor.
 /// Guarantees: Every handle in that duplicate group is recreated so no native or receiver history crosses process identities.
 #[test]

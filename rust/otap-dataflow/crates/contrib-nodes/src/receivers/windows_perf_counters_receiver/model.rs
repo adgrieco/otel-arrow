@@ -165,6 +165,25 @@ impl PendingMetadata {
             }
         }
     }
+
+    pub(super) fn merge_older(&mut self, older: Self) {
+        merge_diagnostics(&mut self.diagnostics, older.diagnostics);
+        for failure in older.failures {
+            if !self.failures.iter().any(|existing| {
+                existing.counter_index == failure.counter_index && existing.reason == failure.reason
+            }) {
+                self.failures.push(failure);
+            }
+        }
+        for overflow in older.overflows {
+            if !self.overflows.iter().any(|existing| {
+                existing.counter_index == overflow.counter_index
+                    && existing.reason == overflow.reason
+            }) {
+                self.overflows.push(overflow);
+            }
+        }
+    }
 }
 
 /// A successful point-in-time PDH reading, independent of Windows handles.
