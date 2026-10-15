@@ -205,7 +205,9 @@ impl<A: PdhApi> Query<A> {
                 metadata
                     .failures
                     .push(sample_failure(target.config_index, &error));
-                if !error.is_permanent_counter_error() {
+                if error.is_permanent_counter_error() {
+                    let _ = self.retry_states.remove(&key);
+                } else {
                     self.schedule_retry(key, target, now);
                 }
                 false

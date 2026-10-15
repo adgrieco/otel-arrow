@@ -697,6 +697,184 @@ fn setup_diagnostic_preserves_cleanup_failure() {
     assert_eq!(state.borrow().removed, vec![0]);
 }
 
+/// Scenario: An exact counter first fails transiently, then exposes an unsupported native type on its queued retry.
+/// Guarantees: The permanent rejection is reported once, terminates the queued retry, and is not counted as recovery.
+#[test]
+fn queued_retry_stops_after_unsupported_type() {
+    let path = r"\Object\Unsupported";
+    let (state, mut query) = fake_query_with_refresh_interval(
+        vec![counter(path, "windows.unsupported")],
+        Vec::new(),
+        Duration::ZERO,
+    );
+    state.borrow_mut().counters.push(FakeCounter {
+        path: path.to_owned(),
+        native_type: 0x4003_0401,
+        raw: None,
+        multi_count: 1,
+        formatted: None,
+        raw_error: false,
+        formatted_error: false,
+    });
+
+    let rejected = query.collect().unwrap();
+    assert_eq!(rejected.metadata.diagnostics.retry_attempts, 1);
+    assert_eq!(rejected.metadata.diagnostics.retry_recoveries, 0);
+    assert_eq!(rejected.metadata.diagnostics.counter_add_failures, 2);
+    assert_eq!(rejected.metadata.failures.len(), 2);
+    assert_eq!(rejected.metadata.failures[1].reason, "unsupported_type");
+    assert_eq!(state.borrow().removed, [0]);
+
+    state.borrow_mut().timestamp = 110;
+    let settled = query.collect().unwrap();
+    assert_eq!(settled.metadata.diagnostics.retry_attempts, 0);
+    assert_eq!(settled.metadata.diagnostics.retry_recoveries, 0);
+    assert_eq!(settled.metadata.diagnostics.counter_add_failures, 0);
+    assert!(settled.metadata.failures.is_empty());
+    assert_eq!(state.borrow().removed, [0]);
+}
+
+/// Scenario: An exact delta Sum first fails transiently, then its queued retry finds a direct native counter.
+/// Guarantees: The invalid metric mapping is reported once, cleans up its native handle, and terminates the queued retry.
+#[test]
+fn queued_retry_stops_after_invalid_mapping() {
+    let path = r"\Object\Operations";
+    let (state, mut query) = fake_query_with_refresh_interval(
+        vec![delta_sum(path, "object.operations", false)],
+        Vec::new(),
+        Duration::ZERO,
+    );
+    state.borrow_mut().counters.push(FakeCounter {
+        path: path.to_owned(),
+        native_type: 0x0001_0100,
+        raw: None,
+        multi_count: 1,
+        formatted: Some(Number::Integer(42)),
+        raw_error: false,
+        formatted_error: false,
+    });
+
+    let rejected = query.collect().unwrap();
+    assert_eq!(rejected.metadata.diagnostics.retry_attempts, 1);
+    assert_eq!(rejected.metadata.diagnostics.retry_recoveries, 0);
+    assert_eq!(rejected.metadata.diagnostics.counter_add_failures, 2);
+    assert_eq!(rejected.metadata.failures.len(), 2);
+    assert_eq!(
+        rejected.metadata.failures[1].reason,
+        "invalid_metric_mapping"
+    );
+    assert_eq!(state.borrow().removed, [0]);
+
+    state.borrow_mut().timestamp = 110;
+    let settled = query.collect().unwrap();
+    assert_eq!(settled.metadata.diagnostics.retry_attempts, 0);
+    assert_eq!(settled.metadata.diagnostics.retry_recoveries, 0);
+    assert_eq!(settled.metadata.diagnostics.counter_add_failures, 0);
+    assert!(settled.metadata.failures.is_empty());
+    assert_eq!(state.borrow().removed, [0]);
+}
+
+/// Scenario: An exact delta Sum first fails transiently, then its queued retry finds an incompatible native type whose cleanup also fails.
+/// Guarantees: The permanent CounterSetup wrapper retains the mapping and cleanup evidence while terminating the queued retry.
+#[test]
+fn queued_retry_stops_after_wrapped_invalid_mapping() {
+    let path = r"\Object\Operations";
+    let (state, mut query) = fake_query_with_refresh_interval(
+        vec![delta_sum(path, "object.operations", false)],
+        Vec::new(),
+        Duration::ZERO,
+    );
+    {
+        let mut state = state.borrow_mut();
+        state.counters.push(FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x0001_0100,
+            raw: None,
+            multi_count: 1,
+            formatted: Some(Number::Integer(42)),
+            raw_error: false,
+            formatted_error: false,
+        });
+        state.remove_error = true;
+    }
+
+    let rejected = query.collect().unwrap();
+    assert_eq!(rejected.metadata.diagnostics.retry_attempts, 1);
+    assert_eq!(rejected.metadata.diagnostics.retry_recoveries, 0);
+    assert_eq!(rejected.metadata.diagnostics.counter_add_failures, 2);
+    assert_eq!(rejected.metadata.failures.len(), 2);
+    assert_eq!(rejected.metadata.failures[1].reason, "counter_setup");
+    assert!(
+        rejected.metadata.failures[1]
+            .error
+            .contains("invalid metric mapping")
+    );
+    assert!(
+        rejected.metadata.failures[1]
+            .error
+            .contains("PdhRemoveCounter")
+    );
+    assert_eq!(state.borrow().removed, [0]);
+
+    state.borrow_mut().timestamp = 110;
+    let settled = query.collect().unwrap();
+    assert_eq!(settled.metadata.diagnostics.retry_attempts, 0);
+    assert_eq!(settled.metadata.diagnostics.retry_recoveries, 0);
+    assert_eq!(settled.metadata.diagnostics.counter_add_failures, 0);
+    assert!(settled.metadata.failures.is_empty());
+    assert_eq!(state.borrow().removed, [0]);
+}
+
+/// Scenario: An exact counter remains transiently unavailable for one queued retry and then becomes valid.
+/// Guarantees: The transient failure remains queued through existing backoff state and successful re-add counts one recovery.
+#[test]
+fn queued_transient_retry_still_recovers() {
+    let path = r"\Memory\Available Bytes";
+    let (state, mut query) = fake_query_with_refresh_interval(
+        vec![counter(path, "system.memory.available")],
+        Vec::new(),
+        Duration::ZERO,
+    );
+
+    let retrying = query.collect().unwrap();
+    assert_eq!(retrying.metadata.diagnostics.retry_attempts, 1);
+    assert_eq!(retrying.metadata.diagnostics.retry_recoveries, 0);
+    assert_eq!(retrying.metadata.diagnostics.counter_add_failures, 2);
+    assert_eq!(retrying.metadata.failures.len(), 2);
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 110;
+        state.counters.push(FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x0001_0100,
+            raw: None,
+            multi_count: 1,
+            formatted: Some(Number::Integer(42)),
+            raw_error: false,
+            formatted_error: false,
+        });
+    }
+    let recovered = query.collect().unwrap();
+    assert_eq!(recovered.metadata.diagnostics.retry_attempts, 1);
+    assert_eq!(recovered.metadata.diagnostics.retry_recoveries, 1);
+    assert_eq!(recovered.metadata.diagnostics.counter_add_failures, 0);
+    assert!(recovered.metadata.failures.is_empty());
+    assert!(matches!(
+        recovered.points[0].value,
+        SampleValue::Value(Number::Integer(42))
+    ));
+
+    state.borrow_mut().timestamp = 120;
+    let steady = query.collect().unwrap();
+    assert_eq!(steady.metadata.diagnostics.retry_attempts, 0);
+    assert_eq!(steady.metadata.diagnostics.retry_recoveries, 0);
+    assert!(matches!(
+        steady.points[0].value,
+        SampleValue::Value(Number::Integer(42))
+    ));
+}
+
 /// Scenario: Expanded paths arrive in different orders and include duplicate instance names.
 /// Guarantees: Stable keys use configured identity plus the full case-insensitive PDH path.
 #[test]
