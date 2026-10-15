@@ -2,6 +2,385 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE;
+
+struct InvalidHandleState {
+    next_handle: usize,
+    paths: BTreeMap<usize, String>,
+    active: BTreeSet<usize>,
+    max_active: usize,
+    add_attempts: Vec<(String, bool)>,
+    cleanup_attempts: Vec<usize>,
+    invalid_handles: BTreeSet<usize>,
+    failed_adds_remaining: usize,
+    cleanup_fails: bool,
+    timestamp: i64,
+    raw_value: i64,
+    no_observation: BTreeSet<String>,
+    expansions: BTreeMap<String, Vec<String>>,
+}
+
+struct InvalidHandlePdh(Rc<RefCell<InvalidHandleState>>);
+
+impl PdhApi for InvalidHandlePdh {
+    type Counter = usize;
+
+    fn add(&mut self, path: &str, localized: bool) -> Result<Self::Counter, Error> {
+        let mut state = self.0.borrow_mut();
+        state.add_attempts.push((path.to_owned(), localized));
+        if state.failed_adds_remaining > 0 {
+            state.failed_adds_remaining -= 1;
+            return Err(Error::Pdh {
+                operation: if localized {
+                    "PdhAddCounterW"
+                } else {
+                    "PdhAddEnglishCounterW"
+                },
+                path: path.to_owned(),
+                status: 1,
+            });
+        }
+        let handle = state.next_handle;
+        state.next_handle += 1;
+        let _ = state.paths.insert(handle, path.to_owned());
+        let _ = state.active.insert(handle);
+        state.max_active = state.max_active.max(state.active.len());
+        Ok(handle)
+    }
+
+    fn remove(&mut self, counter: &Self::Counter, path: &str) -> Result<(), Error> {
+        let mut state = self.0.borrow_mut();
+        state.cleanup_attempts.push(*counter);
+        if state.cleanup_fails {
+            return Err(Error::Pdh {
+                operation: "PdhRemoveCounter",
+                path: path.to_owned(),
+                status: 1,
+            });
+        }
+        let _ = state.active.remove(counter);
+        Ok(())
+    }
+
+    fn counter_type(&mut self, _counter: &Self::Counter, path: &str) -> Result<u32, Error> {
+        if path.contains("Operations Delta") {
+            Ok(0x0040_0500)
+        } else if path.contains("Available Bytes") {
+            Ok(0x0001_0100)
+        } else {
+            Ok(0x2041_0500)
+        }
+    }
+
+    fn collect(&mut self) -> Result<bool, Error> {
+        Ok(true)
+    }
+
+    fn raw(&mut self, counter: &Self::Counter, path: &str) -> Result<Option<RawSample>, Error> {
+        let state = self.0.borrow();
+        if state.invalid_handles.contains(counter) {
+            return Err(Error::Pdh {
+                operation: "PdhGetRawCounterValue",
+                path: path.to_owned(),
+                status: PDH_INVALID_HANDLE,
+            });
+        }
+        if state.no_observation.contains(path) {
+            return Ok(None);
+        }
+        Ok(Some(RawSample {
+            second_value: state.raw_value,
+            multi_count: 1,
+        }))
+    }
+
+    fn formatted(
+        &mut self,
+        counter: &Self::Counter,
+        path: &str,
+        format: ValueFormat,
+    ) -> Result<Option<Number>, Error> {
+        let state = self.0.borrow();
+        if state.invalid_handles.contains(counter) {
+            return Err(Error::Pdh {
+                operation: "PdhGetFormattedCounterValue",
+                path: path.to_owned(),
+                status: PDH_INVALID_HANDLE,
+            });
+        }
+        if state.no_observation.contains(path) {
+            return Ok(None);
+        }
+        Ok(Some(match format {
+            ValueFormat::Integer => Number::Integer(state.raw_value),
+            ValueFormat::Double => Number::Double(state.raw_value as f64),
+        }))
+    }
+
+    fn timestamp(&mut self) -> Result<i64, Error> {
+        Ok(self.0.borrow().timestamp)
+    }
+
+    fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
+        Ok(self
+            .0
+            .borrow()
+            .expansions
+            .get(path)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
+        NativePdh::parse_instance_path(path)
+    }
+}
+
+fn invalid_handle_query(
+    configs: Vec<CounterConfig>,
+    expansions: BTreeMap<String, Vec<String>>,
+) -> (Rc<RefCell<InvalidHandleState>>, Query<InvalidHandlePdh>) {
+    let state = Rc::new(RefCell::new(InvalidHandleState {
+        next_handle: 0,
+        paths: BTreeMap::new(),
+        active: BTreeSet::new(),
+        max_active: 0,
+        add_attempts: Vec::new(),
+        cleanup_attempts: Vec::new(),
+        invalid_handles: BTreeSet::new(),
+        failed_adds_remaining: 0,
+        cleanup_fails: false,
+        timestamp: 100,
+        raw_value: 10,
+        no_observation: BTreeSet::new(),
+        expansions,
+    }));
+    let query = Query::open_with(
+        InvalidHandlePdh(Rc::clone(&state)),
+        configs,
+        Duration::ZERO,
+        256,
+        4_096,
+    )
+    .unwrap();
+    (state, query)
+}
+
+fn handle_for_path(state: &InvalidHandleState, path: &str) -> usize {
+    state
+        .paths
+        .iter()
+        .find_map(|(handle, candidate)| (candidate == path).then_some(*handle))
+        .unwrap()
+}
+
+/// Scenario: One wildcard delta counter's native handle becomes invalid beside a healthy calculated counter.
+/// Guarantees: Only the invalid handle retires, bounded re-add failures do not accumulate handles, localization is preserved, and replacement history starts fresh.
+#[test]
+fn invalid_handle_retries_one_counter_with_fresh_history() {
+    let wildcard = r"\Process(worker*)\Operations Delta";
+    let expanded = r"\Process(worker)\Operations Delta";
+    let healthy = r"\Processor(_Total)\% Processor Time";
+    let affected = CounterConfig {
+        instance_config: InstanceConfig::Wildcard {
+            excluded_aggregation: Some("_Total".to_owned()),
+        },
+        ..delta_sum(wildcard, "process.operations", false)
+    };
+    let (state, mut query) = invalid_handle_query(
+        vec![affected, counter(healthy, "system.cpu.time")],
+        BTreeMap::from([(wildcard.to_owned(), vec![expanded.to_owned()])]),
+    );
+
+    query.prime().unwrap();
+    let old_handle = handle_for_path(&state.borrow(), expanded);
+    {
+        let mut state = state.borrow_mut();
+        let _ = state.invalid_handles.insert(old_handle);
+        state.timestamp = 110;
+        state.raw_value = 20;
+    }
+
+    let retired = query.collect().unwrap();
+    assert_eq!(retired.points.len(), 1);
+    assert_eq!(retired.points[0].counter_index, 1);
+    assert!(matches!(
+        retired.points[0].value,
+        SampleValue::Value(Number::Double(20.0))
+    ));
+    assert_eq!(retired.metadata.diagnostics.counter_read_failures, 1);
+    assert_eq!(retired.metadata.failures[0].counter_index, 0);
+    {
+        let state = state.borrow();
+        assert_eq!(state.cleanup_attempts, [old_handle]);
+        assert_eq!(state.active.len(), 1);
+        assert_eq!(state.max_active, 2);
+    }
+
+    state.borrow_mut().failed_adds_remaining = 2;
+    for (timestamp, raw_value, expected_attempts) in [(120, 30, 3), (130, 40, 4)] {
+        {
+            let mut state = state.borrow_mut();
+            state.timestamp = timestamp;
+            state.raw_value = raw_value;
+        }
+        let retry = query.collect().unwrap();
+        assert_eq!(retry.points.len(), 1);
+        assert_eq!(retry.points[0].counter_index, 1);
+        assert!(matches!(
+            retry.points[0].value,
+            SampleValue::Value(Number::Double(value)) if value == raw_value as f64
+        ));
+        assert_eq!(retry.metadata.diagnostics.retry_attempts, 1);
+        assert_eq!(retry.metadata.diagnostics.counter_add_failures, 1);
+        let state = state.borrow();
+        assert_eq!(state.add_attempts.len(), expected_attempts);
+        assert_eq!(state.active.len(), 1);
+        assert_eq!(state.max_active, 2);
+    }
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 140;
+        state.raw_value = 50;
+    }
+    let warming = query.collect().unwrap();
+    assert!(
+        warming.points.iter().any(|point| {
+            point.counter_index == 0 && matches!(point.value, SampleValue::Warming)
+        })
+    );
+    assert!(warming.points.iter().any(|point| {
+        point.counter_index == 1 && matches!(point.value, SampleValue::Value(Number::Double(50.0)))
+    }));
+    assert_eq!(warming.metadata.diagnostics.retry_attempts, 1);
+    assert_eq!(warming.metadata.diagnostics.retry_recoveries, 1);
+    {
+        let state = state.borrow();
+        assert_eq!(state.active.len(), 2);
+        assert_eq!(state.max_active, 2);
+        let affected_adds = state
+            .add_attempts
+            .iter()
+            .filter(|(path, _)| path == expanded)
+            .collect::<Vec<_>>();
+        assert_eq!(affected_adds.len(), 4);
+        assert!(affected_adds.iter().all(|(_, localized)| *localized));
+    }
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 150;
+        state.raw_value = 60;
+    }
+    let recovered = query.collect().unwrap();
+    let affected = recovered
+        .points
+        .iter()
+        .find(|point| point.counter_index == 0)
+        .unwrap();
+    assert_eq!(affected.start_time_unix_nano, Some(140));
+    assert!(matches!(
+        affected.value,
+        SampleValue::Value(Number::Double(60.0))
+    ));
+}
+
+/// Scenario: An exact direct counter returns PDH_INVALID_HANDLE from its formatted read.
+/// Guarantees: Formatted reads use the same typed retirement path and preserve exact English-add behavior on replacement.
+#[test]
+fn formatted_invalid_handle_retries_exact_counter() {
+    let path = r"\Memory\Available Bytes";
+    let (state, mut query) = invalid_handle_query(
+        vec![counter(path, "system.memory.available")],
+        BTreeMap::new(),
+    );
+    let old_handle = handle_for_path(&state.borrow(), path);
+    let _ = state.borrow_mut().invalid_handles.insert(old_handle);
+
+    let retired = query.collect().unwrap();
+    assert!(retired.points.is_empty());
+    assert_eq!(retired.metadata.diagnostics.counter_read_failures, 1);
+    {
+        let state = state.borrow();
+        assert_eq!(state.cleanup_attempts, [old_handle]);
+        assert_eq!(state.active.len(), 0);
+    }
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 110;
+        state.raw_value = 42;
+    }
+    let recovered = query.collect().unwrap();
+    assert!(matches!(
+        recovered.points[0].value,
+        SampleValue::Value(Number::Integer(42))
+    ));
+    assert_eq!(recovered.metadata.diagnostics.retry_attempts, 1);
+    assert_eq!(recovered.metadata.diagnostics.retry_recoveries, 1);
+    let state = state.borrow();
+    assert_eq!(state.active.len(), 1);
+    assert_eq!(state.max_active, 1);
+    assert_eq!(state.add_attempts.len(), 2);
+    assert!(state.add_attempts.iter().all(|(_, localized)| !localized));
+}
+
+/// Scenario: A counter read produces normal no-observation results without an invalid native handle.
+/// Guarantees: No-observation resets readiness without removing, re-adding, or retrying the counter.
+#[test]
+fn no_observation_does_not_recover_counter_handle() {
+    let path = r"\Provider\Operations Delta";
+    let (state, mut query) = invalid_handle_query(
+        vec![delta_sum(path, "provider.operations", false)],
+        BTreeMap::new(),
+    );
+    let _ = state.borrow_mut().no_observation.insert(path.to_owned());
+
+    for timestamp in [110, 120] {
+        state.borrow_mut().timestamp = timestamp;
+        let sample = query.collect().unwrap();
+        assert!(matches!(sample.points[0].value, SampleValue::NoObservation));
+        assert_eq!(sample.metadata.diagnostics.counter_read_failures, 0);
+        assert_eq!(sample.metadata.diagnostics.retry_attempts, 0);
+    }
+
+    let state = state.borrow();
+    assert_eq!(state.add_attempts.len(), 1);
+    assert!(state.cleanup_attempts.is_empty());
+    assert_eq!(state.active.len(), 1);
+}
+
+/// Scenario: Cleanup fails while retiring a counter whose native handle is invalid.
+/// Guarantees: The handle remains tracked and the typed cleanup failure reaches the existing immediate query-rebuild path.
+#[test]
+fn invalid_handle_cleanup_failure_requires_query_rebuild() {
+    let path = r"\Provider\Operations Delta";
+    let (state, mut query) = invalid_handle_query(
+        vec![delta_sum(path, "provider.operations", false)],
+        BTreeMap::new(),
+    );
+    let handle = handle_for_path(&state.borrow(), path);
+    {
+        let mut state = state.borrow_mut();
+        let _ = state.invalid_handles.insert(handle);
+        state.cleanup_fails = true;
+    }
+
+    let error = query.collect().unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Pdh {
+            operation: "PdhRemoveCounter",
+            ..
+        }
+    ));
+    assert!(error.requires_immediate_query_rebuild());
+    let state = state.borrow();
+    assert_eq!(state.cleanup_attempts, [handle]);
+    assert_eq!(state.active, BTreeSet::from([handle]));
+    assert_eq!(state.add_attempts.len(), 1);
+}
 
 /// Scenario: Two metric mappings use the same exact PDH path.
 /// Guarantees: The query adds two handles and routes one point to each configured mapping index.
@@ -203,6 +582,7 @@ fn startup_prime_preserves_counter_failures() {
     assert_eq!(sample.metadata.failures.len(), 1);
     assert_eq!(sample.metadata.failures[0].counter_index, 0);
     assert_eq!(sample.metadata.diagnostics.counter_read_failures, 1);
+    assert!(state.borrow().removed.is_empty());
 }
 
 /// Scenario: One exact configured path names a duplicate process instance.

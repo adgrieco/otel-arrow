@@ -628,12 +628,15 @@ impl<A: PdhApi> Query<A> {
                 .values_mut()
                 .map(|counter| &mut counter.history.monotonic_sequence),
         );
-        let points = self.collect_points(
+        let points = match self.collect_points(
             has_data,
             start_time_unix_nano,
             timestamp_unix_nano,
             &mut metadata,
-        );
+        ) {
+            Ok(points) => points,
+            Err(error) => return Err(self.restore_collection_error(metadata, error)),
+        };
         metadata.diagnostics.active_expanded_counters = self.active_expanded_count();
         Ok(Sample {
             timestamp_unix_nano,
@@ -648,9 +651,10 @@ impl<A: PdhApi> Query<A> {
         start_time_unix_nano: i64,
         timestamp_unix_nano: i64,
         metadata: &mut PendingMetadata,
-    ) -> Vec<SamplePoint> {
+    ) -> Result<Vec<SamplePoint>, Error> {
         let mut points = Vec::with_capacity(self.counters.len());
-        for counter in self.counters.values_mut() {
+        let mut retired = Vec::new();
+        for (key, counter) in &mut self.counters {
             let metric_kind = self.configs[counter.config_index].metric_kind;
             let result = if has_data {
                 counter.read(
@@ -669,6 +673,9 @@ impl<A: PdhApi> Query<A> {
                         .failures
                         .push(sample_failure(counter.config_index, &error));
                     metadata.diagnostics.counter_read_failures += 1;
+                    if error.is_invalid_counter_handle_read() {
+                        retired.push((key.clone(), counter.target()));
+                    }
                     continue;
                 }
             };
@@ -685,7 +692,18 @@ impl<A: PdhApi> Query<A> {
                 value,
             });
         }
-        points
+        let now = Instant::now();
+        for (key, target) in retired {
+            let counter = self.counters.remove(&key).ok_or(Error::InvalidSample(
+                "invalid-handle recovery lost an existing counter",
+            ))?;
+            if let Err(error) = self.api.remove(&counter.handle, &counter.path) {
+                let _ = self.counters.insert(key, counter);
+                return Err(error);
+            }
+            self.schedule_retry(key, target, now);
+        }
+        Ok(points)
     }
 }
 
@@ -892,6 +910,16 @@ struct CounterHandle<C> {
 }
 
 impl<C> CounterHandle<C> {
+    fn target(&self) -> CounterTarget {
+        CounterTarget {
+            config_index: self.config_index,
+            path: self.path.clone(),
+            origin: self.origin,
+            instance: self.instance.clone(),
+            emit_instance_attribute: self.emit_instance_attribute,
+        }
+    }
+
     fn reset_readiness(&mut self) {
         self.history.restart_pdh_sampling();
     }

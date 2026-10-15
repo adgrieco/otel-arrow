@@ -3,6 +3,7 @@
 
 use super::super::model::{SampleFailure, ScaleError};
 use super::counter_type::UnsupportedNativeType;
+use windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE;
 
 #[derive(Debug, thiserror::Error)]
 pub(in super::super) enum Error {
@@ -86,6 +87,17 @@ impl Error {
             self,
             Self::Pdh { operation, .. }
                 if matches!(*operation, "PdhRemoveCounter" | "PdhRemoveCounter(retry)")
+        )
+    }
+
+    pub(super) fn is_invalid_counter_handle_read(&self) -> bool {
+        matches!(
+            self,
+            Self::Pdh {
+                operation: "PdhGetRawCounterValue" | "PdhGetFormattedCounterValue",
+                status,
+                ..
+            } if *status == PDH_INVALID_HANDLE
         )
     }
 
