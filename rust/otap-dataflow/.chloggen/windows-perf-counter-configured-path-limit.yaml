@@ -1,0 +1,5 @@
+change_type: bug_fix
+component: pipeline
+note: "Enforce the Windows performance counter configured-path limit when instances is an empty list."
+issues: [4344]
+subtext: "An empty instance list remains equivalent to omission, but each counter mapping now counts as one configured path toward the 256-path limit."

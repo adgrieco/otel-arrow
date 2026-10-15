@@ -1011,6 +1011,76 @@ fn bounds_expanded_counter_paths_before_materialization() {
     );
 }
 
+/// Scenario: An empty instance list accompanies exactly 256 or 257 counter mappings.
+/// Guarantees: Empty instances count like omission, accepting the configured path limit and rejecting one path beyond it.
+#[test]
+fn counts_empty_instances_at_configured_path_boundary() {
+    let object = |counters: usize| {
+        json!({
+            "object": "Memory",
+            "instances": [],
+            "counters": (0..counters)
+                .map(|index| json!({"name": format!("Counter {index}")}))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    assert_eq!(
+        Config::from_json(&json!({"perfcounters": [object(MAX_CONFIGURED_COUNTER_PATHS)]}))
+            .unwrap()
+            .counters
+            .len(),
+        MAX_CONFIGURED_COUNTER_PATHS
+    );
+    assert_config_error(
+        json!({"perfcounters": [object(MAX_CONFIGURED_COUNTER_PATHS + 1)]}),
+        "must normalize to at most 256 counter paths",
+    );
+}
+
+/// Scenario: Omitted, empty, and explicit instance selections contribute to one configured path total.
+/// Guarantees: Mixed objects accept an exact total of 256 normalized paths and reject a 257th path before expansion.
+#[test]
+fn totals_configured_paths_across_mixed_instance_forms() {
+    let counters = |prefix: &str, count: usize| {
+        (0..count)
+            .map(|index| json!({"name": format!("{prefix} {index}")}))
+            .collect::<Vec<_>>()
+    };
+    let omitted = json!({
+        "object": "Memory",
+        "counters": counters("Memory", 100)
+    });
+    let empty = json!({
+        "object": "System",
+        "instances": [],
+        "counters": counters("System", 100)
+    });
+    let selected = json!({
+        "object": "Process",
+        "instances": ["worker", "service"],
+        "counters": counters("Process", 28)
+    });
+    let extra = json!({
+        "object": "Processor",
+        "counters": [{"name": "Extra"}]
+    });
+
+    assert_eq!(
+        Config::from_json(&json!({
+            "perfcounters": [omitted.clone(), empty.clone(), selected.clone()]
+        }))
+        .unwrap()
+        .counters
+        .len(),
+        MAX_CONFIGURED_COUNTER_PATHS
+    );
+    assert_config_error(
+        json!({"perfcounters": [omitted, empty, selected, extra]}),
+        "must normalize to at most 256 counter paths",
+    );
+}
+
 /// Scenario: One counter mapping expands across multiple explicit instances.
 /// Guarantees: Repeated description and attribute metadata is shared across paths.
 #[test]

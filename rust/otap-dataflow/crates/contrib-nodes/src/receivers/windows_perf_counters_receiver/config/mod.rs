@@ -505,10 +505,11 @@ fn expanded_counter_count(objects: &[ObjectConfig]) -> Result<usize, Error> {
         let paths_per_counter = match &object.instances {
             None => 1,
             Some(instances)
-                if instances
-                    .as_slice()
-                    .iter()
-                    .any(|instance| instance.trim() == "*") =>
+                if instances.as_slice().is_empty()
+                    || instances
+                        .as_slice()
+                        .iter()
+                        .any(|instance| instance.trim() == "*") =>
             {
                 1
             }
