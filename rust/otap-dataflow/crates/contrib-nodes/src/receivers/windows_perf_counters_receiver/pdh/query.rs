@@ -698,6 +698,8 @@ impl<A: PdhApi> Query<A> {
                 "invalid-handle recovery lost an existing counter",
             ))?;
             if let Err(error) = self.api.remove(&counter.handle, &counter.path) {
+                // An invalid read handle may also be unremovable. Propagating the error
+                // intentionally triggers an immediate query rebuild.
                 let _ = self.counters.insert(key, counter);
                 return Err(error);
             }

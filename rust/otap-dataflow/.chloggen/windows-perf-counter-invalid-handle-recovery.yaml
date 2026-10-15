@@ -1,5 +1,5 @@
 change_type: bug_fix
 component: pipeline
-note: "Recover individual Windows performance counters when a native PDH handle becomes invalid."
+note: "Recover Windows performance counters whose PDH handle becomes invalid."
 issues: [4344]
-subtext: "Only the affected counter is recreated through bounded retry backoff. Healthy counters continue collecting, and replacement counters restart sampling with fresh history."
+subtext: "The affected counter is re-added with bounded retry; if PDH cannot remove the handle, the query is rebuilt."
