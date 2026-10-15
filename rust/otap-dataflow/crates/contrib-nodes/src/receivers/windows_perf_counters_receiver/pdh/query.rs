@@ -109,7 +109,6 @@ impl<A: PdhApi> Query<A> {
             let target = CounterTarget {
                 config_index,
                 path,
-                localized: false,
                 origin: CounterOrigin::Exact,
                 instance: instance.clone(),
                 emit_instance_attribute: self.configs[config_index]
@@ -130,7 +129,7 @@ impl<A: PdhApi> Query<A> {
     }
 
     fn add_counter(&mut self, target: CounterTarget) -> Result<(), Error> {
-        let counter = self.api.add(&target.path, target.localized)?;
+        let counter = self.api.add(&target.path, target.origin.is_wildcard())?;
         let kind = match self
             .api
             .counter_type(&counter, &target.path)
@@ -506,7 +505,6 @@ impl<A: PdhApi> Query<A> {
             let target = CounterTarget {
                 config_index: key.config_index,
                 path,
-                localized: true,
                 origin: CounterOrigin::Wildcard,
                 instance: Some(instance),
                 emit_instance_attribute,
@@ -778,7 +776,6 @@ pub(super) fn exact_add_failure_disposition(error: &Error) -> ExactAddFailureDis
 struct CounterTarget {
     config_index: usize,
     path: String,
-    localized: bool,
     origin: CounterOrigin,
     instance: Option<InstanceIdentity>,
     emit_instance_attribute: bool,
@@ -1095,7 +1092,6 @@ mod tests {
         let target = CounterTarget {
             config_index: 0,
             path: r"\Process(worker)\Private Bytes".to_owned(),
-            localized: true,
             origin: CounterOrigin::Wildcard,
             instance: Some(InstanceIdentity {
                 name: "worker".to_owned(),

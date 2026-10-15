@@ -728,14 +728,12 @@ fn accepts_otlp_metric_names_and_units() {
         })
     };
     let long_name = format!("metric {}", "x".repeat(512));
-    let long_path_name = format!(r"\Memory\{}", "x".repeat(3_000));
     let long_unit = format!("{{{}}}", "u".repeat(128));
     for (name, unit) in [
         (r"\Memory\Available Bytes", "By"),
         ("1 value", "\u{b5}s"),
         ("\u{e9}", "B\ty"),
         (long_name.as_str(), long_unit.as_str()),
-        (long_path_name.as_str(), "By"),
     ] {
         let normalized = Config::from_json(&config(name, unit)).unwrap();
         assert_eq!(normalized.counters[0].name, name);
@@ -744,8 +742,8 @@ fn accepts_otlp_metric_names_and_units() {
     assert_config_error(config(" ", "By"), "metric name must not be empty");
 }
 
-/// Scenario: Path-shaped metric definitions contain exact, wildcard, malformed, or padded segments.
-/// Guarantees: Every definition loads, while each malformed definition produces one warning candidate.
+/// Scenario: Path-shaped metric definitions contain exact, wildcard, malformed, padded, or overlong paths.
+/// Guarantees: Every definition loads, while each definition that cannot match produces one warning candidate.
 #[test]
 fn warns_for_malformed_path_metric_definitions() {
     let config = |name: &str, reference: &str| {
@@ -782,6 +780,14 @@ fn warns_for_malformed_path_metric_definitions() {
         assert!(path_metric_definition_warning(name).is_some());
         assert_config_error(config(name, name), "metric name");
     }
+    let overlong = format!(r"\Memory\{}", "x".repeat(MAX_COUNTER_PATH_LEN));
+    let normalized = Config::from_json(&config(&overlong, "selected")).unwrap();
+    assert_eq!(normalized.counters[0].name, "selected");
+    assert!(path_metric_definition_warning(&overlong).is_some());
+    assert_config_error(
+        config(&overlong, &overlong),
+        "at most 2047 UTF-16 code units",
+    );
     assert_eq!(path_metric_definition_warning("ordinary metric"), None);
 }
 

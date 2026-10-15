@@ -412,6 +412,7 @@ fn validate_metric_name(name: &str) -> Result<&str, Error> {
 }
 
 fn validate_path_metric_name(name: &str) -> Result<(), Error> {
+    validate_path_length("metric name", name)?;
     let field = format!("metric name {name:?}");
     let invalid_padding = || {
         invalid(format!(
