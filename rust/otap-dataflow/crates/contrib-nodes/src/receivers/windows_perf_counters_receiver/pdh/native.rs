@@ -70,14 +70,92 @@ fn is_no_observation_data_status(status: u32) -> bool {
     )
 }
 
-/// Opaque slot in an adapter's query. Slots are never reused.
+/// Opaque generational slot in an adapter's query.
 pub(in super::super) struct CounterToken {
     index: usize,
+    generation: u64,
+}
+
+struct CounterSlot {
+    generation: u64,
+    handle: Option<PDH_HCOUNTER>,
+}
+
+struct CounterHandles {
+    slots: Vec<CounterSlot>,
+    free_slots: Vec<usize>,
+    next_generation: u64,
+}
+
+impl CounterHandles {
+    const fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            free_slots: Vec::new(),
+            next_generation: 0,
+        }
+    }
+
+    fn take_generation(&mut self, path: &str) -> Result<u64, Error> {
+        let generation = self.next_generation;
+        self.next_generation =
+            self.next_generation
+                .checked_add(1)
+                .ok_or_else(|| Error::CounterSetup {
+                    path: path.to_owned(),
+                    message: "counter token generation exhausted".to_owned(),
+                    permanent: true,
+                })?;
+        Ok(generation)
+    }
+
+    fn insert(&mut self, generation: u64, handle: PDH_HCOUNTER) -> CounterToken {
+        let index = if let Some(index) = self.free_slots.pop() {
+            let slot = &mut self.slots[index];
+            debug_assert!(slot.handle.is_none());
+            slot.generation = generation;
+            slot.handle = Some(handle);
+            index
+        } else {
+            self.slots.push(CounterSlot {
+                generation,
+                handle: Some(handle),
+            });
+            self.slots.len() - 1
+        };
+        CounterToken { index, generation }
+    }
+
+    fn handle(&self, counter: &CounterToken, path: &str) -> Result<PDH_HCOUNTER, Error> {
+        self.slots
+            .get(counter.index)
+            .filter(|slot| slot.generation == counter.generation)
+            .and_then(|slot| slot.handle)
+            .ok_or_else(|| Error::InvalidCounterToken {
+                path: path.to_owned(),
+            })
+    }
+
+    fn remove_with(
+        &mut self,
+        counter: &CounterToken,
+        path: &str,
+        remove: impl FnOnce(PDH_HCOUNTER) -> u32,
+    ) -> Result<(), Error> {
+        let handle = self.handle(counter, path)?;
+        check("PdhRemoveCounter", path, remove(handle))?;
+        let slot = &mut self.slots[counter.index];
+        debug_assert_eq!(slot.generation, counter.generation);
+        debug_assert!(slot.handle.is_some());
+        slot.handle = None;
+        self.free_slots.push(counter.index);
+        Ok(())
+    }
 }
 
 pub(in super::super) struct NativePdh {
     query: PDH_HQUERY,
-    counters: Vec<Option<PDH_HCOUNTER>>,
+    counters: CounterHandles,
     node: String,
 }
 
@@ -92,7 +170,7 @@ impl NativePdh {
         let _ = super::QUERY_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             query,
-            counters: Vec::new(),
+            counters: CounterHandles::new(),
             node,
         })
     }
@@ -333,13 +411,7 @@ impl NativePdh {
     }
 
     fn counter_handle(&self, counter: &CounterToken, path: &str) -> Result<PDH_HCOUNTER, Error> {
-        self.counters
-            .get(counter.index)
-            .copied()
-            .flatten()
-            .ok_or_else(|| Error::InvalidCounterToken {
-                path: path.to_owned(),
-            })
+        self.counters.handle(counter, path)
     }
 
     pub(super) fn collect_status(status: u32) -> Result<bool, Error> {
@@ -449,6 +521,7 @@ impl PdhApi for NativePdh {
     type Counter = CounterToken;
 
     fn add(&mut self, path: &str, localized: bool) -> Result<CounterToken, Error> {
+        let generation = self.counters.take_generation(path)?;
         let wide_path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
         let mut handle = null_mut();
         // SAFETY: The adapter owns the live query, path is NUL-terminated,
@@ -469,22 +542,15 @@ impl PdhApi for NativePdh {
             path,
             status,
         )?;
-        let token = CounterToken {
-            index: self.counters.len(),
-        };
-        self.counters.push(Some(handle));
-        Ok(token)
+        Ok(self.counters.insert(generation, handle))
     }
 
     fn remove(&mut self, counter: &CounterToken, path: &str) -> Result<(), Error> {
-        let handle = self.counter_handle(counter, path)?;
-        // SAFETY: Lookup returns an owned, live counter; successful removal
-        // invalidates its slot before another operation can borrow the adapter.
-        check("PdhRemoveCounter", path, unsafe {
-            PdhRemoveCounter(handle)
-        })?;
-        self.counters[counter.index] = None;
-        Ok(())
+        self.counters.remove_with(counter, path, |handle| {
+            // SAFETY: Lookup returns an owned, live counter; only a successful
+            // native removal releases its generational slot.
+            unsafe { PdhRemoveCounter(handle) }
+        })
     }
 
     fn counter_type(&mut self, counter: &CounterToken, path: &str) -> Result<u32, Error> {
@@ -573,6 +639,112 @@ impl Drop for NativePdh {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Performance::PdhFormatFromRawValue;
+
+    fn insert_fixture_counter(counters: &mut CounterHandles, path: &str) -> CounterToken {
+        let generation = counters.take_generation(path).unwrap();
+        counters.insert(generation, std::ptr::dangling_mut())
+    }
+
+    /// Scenario: A long-lived query repeatedly adds and removes a fixed peak number of counters.
+    /// Guarantees: Generational bookkeeping retains storage proportional to peak concurrent ownership, not lifetime additions.
+    #[test]
+    fn counter_slots_remain_bounded_under_sustained_churn() {
+        let path = "fixture";
+        let mut counters = CounterHandles::new();
+        let peak = 4;
+        for _ in 0..1_024 {
+            let tokens = (0..peak)
+                .map(|_| insert_fixture_counter(&mut counters, path))
+                .collect::<Vec<_>>();
+            assert_eq!(counters.slots.len(), peak);
+            assert!(counters.free_slots.is_empty());
+            for token in tokens {
+                counters.remove_with(&token, path, |_| 0).unwrap();
+            }
+            assert_eq!(counters.slots.len(), peak);
+            assert_eq!(counters.free_slots.len(), peak);
+        }
+    }
+
+    /// Scenario: A removed counter's slot is reused by a later addition.
+    /// Guarantees: Generation fencing prevents the stale token from resolving or invoking native removal against the replacement.
+    #[test]
+    fn reused_counter_slot_rejects_stale_token() {
+        let path = "fixture";
+        let mut counters = CounterHandles::new();
+        let removed = insert_fixture_counter(&mut counters, path);
+        counters.remove_with(&removed, path, |_| 0).unwrap();
+        let replacement = insert_fixture_counter(&mut counters, path);
+
+        assert_eq!(removed.index, replacement.index);
+        assert_ne!(removed.generation, replacement.generation);
+        assert!(matches!(
+            counters.handle(&removed, path),
+            Err(Error::InvalidCounterToken { .. })
+        ));
+        let mut native_remove_called = false;
+        assert!(matches!(
+            counters.remove_with(&removed, path, |_| {
+                native_remove_called = true;
+                0
+            }),
+            Err(Error::InvalidCounterToken { .. })
+        ));
+        assert!(!native_remove_called);
+        assert!(counters.handle(&replacement, path).is_ok());
+    }
+
+    /// Scenario: Native removal fails for an owned counter and later succeeds.
+    /// Guarantees: Failure retains the same live ownership, while only successful removal frees the slot and invalidates the token.
+    #[test]
+    fn failed_counter_removal_retains_ownership() {
+        let path = "fixture";
+        let mut counters = CounterHandles::new();
+        let token = insert_fixture_counter(&mut counters, path);
+        let handle = counters.handle(&token, path).unwrap();
+
+        let error = counters
+            .remove_with(&token, path, |_| PDH_INVALID_ARGUMENT)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Pdh {
+                operation: "PdhRemoveCounter",
+                status: PDH_INVALID_ARGUMENT,
+                ..
+            }
+        ));
+        assert_eq!(counters.handle(&token, path).unwrap(), handle);
+        assert!(counters.free_slots.is_empty());
+
+        counters.remove_with(&token, path, |_| 0).unwrap();
+        assert_eq!(counters.free_slots, [token.index]);
+        assert!(matches!(
+            counters.handle(&token, path),
+            Err(Error::InvalidCounterToken { .. })
+        ));
+    }
+
+    /// Scenario: A query reaches the end of the counter-token generation space.
+    /// Guarantees: Exhaustion fails permanently before native ownership is acquired or slot bookkeeping changes.
+    #[test]
+    fn counter_generation_exhaustion_is_explicit() {
+        let mut counters = CounterHandles::new();
+        counters.next_generation = u64::MAX;
+
+        let error = counters.take_generation("fixture").unwrap_err();
+        assert!(matches!(
+            error,
+            Error::CounterSetup {
+                permanent: true,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("generation exhausted"));
+        assert!(counters.slots.is_empty());
+        assert!(counters.free_slots.is_empty());
+        assert_eq!(counters.next_generation, u64::MAX);
+    }
 
     /// Scenario: Native formatting is requested for an exact large integer and a double above 100.
     /// Guarantees: PDH display scaling is disabled, doubles are not capped, and the matching union field preserves each value.
