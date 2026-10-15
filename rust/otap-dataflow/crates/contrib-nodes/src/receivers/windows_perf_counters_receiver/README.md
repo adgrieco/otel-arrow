@@ -203,12 +203,14 @@ may be unused. Surrounding whitespace is removed from metric
 identities, metadata, path segments, references, and attribute keys before
 duplicate detection. Embedded NUL characters are rejected. Malformed, padded,
 or overlong path-shaped metric definition names are accepted with a
-configuration warning, but cannot match generated paths and are rejected as
-explicit path-shaped references. Metric definitions have no receiver-specific
-count limit. At most 256 normalized configured exact or wildcard counter paths
-are accepted; the path total is checked before materialization. Wildcard
-expansion has separate configurable limits. Repeated metric descriptions and
-mapping attributes are shared across explicit instance expansions.
+configuration warning. Malformed or padded names cannot match generated paths
+and are rejected as explicit path-shaped references. Overlong names cannot be
+generated counter paths, but explicit references to their definitions resolve
+normally. Metric definitions have no receiver-specific count limit. At most
+256 normalized configured exact or wildcard counter paths are accepted; the
+path total is checked before materialization. Wildcard expansion has separate
+configurable limits. Repeated metric descriptions and mapping attributes are
+shared across explicit instance expansions.
 Configured paths are limited to 2047 UTF-16 code units. Expanded paths that
 reach PDH's 2048-unit native limit are omitted and diagnosed.
 

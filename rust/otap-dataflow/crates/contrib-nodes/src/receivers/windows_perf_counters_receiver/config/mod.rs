@@ -413,6 +413,10 @@ fn validate_metric_name(name: &str) -> Result<&str, Error> {
 
 fn validate_path_metric_name(name: &str) -> Result<(), Error> {
     validate_path_length("metric name", name)?;
+    validate_path_metric_segments(name)
+}
+
+fn validate_path_metric_segments(name: &str) -> Result<(), Error> {
     let field = format!("metric name {name:?}");
     let invalid_padding = || {
         invalid(format!(
@@ -832,7 +836,7 @@ fn normalize_metric_reference<'a>(
                 return Ok(None);
             };
             if name.starts_with('\\') {
-                validate_path_metric_name(name)?;
+                validate_path_metric_segments(name)?;
             }
             Ok(Some(name))
         }

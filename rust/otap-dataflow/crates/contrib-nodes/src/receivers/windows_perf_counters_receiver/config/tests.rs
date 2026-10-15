@@ -429,21 +429,6 @@ fn treats_empty_metric_name_as_omitted() {
     assert_eq!(config.counters[0].name, r"\Memory\Available Bytes");
 }
 
-/// Scenario: A counter mapping explicitly sets its metric reference to null.
-/// Guarantees: Null is rejected at the indexed mapping instead of selecting path fallback.
-#[test]
-fn rejects_null_metric_reference() {
-    assert_config_error(
-        json!({
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": null}]
-            }]
-        }),
-        "perfcounters[0].counters[0].metric must be a string when present; null metric is invalid",
-    );
-}
-
 /// Scenario: Null metric references appear at each object/counter position or replace the definitions map.
 /// Guarantees: Every null reference reports its exact location and a null definitions map is rejected.
 #[test]
@@ -729,11 +714,13 @@ fn accepts_otlp_metric_names_and_units() {
     };
     let long_name = format!("metric {}", "x".repeat(512));
     let long_unit = format!("{{{}}}", "u".repeat(128));
+    let overlong_path_name = format!(r"\Memory\{}", "x".repeat(MAX_COUNTER_PATH_LEN));
     for (name, unit) in [
         (r"\Memory\Available Bytes", "By"),
         ("1 value", "\u{b5}s"),
         ("\u{e9}", "B\ty"),
         (long_name.as_str(), long_unit.as_str()),
+        (overlong_path_name.as_str(), "1"),
     ] {
         let normalized = Config::from_json(&config(name, unit)).unwrap();
         assert_eq!(normalized.counters[0].name, name);
@@ -784,10 +771,6 @@ fn warns_for_malformed_path_metric_definitions() {
     let normalized = Config::from_json(&config(&overlong, "selected")).unwrap();
     assert_eq!(normalized.counters[0].name, "selected");
     assert!(path_metric_definition_warning(&overlong).is_some());
-    assert_config_error(
-        config(&overlong, &overlong),
-        "at most 2047 UTF-16 code units",
-    );
     assert_eq!(path_metric_definition_warning("ordinary metric"), None);
 }
 

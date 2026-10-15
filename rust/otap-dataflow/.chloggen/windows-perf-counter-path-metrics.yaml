@@ -2,4 +2,4 @@ change_type: bug_fix
 component: pipeline
 note: "Preserve configured instance spelling in path-named Windows performance counter metrics and validate metric metadata consistently."
 issues: [4344]
-subtext: "Path definitions support exact and wildcard instances. Lookup stays exact and case-sensitive. Case-only, malformed, padded, and overlong path definitions warn; invalid path references remain rejected."
+subtext: "Path definitions support exact and wildcard instances. Lookup stays exact and case-sensitive. Case-only, malformed, padded, and overlong definitions warn. Malformed or padded references reject; defined overlong names resolve."
