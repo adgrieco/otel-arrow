@@ -875,6 +875,48 @@ fn queued_transient_retry_still_recovers() {
     ));
 }
 
+/// Scenario: A wildcard refresh repeatedly discovers an instance whose native type is permanently unsupported.
+/// Guarantees: Each refresh records one bounded rejection without queuing retries or permanently blacklisting rediscovery.
+#[test]
+fn wildcard_refresh_retries_permanently_rejected_instance() {
+    let template = r"\Process(*)\Unsupported";
+    let expanded = r"\Process(worker)\Unsupported";
+    let mut config = counter(template, "process.unsupported");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let (state, mut query) = fake_query_with_refresh_interval(
+        vec![config],
+        vec![FakeCounter {
+            path: expanded.to_owned(),
+            native_type: 0x4003_0401,
+            raw: None,
+            multi_count: 1,
+            formatted: None,
+            raw_error: false,
+            formatted_error: false,
+        }],
+        Duration::ZERO,
+    );
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(template.to_owned(), vec![expanded.to_owned()]);
+
+    for (timestamp, expected_attempts) in [(110, 1), (120, 2)] {
+        state.borrow_mut().timestamp = timestamp;
+        let rejected = query.collect().unwrap();
+        assert_eq!(rejected.metadata.diagnostics.retry_attempts, 0);
+        assert_eq!(rejected.metadata.diagnostics.retry_recoveries, 0);
+        assert_eq!(rejected.metadata.diagnostics.counter_add_failures, 1);
+        assert_eq!(rejected.metadata.failures.len(), 1);
+        assert_eq!(rejected.metadata.failures[0].reason, "unsupported_type");
+        let state = state.borrow();
+        assert_eq!(state.added.len(), expected_attempts);
+        assert_eq!(state.removed.len(), expected_attempts);
+    }
+}
+
 /// Scenario: Expanded paths arrive in different orders and include duplicate instance names.
 /// Guarantees: Stable keys use configured identity plus the full case-insensitive PDH path.
 #[test]
