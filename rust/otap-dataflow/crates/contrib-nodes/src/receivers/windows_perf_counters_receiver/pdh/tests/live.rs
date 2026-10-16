@@ -490,6 +490,12 @@ async fn live_pdh_adapter_rejects_removed_tokens() {
 
 struct CounterProcess(Child);
 
+impl CounterProcess {
+    fn id(&self) -> i64 {
+        i64::from(self.0.id())
+    }
+}
+
 impl Drop for CounterProcess {
     fn drop(&mut self) {
         drop(self.0.stdin.take());
@@ -512,6 +518,234 @@ fn spawn_counter_process(executable: &Path) -> CounterProcess {
         .unwrap();
     assert_eq!(ready.trim(), "ready");
     child
+}
+
+struct CounterProcessFixture {
+    directory: std::path::PathBuf,
+    executable: std::path::PathBuf,
+    instance: String,
+    processes: Vec<CounterProcess>,
+}
+
+impl CounterProcessFixture {
+    fn new() -> Self {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "otel-arrow-pdh-membership-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let instance = format!(
+            "otm{:06x}{:06x}",
+            std::process::id() & 0x00ff_ffff,
+            nonce & 0x00ff_ffff
+        );
+        let executable = directory.join(format!("{instance}.exe"));
+        let fixture = Self {
+            directory,
+            executable,
+            instance,
+            processes: Vec::new(),
+        };
+        let source = std::env::var_os("COMSPEC").expect("COMSPEC must identify cmd.exe");
+        let _ = std::fs::copy(source, &fixture.executable).unwrap();
+        fixture
+    }
+
+    fn spawn(&mut self) -> i64 {
+        let process = spawn_counter_process(&self.executable);
+        let id = process.id();
+        self.processes.push(process);
+        id
+    }
+
+    fn stop(&mut self, id: i64) {
+        let index = self
+            .processes
+            .iter()
+            .position(|process| process.id() == id)
+            .unwrap_or_else(|| panic!("fixture does not own process ID {id}"));
+        drop(self.processes.swap_remove(index));
+    }
+}
+
+impl Drop for CounterProcessFixture {
+    fn drop(&mut self) {
+        self.processes.clear();
+        let _ = std::fs::remove_file(&self.executable);
+        let _ = std::fs::remove_dir(&self.directory);
+    }
+}
+
+#[derive(Debug)]
+struct LiveProcessMembership {
+    ids: BTreeSet<i64>,
+    unsuffixed_id: Option<i64>,
+    wildcard_points: usize,
+    wildcard_paths: BTreeSet<String>,
+    exact_points: usize,
+    exact_valid: bool,
+    unexpected_points: usize,
+    invalid_wildcard_values: Vec<SampleValue>,
+    metadata: PendingMetadata,
+}
+
+impl LiveProcessMembership {
+    fn from_sample(sample: Sample, instance_name: &str) -> Self {
+        let mut ids = BTreeSet::new();
+        let mut unsuffixed_id = None;
+        let mut wildcard_points = 0;
+        let mut wildcard_paths = BTreeSet::new();
+        let mut exact_points = 0;
+        let mut exact_valid = false;
+        let mut unexpected_points = 0;
+        let mut invalid_wildcard_values = Vec::new();
+        for point in sample.points {
+            match point.counter_index {
+                0 => {
+                    exact_points += 1;
+                    exact_valid = point.path == r"\Memory\Available Bytes"
+                        && point.instance.is_none()
+                        && matches!(
+                            point.value,
+                            SampleValue::Value(Number::Integer(value)) if value >= 0
+                        );
+                }
+                1 => {
+                    wildcard_points += 1;
+                    let _ = wildcard_paths.insert(point.path.clone());
+                    match point.value {
+                        SampleValue::Value(Number::Integer(id)) if id > 0 => {
+                            let _ = ids.insert(id);
+                            if point.instance.as_ref().is_some_and(|instance| {
+                                instance.name.eq_ignore_ascii_case(instance_name)
+                                    && instance.index == 0
+                            }) {
+                                unsuffixed_id = Some(id);
+                            }
+                        }
+                        value => invalid_wildcard_values.push(value),
+                    }
+                }
+                _ => unexpected_points += 1,
+            }
+        }
+        Self {
+            ids,
+            unsuffixed_id,
+            wildcard_points,
+            wildcard_paths,
+            exact_points,
+            exact_valid,
+            unexpected_points,
+            invalid_wildcard_values,
+            metadata: sample.metadata,
+        }
+    }
+
+    fn matches(&self, expected: &BTreeSet<i64>) -> bool {
+        self.ids == *expected
+            && self.unsuffixed_id.is_some()
+            && self.wildcard_points == expected.len()
+            && self.wildcard_paths.len() == self.wildcard_points
+            && self.exact_points == 1
+            && self.exact_valid
+            && self.unexpected_points == 0
+            && self.invalid_wildcard_values.is_empty()
+            && self.metadata.failures.is_empty()
+            && self.metadata.overflows.is_empty()
+    }
+}
+
+async fn wait_for_live_process_membership(
+    query: &mut Query,
+    instance_name: &str,
+    expected: &BTreeSet<i64>,
+    phase: &str,
+) -> LiveProcessMembership {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let last_observed = match query.collect() {
+            Ok(sample) => {
+                let observed = LiveProcessMembership::from_sample(sample, instance_name);
+                if observed.matches(expected) {
+                    return observed;
+                }
+                format!("{observed:#?}")
+            }
+            Err(error) => format!("collection error: {error:?}"),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "{phase} did not converge; expected process IDs {expected:?}; last observed: \
+             {last_observed}"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// Scenario: A filtered process wildcard repeatedly changes membership while one query stays open.
+/// Guarantees: Each phase emits every owned PID once, no stale IDs, and one healthy exact peer.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+async fn live_pdh_refreshes_process_membership_after_duplicate_renumbering() {
+    let _serial = TEST_PDH_LOCK.lock().await;
+    let mut fixture = CounterProcessFixture::new();
+    let mut expected = BTreeSet::from([fixture.spawn(), fixture.spawn()]);
+    let mut wildcard = counter(
+        &format!(r"\Process({}*)\ID Process", fixture.instance),
+        "process.id",
+    );
+    wildcard.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let mut query = Query::open(
+        vec![
+            counter(r"\Memory\Available Bytes", "windows.memory.available"),
+            wildcard,
+        ],
+        Duration::from_millis(100),
+        16,
+        16,
+        "membership".to_owned(),
+    )
+    .unwrap();
+
+    let mut observed = wait_for_live_process_membership(
+        &mut query,
+        &fixture.instance,
+        &expected,
+        "initial two-process membership",
+    )
+    .await;
+    for cycle in 1..=2 {
+        let removed = observed
+            .unsuffixed_id
+            .expect("converged membership must identify the unsuffixed instance");
+        assert!(expected.remove(&removed));
+        fixture.stop(removed);
+        let _ = wait_for_live_process_membership(
+            &mut query,
+            &fixture.instance,
+            &expected,
+            &format!("cycle {cycle} surviving process after renumbering"),
+        )
+        .await;
+
+        let replacement = fixture.spawn();
+        assert!(expected.insert(replacement));
+        observed = wait_for_live_process_membership(
+            &mut query,
+            &fixture.instance,
+            &expected,
+            &format!("cycle {cycle} replacement discovery"),
+        )
+        .await;
+    }
+    assert_eq!(observed.ids, expected);
 }
 
 /// Scenario: Parsed configuration names duplicate live process instances using #0 and #1.
