@@ -4,7 +4,7 @@
 #[cfg(test)]
 use super::config::InstanceConfig;
 use super::config::{Aggregation, CounterConfig, MetricKind};
-use super::model::{InstanceIdentity, Number, Sample, SamplePoint, SampleValue};
+use super::model::{InstanceIdentity, Number, Sample, SampleFailure, SamplePoint, SampleValue};
 use arrow::error::ArrowError;
 use otel_arrow_dfe_pdata::encode::record::attributes::StrKeysAttributesRecordBatchBuilder;
 use otel_arrow_dfe_pdata::encode::record::metrics::{
@@ -43,6 +43,34 @@ struct ProjectionBuilder {
     metric_ids: BTreeMap<Arc<str>, u16>,
 }
 
+#[derive(Debug)]
+pub(super) enum ProjectionOutcome {
+    Projected {
+        records: Option<OtapArrowRecords>,
+        point_failures: Vec<SampleFailure>,
+    },
+    BatchDropped {
+        error: ArrowError,
+        point_failures: Vec<SampleFailure>,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct ProjectionInvariantError(ArrowError);
+
+struct PreparedPoint<'a> {
+    counter: &'a CounterConfig,
+    point: &'a SamplePoint,
+    value: Number,
+    start_time_unix_nano: Option<i64>,
+}
+
+enum PointPreparationError {
+    Expected(SampleFailure),
+    Invariant(ProjectionInvariantError),
+}
+
 impl ProjectionBuilder {
     fn new() -> Self {
         Self {
@@ -55,36 +83,35 @@ impl ProjectionBuilder {
 
     fn append_point(
         &mut self,
-        counters: &[CounterConfig],
         point_id: u32,
-        point: SamplePoint,
-        value: Number,
-    ) -> Result<(), ArrowError> {
-        validate_point_timestamp(&point)?;
-        let counter = counters.get(point.counter_index).ok_or_else(|| {
-            ArrowError::InvalidArgumentError(format!(
-                "sample references missing configured counter {}",
-                point.counter_index
-            ))
-        })?;
-        let start_time = point_start_time(counter, &point)?;
-        let metric_id = self.metric_id(counter)?;
+        prepared: PreparedPoint<'_>,
+    ) -> Result<(), ProjectionInvariantError> {
+        let metric_id = self.metric_id(prepared.counter)?;
         self.points.append_id(point_id);
         self.points.append_parent_id(metric_id);
-        self.points.append_start_time_unix_nano(start_time);
-        self.points.append_time_unix_nano(point.timestamp_unix_nano);
-        append_number(&mut self.points, &point.path, value)?;
+        self.points
+            .append_start_time_unix_nano(prepared.start_time_unix_nano);
+        self.points
+            .append_time_unix_nano(prepared.point.timestamp_unix_nano);
+        append_number(&mut self.points, prepared.value);
         self.points.append_flags(0);
-        append_attributes(&mut self.attributes, point_id, counter, &point);
+        append_attributes(
+            &mut self.attributes,
+            point_id,
+            prepared.counter,
+            prepared.point,
+        );
         Ok(())
     }
 
-    fn metric_id(&mut self, counter: &CounterConfig) -> Result<u16, ArrowError> {
+    fn metric_id(&mut self, counter: &CounterConfig) -> Result<u16, ProjectionInvariantError> {
         if let Some(metric_id) = self.metric_ids.get(counter.name.as_ref()) {
             return Ok(*metric_id);
         }
         let metric_id = u16::try_from(self.metric_ids.len()).map_err(|_| {
-            ArrowError::InvalidArgumentError("too many configured metrics".to_owned())
+            ProjectionInvariantError(ArrowError::InvalidArgumentError(
+                "too many configured metrics".to_owned(),
+            ))
         })?;
         self.metrics.append_id(metric_id);
         self.metrics.append_metric_type(match counter.metric_kind {
@@ -158,20 +185,17 @@ impl ProjectionBuilder {
     }
 }
 
-fn validate_point_timestamp(point: &SamplePoint) -> Result<(), ArrowError> {
+fn validate_point_timestamp(counter: &CounterConfig, point: &SamplePoint) -> Result<(), String> {
     if point.timestamp_unix_nano <= 0 {
-        return Err(ArrowError::InvalidArgumentError(format!(
+        return Err(format!(
             "counter {} has non-positive timestamp {}",
-            point.path, point.timestamp_unix_nano
-        )));
+            counter.path, point.timestamp_unix_nano
+        ));
     }
     Ok(())
 }
 
-fn point_start_time(
-    counter: &CounterConfig,
-    point: &SamplePoint,
-) -> Result<Option<i64>, ArrowError> {
+fn point_start_time(counter: &CounterConfig, point: &SamplePoint) -> Result<Option<i64>, String> {
     let MetricKind::Sum {
         aggregation,
         monotonic,
@@ -180,50 +204,51 @@ fn point_start_time(
         return Ok(None);
     };
     let start_time = point.start_time_unix_nano.ok_or_else(|| {
-        ArrowError::InvalidArgumentError(format!(
+        format!(
             "{} {} ({}) is missing its start time",
             sum_kind(aggregation, monotonic),
             counter.name,
-            point.path
-        ))
+            counter.path
+        )
     })?;
     if start_time <= 0
         || start_time > point.timestamp_unix_nano
         || aggregation == Aggregation::Delta && start_time == point.timestamp_unix_nano
     {
-        return Err(ArrowError::InvalidArgumentError(format!(
+        return Err(format!(
             "{} {} ({}) has invalid start time {} for timestamp {}",
             sum_kind(aggregation, monotonic),
             counter.name,
-            point.path,
+            counter.path,
             start_time,
             point.timestamp_unix_nano
-        )));
+        ));
     }
     Ok(Some(start_time))
 }
 
-fn append_number(
-    points: &mut NumberDataPointsRecordBatchBuilder,
-    path: &str,
-    value: Number,
-) -> Result<(), ArrowError> {
+fn validate_number(path: &str, value: Number) -> Result<(), String> {
+    if let Number::Double(value) = value
+        && !value.is_finite()
+    {
+        return Err(format!(
+            "counter {path} has non-finite double value {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn append_number(points: &mut NumberDataPointsRecordBatchBuilder, value: Number) {
     match value {
         Number::Integer(value) => {
             points.append_int_value(Some(value));
             points.append_double_value(None);
         }
-        Number::Double(value) if value.is_finite() => {
+        Number::Double(value) => {
             points.append_int_value(None);
             points.append_double_value(Some(value));
         }
-        Number::Double(value) => {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "counter {path} has non-finite double value {value}"
-            )));
-        }
     }
-    Ok(())
 }
 
 fn append_attributes(
@@ -259,34 +284,130 @@ fn append_attributes(
     }
 }
 
-/// Project the ready values from one scrape directly into OTAP metric streams.
+fn prepare_point<'a>(
+    counters: &'a [CounterConfig],
+    point: &'a SamplePoint,
+    value: Number,
+) -> Result<PreparedPoint<'a>, PointPreparationError> {
+    let counter = counters.get(point.counter_index).ok_or_else(|| {
+        PointPreparationError::Invariant(ProjectionInvariantError(
+            ArrowError::InvalidArgumentError(format!(
+                "sample references missing configured counter {}",
+                point.counter_index
+            )),
+        ))
+    })?;
+    let start_time_unix_nano = validate_point_timestamp(counter, point)
+        .and_then(|()| point_start_time(counter, point))
+        .and_then(|start_time| {
+            validate_number(&counter.path, value)?;
+            Ok(start_time)
+        })
+        .map_err(|error| {
+            PointPreparationError::Expected(SampleFailure {
+                counter_index: point.counter_index,
+                reason: "projection.point",
+                error,
+                diagnostic_only: false,
+            })
+        })?;
+    Ok(PreparedPoint {
+        counter,
+        point,
+        value,
+        start_time_unix_nano,
+    })
+}
+
+fn recoverable_batch_error(error: &ArrowError) -> bool {
+    matches!(
+        error,
+        ArrowError::MemoryError(_) | ArrowError::ComputeError(_)
+    )
+}
+
+fn project_with_finish<F>(
+    counters: &[CounterConfig],
+    sample: &Sample,
+    finish: F,
+) -> Result<ProjectionOutcome, ProjectionInvariantError>
+where
+    F: FnOnce(ProjectionBuilder) -> Result<OtapArrowRecords, ArrowError>,
+{
+    if sample.timestamp_unix_nano <= 0 {
+        return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
+            format!(
+                "sample has non-positive timestamp {}",
+                sample.timestamp_unix_nano
+            ),
+        )));
+    }
+    let mut builder = ProjectionBuilder::new();
+    let mut point_failures = Vec::new();
+    let mut point_count = 0_usize;
+    let ready = sample.points.iter().filter_map(|point| match point.value {
+        SampleValue::Value(value) => Some((point, value)),
+        SampleValue::Warming | SampleValue::NoObservation => None,
+    });
+    for (point, value) in ready {
+        let prepared = match prepare_point(counters, point, value) {
+            Ok(prepared) => prepared,
+            Err(PointPreparationError::Expected(failure)) => {
+                point_failures.push(failure);
+                continue;
+            }
+            Err(PointPreparationError::Invariant(error)) => return Err(error),
+        };
+        let point_id = u32::try_from(point_count).map_err(|_| {
+            ProjectionInvariantError(ArrowError::InvalidArgumentError(
+                "too many counter values".to_owned(),
+            ))
+        })?;
+        builder.append_point(point_id, prepared)?;
+        point_count += 1;
+    }
+    if builder.metric_ids.is_empty() {
+        return Ok(ProjectionOutcome::Projected {
+            records: None,
+            point_failures,
+        });
+    }
+    match finish(builder) {
+        Ok(records) => Ok(ProjectionOutcome::Projected {
+            records: Some(records),
+            point_failures,
+        }),
+        Err(error) if recoverable_batch_error(&error) => Ok(ProjectionOutcome::BatchDropped {
+            error,
+            point_failures,
+        }),
+        Err(error) => Err(ProjectionInvariantError(error)),
+    }
+}
+
+/// Project one scrape while isolating expected point and batch data failures.
+pub(super) fn project_sample(
+    counters: &[CounterConfig],
+    sample: &Sample,
+) -> Result<ProjectionOutcome, ProjectionInvariantError> {
+    project_with_finish(counters, sample, ProjectionBuilder::finish)
+}
+
+#[cfg(test)]
 pub(super) fn into_otap(
     counters: &[CounterConfig],
     sample: Sample,
 ) -> Result<Option<OtapArrowRecords>, ArrowError> {
-    if sample.timestamp_unix_nano <= 0 {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "sample has non-positive timestamp {}",
-            sample.timestamp_unix_nano
-        )));
+    match project_sample(counters, &sample).map_err(|error| error.0)? {
+        ProjectionOutcome::Projected {
+            records,
+            point_failures,
+        } if point_failures.is_empty() => Ok(records),
+        ProjectionOutcome::Projected { point_failures, .. } => Err(
+            ArrowError::InvalidArgumentError(point_failures[0].error.clone()),
+        ),
+        ProjectionOutcome::BatchDropped { error, .. } => Err(error),
     }
-    let mut builder = ProjectionBuilder::new();
-    let ready = sample
-        .points
-        .into_iter()
-        .filter_map(|point| match point.value {
-            SampleValue::Value(value) => Some((point, value)),
-            SampleValue::Warming | SampleValue::NoObservation => None,
-        });
-    for (index, (point, value)) in ready.enumerate() {
-        let point_id = u32::try_from(index)
-            .map_err(|_| ArrowError::InvalidArgumentError("too many counter values".to_owned()))?;
-        builder.append_point(counters, point_id, point, value)?;
-    }
-    if builder.metric_ids.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(builder.finish()?))
 }
 
 #[cfg(test)]
@@ -862,7 +983,7 @@ mod tests {
     }
 
     /// Scenario: An emitted non-monotonic Sum has an invalid or boundary cumulative start time.
-    /// Guarantees: Only 0 < start <= observation time is accepted and errors identify the PDH counter and both times.
+    /// Guarantees: Invalid intervals cannot escape, and diagnostics use bounded template identity with both times.
     #[test]
     fn validates_non_monotonic_sum_start_time() {
         let counters = [non_monotonic_sum(
@@ -887,7 +1008,7 @@ mod tests {
                 ),
                 Err(ArrowError::InvalidArgumentError(message))
                     if message == format!(
-                        "non-monotonic cumulative Sum windows.process.private (\\Process(worker)\\Private Bytes) \
+                        "non-monotonic cumulative Sum windows.process.private (\\Process(*)\\Private Bytes) \
                          has invalid start time {start} for timestamp 10"
                     )
             ));
@@ -1330,6 +1451,166 @@ mod tests {
                     )
             ));
         }
+    }
+
+    /// Scenario: One scrape contains a valid point and a non-finite peer.
+    /// Guarantees: One bad provider value cannot suppress healthy telemetry or leak instance identity into diagnostics.
+    #[test]
+    fn isolates_invalid_point_from_healthy_peer() {
+        let counters = [counter(
+            r"\Process(*)\Working Set",
+            "windows.process.memory.usage",
+            "By",
+        )];
+        let outcome = project_sample(
+            &counters,
+            &Sample {
+                timestamp_unix_nano: 1,
+                points: vec![
+                    point(
+                        0,
+                        r"\Process(worker#1)\Working Set",
+                        SampleValue::Value(Number::Integer(42)),
+                    ),
+                    point(
+                        0,
+                        r"\Process(secret#1)\Working Set",
+                        SampleValue::Value(Number::Double(f64::NAN)),
+                    ),
+                ],
+                metadata: Default::default(),
+            },
+        )
+        .unwrap();
+        let ProjectionOutcome::Projected {
+            records: Some(records),
+            point_failures,
+        } = outcome
+        else {
+            panic!("expected a projected batch");
+        };
+
+        assert_eq!(
+            point_failures,
+            vec![SampleFailure {
+                counter_index: 0,
+                reason: "projection.point",
+                error: "counter \\Process(*)\\Working Set has non-finite double value NaN"
+                    .to_owned(),
+                diagnostic_only: false,
+            }]
+        );
+        let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
+        assert_eq!(points.num_rows(), 1);
+        assert_eq!(
+            points
+                .column_by_name("int_value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
+    }
+
+    /// Scenario: Arrow cannot finish an otherwise valid batch because of a recoverable memory or computation failure.
+    /// Guarantees: A transient batch failure cannot terminate the source or poison the next scrape.
+    #[test]
+    fn isolates_recoverable_batch_failure_from_subsequent_projection() {
+        let counters = [counter(
+            r"\Memory\Available Bytes",
+            "windows.memory.available",
+            "By",
+        )];
+        let sample = Sample {
+            timestamp_unix_nano: 1,
+            points: vec![point(
+                0,
+                r"\Memory\Available Bytes",
+                SampleValue::Value(Number::Integer(42)),
+            )],
+            metadata: Default::default(),
+        };
+
+        for error in [
+            ArrowError::MemoryError("injected memory failure".to_owned()),
+            ArrowError::ComputeError("injected computation failure".to_owned()),
+        ] {
+            assert!(matches!(
+                project_with_finish(&counters, &sample, move |_| Err(error)).unwrap(),
+                ProjectionOutcome::BatchDropped {
+                    point_failures,
+                    ..
+                } if point_failures.is_empty()
+            ));
+        }
+
+        assert!(matches!(
+            project_sample(&counters, &sample).unwrap(),
+            ProjectionOutcome::Projected {
+                records: Some(_),
+                point_failures,
+            } if point_failures.is_empty()
+        ));
+    }
+
+    /// Scenario: Arrow reports a schema failure while finishing an otherwise valid batch.
+    /// Guarantees: Structural corruption cannot be hidden as a recoverable dropped scrape.
+    #[test]
+    fn rejects_schema_batch_failure_as_invariant() {
+        let counters = [counter(
+            r"\Memory\Available Bytes",
+            "windows.memory.available",
+            "By",
+        )];
+        let sample = Sample {
+            timestamp_unix_nano: 1,
+            points: vec![point(
+                0,
+                r"\Memory\Available Bytes",
+                SampleValue::Value(Number::Integer(42)),
+            )],
+            metadata: Default::default(),
+        };
+
+        let error = project_with_finish(&counters, &sample, |_| {
+            Err(ArrowError::SchemaError(
+                "injected schema failure".to_owned(),
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "Schema error: injected schema failure");
+    }
+
+    /// Scenario: A sample references a configured-counter index that does not exist.
+    /// Guarantees: Internal contract corruption cannot masquerade as recoverable point loss.
+    #[test]
+    fn rejects_missing_counter_index_as_invariant() {
+        let counters = [counter(
+            r"\Memory\Available Bytes",
+            "windows.memory.available",
+            "By",
+        )];
+        let error = project_sample(
+            &counters,
+            &Sample {
+                timestamp_unix_nano: 1,
+                points: vec![point(
+                    1,
+                    r"\Memory\Available Bytes",
+                    SampleValue::Value(Number::Integer(42)),
+                )],
+                metadata: Default::default(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid argument error: sample references missing configured counter 1"
+        );
     }
 
     /// Scenario: Two expanded instances map to one configured wildcard metric.

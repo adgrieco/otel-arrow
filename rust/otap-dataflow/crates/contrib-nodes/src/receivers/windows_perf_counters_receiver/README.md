@@ -331,6 +331,13 @@ normal omission and diagnostic behavior without fabricating readiness.
   baselines are invalidated so later values are not compared with stale PDH
   samples. Other counter-local invalid statuses, non-finite output, or scaling
   failures omit only that point; healthy peers remain in the batch.
+- Projection validates every ready point before mutating the Arrow batch.
+  Invalid point timestamps, Sum start times, or non-finite values omit only
+  that point. Broken sample/configuration identity and Arrow schema errors
+  remain fatal receiver invariants.
+- An Arrow memory or computation failure while finishing a batch drops only
+  that scrape. The receiver records a failed scrape and attempts the next
+  scheduled collection without retaining partial projection state.
 - Counter add failures retry with exponential backoff capped by
   `wildcard_refresh_interval`. Counter read failures omit only the affected
   point and retain the existing handle for the next scheduled collection.
@@ -419,14 +426,15 @@ and low-cardinality reason. Other runtime events are:
 
 - `windows_perf_counters_receiver.instance_limit.exceeded`
 - `windows_perf_counters_receiver.instances.change`
+- `windows_perf_counters_receiver.projection.batch.drop`
 - `windows_perf_counters_receiver.recovery.change`
 - `windows_perf_counters_receiver.scrape.fail`
 - `windows_perf_counters_receiver.scrape.timeout`
 - `windows_perf_counters_receiver.shutdown.timeout`
 - `windows_perf_counters_receiver.query.close.fail`
 
-Repeated scrape and counter warnings are suppressed until the affected
-condition recovers. Configuration events are:
+Repeated scrape, projection-batch, and counter warnings are suppressed until
+the affected condition recovers. Configuration events are:
 
 - `windows_perf_counters_receiver.config.instance_override`
 - `windows_perf_counters_receiver.config.metric_definition.unused_path`
@@ -435,8 +443,8 @@ condition recovers. Configuration events are:
 The instance-override warning reports a static `instance` value that can
 collapse multiple selected native instances. Unused-path warnings retain the
 original raw path-shaped definition key and do not claim that PDH would reject
-it. Case-collision warnings are deduplicated once per Unicode lowercase identity
-group.
+it. Case-collision warnings list every configured spelling and are deduplicated
+once per Unicode lowercase identity group.
 
 The `receiver.windowsperfcounters.scrapes` measurement metric set attributes
 collection attempts by outcome. The `receiver.windowsperfcounters` health

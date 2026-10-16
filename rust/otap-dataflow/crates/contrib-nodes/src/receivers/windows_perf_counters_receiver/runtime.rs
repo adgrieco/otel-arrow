@@ -6,7 +6,7 @@
 use super::config::Config;
 use super::metrics::WindowsPerfCountersReceiverMetrics;
 use super::model::{Sample, SampleFailure};
-use super::otap_builder::into_otap;
+use super::otap_builder::{ProjectionOutcome, project_sample};
 use super::pdh;
 use async_trait::async_trait;
 use linkme::distributed_slice;
@@ -42,6 +42,15 @@ fn failed_counter_value_count(failures: &[SampleFailure]) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+fn append_projection_failures(sample: &mut Sample, failures: Vec<SampleFailure>) {
+    sample.metadata.diagnostics.counter_read_failures = sample
+        .metadata
+        .diagnostics
+        .counter_read_failures
+        .saturating_add(u64::try_from(failures.len()).unwrap_or(u64::MAX));
+    sample.metadata.failures.extend(failures);
+}
+
 fn receiver_error(
     effect_handler: &local::EffectHandler<OtapPdata>,
     error: impl Into<String>,
@@ -58,12 +67,14 @@ fn receiver_error(
 #[derive(Default)]
 struct FailureLogState {
     scrape_failed: bool,
+    projection_batch_failed: bool,
     active_counter_failures: BTreeSet<(usize, &'static str)>,
 }
 
 impl FailureLogState {
     fn record_success(&mut self) {
         self.scrape_failed = false;
+        self.projection_batch_failed = false;
     }
 
     fn log_scrape_failure(&mut self, node: &str, error: &pdh::Error) {
@@ -86,6 +97,18 @@ impl FailureLogState {
             );
             self.scrape_failed = true;
         }
+    }
+
+    fn log_projection_batch_drop(&mut self, node: &str, error: &arrow::error::ArrowError) {
+        if !self.projection_batch_failed {
+            otel_arrow_dfe_telemetry::otel_warn!(
+                "windows_perf_counters_receiver.projection.batch.drop",
+                node = node,
+                error = %error
+            );
+            self.projection_batch_failed = true;
+        }
+        self.scrape_failed = true;
     }
 
     fn log_counter_failures(
@@ -228,14 +251,18 @@ impl WindowsPerfCountersReceiver {
             .record(scrape_start.elapsed().as_secs_f64());
     }
 
-    fn record_successful_sample(&self, scrape_start: Instant, sample: &Sample) {
-        self.record_completed_scrape(scrape_start, true, false);
+    fn record_sample_diagnostics(&self, sample: &Sample) {
         let mut metrics = self.metrics.borrow_mut();
         metrics.health.apply(&sample.metadata.diagnostics);
         metrics
             .health
             .failed_counter_values
             .add(failed_counter_value_count(&sample.metadata.failures));
+    }
+
+    fn record_successful_sample(&self, scrape_start: Instant, sample: &Sample) {
+        self.record_completed_scrape(scrape_start, true, false);
+        self.record_sample_diagnostics(sample);
     }
 
     fn log_sample_events(&self, sample: &Sample) {
@@ -313,12 +340,10 @@ impl WindowsPerfCountersReceiver {
         loop {
             let _ = interval.tick().await;
             let scrape_start = Instant::now();
-            let sample = match with_optional_timeout(self.config.timeout, worker.collect()).await {
-                Ok(Ok(sample)) => {
-                    self.record_successful_sample(scrape_start, &sample);
-                    failure_logs.record_success();
-                    sample
-                }
+            let mut sample = match with_optional_timeout(self.config.timeout, worker.collect())
+                .await
+            {
+                Ok(Ok(sample)) => sample,
                 Ok(Err(err)) if err.is_collection_failure() => {
                     self.record_completed_scrape(scrape_start, false, err.is_overrun());
                     failure_logs.log_scrape_failure(&self.node, &err);
@@ -335,18 +360,44 @@ impl WindowsPerfCountersReceiver {
                     continue;
                 }
             };
-            self.log_sample_events(&sample);
-            failure_logs.log_counter_failures(self, &sample, effect_handler)?;
-            let Some(records) = into_otap(&self.config.counters, sample)
-                .map_err(|err| receiver_error(effect_handler, err.to_string(), ""))?
-            else {
-                continue;
+            let projection = match project_sample(&self.config.counters, &sample) {
+                Ok(projection) => projection,
+                Err(err) => {
+                    self.record_completed_scrape(scrape_start, false, false);
+                    return Err(receiver_error(effect_handler, err.to_string(), ""));
+                }
             };
-            let pdata = OtapPdata::new(Context::default(), records.into());
-            effect_handler
-                .send_message_with_source_node(pdata)
-                .await
-                .map_err(Error::from)?;
+            match projection {
+                ProjectionOutcome::Projected {
+                    records,
+                    point_failures,
+                } => {
+                    append_projection_failures(&mut sample, point_failures);
+                    self.record_successful_sample(scrape_start, &sample);
+                    failure_logs.record_success();
+                    self.log_sample_events(&sample);
+                    failure_logs.log_counter_failures(self, &sample, effect_handler)?;
+                    let Some(records) = records else {
+                        continue;
+                    };
+                    let pdata = OtapPdata::new(Context::default(), records.into());
+                    effect_handler
+                        .send_message_with_source_node(pdata)
+                        .await
+                        .map_err(Error::from)?;
+                }
+                ProjectionOutcome::BatchDropped {
+                    error,
+                    point_failures,
+                } => {
+                    append_projection_failures(&mut sample, point_failures);
+                    self.record_completed_scrape(scrape_start, false, false);
+                    self.record_sample_diagnostics(&sample);
+                    self.log_sample_events(&sample);
+                    failure_logs.log_counter_failures(self, &sample, effect_handler)?;
+                    failure_logs.log_projection_batch_drop(&self.node, &error);
+                }
+            }
         }
     }
 }
@@ -478,6 +529,42 @@ mod tests {
         ];
 
         assert_eq!(failed_counter_value_count(&failures), 1);
+    }
+
+    /// Scenario: Projection omits two invalid points after native collection already reported one read failure.
+    /// Guarantees: Health telemetry stays truthful when native and projection failures share one scrape.
+    #[test]
+    fn projection_failures_extend_sample_accounting() {
+        let mut sample = Sample::empty(1);
+        sample.metadata.diagnostics.counter_read_failures = 1;
+        sample.metadata.failures.push(SampleFailure {
+            counter_index: 0,
+            reason: "counter CStatus",
+            error: "PDH_INVALID_DATA".to_owned(),
+            diagnostic_only: false,
+        });
+
+        append_projection_failures(
+            &mut sample,
+            vec![
+                SampleFailure {
+                    counter_index: 1,
+                    reason: "projection.point",
+                    error: "invalid timestamp".to_owned(),
+                    diagnostic_only: false,
+                },
+                SampleFailure {
+                    counter_index: 2,
+                    reason: "projection.point",
+                    error: "invalid start time".to_owned(),
+                    diagnostic_only: false,
+                },
+            ],
+        );
+
+        assert_eq!(sample.metadata.diagnostics.counter_read_failures, 3);
+        assert_eq!(sample.metadata.failures.len(), 3);
+        assert_eq!(failed_counter_value_count(&sample.metadata.failures), 3);
     }
 
     /// Scenario: Collection has a nonzero initial delay before its first request.

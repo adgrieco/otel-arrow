@@ -1072,7 +1072,7 @@ fn accepts_case_distinct_metric_names() {
 }
 
 /// Scenario: Ordinary and path-shaped metric definitions differ only by Unicode case.
-/// Guarantees: Every otherwise-valid identity group produces one warning candidate regardless of path shape.
+/// Guarantees: Operators see every conflicting spelling once per group instead of an incomplete or noisy warning.
 #[test]
 fn warns_once_for_case_distinct_metric_definitions() {
     let names = [
@@ -1090,12 +1090,24 @@ fn warns_once_for_case_distinct_metric_definitions() {
 
     assert_eq!(
         case_distinct_metric_definitions(names.iter().map(String::as_str)),
-        [
-            (names[0].as_str(), names[1].as_str()),
-            (names[3].as_str(), names[4].as_str()),
-            (names[6].as_str(), names[7].as_str()),
-            (names[8].as_str(), names[9].as_str())
-        ]
+        BTreeMap::from([
+            (
+                "cpu".to_owned(),
+                vec![names[0].as_str(), names[1].as_str(), names[2].as_str()]
+            ),
+            (
+                r"\malformed".to_owned(),
+                vec![names[6].as_str(), names[7].as_str()]
+            ),
+            (
+                r"\memory\available bytes".to_owned(),
+                vec![names[3].as_str(), names[4].as_str(), names[5].as_str()]
+            ),
+            (
+                "\u{00e4}vailable".to_owned(),
+                vec![names[8].as_str(), names[9].as_str()]
+            )
+        ])
     );
 }
 

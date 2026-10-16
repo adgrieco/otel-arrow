@@ -77,11 +77,11 @@ impl Config {
 pub(super) struct CounterConfig {
     /// PDH path, optionally wildcarding only the instance segment.
     pub(super) path: String,
-    /// OTel metric name.
+    /// OTel metric name shared by counters that use the same definition.
     pub(super) name: Arc<str>,
-    /// OTel metric unit.
+    /// OTel metric unit shared by counters that use the same definition.
     pub(super) unit: Arc<str>,
-    /// OTel metric description, shared by every counter mapped to this metric.
+    /// OTel metric description shared by counters that use the same definition.
     pub(super) description: Arc<str>,
     /// OTel metric stream kind.
     pub(super) metric_kind: MetricKind,
@@ -410,6 +410,7 @@ fn normalize_metric_name(name: &str) -> Result<(&str, bool), Error> {
     let path_shaped = is_path_metric_name(name);
     let trimmed = name.trim();
     require_name("metric name", trimmed)?;
+    // Some Windows counter names end in a space, so a trimmed path may not resolve.
     let name = if path_shaped { name } else { trimmed };
     validate_no_control_characters("metric name", name)?;
     Ok((name, path_shaped))
@@ -588,13 +589,12 @@ fn normalize_metrics(
             },
         );
     }
-    for (first, second) in case_distinct_metric_definitions(metrics.keys().map(Arc::as_ref)) {
+    for group in case_distinct_metric_definitions(metrics.keys().map(Arc::as_ref)).into_values() {
         otel_arrow_dfe_telemetry::otel_warn!(
             "windows_perf_counters_receiver.config.metric_definition.case_collision",
             message = "metric definitions differ only by case; exact lookup keeps them distinct, \
                        but this may be a configuration typo",
-            first = first,
-            second = second
+            names = format!("{group:?}")
         );
     }
     Ok(metrics)
@@ -602,21 +602,13 @@ fn normalize_metrics(
 
 fn case_distinct_metric_definitions<'a>(
     names: impl IntoIterator<Item = &'a str>,
-) -> Vec<(&'a str, &'a str)> {
-    let mut first_by_identity = BTreeMap::new();
-    let mut warned = HashSet::new();
-    let mut collisions = Vec::new();
+) -> BTreeMap<String, Vec<&'a str>> {
+    let mut groups = BTreeMap::<String, Vec<&str>>::new();
     for name in names {
-        let identity = name.to_lowercase();
-        if let Some(first) = first_by_identity.get(&identity) {
-            if warned.insert(identity) {
-                collisions.push((*first, name));
-            }
-        } else {
-            let _ = first_by_identity.insert(identity, name);
-        }
+        groups.entry(name.to_lowercase()).or_default().push(name);
     }
-    collisions
+    groups.retain(|_, group| group.len() > 1);
+    groups
 }
 
 fn unused_path_metric_definitions<'a>(
