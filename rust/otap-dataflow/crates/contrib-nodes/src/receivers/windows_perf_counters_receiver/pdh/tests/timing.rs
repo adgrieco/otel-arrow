@@ -49,6 +49,84 @@ fn monotonic_start_time_tracks_sum_resets() {
     assert_eq!(sequence.previous_timestamp_unix_nano, Some(130));
 }
 
+/// Scenario: A valid monotonic observation is consumed by startup priming before two values are published.
+/// Guarantees: Priming preserves reset detection without backdating the first exported cumulative sequence.
+#[test]
+fn monotonic_prime_defers_start_until_first_publication() {
+    let mut sequence = MonotonicSequence::default();
+    prime_monotonic_sequence("counter", &mut sequence, 10, 100).unwrap();
+    assert_eq!(sequence.start_time_unix_nano, None);
+    assert_eq!(sequence.previous_value, Some(10));
+    assert_eq!(sequence.previous_timestamp_unix_nano, Some(100));
+
+    assert_eq!(
+        monotonic_start_time("counter", &mut sequence, 15, 110).unwrap(),
+        110
+    );
+    assert_eq!(
+        monotonic_start_time("counter", &mut sequence, 20, 120).unwrap(),
+        110
+    );
+}
+
+/// Scenario: A primed monotonic query publishes, omits one value, resumes, and then observes a decrease.
+/// Guarantees: Unexported and omitted observations never backdate output, while a real reset starts a new exported sequence.
+#[test]
+fn primed_monotonic_query_tracks_published_sequence_only() {
+    let path = r"\TCPv4\Connection Failures";
+    let (state, mut query) = fake_query(
+        vec![monotonic_sum(path, "windows.tcp.connection_failures", "1")],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0,
+            raw: None,
+            multi_count: 1,
+            formatted: Some(Number::Integer(10)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+    query.prime().unwrap();
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 110;
+        state.counters[0].formatted = Some(Number::Integer(20));
+    }
+    let first = query.collect().unwrap();
+    assert_eq!(first.points[0].start_time_unix_nano, Some(110));
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 120;
+        state.counters[0].formatted = None;
+    }
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::NoObservation
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 130;
+        state.counters[0].formatted = Some(Number::Integer(30));
+    }
+    assert_eq!(
+        query.collect().unwrap().points[0].start_time_unix_nano,
+        Some(110)
+    );
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 140;
+        state.counters[0].formatted = Some(Number::Integer(5));
+    }
+    assert_eq!(
+        query.collect().unwrap().points[0].start_time_unix_nano,
+        Some(140)
+    );
+}
+
 /// Scenario: Query rollback occurs while a monotonic Sum series is omitted.
 /// Guarantees: Cleared sequence state remains empty until the next valid observation starts fresh.
 #[test]

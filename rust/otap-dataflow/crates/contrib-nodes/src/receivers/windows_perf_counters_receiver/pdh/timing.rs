@@ -37,28 +37,49 @@ pub(super) fn monotonic_start_time(
     value: i64,
     timestamp_unix_nano: i64,
 ) -> Result<i64, Error> {
+    update_monotonic_sequence(path, sequence, value, timestamp_unix_nano, true)?.ok_or(
+        Error::InvalidSample("monotonic Sum start time was not initialized"),
+    )
+}
+
+pub(super) fn prime_monotonic_sequence(
+    path: &str,
+    sequence: &mut MonotonicSequence,
+    value: i64,
+    timestamp_unix_nano: i64,
+) -> Result<(), Error> {
+    let _ = update_monotonic_sequence(path, sequence, value, timestamp_unix_nano, false)?;
+    Ok(())
+}
+
+fn update_monotonic_sequence(
+    path: &str,
+    sequence: &mut MonotonicSequence,
+    value: i64,
+    timestamp_unix_nano: i64,
+    publish: bool,
+) -> Result<Option<i64>, Error> {
     if value < 0 {
         return Err(Error::Calculation {
             path: path.to_owned(),
             message: format!("monotonic Sum value must be non-negative, got {value}"),
         });
     }
-    if sequence.start_time_unix_nano.is_none()
-        || sequence.previous_value.is_none()
-        || sequence
-            .previous_value
-            .is_some_and(|previous| value < previous)
+    let reset = sequence
+        .previous_value
+        .is_some_and(|previous| value < previous)
         || sequence
             .previous_timestamp_unix_nano
-            .is_some_and(|previous| timestamp_unix_nano < previous)
-    {
+            .is_some_and(|previous| timestamp_unix_nano < previous);
+    if reset {
+        sequence.start_time_unix_nano = None;
+    }
+    if publish && sequence.start_time_unix_nano.is_none() {
         sequence.start_time_unix_nano = Some(timestamp_unix_nano);
     }
     sequence.previous_value = Some(value);
     sequence.previous_timestamp_unix_nano = Some(timestamp_unix_nano);
-    sequence.start_time_unix_nano.ok_or(Error::InvalidSample(
-        "monotonic Sum start time was not initialized",
-    ))
+    Ok(sequence.start_time_unix_nano)
 }
 
 pub(super) fn reset_monotonic_sequences_on_query_rollback<'a>(

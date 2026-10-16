@@ -1,0 +1,5 @@
+change_type: bug_fix
+component: pipeline
+note: Start cumulative monotonic Windows performance-counter sequences at their first exported point.
+issues: [4074]
+subtext: Startup, replacement, and rebuild priming still seed native history, but no longer backdate start_time_unix_nano to an observation that was never exported.

@@ -375,7 +375,7 @@ fn cross_query_delta_intervals_use_their_own_timestamps() {
 }
 
 /// Scenario: One isolated query fails collection while a shared peer remains healthy.
-/// Guarantees: The scrape emits the healthy peer, reports the isolated mapping failure, and does not recreate the failed query.
+/// Guarantees: The healthy peer publishes its unknown monotonic start, reports the isolated failure, and does not recreate the failed query.
 #[test]
 fn isolated_query_failure_preserves_healthy_peer_output() {
     let shared_path = r"\Memory\Available Bytes";
@@ -429,7 +429,10 @@ fn isolated_query_failure_preserves_healthy_peer_output() {
 
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.points[0].counter_index, 0);
-    assert_eq!(sample.points[0].start_time_unix_nano, Some(100));
+    assert_eq!(
+        sample.points[0].start_time_unix_nano,
+        Some(sample.points[0].timestamp_unix_nano)
+    );
     assert_eq!(sample.metadata.failures.len(), 1);
     assert_eq!(sample.metadata.failures[0].counter_index, 1);
     assert_eq!(sample.metadata.failures[0].reason, "PdhCollectQueryData");
@@ -552,6 +555,141 @@ fn recreated_query_primes_before_swap_and_preserves_old_query_on_failure() {
         }
     }
     assert_eq!(open_calls.get(), 6);
+}
+
+/// Scenario: A recreated monotonic direct-count query is primed before each of two scrapes.
+/// Guarantees: Every replacement's first exported point uses start equal to time, including in decoded OTAP, rather than exposing the prime timestamp.
+#[test]
+fn recreated_monotonic_query_defers_start_until_publication() {
+    let path = r"\TCPv4\Connection Failures";
+    let mut config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
+    config.recreate_query = true;
+    let projection_config = config.clone();
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let open_calls = Rc::new(Cell::new(0_usize));
+    let factory_open_calls = Rc::clone(&open_calls);
+    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
+        let open_index = factory_open_calls.get();
+        factory_open_calls.set(open_index + 1);
+        let offset = i64::try_from(open_index).unwrap() * 10;
+        let (state, query) = fake_query(
+            configs,
+            vec![FakeCounter {
+                path: path.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(10 + offset)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+        );
+        state.borrow_mut().timestamp = 100 + offset;
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let plan = query_plans(vec![config]).pop().unwrap();
+    let mut queries = vec![QuerySlot::open_initial(plan, 4_096, &mut open).unwrap()];
+
+    for (scrape_index, timestamp) in [110, 120].into_iter().enumerate() {
+        {
+            let states = states.borrow();
+            let mut state = states[scrape_index].borrow_mut();
+            state.timestamp = timestamp;
+            state.counters[0].formatted = Some(Number::Integer(timestamp / 10 + 10));
+        }
+        let sample =
+            collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+        assert_eq!(sample.points[0].timestamp_unix_nano, timestamp);
+        assert_eq!(sample.points[0].start_time_unix_nano, Some(timestamp));
+
+        if scrape_index == 0 {
+            let records = into_otap(std::slice::from_ref(&projection_config), sample)
+                .unwrap()
+                .unwrap();
+            let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
+            let starts = points
+                .column_by_name("start_time_unix_nano")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                .unwrap();
+            let times = points
+                .column_by_name("time_unix_nano")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                .unwrap();
+            assert_eq!(starts.value(0), times.value(0));
+        }
+    }
+    assert_eq!(open_calls.get(), 3);
+}
+
+/// Scenario: A monotonic direct-count query is rebuilt after repeated collection failures and primed successfully.
+/// Guarantees: Rebuild priming restores native readiness without backdating the first recovered cumulative point.
+#[test]
+fn rebuilt_monotonic_query_defers_start_until_publication() {
+    let path = r"\TCPv4\Connection Failures";
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let open_calls = Rc::new(Cell::new(0_usize));
+    let factory_open_calls = Rc::clone(&open_calls);
+    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
+        let open_index = factory_open_calls.get();
+        factory_open_calls.set(open_index + 1);
+        let offset = i64::try_from(open_index).unwrap() * 10;
+        let (state, query) = fake_query(
+            configs,
+            vec![FakeCounter {
+                path: path.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(10 + offset)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+        );
+        state.borrow_mut().timestamp = 100 + offset;
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let plan = query_plans(vec![monotonic_sum(
+        path,
+        "windows.tcp.connection_failures",
+        "{failure}",
+    )])
+    .pop()
+    .unwrap();
+    let mut query = QuerySlot::open_initial(plan, 4_096, &mut open).unwrap();
+    states.borrow()[0].borrow_mut().collect_error = true;
+    let now = Instant::now();
+    for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
+        assert!(
+            query
+                .collect(now, Duration::ZERO, 4_096, &mut open)
+                .is_err()
+        );
+    }
+
+    let rebuilt = query
+        .collect(now, Duration::ZERO, 4_096, &mut open)
+        .unwrap();
+    assert!(rebuilt.points.is_empty());
+    {
+        let states = states.borrow();
+        let mut state = states[1].borrow_mut();
+        state.timestamp = 120;
+        state.counters[0].formatted = Some(Number::Integer(30));
+    }
+    let recovered = query
+        .collect(now, Duration::ZERO, 4_096, &mut open)
+        .unwrap();
+    assert_eq!(recovered.points[0].timestamp_unix_nano, 120);
+    assert_eq!(recovered.points[0].start_time_unix_nano, Some(120));
+    assert_eq!(open_calls.get(), 2);
 }
 
 /// Scenario: One initial native open remains blocked while virtual time advances beyond the former deadline.

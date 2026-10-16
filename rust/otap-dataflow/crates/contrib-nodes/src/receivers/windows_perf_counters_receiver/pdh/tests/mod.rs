@@ -14,6 +14,7 @@ use super::query::*;
 use super::timing::*;
 use super::worker::*;
 use super::*;
+use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};

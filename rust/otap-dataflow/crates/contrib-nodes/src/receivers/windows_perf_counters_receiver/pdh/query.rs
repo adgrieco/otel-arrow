@@ -17,7 +17,7 @@ use super::expansion::{
 use super::native::NativePdh;
 use super::timing::{
     MonotonicSequence, advance_collection_time, delta_interval_start, monotonic_start_time,
-    positive_timestamp,
+    positive_timestamp, prime_monotonic_sequence,
 };
 use super::{PdhApi, ValueFormat};
 use std::collections::{BTreeMap, BTreeSet};
@@ -587,7 +587,7 @@ impl<A: PdhApi> Query<A> {
     }
 
     pub(super) fn prime(&mut self) -> Result<(), Error> {
-        let sample = self.collect()?;
+        let sample = self.collect_with_monotonic_publication(false)?;
         self.pending.merge(sample.metadata);
         Ok(())
     }
@@ -627,6 +627,13 @@ impl<A: PdhApi> Query<A> {
     }
 
     pub(super) fn collect(&mut self) -> Result<Sample, Error> {
+        self.collect_with_monotonic_publication(true)
+    }
+
+    fn collect_with_monotonic_publication(
+        &mut self,
+        publish_monotonic_start: bool,
+    ) -> Result<Sample, Error> {
         let mut metadata = std::mem::take(&mut self.pending);
         if self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval
             && let Err(error) = self.refresh_wildcards(&mut metadata)
@@ -680,6 +687,7 @@ impl<A: PdhApi> Query<A> {
             has_data,
             start_time_unix_nano,
             timestamp_unix_nano,
+            publish_monotonic_start,
             &mut metadata,
         ) {
             Ok(points) => points,
@@ -698,6 +706,7 @@ impl<A: PdhApi> Query<A> {
         has_data: bool,
         start_time_unix_nano: i64,
         timestamp_unix_nano: i64,
+        publish_monotonic_start: bool,
         metadata: &mut PendingMetadata,
     ) -> Result<Vec<SamplePoint>, Error> {
         let mut points = Vec::with_capacity(self.counters.len());
@@ -710,6 +719,7 @@ impl<A: PdhApi> Query<A> {
                     metric_kind,
                     start_time_unix_nano,
                     timestamp_unix_nano,
+                    publish_monotonic_start,
                 )
             } else {
                 Ok((SampleValue::NoObservation, None))
@@ -980,6 +990,7 @@ impl<C> CounterHandle<C> {
         metric_kind: MetricKind,
         query_start_time_unix_nano: i64,
         timestamp_unix_nano: i64,
+        publish_monotonic_start: bool,
     ) -> Result<(SampleValue, Option<i64>), Error> {
         if let Some(value) = self.prepare_raw_sample(api, timestamp_unix_nano)? {
             return Ok((value, None));
@@ -1006,6 +1017,7 @@ impl<C> CounterHandle<C> {
             delta_start_time,
             query_start_time_unix_nano,
             timestamp_unix_nano,
+            publish_monotonic_start,
         )?;
         Ok((SampleValue::Value(scaled), point_start_time))
     }
@@ -1127,6 +1139,7 @@ impl<C> CounterHandle<C> {
         delta_start_time: Option<i64>,
         query_start_time_unix_nano: i64,
         timestamp_unix_nano: i64,
+        publish_monotonic_start: bool,
     ) -> Result<Option<i64>, Error> {
         Ok(match metric_kind {
             MetricKind::Sum {
@@ -1138,12 +1151,22 @@ impl<C> CounterHandle<C> {
                         "monotonic Sum was not backed by a direct formatted value",
                     ));
                 };
-                Some(monotonic_start_time(
-                    &self.path,
-                    &mut self.history.monotonic_sequence,
-                    direct_value,
-                    timestamp_unix_nano,
-                )?)
+                if publish_monotonic_start {
+                    Some(monotonic_start_time(
+                        &self.path,
+                        &mut self.history.monotonic_sequence,
+                        direct_value,
+                        timestamp_unix_nano,
+                    )?)
+                } else {
+                    prime_monotonic_sequence(
+                        &self.path,
+                        &mut self.history.monotonic_sequence,
+                        direct_value,
+                        timestamp_unix_nano,
+                    )?;
+                    None
+                }
             }
             MetricKind::Sum {
                 aggregation: Aggregation::Delta,

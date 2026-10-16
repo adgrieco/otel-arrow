@@ -168,7 +168,10 @@ query and reports the bounded mapping failure. Wildcard-expanded instances and
 explicit instance paths from the same mapping share its isolated query;
 unrelated mappings keep their own sampling histories. Each successful
 replacement starts a new cumulative sequence, so cumulative Sum points from a
-mapping with `recreate_query: true` have a new start time on every scrape.
+mapping with `recreate_query: true` have a new start time on every scrape. For
+monotonic Sums, the first point published from each replacement reports
+`start_time_unix_nano == time_unix_nano`; priming does not expose an earlier
+unpublished start.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
 Object, instance, aggregation, and counter components preserve their configured
@@ -309,10 +312,12 @@ For example, `\Memory\Available Bytes` remains an exact byte count with unit
 The receiver opens the PDH query on its worker and performs one startup
 collection without emitting points. This prime seeds valid native and
 receiver-side sample history before `initial_delay` and the first scheduled
-scrape. A priming collection, timestamp, or refresh failure is retained as
-bounded diagnostics while the worker starts and follows its normal retry and
-query-rebuild policy. No-data, invalid, or counter-local failures retain their
-normal omission and diagnostic behavior without fabricating readiness.
+scrape. It records monotonic values for later reset detection but does not
+establish their exported cumulative start. A priming collection, timestamp, or
+refresh failure is retained as bounded diagnostics while the worker starts and
+follows its normal retry and query-rebuild policy. No-data, invalid, or
+counter-local failures retain their normal omission and diagnostic behavior
+without fabricating readiness.
 The initial pass has no fixed timeout. Drain or shutdown remains responsive and
 requests worker cleanup, but a native call already in progress must return
 before its query resources can be released. A transient `PdhOpenQueryW`
@@ -374,10 +379,12 @@ Each emitted point uses the collection timestamp. Non-monotonic Sum points use
 the current PDH query's opening time as their cumulative start time; a query
 rebuild or backward wall-clock adjustment starts a new cumulative sequence.
 Monotonic Sum points track sequence start independently for each exact or
-expanded handle. A decrease, handle recreation, newly discovered instance, or
-backward wall-clock adjustment relative to that series' previous observation
-starts a new sequence for only that point. Query-level clock rollback clears
-all monotonic Sum sequences; an omitted series starts fresh at its next valid
+expanded handle. The first point published after open, recreation, or rebuild
+uses its own timestamp as the unknown cumulative start; later points retain that
+start. A decrease, handle recreation, newly discovered instance, or backward
+wall-clock adjustment relative to that series' previous observation starts a
+new sequence for only that point. Query-level clock rollback clears all
+monotonic Sum sequences; an omitted series starts fresh at its next valid
 observation. Equal timestamps do not reset a sequence. A value wrap is treated
 as a decrease; the receiver does not compensate for it. Negative monotonic Sum
 values are omitted as invalid. Gauge points do not use or validate cumulative

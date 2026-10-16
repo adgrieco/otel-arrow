@@ -189,7 +189,7 @@ async fn live_pdh_startup_prime_enables_first_calculated_scrape() {
 }
 
 /// Scenario: Worker startup primes a Windows direct count mapped to a cumulative monotonic Sum.
-/// Guarantees: The first scrape emits with a sequence start retained from the earlier prime.
+/// Guarantees: The first exported point reports an unknown cumulative start instead of backdating it to an unexported prime.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_collects_first_monotonic_direct_value() {
@@ -215,8 +215,7 @@ async fn live_pdh_collects_first_monotonic_direct_value() {
         SampleValue::Value(Number::Integer(value)) if value >= 0
     ));
     let start_time = sample.points[0].start_time_unix_nano.unwrap();
-    assert!(start_time > 0);
-    assert!(start_time < sample.timestamp_unix_nano);
+    assert_eq!(start_time, sample.timestamp_unix_nano);
     assert!(
         worker
             .shutdown(Instant::now() + Duration::from_secs(2))
