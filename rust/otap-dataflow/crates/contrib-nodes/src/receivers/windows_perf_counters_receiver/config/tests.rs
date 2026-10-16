@@ -288,9 +288,9 @@ fn defaults_path_metrics_without_definitions_or_references() {
     for definitions in [None, Some(json!({}))] {
         let mut value = json!({
             "perfcounters": [{
-                "object": " Process ",
-                "instances": [" app#00 ", "worker#001"],
-                "counters": [{"name": " Private Bytes ", "scale_power10": -3}]
+                "object": "Process",
+                "instances": ["app#00", "worker#001"],
+                "counters": [{"name": "Private Bytes", "scale_power10": -3}]
             }]
         });
         if let Some(definitions) = definitions {
@@ -664,25 +664,29 @@ fn identifies_risky_instance_overrides() {
     assert!(!should_warn_instance_override(true, &ignored_attributes));
 }
 
-/// Scenario: A canonical Windows counter name contains parentheses.
-/// Guarantees: Counter-name punctuation remains valid while path separators and wildcards are rejected.
+/// Scenario: Native object, instance, and counter components contain PDH-significant delimiters.
+/// Guarantees: Configuration preserves parentheses, backslashes, question marks, and asterisks for PDH to interpret.
 #[test]
-fn accepts_parentheses_in_counter_names() {
+fn preserves_native_component_delimiters() {
     let config = Config::from_json(&json!({
         "metrics": {"test": metric()},
         "perfcounters": [{
-            "object": "Object",
-            "counters": [{"name": "Counter (value)", "metric": "test"}]
+            "object": "Object (IPv4)",
+            "instances": r"C:\pagefile.sys(parent)?",
+            "counters": [{"name": r"Counter (value)\*?", "metric": "test"}]
         }]
     }))
     .unwrap();
-    assert_eq!(config.counters[0].path, r"\Object\Counter (value)");
+    assert_eq!(
+        config.counters[0].path,
+        r"\Object (IPv4)(C:\pagefile.sys(parent)?)\Counter (value)\*?"
+    );
 }
 
-/// Scenario: Metric definitions and path segments contain surrounding whitespace.
-/// Guarantees: Normalization trims identities consistently while preserving attribute values.
+/// Scenario: Ordinary metadata and native path components contain surrounding whitespace.
+/// Guarantees: Ordinary labels are trimmed while nonblank object and counter spelling remains native identity.
 #[test]
-fn trims_metric_metadata_attributes_and_paths() {
+fn trims_metadata_but_preserves_native_component_spelling() {
     let config = Config::from_json(&json!({
         "metrics": {" windows.memory.available ": {
             "description": " Available memory. ",
@@ -700,7 +704,7 @@ fn trims_metric_metadata_attributes_and_paths() {
     }))
     .unwrap();
     let counter = &config.counters[0];
-    assert_eq!(counter.path, r"\Memory\Available Bytes");
+    assert_eq!(counter.path, r"\ Memory \ Available Bytes ");
     assert_eq!(counter.name.as_ref(), "windows.memory.available");
     assert_eq!(&*counter.description, "Available memory.");
     assert_eq!(counter.unit.as_ref(), "By");
@@ -708,68 +712,99 @@ fn trims_metric_metadata_attributes_and_paths() {
         *counter.attributes,
         BTreeMap::from([("state".to_owned(), " free ".to_owned())])
     );
+
+    let instances = Config::from_json(&json!({
+        "perfcounters": [{
+            "object": "Process",
+            "instances": [" worker ", "*"],
+            "aggregation_name": " _Total ",
+            "counters": [{"name": "Private Bytes"}]
+        }]
+    }))
+    .unwrap();
+    assert_eq!(instances.counters[0].path, r"\Process(*)\Private Bytes");
+    assert_eq!(
+        instances.counters[0].instance_config.excluded_aggregation(),
+        Some(" _Total ")
+    );
 }
 
-/// Scenario: Padded path definitions exist alone, beside valid definitions, or are referenced.
-/// Guarantees: Padded keys cannot supply fallback metadata or collide, and padded references fail.
+/// Scenario: An exact nonblank instance contains surrounding whitespace.
+/// Guarantees: Its configured/native spelling remains distinct and supplies the implicit metric name unchanged.
 #[test]
-fn preserves_padded_path_metric_definition_identity() {
-    let path = r"\Memory\Available Bytes";
-    let padded = r"\Memory\Available Bytes ";
-    let leading_padded = r" \Memory\Available Bytes";
-    let config = |metrics| {
-        json!({
-            "metrics": metrics,
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{"name": "Available Bytes"}]
+fn preserves_significant_instance_spaces() {
+    let config = Config::from_json(&json!({
+        "perfcounters": [{
+            "object": "Process",
+            "instances": " worker ",
+            "counters": [{"name": "Private Bytes"}]
+        }]
+    }))
+    .unwrap();
+    let counter = &config.counters[0];
+    assert_eq!(counter.path, r"\Process( worker )\Private Bytes");
+    assert_eq!(counter.name.as_ref(), r"\Process( worker )\Private Bytes");
+}
+
+/// Scenario: A leading-padded metric key and reference are ordinary labels before normalization.
+/// Guarantees: Both trim once and resolve exactly without being reclassified as raw path-shaped input.
+#[test]
+fn resolves_leading_padded_ordinary_reference() {
+    let configured = r" \Memory\Available Bytes";
+    let config = Config::from_json(&json!({
+        "metrics": {
+            configured: {"description": "Selected.", "unit": "By"}
+        },
+        "perfcounters": [{
+            "object": "Memory",
+            "counters": [{
+                "name": "Available Bytes",
+                "metric": configured
             }]
-        })
-    };
-
-    let fallback = Config::from_json(&config(json!({
-        padded: {
-            "description": "Padded definition.",
-            "unit": "By",
-            "sum": {"aggregation": "cumulative", "monotonic": true}
-        }
-    })))
+        }]
+    }))
     .unwrap();
-    let counter = &fallback.counters[0];
-    assert_eq!(counter.name.as_ref(), path);
-    assert_eq!(counter.unit.as_ref(), "1");
-    assert!(counter.description.is_empty());
-    assert_eq!(counter.metric_kind, MetricKind::Gauge);
-
-    let coexisting = Config::from_json(&config(json!({
-        path: {"description": "Valid definition.", "unit": "By", "gauge": {}},
-        padded: {"description": "Padded definition.", "unit": "s", "gauge": {}}
-    })))
-    .unwrap();
-    let counter = &coexisting.counters[0];
-    assert_eq!(counter.name.as_ref(), path);
+    let counter = &config.counters[0];
+    assert_eq!(counter.name.as_ref(), r"\Memory\Available Bytes");
     assert_eq!(counter.unit.as_ref(), "By");
-    assert_eq!(&*counter.description, "Valid definition.");
-    assert!(path_metric_definition_warning(padded).is_some());
-    assert_eq!(path_metric_definition_warning(path), None);
+    assert_eq!(counter.description.as_ref(), "Selected.");
+}
 
+/// Scenario: A segment-padded path definition is selected by an exact path-shaped reference.
+/// Guarantees: Exact lookup resolves the definition without segment or native-path validation.
+#[test]
+fn resolves_segment_padded_path_reference() {
+    let padded = r"\Memory \Available Bytes ";
+    let config = Config::from_json(&json!({
+        "metrics": {
+            padded: {"description": "Selected.", "unit": "By"}
+        },
+        "perfcounters": [{
+            "object": "Memory",
+            "counters": [{"name": "Available Bytes", "metric": padded}]
+        }]
+    }))
+    .unwrap();
+    assert_eq!(config.counters[0].name.as_ref(), padded);
+    assert_eq!(config.counters[0].description.as_ref(), "Selected.");
+}
+
+/// Scenario: A padded path-shaped reference has no exact definition.
+/// Guarantees: It reports an undefined metric instead of a native-path syntax or padding error.
+#[test]
+fn rejects_undefined_padded_path_reference() {
     assert_config_error(
         json!({
-            "metrics": {
-                leading_padded: {
-                    "description": "Leading-padded definition.",
-                    "unit": "By"
-                }
-            },
+            "metrics": {r"\Memory\Available Bytes": metric()},
             "perfcounters": [{
                 "object": "Memory",
                 "counters": [{
                     "name": "Available Bytes",
-                    "metric": leading_padded
+                    "metric": r"\Memory\Available Bytes "
                 }]
             }]
         }),
-        "must start with '\\'",
+        "references undefined metric",
     );
 }
 
@@ -850,7 +885,7 @@ fn rejects_controls_remaining_after_metric_normalization() {
                 "counters": [{"name": "Available Bytes"}]
             }]
         }),
-        "metric name must not contain control characters",
+        "perfcounters[0].object must not contain control characters",
     );
 
     let normalized = Config::from_json(&config(
@@ -862,52 +897,69 @@ fn rejects_controls_remaining_after_metric_normalization() {
     assert_eq!(normalized.counters[0].unit.as_ref(), "1");
 }
 
-/// Scenario: Path-shaped metric definitions contain exact, wildcard, malformed, padded, or overlong paths.
-/// Guarantees: Every definition loads, while each definition that cannot match produces one warning candidate.
+/// Scenario: Path-shaped definitions are selected implicitly, by a wildcard template, or by an explicit alias.
+/// Guarantees: Only raw path-shaped definitions unused by every mapping produce one usage-warning candidate.
 #[test]
-fn warns_for_malformed_path_metric_definitions() {
-    let config = |name: &str, reference: &str| {
-        json!({
-            "metrics": {
-                "selected": {"description": "Value.", "unit": "By"},
-                name: {"description": "Unused.", "unit": "1"}
+fn identifies_unused_path_metric_definitions() {
+    let config = Config::from_json(&json!({
+        "metrics": {
+            r"\Memory\Available Bytes": {"unit": "By"},
+            r"\Process(worker*)\Private Bytes": {"unit": "By"},
+            r"\alias": {"unit": "By"},
+            r"\unused": {"unit": "1"},
+            r" \ordinary-after-trim": {"unit": "1"},
+            "ordinary": {"unit": "1"}
+        },
+        "perfcounters": [
+            {
+                "object": "Memory",
+                "counters": [
+                    {"name": "Available Bytes"},
+                    {"name": "Cache Bytes", "metric": r"\alias"}
+                ]
             },
+            {
+                "object": "Process",
+                "instances": "worker*",
+                "counters": [{"name": "Private Bytes"}]
+            }
+        ]
+    }))
+    .unwrap();
+    let definitions = [
+        (r"\Memory\Available Bytes", true),
+        (r"\Process(worker*)\Private Bytes", true),
+        (r"\alias", true),
+        (r"\unused", true),
+        (r"\ordinary-after-trim", false),
+        ("ordinary", false),
+    ];
+    assert_eq!(
+        unused_path_metric_definitions(
+            definitions,
+            config.counters.iter().map(|counter| counter.name.as_ref())
+        ),
+        [r"\unused"]
+    );
+}
+
+/// Scenario: Malformed and overlong path-shaped definitions are selected by exact references.
+/// Guarantees: Metric identity lookup does not impose native segment or generated-path length validation.
+#[test]
+fn resolves_exact_malformed_and_overlong_path_references() {
+    let overlong = format!(r"\Memory\{}", "x".repeat(MAX_COUNTER_PATH_LEN));
+    for name in [r"\Memory", r"\Memory(*)\X\Y", overlong.as_str()] {
+        let config = Config::from_json(&json!({
+            "metrics": {name: {"description": "Selected.", "unit": "By"}},
             "perfcounters": [{
                 "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": reference}]
+                "counters": [{"name": "Available Bytes", "metric": name}]
             }]
-        })
-    };
-    for name in [
-        r"\Memory\Available Bytes",
-        r"\Process(app#001)\Private Bytes",
-        r"\Process(worker*)\Private Bytes",
-    ] {
-        assert_eq!(
-            Config::from_json(&config(name, name)).unwrap().counters[0]
-                .name
-                .as_ref(),
-            name,
-        );
-        assert_eq!(path_metric_definition_warning(name), None);
+        }))
+        .unwrap();
+        assert_eq!(config.counters[0].name.as_ref(), name);
+        assert_eq!(config.counters[0].description.as_ref(), "Selected.");
     }
-    for name in [
-        r"\Memory",
-        r"\Memory(*)\X\Y",
-        r"\Memory(#0)\X",
-        r"\Process( app )\X",
-        r"\Memory\Available Bytes ",
-    ] {
-        let normalized = Config::from_json(&config(name, "selected")).unwrap();
-        assert_eq!(normalized.counters[0].name.as_ref(), "selected");
-        assert!(path_metric_definition_warning(name).is_some());
-        assert_config_error(config(name, name), "metric name");
-    }
-    let overlong = format!(r"\Memory\{}", "x".repeat(MAX_COUNTER_PATH_LEN));
-    let normalized = Config::from_json(&config(&overlong, "selected")).unwrap();
-    assert_eq!(normalized.counters[0].name.as_ref(), "selected");
-    assert!(path_metric_definition_warning(&overlong).is_some());
-    assert_eq!(path_metric_definition_warning("ordinary metric"), None);
 }
 
 /// Scenario: Metric units are blank or contain printable OTLP unit text.
@@ -1020,7 +1072,7 @@ fn accepts_case_distinct_metric_names() {
 }
 
 /// Scenario: Ordinary and path-shaped metric definitions differ only by Unicode case.
-/// Guarantees: Each valid identity group produces one warning candidate and malformed paths are excluded.
+/// Guarantees: Every otherwise-valid identity group produces one warning candidate regardless of path shape.
 #[test]
 fn warns_once_for_case_distinct_metric_definitions() {
     let names = [
@@ -1041,6 +1093,7 @@ fn warns_once_for_case_distinct_metric_definitions() {
         [
             (names[0].as_str(), names[1].as_str()),
             (names[3].as_str(), names[4].as_str()),
+            (names[6].as_str(), names[7].as_str()),
             (names[8].as_str(), names[9].as_str())
         ]
     );
@@ -1123,8 +1176,53 @@ fn rejects_nul_in_path_segments() {
         };
         assert_config_error(
             json!({"metrics": {"test": metric()}, "perfcounters": [object]}),
-            "contains a reserved performance-counter path character",
+            "must not contain control characters",
         );
+    }
+}
+
+/// Scenario: Native object, instance, and counter components are blank, or the optional aggregation name is blank.
+/// Guarantees: Required blanks fail without trimming nonblank spelling, while blank aggregation retains its documented default.
+#[test]
+fn handles_blank_native_components_and_aggregation() {
+    for value in [
+        json!({
+            "perfcounters": [{
+                "object": " ",
+                "counters": [{"name": "Available Bytes"}]
+            }]
+        }),
+        json!({
+            "perfcounters": [{
+                "object": "Process",
+                "instances": " ",
+                "counters": [{"name": "Private Bytes"}]
+            }]
+        }),
+        json!({
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{"name": " "}]
+            }]
+        }),
+        json!({
+            "perfcounters": [{
+                "object": "Process",
+                "instances": "*",
+                "aggregation_name": " ",
+                "counters": [{"name": "Private Bytes"}]
+            }]
+        }),
+    ] {
+        if value["perfcounters"][0]["aggregation_name"].is_string() {
+            let config = Config::from_json(&value).unwrap();
+            assert_eq!(
+                config.counters[0].instance_config.excluded_aggregation(),
+                Some("_Total")
+            );
+        } else {
+            assert_config_error(value, "must not be empty");
+        }
     }
 }
 
@@ -1299,36 +1397,49 @@ fn keeps_distinct_implicit_metric_name_backing() {
     assert!(Arc::ptr_eq(&first.unit, &second.unit));
 }
 
-/// Scenario: Trimmed path segments create duplicate instance or output identities.
-/// Guarantees: Duplicate detection operates on normalized, case-insensitive PDH paths.
+/// Scenario: Native components differ only by significant surrounding spaces.
+/// Guarantees: Exact spelling remains distinct while case-only duplicates still use native identity comparison.
 #[test]
-fn rejects_duplicates_after_path_normalization() {
+fn preserves_space_distinct_native_paths() {
+    let instances = Config::from_json(&json!({
+        "metrics": {"test": metric()},
+        "perfcounters": [{
+            "object": "Process",
+            "instances": ["app", " APP "],
+            "counters": [{"name": "Private Bytes", "metric": "test"}]
+        }]
+    }))
+    .unwrap();
+    assert_eq!(instances.counters[0].path, r"\Process(app)\Private Bytes");
+    assert_eq!(instances.counters[1].path, r"\Process( APP )\Private Bytes");
+
+    let paths = Config::from_json(&json!({
+        "metrics": {"test": metric()},
+        "perfcounters": [
+            {
+                "object": "Memory",
+                "counters": [{"name": "Available Bytes", "metric": "test"}]
+            },
+            {
+                "object": " memory ",
+                "counters": [{"name": " available bytes ", "metric": "test"}]
+            }
+        ]
+    }))
+    .unwrap();
+    assert_eq!(paths.counters[0].path, r"\Memory\Available Bytes");
+    assert_eq!(paths.counters[1].path, r"\ memory \ available bytes ");
+
     assert_config_error(
         json!({
             "metrics": {"test": metric()},
             "perfcounters": [{
                 "object": "Process",
-                "instances": ["app", " APP "],
+                "instances": ["app", "APP"],
                 "counters": [{"name": "Private Bytes", "metric": "test"}]
             }]
         }),
         "instances contains duplicate",
-    );
-    assert_config_error(
-        json!({
-            "metrics": {"test": metric()},
-            "perfcounters": [
-                {
-                    "object": "Memory",
-                    "counters": [{"name": "Available Bytes", "metric": "test"}]
-                },
-                {
-                    "object": " memory ",
-                    "counters": [{"name": " available bytes ", "metric": "test"}]
-                }
-            ]
-        }),
-        "duplicate counter output mapping",
     );
 }
 
@@ -1586,13 +1697,6 @@ fn rejects_invalid_configuration() {
                     "metric": "test",
                     "attributes": {"windows.perf_counter.path": "override"}
                 }]
-            }]
-        }),
-        json!({
-            "metrics": {"test": metric()},
-            "perfcounters": [{
-                "object": "Mem\\ory",
-                "counters": [{"name": "Available Bytes", "metric": "test"}]
             }]
         }),
         json!({

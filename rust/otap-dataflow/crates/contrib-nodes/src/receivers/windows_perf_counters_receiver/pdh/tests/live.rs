@@ -422,6 +422,165 @@ async fn live_pdh_unavailable_exact_counter_retries_after_startup() {
     assert_eq!(after.1 - before.1, 1);
 }
 
+/// Scenario: A provider counter requires its trailing space while the trimmed spelling is unavailable.
+/// Guarantees: Parsed native spelling reaches PDH unchanged, the exact provider path emits, and the trimmed peer fails counter-locally beside a healthy control.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+async fn live_pdh_preserves_provider_significant_counter_space() {
+    let _serial = TEST_PDH_LOCK.lock().await;
+    let config = Config::from_json(&serde_json::json!({
+        "metrics": {
+            "provider.exact": {"unit": "1"},
+            "provider.trimmed": {"unit": "1"},
+            "memory.control": {"unit": "By"}
+        },
+        "perfcounters": [
+            {
+                "object": "Hyper-V Virtual Switch Port",
+                "instances": "*",
+                "counters": [
+                    {
+                        "name": "IPsec SAs Offloaded ",
+                        "metric": "provider.exact"
+                    },
+                    {
+                        "name": "IPsec SAs Offloaded",
+                        "metric": "provider.trimmed"
+                    }
+                ]
+            },
+            {
+                "object": "Memory",
+                "counters": [{
+                    "name": "Available Bytes",
+                    "metric": "memory.control"
+                }]
+            }
+        ]
+    }))
+    .unwrap();
+    assert_eq!(
+        config.counters[0].path,
+        r"\Hyper-V Virtual Switch Port(*)\IPsec SAs Offloaded "
+    );
+    assert_eq!(
+        config.counters[1].path,
+        r"\Hyper-V Virtual Switch Port(*)\IPsec SAs Offloaded"
+    );
+    let mut worker = Worker::start(
+        config.counters,
+        Duration::from_secs(30),
+        256,
+        4_096,
+        "native-spelling".to_owned(),
+    )
+    .await
+    .unwrap();
+    let sample = worker.collect().await.unwrap();
+    assert!(sample.points.iter().any(|point| {
+        point.counter_index == 0
+            && point.path.ends_with(r"\IPsec SAs Offloaded ")
+            && matches!(
+                point.value,
+                SampleValue::Value(Number::Integer(value)) if value >= 0
+            )
+    }));
+    assert!(sample.points.iter().any(|point| {
+        point.counter_index == 2
+            && point.path == r"\Memory\Available Bytes"
+            && matches!(
+                point.value,
+                SampleValue::Value(Number::Integer(value)) if value >= 0
+            )
+    }));
+    assert!(!sample.points.iter().any(|point| point.counter_index == 1));
+    assert!(
+        sample.metadata.failures.iter().any(|failure| {
+            failure.counter_index == 1
+                && failure.reason == "PdhAddEnglishCounterW(wildcard)"
+                && failure.error == "PDH status 0xC0000BB9"
+        }),
+        "{:#?}",
+        sample.metadata
+    );
+    assert!(
+        worker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap()
+    );
+}
+
+/// Scenario: A real Paging File instance contains a backslash that configuration previously rejected.
+/// Guarantees: The exact F1 path reaches PDH, emits a finite value, and remains isolated beside a healthy control.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+async fn live_pdh_collects_backslashed_paging_file_instance() {
+    let _serial = TEST_PDH_LOCK.lock().await;
+    let config = Config::from_json(&serde_json::json!({
+        "metrics": {
+            "paging.usage": {"unit": "%"},
+            "memory.control": {"unit": "By"}
+        },
+        "perfcounters": [
+            {
+                "object": "Paging File",
+                "instances": r"C:\pagefile.sys",
+                "counters": [{"name": "% Usage", "metric": "paging.usage"}]
+            },
+            {
+                "object": "Memory",
+                "counters": [{
+                    "name": "Available Bytes",
+                    "metric": "memory.control"
+                }]
+            }
+        ]
+    }))
+    .unwrap();
+    assert_eq!(
+        config.counters[0].path,
+        r"\Paging File(C:\pagefile.sys)\% Usage"
+    );
+    let mut worker = Worker::start(
+        config.counters,
+        Duration::from_secs(30),
+        256,
+        4_096,
+        "native-delimiter".to_owned(),
+    )
+    .await
+    .unwrap();
+    let sample = worker.collect().await.unwrap();
+    assert!(
+        sample.metadata.failures.is_empty(),
+        "{:#?}",
+        sample.metadata
+    );
+    assert!(sample.points.iter().any(|point| {
+        point.counter_index == 0
+            && point.path == r"\Paging File(C:\pagefile.sys)\% Usage"
+            && matches!(
+                point.value,
+                SampleValue::Value(Number::Double(value)) if value.is_finite() && value >= 0.0
+            )
+    }));
+    assert!(sample.points.iter().any(|point| {
+        point.counter_index == 1
+            && point.path == r"\Memory\Available Bytes"
+            && matches!(
+                point.value,
+                SampleValue::Value(Number::Integer(value)) if value >= 0
+            )
+    }));
+    assert!(
+        worker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap()
+    );
+}
+
 /// Scenario: Every configured exact counter is unavailable when the worker starts.
 /// Guarantees: Startup succeeds with an empty active set and reports retryable failures without points.
 #[tokio::test(flavor = "current_thread")]

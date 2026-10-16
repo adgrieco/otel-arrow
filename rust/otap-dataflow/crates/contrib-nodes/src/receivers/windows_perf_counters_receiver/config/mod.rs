@@ -18,10 +18,6 @@ const DEFAULT_MAX_EXPANDED_COUNTERS: usize = 4_096;
 const DEFAULT_AGGREGATION_NAME: &str = "_Total";
 const RECEIVER_ATTRIBUTE_PREFIX: &str = "windows.perf_counter.";
 
-const OBJECT_INSTANCE_RESERVED: &[char] = &['\\', '(', ')', '*', '?', '\0'];
-const INSTANCE_PATTERN_RESERVED: &[char] = &['\\', '(', ')', '?', '\0'];
-const COUNTER_RESERVED: &[char] = &['\\', '*', '?', '\0'];
-
 /// Configuration normalized for Windows performance-counter collection.
 #[derive(Debug, Clone)]
 pub(super) struct Config {
@@ -51,6 +47,7 @@ impl Config {
         let expanded_count = expanded_counter_count(&user.perfcounters)?;
         let counters = normalize_counters(user.perfcounters, &metrics, expanded_count)?;
         validate_counter_outputs(&counters)?;
+        warn_for_unused_path_metric_definitions(&metrics, &counters);
 
         Ok(Self {
             counters,
@@ -356,23 +353,14 @@ fn validate_no_control_characters(field: &str, value: &str) -> Result<(), Error>
     Ok(())
 }
 
-fn validate_path_segment<'a>(
-    field: &str,
-    value: &'a str,
-    reserved: &[char],
-) -> Result<&'a str, Error> {
-    let value = value.trim();
+fn validate_native_component<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
     require_name(field, value)?;
-    if value.contains(reserved) {
-        return Err(invalid(format!(
-            "{field} contains a reserved performance-counter path character"
-        )));
-    }
+    validate_no_control_characters(field, value)?;
     Ok(value)
 }
 
 fn validate_object<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
-    validate_path_segment(field, value, OBJECT_INSTANCE_RESERVED)
+    validate_native_component(field, value)
 }
 
 /// Splits a PDH duplicate-instance suffix, such as `app#2`, into name and index.
@@ -383,7 +371,7 @@ fn instance_index(value: &str) -> Option<(&str, &str)> {
 }
 
 fn validate_instance<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
-    let value = validate_path_segment(field, value, OBJECT_INSTANCE_RESERVED)?;
+    let value = validate_native_component(field, value)?;
     if instance_index(value).is_some_and(|(name, _)| name.is_empty()) {
         return Err(invalid(format!(
             "{field} must include an instance name before its index"
@@ -393,7 +381,7 @@ fn validate_instance<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> 
 }
 
 fn validate_instance_pattern<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
-    validate_path_segment(field, value, INSTANCE_PATTERN_RESERVED)
+    validate_native_component(field, value)
 }
 
 /// Canonicalizes PDH's decimal instance index, where the first occurrence omits `#0`.
@@ -411,72 +399,20 @@ fn normalize_instance<'a>(field: &str, value: &'a str) -> Result<(String, &'a st
 }
 
 fn validate_counter_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
-    validate_path_segment(field, value, COUNTER_RESERVED)
+    validate_native_component(field, value)
 }
 
 fn is_path_metric_name(name: &str) -> bool {
-    name.trim_start().starts_with('\\')
+    name.starts_with('\\')
 }
 
-fn validate_metric_name(name: &str) -> Result<&str, Error> {
+fn normalize_metric_name(name: &str) -> Result<(&str, bool), Error> {
+    let path_shaped = is_path_metric_name(name);
     let trimmed = name.trim();
     require_name("metric name", trimmed)?;
-    let name = if is_path_metric_name(name) {
-        name
-    } else {
-        trimmed
-    };
+    let name = if path_shaped { name } else { trimmed };
     validate_no_control_characters("metric name", name)?;
-    Ok(name)
-}
-
-fn validate_path_metric_name(name: &str) -> Result<(), Error> {
-    validate_path_length("metric name", name)?;
-    validate_path_metric_segments(name)
-}
-
-fn validate_path_metric_segments(name: &str) -> Result<(), Error> {
-    let field = format!("metric name {name:?}");
-    let invalid_padding = || {
-        invalid(format!(
-            "{field} segments must not have surrounding whitespace"
-        ))
-    };
-    let path = name
-        .strip_prefix('\\')
-        .ok_or_else(|| invalid(format!("{field} must start with '\\'")))?;
-    let (object, counter) = path
-        .split_once('\\')
-        .ok_or_else(|| invalid(format!("{field} must be a full counter path")))?;
-    let object = if let Some((object, instance)) = object.split_once('(') {
-        let instance = instance
-            .strip_suffix(')')
-            .ok_or_else(|| invalid(format!("{field} must close its instance parentheses")))?;
-        let checked_instance = if instance.contains('*') {
-            validate_instance_pattern(&field, instance)?
-        } else {
-            validate_instance(&field, instance)?
-        };
-        if checked_instance != instance {
-            return Err(invalid_padding());
-        }
-        object
-    } else {
-        object
-    };
-    let checked_object = validate_object(&field, object)?;
-    let checked_counter = validate_counter_name(&field, counter)?;
-    if checked_object != object || checked_counter != counter {
-        return Err(invalid_padding());
-    }
-    Ok(())
-}
-
-fn path_metric_definition_warning(name: &str) -> Option<String> {
-    is_path_metric_name(name)
-        .then(|| validate_path_metric_name(name).err())
-        .flatten()
-        .map(|error| error.to_string())
+    Ok((name, path_shaped))
 }
 
 fn normalize_metric_unit(unit: &str) -> Result<&str, Error> {
@@ -527,10 +463,7 @@ fn expanded_counter_count(objects: &[ObjectConfig]) -> Result<usize, Error> {
             None => 1,
             Some(instances)
                 if instances.as_slice().is_empty()
-                    || instances
-                        .as_slice()
-                        .iter()
-                        .any(|instance| instance.trim() == "*") =>
+                    || instances.as_slice().iter().any(|instance| instance == "*") =>
             {
                 1
             }
@@ -551,6 +484,7 @@ struct NormalizedMetric {
     description: Arc<str>,
     unit: Arc<str>,
     kind: MetricKind,
+    path_shaped: bool,
 }
 
 static DEFAULT_METRIC: LazyLock<NormalizedMetric> = LazyLock::new(default_metric);
@@ -560,6 +494,7 @@ fn default_metric() -> NormalizedMetric {
         description: Arc::from(""),
         unit: Arc::from("1"),
         kind: MetricKind::Gauge,
+        path_shaped: false,
     }
 }
 
@@ -635,7 +570,7 @@ fn normalize_metrics(
     let mut metrics = BTreeMap::new();
     let mut configured_by_identity = BTreeMap::new();
     for (configured_name, metric) in configured {
-        let name = validate_metric_name(configured_name)?;
+        let (name, path_shaped) = normalize_metric_name(configured_name)?;
         if let Some(first) =
             configured_by_identity.insert(name.to_owned(), configured_name.as_str())
         {
@@ -643,21 +578,13 @@ fn normalize_metrics(
                 "metrics keys {first:?} and {configured_name:?} normalize to duplicate {name:?}"
             )));
         }
-        if let Some(reason) = path_metric_definition_warning(name) {
-            otel_arrow_dfe_telemetry::otel_warn!(
-                "windows_perf_counters_receiver.config.metric_definition.invalid_path",
-                message = "path-shaped metric definition is malformed, padded, or overlong; it \
-                           is retained for Go parity but cannot match a generated counter path",
-                definition = name,
-                reason = reason
-            );
-        }
         let _ = metrics.insert(
             Arc::from(name),
             NormalizedMetric {
                 description: Arc::from(metric.description.trim()),
                 unit: Arc::from(normalize_metric_unit(&metric.unit)?),
                 kind: metric.kind(name)?,
+                path_shaped,
             },
         );
     }
@@ -680,9 +607,6 @@ fn case_distinct_metric_definitions<'a>(
     let mut warned = HashSet::new();
     let mut collisions = Vec::new();
     for name in names {
-        if is_path_metric_name(name) && validate_path_metric_name(name).is_err() {
-            continue;
-        }
         let identity = name.to_lowercase();
         if let Some(first) = first_by_identity.get(&identity) {
             if warned.insert(identity) {
@@ -693,6 +617,35 @@ fn case_distinct_metric_definitions<'a>(
         }
     }
     collisions
+}
+
+fn unused_path_metric_definitions<'a>(
+    definitions: impl IntoIterator<Item = (&'a str, bool)>,
+    selected: impl IntoIterator<Item = &'a str>,
+) -> Vec<&'a str> {
+    let selected = selected.into_iter().collect::<HashSet<_>>();
+    definitions
+        .into_iter()
+        .filter_map(|(name, path_shaped)| (path_shaped && !selected.contains(name)).then_some(name))
+        .collect()
+}
+
+fn warn_for_unused_path_metric_definitions(
+    metrics: &BTreeMap<Arc<str>, NormalizedMetric>,
+    counters: &[CounterConfig],
+) {
+    for definition in unused_path_metric_definitions(
+        metrics
+            .iter()
+            .map(|(name, metric)| (name.as_ref(), metric.path_shaped)),
+        counters.iter().map(|counter| counter.name.as_ref()),
+    ) {
+        otel_arrow_dfe_telemetry::otel_warn!(
+            "windows_perf_counters_receiver.config.metric_definition.unused_path",
+            message = "path-shaped metric definition is not selected by any counter mapping",
+            definition = definition
+        );
+    }
 }
 
 fn normalize_counters(
@@ -869,10 +822,7 @@ fn normalize_metric_reference<'a>(
             if name.trim().is_empty() {
                 return Ok(None);
             }
-            let name = validate_metric_name(name)?;
-            if is_path_metric_name(name) {
-                validate_path_metric_segments(name)?;
-            }
+            let (name, _) = normalize_metric_name(name)?;
             Ok(Some(name))
         }
         Some(None) => Err(invalid(format!(

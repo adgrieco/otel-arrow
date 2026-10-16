@@ -169,9 +169,12 @@ replacement starts a new cumulative sequence, so cumulative Sum points from a
 mapping with `recreate_query: true` have a new start time on every scrape.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
-Counter names may contain parentheses, as required by counters such as
-`Avg. Disk sec/Read (Base)`, but cannot contain path separators or wildcard
-path syntax.
+Object, instance, aggregation, and counter components preserve their configured
+spelling, including leading or trailing spaces. Blank components and control
+characters are rejected, but delimiters such as backslashes and parentheses are
+passed to PDH because providers may use them as part of valid native identity.
+An invalid or unavailable constructed path is diagnosed for that counter
+without rejecting unrelated mappings.
 
 Configure performance object and counter names in English. Exact paths are
 added through PDH's language-neutral English API. Before wildcard expansion,
@@ -207,22 +210,22 @@ invalid intervals, unsupported scales, and duplicate outputs are configuration
 errors. A duplicate output has the same path ignoring case, the same metric
 name, and the same static attributes. Optional metadata may be empty and metric
 definitions may be unused. Ordinary metric names and references, metadata,
-path segments, units, and attribute keys are trimmed. Path-shaped definition
-keys are retained unchanged. If ordinary definition keys collide after
-trimming, the error identifies both configured keys. Metric names, units, and
-references may not contain control characters after their documented
-normalization; descriptions are exempt. Malformed, padded, or overlong
-path-shaped metric definition names are accepted with a configuration warning.
-Malformed or padded names cannot match generated paths. Explicit path-shaped
-references are validated without repair, so leading- or segment-padded
-references are rejected. Overlong names cannot be generated counter paths, but
-explicit references to their definitions resolve normally. Metric definitions
-have no receiver-specific count limit. At most 256 normalized configured exact
-or wildcard counter paths are accepted; the path total is checked before
-materialization. Wildcard expansion has separate configurable limits. Metric
-names, units, descriptions, and mapping attributes share immutable backing
-across explicit instance expansions; configuration clones preserve that
-backing.
+units, and attribute keys are trimmed. A definition or reference is path-shaped
+only when its first configured character is `\`; such values retain exact
+spelling. Leading whitespace therefore makes a value ordinary, and ordinary
+normalization does not reclassify it afterward. If ordinary definition keys
+collide after trimming, the error identifies both configured keys. Metric names,
+units, and references may not contain control characters after their documented
+normalization; descriptions are exempt. Exact references resolve any matching
+definition key, including padded, malformed, alias, or overlong path-shaped
+keys; no match reports an undefined metric. A path-shaped definition that is
+not selected by an implicit configured path/template or an explicit reference
+produces one usage warning. Metric definitions have no receiver-specific count
+limit. At most 256 normalized configured exact or wildcard counter paths are
+accepted; the path total is checked before materialization. Wildcard expansion
+has separate configurable limits. Metric names, units, descriptions, and
+mapping attributes share immutable backing across explicit instance expansions;
+configuration clones preserve that backing.
 Configured paths are limited to 2047 UTF-16 code units. Expanded paths that
 reach PDH's 2048-unit native limit are omitted and diagnosed.
 
@@ -426,13 +429,14 @@ Repeated scrape and counter warnings are suppressed until the affected
 condition recovers. Configuration events are:
 
 - `windows_perf_counters_receiver.config.instance_override`
-- `windows_perf_counters_receiver.config.metric_definition.invalid_path`
+- `windows_perf_counters_receiver.config.metric_definition.unused_path`
 - `windows_perf_counters_receiver.config.metric_definition.case_collision`
 
 The instance-override warning reports a static `instance` value that can
-collapse multiple selected native instances. Invalid-path warnings retain the
-original malformed, padded, or overlong key. Case-collision warnings are
-deduplicated once per Unicode lowercase identity group.
+collapse multiple selected native instances. Unused-path warnings retain the
+original raw path-shaped definition key and do not claim that PDH would reject
+it. Case-collision warnings are deduplicated once per Unicode lowercase identity
+group.
 
 The `receiver.windowsperfcounters.scrapes` measurement metric set attributes
 collection attempts by outcome. The `receiver.windowsperfcounters` health
