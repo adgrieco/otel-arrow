@@ -75,7 +75,7 @@ config:
 | `perfcounters` | Yes | None | Performance objects and counter mappings |
 | `initial_delay` | No | `1s` | Delay before the first collection request; non-positive means immediate |
 | `collection_interval` | No | `1m` | Any positive collection interval |
-| `timeout` | No | Collection interval | Scrape deadline; `0s` disables it |
+| `timeout` | No | Disabled | Optional scrape discard deadline; `0s` also disables it |
 | `wildcard_refresh_interval` | No | See below | Wildcard discovery cadence |
 | `max_instances_per_wildcard` | No | `256` | Per-path expansion limit |
 | `max_expanded_counters` | No | `4096` | Receiver-wide expansion limit |
@@ -358,10 +358,12 @@ failures still reject startup explicitly.
   returning an error. Query collection failures retry the existing query with
   bounded exponential backoff. Three consecutive failures rebuild the
   worker-owned query and all counters.
-- Each scrape is bounded by `timeout`, which defaults to `collection_interval`;
-  `0s` disables the deadline. If a native collection call remains blocked after
-  an enabled timeout, later ticks fail fast while the worker is busy; no
-  additional collection request is queued.
+- By default, the receiver waits for an accepted scrape and delivers a late
+  result with its original point timestamps. A scrape completing after
+  `collection_interval` records an overrun but remains successful. Setting a
+  positive `timeout` opts into discarding a late result; `0s` also leaves the
+  deadline disabled. The native call continues to own the capacity-one worker,
+  so later ticks fail fast while it is busy and no additional request is queued.
 - Wildcard expansion is sorted before applying the configured limits. Excess
   instances are omitted, reported explicitly, and reconsidered at the next
   discovery refresh; they are never presented as a complete expansion.

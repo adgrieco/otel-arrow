@@ -51,6 +51,10 @@ fn append_projection_failures(sample: &mut Sample, failures: Vec<SampleFailure>)
     sample.metadata.failures.extend(failures);
 }
 
+fn scrape_overran(collection_interval: Duration, elapsed: Duration) -> bool {
+    elapsed > collection_interval
+}
+
 fn receiver_error(
     effect_handler: &local::EffectHandler<OtapPdata>,
     error: impl Into<String>,
@@ -260,8 +264,8 @@ impl WindowsPerfCountersReceiver {
             .add(failed_counter_value_count(&sample.metadata.failures));
     }
 
-    fn record_successful_sample(&self, scrape_start: Instant, sample: &Sample) {
-        self.record_completed_scrape(scrape_start, true, false);
+    fn record_successful_sample(&self, scrape_start: Instant, sample: &Sample, overrun: bool) {
+        self.record_completed_scrape(scrape_start, true, overrun);
         self.record_sample_diagnostics(sample);
     }
 
@@ -345,7 +349,9 @@ impl WindowsPerfCountersReceiver {
             {
                 Ok(Ok(sample)) => sample,
                 Ok(Err(err)) if err.is_collection_failure() => {
-                    self.record_completed_scrape(scrape_start, false, err.is_overrun());
+                    let overrun = err.is_overrun()
+                        || scrape_overran(self.config.collection_interval, scrape_start.elapsed());
+                    self.record_completed_scrape(scrape_start, false, overrun);
                     failure_logs.log_scrape_failure(&self.node, &err);
                     continue;
                 }
@@ -360,10 +366,11 @@ impl WindowsPerfCountersReceiver {
                     continue;
                 }
             };
+            let overrun = scrape_overran(self.config.collection_interval, scrape_start.elapsed());
             let projection = match project_sample(&self.config.counters, &sample) {
                 Ok(projection) => projection,
                 Err(err) => {
-                    self.record_completed_scrape(scrape_start, false, false);
+                    self.record_completed_scrape(scrape_start, false, overrun);
                     return Err(receiver_error(effect_handler, err.to_string(), ""));
                 }
             };
@@ -373,7 +380,7 @@ impl WindowsPerfCountersReceiver {
                     point_failures,
                 } => {
                     append_projection_failures(&mut sample, point_failures);
-                    self.record_successful_sample(scrape_start, &sample);
+                    self.record_successful_sample(scrape_start, &sample, overrun);
                     failure_logs.record_success();
                     self.log_sample_events(&sample);
                     failure_logs.log_counter_failures(self, &sample, effect_handler)?;
@@ -391,7 +398,7 @@ impl WindowsPerfCountersReceiver {
                     point_failures,
                 } => {
                     append_projection_failures(&mut sample, point_failures);
-                    self.record_completed_scrape(scrape_start, false, false);
+                    self.record_completed_scrape(scrape_start, false, overrun);
                     self.record_sample_diagnostics(&sample);
                     self.log_sample_events(&sample);
                     failure_logs.log_counter_failures(self, &sample, effect_handler)?;
@@ -676,8 +683,8 @@ mod tests {
         run_live_lifecycle(false);
     }
 
-    /// Scenario: Scrape timeout is enabled or explicitly disabled.
-    /// Guarantees: Enabled deadlines expire while disabled deadlines await the same future to completion.
+    /// Scenario: Scrape discard is explicitly enabled or left disabled.
+    /// Guarantees: Default late data is retained while a positive deadline can intentionally discard it.
     #[tokio::test(start_paused = true)]
     async fn optional_timeout_controls_scrape_deadline() {
         let timed = with_optional_timeout(
@@ -689,5 +696,47 @@ mod tests {
 
         let untimed = with_optional_timeout(None, async { 42 }).await;
         assert_eq!(untimed.unwrap(), 42);
+    }
+
+    /// Scenario: Collection finishes before, exactly at, or after its scheduled cadence.
+    /// Guarantees: Only genuinely late completion increments overrun telemetry without turning success into failure.
+    #[test]
+    fn classifies_collection_cadence_overrun() {
+        let interval = Duration::from_secs(1);
+
+        assert!(!scrape_overran(
+            interval,
+            interval - Duration::from_nanos(1)
+        ));
+        assert!(!scrape_overran(interval, interval));
+        assert!(scrape_overran(interval, interval + Duration::from_nanos(1)));
+    }
+
+    /// Scenario: One collection spans several scheduled interval ticks.
+    /// Guarantees: Late completion resumes at the next cadence boundary instead of bursting queued scrapes.
+    #[tokio::test(start_paused = true)]
+    async fn missed_collection_ticks_are_skipped() {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let _ = interval.tick().await;
+
+        tokio::time::advance(Duration::from_millis(3_500)).await;
+        let _ = interval.tick().await;
+        let next = interval.tick();
+        tokio::pin!(next);
+        tokio::select! {
+            biased;
+            _ = &mut next => panic!("missed ticks queued an immediate extra scrape"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        tokio::time::advance(Duration::from_millis(499)).await;
+        tokio::select! {
+            biased;
+            _ = &mut next => panic!("next scrape ran before the cadence boundary"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let _ = next.await;
     }
 }

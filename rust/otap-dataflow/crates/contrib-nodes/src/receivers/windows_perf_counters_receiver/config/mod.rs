@@ -27,7 +27,7 @@ pub(super) struct Config {
     pub(super) collection_interval: Duration,
     /// Delay before the first collection request; defaults to one second.
     pub(super) initial_delay: Duration,
-    /// Maximum wait for one scrape; `None` disables the deadline.
+    /// Optional discard deadline for one scrape; `None` waits for completion.
     pub(super) timeout: Option<Duration>,
     /// Time between wildcard discovery refreshes; defaults to the collection interval.
     pub(super) wildcard_refresh_interval: Option<Duration>,
@@ -56,7 +56,7 @@ impl Config {
             timeout: match user.timeout {
                 Some(Duration::ZERO) => None,
                 Some(timeout) => Some(timeout),
-                None => Some(user.collection_interval),
+                None => None,
             },
             wildcard_refresh_interval: user.wildcard_refresh_interval,
             max_instances_per_wildcard: user.max_instances_per_wildcard,

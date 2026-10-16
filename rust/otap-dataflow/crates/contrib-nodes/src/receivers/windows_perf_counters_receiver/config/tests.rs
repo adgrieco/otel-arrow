@@ -98,12 +98,12 @@ fn normalizes_structured_configuration() {
     );
     assert_eq!(config.collection_interval, Duration::from_secs(60));
     assert_eq!(config.initial_delay, Duration::from_secs(1));
-    assert_eq!(config.timeout, Some(Duration::from_secs(60)));
+    assert_eq!(config.timeout, None);
     assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(60));
 }
 
 /// Scenario: Timeout is omitted, positive, zero, or negative.
-/// Guarantees: Omission follows the interval, positive values are retained, zero disables it, and negatives fail.
+/// Guarantees: Late data is retained by default, explicit positive deadlines opt into discard, and invalid negatives fail.
 #[test]
 fn normalizes_scrape_timeout() {
     let base = json!({
@@ -115,7 +115,7 @@ fn normalizes_scrape_timeout() {
     });
 
     let omitted = Config::from_json(&base).unwrap();
-    assert_eq!(omitted.timeout, Some(Duration::from_secs(45)));
+    assert_eq!(omitted.timeout, None);
 
     let mut positive = base.clone();
     positive["timeout"] = json!("10s");

@@ -1,0 +1,5 @@
+change_type: bug_fix
+component: pipeline
+note: Deliver late Windows performance-counter scrapes by default instead of discarding them at the collection interval.
+issues: [4074]
+subtext: Positive timeout values now opt into discard. Late default scrapes remain successful, retain their point timestamps, and increment overrun telemetry without queueing overlapping work.
