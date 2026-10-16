@@ -81,9 +81,9 @@ pub(super) struct CounterConfig {
     /// PDH path, optionally wildcarding only the instance segment.
     pub(super) path: String,
     /// OTel metric name.
-    pub(super) name: String,
+    pub(super) name: Arc<str>,
     /// OTel metric unit.
-    pub(super) unit: String,
+    pub(super) unit: Arc<str>,
     /// OTel metric description, shared by every counter mapped to this metric.
     pub(super) description: Arc<str>,
     /// OTel metric stream kind.
@@ -347,6 +347,15 @@ fn require_name(field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_no_control_characters(field: &str, value: &str) -> Result<(), Error> {
+    if value.chars().any(char::is_control) {
+        return Err(invalid(format!(
+            "{field} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_path_segment<'a>(
     field: &str,
     value: &'a str,
@@ -405,9 +414,19 @@ fn validate_counter_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Err
     validate_path_segment(field, value, COUNTER_RESERVED)
 }
 
+fn is_path_metric_name(name: &str) -> bool {
+    name.trim_start().starts_with('\\')
+}
+
 fn validate_metric_name(name: &str) -> Result<&str, Error> {
-    let name = name.trim();
-    require_name("metric name", name)?;
+    let trimmed = name.trim();
+    require_name("metric name", trimmed)?;
+    let name = if is_path_metric_name(name) {
+        name
+    } else {
+        trimmed
+    };
+    validate_no_control_characters("metric name", name)?;
     Ok(name)
 }
 
@@ -454,15 +473,17 @@ fn validate_path_metric_segments(name: &str) -> Result<(), Error> {
 }
 
 fn path_metric_definition_warning(name: &str) -> Option<String> {
-    name.starts_with('\\')
+    is_path_metric_name(name)
         .then(|| validate_path_metric_name(name).err())
         .flatten()
         .map(|error| error.to_string())
 }
 
-fn normalize_metric_unit(unit: &str) -> &str {
+fn normalize_metric_unit(unit: &str) -> Result<&str, Error> {
     let unit = unit.trim();
-    if unit.is_empty() { "1" } else { unit }
+    let unit = if unit.is_empty() { "1" } else { unit };
+    validate_no_control_characters("metric unit", unit)?;
+    Ok(unit)
 }
 
 fn should_warn_instance_override(
@@ -528,7 +549,7 @@ fn expanded_counter_count(objects: &[ObjectConfig]) -> Result<usize, Error> {
 
 struct NormalizedMetric {
     description: Arc<str>,
-    unit: String,
+    unit: Arc<str>,
     kind: MetricKind,
 }
 
@@ -537,15 +558,15 @@ static DEFAULT_METRIC: LazyLock<NormalizedMetric> = LazyLock::new(default_metric
 fn default_metric() -> NormalizedMetric {
     NormalizedMetric {
         description: Arc::from(""),
-        unit: "1".to_owned(),
+        unit: Arc::from("1"),
         kind: MetricKind::Gauge,
     }
 }
 
 #[derive(Clone)]
 struct ResolvedMetric {
-    name: String,
-    unit: String,
+    name: Arc<str>,
+    unit: Arc<str>,
     description: Arc<str>,
     kind: MetricKind,
     attributes: Arc<BTreeMap<String, String>>,
@@ -573,7 +594,7 @@ struct ObjectNormalizer<'a> {
     object_name: &'a str,
     aggregation_name: &'a str,
     instances: &'a NormalizedInstances,
-    metrics: &'a BTreeMap<String, NormalizedMetric>,
+    metrics: &'a BTreeMap<Arc<str>, NormalizedMetric>,
 }
 
 fn validate_user_config(user: &UserConfig) -> Result<(), Error> {
@@ -610,38 +631,41 @@ fn validate_user_config(user: &UserConfig) -> Result<(), Error> {
 
 fn normalize_metrics(
     configured: &BTreeMap<String, MetricConfig>,
-) -> Result<BTreeMap<String, NormalizedMetric>, Error> {
+) -> Result<BTreeMap<Arc<str>, NormalizedMetric>, Error> {
     let mut metrics = BTreeMap::new();
-    let mut identities = HashSet::new();
-    for (name, metric) in configured {
-        let name = validate_metric_name(name)?;
-        if !identities.insert(name.to_owned()) {
-            return Err(invalid(format!("metrics contains duplicate {name:?}")));
+    let mut configured_by_identity = BTreeMap::new();
+    for (configured_name, metric) in configured {
+        let name = validate_metric_name(configured_name)?;
+        if let Some(first) =
+            configured_by_identity.insert(name.to_owned(), configured_name.as_str())
+        {
+            return Err(invalid(format!(
+                "metrics keys {first:?} and {configured_name:?} normalize to duplicate {name:?}"
+            )));
         }
         if let Some(reason) = path_metric_definition_warning(name) {
             otel_arrow_dfe_telemetry::otel_warn!(
-                "otelcol.node.windowsperfcounters.config.path_metric_invalid_definition",
-                message = "path-shaped metric definition is malformed; it is retained for Go \
-                           parity but cannot match a generated counter path",
+                "windows_perf_counters_receiver.config.metric_definition.invalid_path",
+                message = "path-shaped metric definition is malformed, padded, or overlong; it \
+                           is retained for Go parity but cannot match a generated counter path",
                 definition = name,
                 reason = reason
             );
         }
         let _ = metrics.insert(
-            name.to_owned(),
+            Arc::from(name),
             NormalizedMetric {
                 description: Arc::from(metric.description.trim()),
-                unit: normalize_metric_unit(&metric.unit).to_owned(),
+                unit: Arc::from(normalize_metric_unit(&metric.unit)?),
                 kind: metric.kind(name)?,
             },
         );
     }
-    for (first, second) in case_distinct_path_metric_definitions(metrics.keys().map(String::as_str))
-    {
+    for (first, second) in case_distinct_metric_definitions(metrics.keys().map(Arc::as_ref)) {
         otel_arrow_dfe_telemetry::otel_warn!(
-            "otelcol.node.windowsperfcounters.config.path_metric_case_collision",
-            message = "path-shaped metric definitions differ only by case; exact lookup keeps \
-                       them distinct, but this may be a configuration typo",
+            "windows_perf_counters_receiver.config.metric_definition.case_collision",
+            message = "metric definitions differ only by case; exact lookup keeps them distinct, \
+                       but this may be a configuration typo",
             first = first,
             second = second
         );
@@ -649,17 +673,17 @@ fn normalize_metrics(
     Ok(metrics)
 }
 
-fn case_distinct_path_metric_definitions<'a>(
+fn case_distinct_metric_definitions<'a>(
     names: impl IntoIterator<Item = &'a str>,
 ) -> Vec<(&'a str, &'a str)> {
     let mut first_by_identity = BTreeMap::new();
     let mut warned = HashSet::new();
     let mut collisions = Vec::new();
     for name in names {
-        if !name.starts_with('\\') || validate_path_metric_name(name).is_err() {
+        if is_path_metric_name(name) && validate_path_metric_name(name).is_err() {
             continue;
         }
-        let identity = name.to_ascii_lowercase();
+        let identity = name.to_lowercase();
         if let Some(first) = first_by_identity.get(&identity) {
             if warned.insert(identity) {
                 collisions.push((*first, name));
@@ -673,7 +697,7 @@ fn case_distinct_path_metric_definitions<'a>(
 
 fn normalize_counters(
     objects: Vec<ObjectConfig>,
-    metrics: &BTreeMap<String, NormalizedMetric>,
+    metrics: &BTreeMap<Arc<str>, NormalizedMetric>,
     capacity: usize,
 ) -> Result<Vec<CounterConfig>, Error> {
     let mut counters = Vec::with_capacity(capacity);
@@ -693,7 +717,7 @@ fn normalize_counters(
 fn normalize_object(
     object_index: usize,
     object: ObjectConfig,
-    metrics: &BTreeMap<String, NormalizedMetric>,
+    metrics: &BTreeMap<Arc<str>, NormalizedMetric>,
     output: &mut Vec<CounterConfig>,
     source_mapping_index: &mut usize,
 ) -> Result<(), Error> {
@@ -781,13 +805,22 @@ impl ObjectNormalizer<'_> {
         if let Some(explicit) = explicit {
             return explicit.clone();
         }
-        let metric = self.metrics.get(configured_path).unwrap_or(&DEFAULT_METRIC);
-        ResolvedMetric {
-            name: configured_path.to_owned(),
-            unit: metric.unit.clone(),
-            description: Arc::clone(&metric.description),
-            kind: metric.kind,
-            attributes: Arc::new(BTreeMap::new()),
+        if let Some((name, metric)) = self.metrics.get_key_value(configured_path) {
+            ResolvedMetric {
+                name: Arc::clone(name),
+                unit: Arc::clone(&metric.unit),
+                description: Arc::clone(&metric.description),
+                kind: metric.kind,
+                attributes: Arc::new(BTreeMap::new()),
+            }
+        } else {
+            ResolvedMetric {
+                name: Arc::from(configured_path),
+                unit: Arc::clone(&DEFAULT_METRIC.unit),
+                description: Arc::clone(&DEFAULT_METRIC.description),
+                kind: DEFAULT_METRIC.kind,
+                attributes: Arc::new(BTreeMap::new()),
+            }
         }
     }
 
@@ -801,7 +834,7 @@ impl ObjectNormalizer<'_> {
         let Some(name) = metric_name else {
             return Ok(None);
         };
-        let metric = self.metrics.get(name).ok_or_else(|| {
+        let (name, metric) = self.metrics.get_key_value(name).ok_or_else(|| {
             invalid(format!(
                 "{counter_field}.metric references undefined metric {name:?}"
             ))
@@ -809,7 +842,7 @@ impl ObjectNormalizer<'_> {
         let attributes = normalize_attributes(counter_field, configured_attributes)?;
         if should_warn_instance_override(self.instances.has_multiple_or_wildcard(), &attributes) {
             otel_arrow_dfe_telemetry::otel_warn!(
-                "otelcol.node.windowsperfcounters.config.instance_override",
+                "windows_perf_counters_receiver.config.instance_override",
                 message = "a static instance attribute overrides generated instance identity for \
                            multiple or wildcard instances and may merge distinct series",
                 object_index = self.object_index,
@@ -817,8 +850,8 @@ impl ObjectNormalizer<'_> {
             );
         }
         Ok(Some(ResolvedMetric {
-            name: name.to_owned(),
-            unit: metric.unit.clone(),
+            name: Arc::clone(name),
+            unit: Arc::clone(&metric.unit),
             description: Arc::clone(&metric.description),
             kind: metric.kind,
             attributes: Arc::new(attributes),
@@ -833,10 +866,11 @@ fn normalize_metric_reference<'a>(
     match configured {
         None => Ok(None),
         Some(Some(name)) => {
-            let Some(name) = Some(name.trim()).filter(|name| !name.is_empty()) else {
+            if name.trim().is_empty() {
                 return Ok(None);
-            };
-            if name.starts_with('\\') {
+            }
+            let name = validate_metric_name(name)?;
+            if is_path_metric_name(name) {
                 validate_path_metric_segments(name)?;
             }
             Ok(Some(name))
@@ -1011,6 +1045,8 @@ fn validate_path_length(field: &str, path: &str) -> Result<(), Error> {
 
 fn validate_counter(counter: &CounterConfig) -> Result<(), Error> {
     validate_path_length("counter path", &counter.path)?;
+    validate_no_control_characters("metric name", &counter.name)?;
+    validate_no_control_characters("metric unit", &counter.unit)?;
     if !(MIN_SCALE_POWER10..=MAX_SCALE_POWER10).contains(&counter.scale_power10) {
         return Err(invalid(format!(
             "counter path {:?} scale_power10 must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}",

@@ -627,7 +627,7 @@ impl Drop for NativePdh {
         let _ = super::QUERY_CLOSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if status != 0 {
             otel_arrow_dfe_telemetry::otel_warn!(
-                "otelcol.node.windows_perf_counters.close.fail",
+                "windows_perf_counters_receiver.query.close.fail",
                 node = self.node.as_str(),
                 status = status as u64
             );

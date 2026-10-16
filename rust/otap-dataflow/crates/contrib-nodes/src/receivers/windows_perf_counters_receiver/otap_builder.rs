@@ -14,7 +14,6 @@ use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords};
 use otel_arrow_dfe_pdata::otlp::metrics::MetricType;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use std::collections::BTreeMap;
-#[cfg(test)]
 use std::sync::Arc;
 
 const AGGREGATION_TEMPORALITY_DELTA: i32 = 1;
@@ -41,7 +40,7 @@ struct ProjectionBuilder {
     metrics: MetricsRecordBatchBuilder,
     points: NumberDataPointsRecordBatchBuilder,
     attributes: StrKeysAttributesRecordBatchBuilder<u32>,
-    metric_ids: BTreeMap<String, u16>,
+    metric_ids: BTreeMap<Arc<str>, u16>,
 }
 
 impl ProjectionBuilder {
@@ -81,7 +80,7 @@ impl ProjectionBuilder {
     }
 
     fn metric_id(&mut self, counter: &CounterConfig) -> Result<u16, ArrowError> {
-        if let Some(metric_id) = self.metric_ids.get(&counter.name) {
+        if let Some(metric_id) = self.metric_ids.get(counter.name.as_ref()) {
             return Ok(*metric_id);
         }
         let metric_id = u16::try_from(self.metric_ids.len()).map_err(|_| {
@@ -301,8 +300,8 @@ mod tests {
     fn counter(path: &str, name: &str, unit: &str) -> CounterConfig {
         CounterConfig {
             path: path.to_owned(),
-            name: name.to_owned(),
-            unit: unit.to_owned(),
+            name: Arc::from(name),
+            unit: Arc::from(unit),
             description: Arc::from(format!("Description for {name}.")),
             metric_kind: MetricKind::Gauge,
             attributes: Arc::new(BTreeMap::new()),

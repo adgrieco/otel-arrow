@@ -28,8 +28,8 @@ use tokio::sync::oneshot;
 fn counter(path: &str, name: &str) -> CounterConfig {
     CounterConfig {
         path: path.to_owned(),
-        name: name.to_owned(),
-        unit: "By".to_owned(),
+        name: Arc::from(name),
+        unit: Arc::from("By"),
         description: Arc::from(format!("Description for {name}.")),
         metric_kind: MetricKind::Gauge,
         attributes: Arc::new(BTreeMap::new()),
@@ -46,7 +46,7 @@ fn monotonic_sum(path: &str, name: &str, unit: &str) -> CounterConfig {
             aggregation: Aggregation::Cumulative,
             monotonic: true,
         },
-        unit: unit.to_owned(),
+        unit: Arc::from(unit),
         ..counter(path, name)
     }
 }
@@ -57,7 +57,7 @@ fn delta_sum(path: &str, name: &str, monotonic: bool) -> CounterConfig {
             aggregation: Aggregation::Delta,
             monotonic,
         },
-        unit: "{operation}".to_owned(),
+        unit: Arc::from("{operation}"),
         ..counter(path, name)
     }
 }

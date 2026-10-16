@@ -69,7 +69,7 @@ impl FailureLogState {
     fn log_scrape_failure(&mut self, node: &str, error: &pdh::Error) {
         if !self.scrape_failed {
             otel_arrow_dfe_telemetry::otel_warn!(
-                "otelcol.node.windowsperfcounters.scrape.fail",
+                "windows_perf_counters_receiver.scrape.fail",
                 node = node,
                 error = %error
             );
@@ -80,7 +80,7 @@ impl FailureLogState {
     fn log_scrape_timeout(&mut self, node: &str, timeout: Duration) {
         if !self.scrape_failed {
             otel_arrow_dfe_telemetry::otel_warn!(
-                "otelcol.node.windowsperfcounters.scrape.timeout",
+                "windows_perf_counters_receiver.scrape.timeout",
                 node = node,
                 timeout_seconds = timeout.as_secs_f64()
             );
@@ -109,7 +109,7 @@ impl FailureLogState {
             let key = (failure.counter_index, failure.reason);
             if !self.active_counter_failures.contains(&key) {
                 otel_arrow_dfe_telemetry::otel_warn!(
-                    "otelcol.node.windowsperfcounters.counter.fail",
+                    "windows_perf_counters_receiver.counter.fail",
                     node = receiver.node.as_str(),
                     path_template = counter.path.as_str(),
                     reason = failure.reason,
@@ -242,7 +242,7 @@ impl WindowsPerfCountersReceiver {
         for overflow in &sample.metadata.overflows {
             let path_template = &self.config.counters[overflow.counter_index].path;
             otel_arrow_dfe_telemetry::otel_warn!(
-                "otelcol.node.windowsperfcounters.instance_limit.exceeded",
+                "windows_perf_counters_receiver.instance_limit.exceeded",
                 node = self.node.as_str(),
                 path_template = path_template,
                 reason = overflow.reason,
@@ -255,7 +255,7 @@ impl WindowsPerfCountersReceiver {
             || sample.metadata.diagnostics.instances_removed > 0
         {
             otel_arrow_dfe_telemetry::otel_info!(
-                "otelcol.node.windowsperfcounters.instances.change",
+                "windows_perf_counters_receiver.instances.change",
                 node = self.node.as_str(),
                 added = sample.metadata.diagnostics.instances_added,
                 removed = sample.metadata.diagnostics.instances_removed,
@@ -268,7 +268,7 @@ impl WindowsPerfCountersReceiver {
             || sample.metadata.diagnostics.query_recreation_failures > 0
         {
             otel_arrow_dfe_telemetry::otel_info!(
-                "otelcol.node.windowsperfcounters.recovery",
+                "windows_perf_counters_receiver.recovery.change",
                 node = self.node.as_str(),
                 retry_attempts = sample.metadata.diagnostics.retry_attempts,
                 retry_recoveries = sample.metadata.diagnostics.retry_recoveries,
@@ -427,7 +427,7 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
             Ok(true) => {}
             Ok(false) => {
                 otel_arrow_dfe_telemetry::otel_warn!(
-                    "otelcol.node.windowsperfcounters.shutdown.timeout",
+                    "windows_perf_counters_receiver.shutdown.timeout",
                     node = self.node.as_str()
                 );
             }
@@ -530,8 +530,8 @@ mod tests {
             config: Config {
                 counters: vec![CounterConfig {
                     path: r"\Memory\Available Bytes".to_owned(),
-                    name: "windows.memory.available".to_owned(),
-                    unit: "By".to_owned(),
+                    name: Arc::from("windows.memory.available"),
+                    unit: Arc::from("By"),
                     description: Arc::from("Available physical memory."),
                     metric_kind: MetricKind::Gauge,
                     attributes: Arc::new(BTreeMap::new()),

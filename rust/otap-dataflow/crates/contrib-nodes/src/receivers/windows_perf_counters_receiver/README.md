@@ -67,6 +67,8 @@ config:
 
 ### Receiver options
 
+<!-- markdownlint-disable MD013 -->
+
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `metrics` | No | Empty | Optional metric metadata keyed by OTel metric name |
@@ -77,6 +79,8 @@ config:
 | `wildcard_refresh_interval` | No | See below | Wildcard discovery cadence |
 | `max_instances_per_wildcard` | No | `256` | Per-path expansion limit |
 | `max_expanded_counters` | No | `4096` | Receiver-wide expansion limit |
+
+<!-- markdownlint-enable MD013 -->
 
 `wildcard_refresh_interval` defaults to `collection_interval` and must be at
 least that interval. Both expansion limits must be between
@@ -96,13 +100,15 @@ one `gauge: {}` or `sum:` object; omitting both defaults to Gauge. A Sum
 requires `aggregation: cumulative` or `aggregation: delta`; `monotonic`
 defaults to `false`. Empty and null Sum configurations are rejected. Metrics
 that configure both Gauge and Sum are also rejected. Gauge may use YAML
-shorthand such as `gauge:`. Metric names must be non-empty after trimming but
-are otherwise OTLP stream names rather than SDK instrument names, so names
-such as `\Memory\Available Bytes` are accepted. Metric identity and lookup are
-case-sensitive, so definitions such as `cpu` and `CPU` remain distinct.
-Path-shaped definitions that differ only by case are also accepted, but emit
-one configuration warning because they are likely a typo. Units are trimmed
-but have no receiver-specific character or length restriction.
+shorthand such as `gauge:`. Ordinary metric names are trimmed and must remain
+non-empty. Path-shaped definition keys are retained unchanged. Names are OTLP
+stream names rather than SDK instrument names, so names such as
+`\Memory\Available Bytes` are accepted. Metric identity and lookup are
+case-sensitive, so definitions such as `cpu` and `CPU` remain distinct. Every
+valid group that differs only by Unicode lowercase identity emits one
+configuration warning because it may be a typo. Units are trimmed, blank units
+default to `"1"`, and non-empty units have no receiver-specific length limit.
+Metric names and units may not contain control characters after normalization.
 Multiple counter mappings may reference one metric and contribute points
 distinguished by their configured attributes. Gauges have point-in-time
 semantics and no start timestamp. Cumulative monotonic Sums are limited to
@@ -197,24 +203,32 @@ duplicate checks: the first occurrence omits `#0`, and leading zeroes are
 removed from later indexes.
 
 Unknown fields, explicit references to undefined metrics, duplicate instances,
-duplicate normalized paths, invalid intervals, and unsupported scales are
-configuration errors. Optional metadata may be empty and metric definitions
-may be unused. Surrounding whitespace is removed from metric
-identities, metadata, path segments, references, and attribute keys before
-duplicate detection. Embedded NUL characters are rejected. Malformed, padded,
-or overlong path-shaped metric definition names are accepted with a
-configuration warning. Malformed or padded names cannot match generated paths
-and are rejected as explicit path-shaped references. Overlong names cannot be
-generated counter paths, but explicit references to their definitions resolve
-normally. Metric definitions have no receiver-specific count limit. At most
-256 normalized configured exact or wildcard counter paths are accepted; the
-path total is checked before materialization. Wildcard expansion has separate
-configurable limits. Repeated metric descriptions and mapping attributes are
-shared across explicit instance expansions.
+invalid intervals, unsupported scales, and duplicate outputs are configuration
+errors. A duplicate output has the same path ignoring case, the same metric
+name, and the same static attributes. Optional metadata may be empty and metric
+definitions may be unused. Ordinary metric names and references, metadata,
+path segments, units, and attribute keys are trimmed. Path-shaped definition
+keys are retained unchanged. If ordinary definition keys collide after
+trimming, the error identifies both configured keys. Metric names, units, and
+references may not contain control characters after their documented
+normalization; descriptions are exempt. Malformed, padded, or overlong
+path-shaped metric definition names are accepted with a configuration warning.
+Malformed or padded names cannot match generated paths. Explicit path-shaped
+references are validated without repair, so leading- or segment-padded
+references are rejected. Overlong names cannot be generated counter paths, but
+explicit references to their definitions resolve normally. Metric definitions
+have no receiver-specific count limit. At most 256 normalized configured exact
+or wildcard counter paths are accepted; the path total is checked before
+materialization. Wildcard expansion has separate configurable limits. Metric
+names, units, descriptions, and mapping attributes share immutable backing
+across explicit instance expansions; configuration clones preserve that
+backing.
 Configured paths are limited to 2047 UTF-16 code units. Expanded paths that
 reach PDH's 2048-unit native limit are omitted and diagnosed.
 
 ## Supported counter families
+
+<!-- markdownlint-disable MD013 -->
 
 | Family | Native types | Samples | Output |
 | --- | --- | --- | --- |
@@ -229,6 +243,8 @@ reach PDH's 2048-unit native limit are omitted and diagnosed.
 | Raw fractions | `PERF_RAW_FRACTION`, `PERF_LARGE_RAW_FRACTION` | One | Double |
 | Sample fractions | `PERF_SAMPLE_FRACTION` | Two | Double |
 | Averages | `PERF_AVERAGE_TIMER`, `PERF_AVERAGE_BULK` | Two | Double |
+
+<!-- markdownlint-enable MD013 -->
 
 Use a Gauge for rates, ratios, utilization, and other non-additive current
 values. A monotonic Sum asserts that the selected PDH counter is a running
@@ -395,15 +411,28 @@ not by `--validate-and-exit`.
 ## Telemetry
 
 Counter-local failures emit
-`otelcol.node.windowsperfcounters.counter.fail` with a configured path template
-and low-cardinality reason. Expansion overflow, instance changes, recovery,
-query-level failures, scrape timeouts, shutdown timeouts, and query-close
-failures use the same `otelcol.node.windowsperfcounters.*` event namespace.
+`windows_perf_counters_receiver.counter.fail` with a configured path template
+and low-cardinality reason. Other runtime events are:
+
+- `windows_perf_counters_receiver.instance_limit.exceeded`
+- `windows_perf_counters_receiver.instances.change`
+- `windows_perf_counters_receiver.recovery.change`
+- `windows_perf_counters_receiver.scrape.fail`
+- `windows_perf_counters_receiver.scrape.timeout`
+- `windows_perf_counters_receiver.shutdown.timeout`
+- `windows_perf_counters_receiver.query.close.fail`
+
 Repeated scrape and counter warnings are suppressed until the affected
-condition recovers.
-Configuration emits
-`otelcol.node.windowsperfcounters.config.instance_override` when a static
-`instance` value can collapse multiple selected native instances.
+condition recovers. Configuration events are:
+
+- `windows_perf_counters_receiver.config.instance_override`
+- `windows_perf_counters_receiver.config.metric_definition.invalid_path`
+- `windows_perf_counters_receiver.config.metric_definition.case_collision`
+
+The instance-override warning reports a static `instance` value that can
+collapse multiple selected native instances. Invalid-path warnings retain the
+original malformed, padded, or overlong key. Case-collision warnings are
+deduplicated once per Unicode lowercase identity group.
 
 The `receiver.windowsperfcounters.scrapes` measurement metric set attributes
 collection attempts by outcome. The `receiver.windowsperfcounters` health
