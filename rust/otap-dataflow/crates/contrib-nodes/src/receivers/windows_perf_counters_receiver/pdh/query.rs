@@ -35,7 +35,8 @@ pub(super) struct Query<A: PdhApi = NativePdh> {
     pub(super) pending: PendingMetadata,
     wildcard_refresh_interval: Duration,
     max_instances_per_wildcard: usize,
-    max_expanded_counters: usize,
+    max_native_counters: usize,
+    exact_counter_reservations: usize,
     pub(super) last_wildcard_refresh: Instant,
 }
 
@@ -44,7 +45,7 @@ impl Query {
         configs: Vec<CounterConfig>,
         wildcard_refresh_interval: Duration,
         max_instances_per_wildcard: usize,
-        max_expanded_counters: usize,
+        max_native_counters: usize,
         node: String,
     ) -> Result<Self, Error> {
         Self::open_with(
@@ -52,7 +53,7 @@ impl Query {
             configs,
             wildcard_refresh_interval,
             max_instances_per_wildcard,
-            max_expanded_counters,
+            max_native_counters,
         )
     }
 }
@@ -63,8 +64,17 @@ impl<A: PdhApi> Query<A> {
         configs: Vec<CounterConfig>,
         wildcard_refresh_interval: Duration,
         max_instances_per_wildcard: usize,
-        max_expanded_counters: usize,
+        max_native_counters: usize,
     ) -> Result<Self, Error> {
+        let exact_counter_reservations = configs
+            .iter()
+            .filter(|config| !config.instance_config.is_wildcard())
+            .count();
+        if exact_counter_reservations > max_native_counters {
+            return Err(Error::InvalidSample(
+                "query native-counter limit is below its exact-counter reservation",
+            ));
+        }
         let start_time_unix_nano = positive_timestamp(api.timestamp()?)?;
         let mut query = Self {
             api,
@@ -76,7 +86,8 @@ impl<A: PdhApi> Query<A> {
             pending: PendingMetadata::default(),
             wildcard_refresh_interval,
             max_instances_per_wildcard,
-            max_expanded_counters,
+            max_native_counters,
+            exact_counter_reservations,
             last_wildcard_refresh: Instant::now(),
         };
         query.initialize_exact_counters();
@@ -309,7 +320,7 @@ impl<A: PdhApi> Query<A> {
             let allocation = expansion_allocation(
                 discovered,
                 self.max_instances_per_wildcard,
-                self.max_expanded_counters.saturating_sub(expanded_total),
+                self.remaining_expansion_capacity(expanded_total),
             );
             metadata.record_expansion_overflows(discovery.config_index, discovered, allocation);
             let retained = retained.into_iter().take(allocation.retained);
@@ -362,7 +373,7 @@ impl<A: PdhApi> Query<A> {
             let allocation = limit_expanded_paths(
                 &mut paths,
                 self.max_instances_per_wildcard,
-                self.max_expanded_counters.saturating_sub(expanded_total),
+                self.remaining_expansion_capacity(expanded_total),
             );
             metadata.record_expansion_overflows(config_index, discovered, allocation);
             expanded_total += paths.len();
@@ -558,8 +569,21 @@ impl<A: PdhApi> Query<A> {
             .count()
     }
 
-    pub(super) fn set_max_expanded_counters(&mut self, max_expanded_counters: usize) {
-        self.max_expanded_counters = max_expanded_counters;
+    pub(super) fn reserved_native_entry_count(&self) -> usize {
+        self.exact_counter_reservations + self.reserved_expanded_count()
+    }
+
+    pub(super) fn set_max_native_counters(
+        &mut self,
+        max_native_counters: usize,
+    ) -> Result<(), Error> {
+        if self.exact_counter_reservations > max_native_counters {
+            return Err(Error::InvalidSample(
+                "query native-counter limit is below its exact-counter reservation",
+            ));
+        }
+        self.max_native_counters = max_native_counters;
+        Ok(())
     }
 
     pub(super) fn prime(&mut self) -> Result<(), Error> {
@@ -578,6 +602,28 @@ impl<A: PdhApi> Query<A> {
                 error: error.bounded_detail(),
                 diagnostic_only: true,
             }));
+    }
+
+    fn remaining_expansion_capacity(&self, allocated_expanded: usize) -> usize {
+        self.max_native_counters
+            .saturating_sub(self.exact_counter_reservations)
+            .saturating_sub(allocated_expanded)
+    }
+
+    fn reserved_expanded_count(&self) -> usize {
+        let live = self
+            .counters
+            .values()
+            .filter(|counter| counter.origin.is_wildcard())
+            .count();
+        let retrying = self
+            .retry_states
+            .iter()
+            .filter(|(key, state)| {
+                state.target.origin.is_wildcard() && !self.counters.contains_key(*key)
+            })
+            .count();
+        live.saturating_add(retrying)
     }
 
     pub(super) fn collect(&mut self) -> Result<Sample, Error> {

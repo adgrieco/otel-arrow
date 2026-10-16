@@ -95,36 +95,42 @@ fn query_plans_isolate_recreated_source_mappings() {
     assert!(plans[2].recreate_query);
 }
 
-/// Scenario: Multiple recreated wildcard mappings compete for one receiver-wide expansion limit.
-/// Guarantees: Initial queries and overlapping replacements share the configured limit instead of multiplying it per query.
+/// Scenario: One exact mapping and multiple recreated wildcard mappings compete for one receiver-wide native-entry limit.
+/// Guarantees: Exact reservations and replacement allocations share one ownership budget so isolated queries cannot multiply retained entries.
 #[test]
-fn recreated_queries_share_receiver_expansion_limit() {
+fn recreated_queries_share_receiver_native_entry_limit() {
+    let mut exact = counter(r"\Memory\Available Bytes", "memory.available");
+    exact.source_mapping_index = 0;
     let mut first = counter(r"\Process(first*)\Private Bytes", "process.first");
     first.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
     };
     first.recreate_query = true;
-    first.source_mapping_index = 0;
+    first.source_mapping_index = 1;
     let mut second = counter(r"\Process(second*)\Private Bytes", "process.second");
     second.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
     };
     second.recreate_query = true;
-    second.source_mapping_index = 1;
+    second.source_mapping_index = 2;
 
     let observed_limits = Rc::new(RefCell::new(Vec::new()));
     let factory_limits = Rc::clone(&observed_limits);
     let mut open = move |configs: Vec<CounterConfig>, max_expanded_counters: usize| {
         factory_limits.borrow_mut().push(max_expanded_counters);
         let template = configs[0].path.clone();
-        let prefix = if configs[0].source_mapping_index == 0 {
-            "first"
+        let paths = if configs[0].instance_config.is_wildcard() {
+            let prefix = if configs[0].source_mapping_index == 1 {
+                "first"
+            } else {
+                "second"
+            };
+            (0..3)
+                .map(|index| format!(r"\Process({prefix}{index})\Private Bytes"))
+                .collect::<Vec<_>>()
         } else {
-            "second"
+            vec![template.clone()]
         };
-        let paths = (0..3)
-            .map(|index| format!(r"\Process({prefix}{index})\Private Bytes"))
-            .collect::<Vec<_>>();
         let state = Rc::new(RefCell::new(FakeState {
             counters: paths
                 .iter()
@@ -145,7 +151,12 @@ fn recreated_queries_share_receiver_expansion_limit() {
             timestamp_error: false,
             remove_error: false,
             removed: Vec::new(),
-            expansions: [(template, paths)].into_iter().collect(),
+            expansions: configs[0]
+                .instance_config
+                .is_wildcard()
+                .then_some((template, paths))
+                .into_iter()
+                .collect(),
         }));
         Query::open_with(
             FakePdh(state),
@@ -157,31 +168,131 @@ fn recreated_queries_share_receiver_expansion_limit() {
     };
 
     let mut queries = Vec::new();
-    for plan in query_plans(vec![first, second]) {
-        let active = queries
+    for plan in query_plans(vec![exact, first, second]) {
+        let reserved = queries
             .iter()
-            .map(QuerySlot::active_expanded_count)
+            .map(QuerySlot::reserved_native_entry_count)
             .sum::<usize>();
-        queries.push(QuerySlot::open_initial(plan, 4 - active, &mut open).unwrap());
+        queries.push(QuerySlot::open_initial(plan, 5 - reserved, &mut open).unwrap());
     }
     assert_eq!(
         queries
             .iter()
             .map(QuerySlot::active_expanded_count)
             .collect::<Vec<_>>(),
-        [3, 1]
+        [0, 3, 1]
     );
 
-    let sample = collect_queries(&mut queries, Duration::from_secs(30), 4, &mut open).unwrap();
+    let sample = collect_queries(&mut queries, Duration::from_secs(30), 5, &mut open).unwrap();
     assert_eq!(sample.metadata.diagnostics.active_expanded_counters, 4);
-    assert_eq!(observed_limits.borrow().as_slice(), [4, 1, 3, 1]);
+    assert_eq!(observed_limits.borrow().as_slice(), [5, 4, 1, 3, 1]);
     assert_eq!(
         queries
             .iter()
-            .map(QuerySlot::active_expanded_count)
+            .map(QuerySlot::reserved_native_entry_count)
             .sum::<usize>(),
-        4
+        5
     );
+}
+
+/// Scenario: An exact-only query is temporarily unavailable while a later query opens.
+/// Guarantees: The absent slot keeps its exact reservation so recovery cannot overcommit capacity already given to healthy peers.
+#[test]
+fn unavailable_query_reserves_exact_native_entry() {
+    let unavailable = QueryPlan {
+        configs: vec![counter(r"\Unavailable\Value", "windows.unavailable")],
+        global_indices: vec![0],
+        recreate_query: false,
+    };
+    let mut open = |_: Vec<CounterConfig>, _: usize| {
+        Err::<Query<FakePdh>, _>(Error::Pdh {
+            operation: "PdhOpenQueryW",
+            path: "<query>".to_owned(),
+            status: 1,
+        })
+    };
+    let slot = QuerySlot::open_initial(unavailable, 2, &mut open).unwrap();
+
+    assert_eq!(slot.reserved_native_entry_count(), 1);
+    assert_eq!(
+        remaining_native_capacity(2, std::iter::once(slot.reserved_native_entry_count())),
+        1
+    );
+}
+
+/// Scenario: One query combines an exact mapping with a wildcard that discovers three paths under a two-entry limit.
+/// Guarantees: Exact ownership reduces same-query expansion capacity so wildcard discovery cannot overcommit the receiver budget.
+#[test]
+fn exact_reservation_reduces_same_query_expansion_capacity() {
+    let exact_path = r"\Memory\Available Bytes";
+    let wildcard_path = r"\Process(*)\Private Bytes";
+    let expanded = (0..3)
+        .map(|index| format!(r"\Process(worker{index})\Private Bytes"))
+        .collect::<Vec<_>>();
+    let state = Rc::new(RefCell::new(FakeState {
+        counters: std::iter::once(exact_path.to_owned())
+            .chain(expanded.iter().cloned())
+            .map(|path| FakeCounter {
+                path,
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            })
+            .collect(),
+        added: Vec::new(),
+        collect_has_data: true,
+        collect_error: false,
+        timestamp: 100,
+        timestamp_error: false,
+        remove_error: false,
+        removed: Vec::new(),
+        expansions: [(wildcard_path.to_owned(), expanded)].into_iter().collect(),
+    }));
+    let mut wildcard = counter(wildcard_path, "process.private");
+    wildcard.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+
+    let query = Query::open_with(
+        FakePdh(Rc::clone(&state)),
+        vec![counter(exact_path, "memory.available"), wildcard],
+        Duration::from_secs(30),
+        256,
+        2,
+    )
+    .unwrap();
+
+    assert_eq!(query.active_expanded_count(), 1);
+    assert_eq!(query.reserved_native_entry_count(), 2);
+    assert_eq!(state.borrow().added.len(), 2);
+}
+
+/// Scenario: A worker allocation supplies fewer entries than one query's exact configurations require.
+/// Guarantees: Internal accounting corruption fails explicitly before opening native handles instead of silently exceeding the receiver limit.
+#[test]
+fn query_rejects_limit_below_exact_reservation() {
+    let result = Query::open_with(
+        StartupTestPdh {
+            dropped: Arc::new(AtomicBool::new(false)),
+        },
+        vec![
+            counter(r"\Memory\Available Bytes", "memory.available"),
+            counter(r"\System\Processes", "system.processes"),
+        ],
+        Duration::from_secs(30),
+        256,
+        1,
+    );
+
+    assert!(matches!(
+        result,
+        Err(Error::InvalidSample(
+            "query native-counter limit is below its exact-counter reservation"
+        ))
+    ));
 }
 
 /// Scenario: A delta mapping and a recreated peer collect through separate queries with different clocks.

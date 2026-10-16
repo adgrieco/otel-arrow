@@ -1,0 +1,5 @@
+change_type: bug_fix
+component: pipeline
+note: Apply the Windows performance-counter receiver-wide limit to exact and wildcard-expanded native counters.
+issues: [4074]
+subtext: Remove the separate 256 configured-path cap. Exact paths reserve capacity for retries, while wildcard templates consume capacity only for concrete expansions.

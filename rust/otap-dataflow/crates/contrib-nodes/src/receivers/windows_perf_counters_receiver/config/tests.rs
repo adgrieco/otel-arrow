@@ -994,11 +994,11 @@ fn normalizes_unrestricted_metric_units() {
     }
 }
 
-/// Scenario: More than 256 metric definitions are configured but only one is referenced.
-/// Guarantees: Unused metadata definitions do not consume the configured PDH path budget.
+/// Scenario: More metric definitions are configured than the default native-counter budget.
+/// Guarantees: Unused metadata cannot prevent an otherwise bounded receiver configuration from starting.
 #[test]
-fn allows_metric_definitions_beyond_counter_path_limit() {
-    let metrics = (0..=MAX_CONFIGURED_COUNTER_PATHS)
+fn allows_metric_definitions_beyond_native_counter_limit() {
+    let metrics = (0..=DEFAULT_MAX_EXPANDED_COUNTERS)
         .map(|index| (format!("m{index}"), metric()))
         .collect::<serde_json::Map<_, _>>();
     let config = Config::from_json(&json!({
@@ -1238,10 +1238,10 @@ fn handles_blank_native_components_and_aggregation() {
     }
 }
 
-/// Scenario: Instance and counter lists multiply beyond the normalized path cap.
-/// Guarantees: The total is rejected before allocating the expanded path vector.
+/// Scenario: Explicit instances and counter mappings produce more exact paths than the configured native-entry budget.
+/// Guarantees: Exact handles cannot bypass the receiver-wide bound that also limits wildcard expansion.
 #[test]
-fn bounds_expanded_counter_paths_before_materialization() {
+fn bounds_exact_paths_by_native_counter_budget() {
     let object = |instances: usize, counters: usize| {
         json!({
             "object": "Process",
@@ -1251,29 +1251,34 @@ fn bounds_expanded_counter_paths_before_materialization() {
                 .collect::<Vec<_>>()
         })
     };
-    let config =
-        |perfcounters| json!({"metrics": {"test": metric()}, "perfcounters": perfcounters});
+    let config = |perfcounters, limit| {
+        json!({
+            "metrics": {"test": metric()},
+            "perfcounters": perfcounters,
+            "max_expanded_counters": limit
+        })
+    };
     assert_eq!(
-        Config::from_json(&config(json!([object(16, 16)])))
+        Config::from_json(&config(json!([object(16, 16)]), 256))
             .unwrap()
             .counters
             .len(),
-        MAX_CONFIGURED_COUNTER_PATHS
+        256
     );
     assert_config_error(
-        config(json!([object(17, 16)])),
-        "must normalize to at most 256 counter paths",
+        config(json!([object(17, 16)]), 271),
+        "normalize to 272 exact counter paths, exceeding max_expanded_counters 271",
     );
     assert_config_error(
-        config(json!([object(1, 129), object(1, 128)])),
-        "must normalize to at most 256 counter paths",
+        config(json!([object(1, 129), object(1, 128)]), 256),
+        "normalize to 257 exact counter paths, exceeding max_expanded_counters 256",
     );
 }
 
-/// Scenario: An empty instance list accompanies exactly 256 or 257 counter mappings.
-/// Guarantees: Empty instances count like omission, accepting the configured path limit and rejecting one path beyond it.
+/// Scenario: An empty instance list accompanies 257 exact counter mappings and an equally sized native budget.
+/// Guarantees: Larger bounded deployments are not rejected by an unrelated legacy template cap.
 #[test]
-fn counts_empty_instances_at_configured_path_boundary() {
+fn allows_exact_paths_beyond_removed_template_cap() {
     let object = |counters: usize| {
         json!({
             "object": "Memory",
@@ -1283,24 +1288,22 @@ fn counts_empty_instances_at_configured_path_boundary() {
                 .collect::<Vec<_>>()
         })
     };
-
     assert_eq!(
-        Config::from_json(&json!({"perfcounters": [object(MAX_CONFIGURED_COUNTER_PATHS)]}))
-            .unwrap()
-            .counters
-            .len(),
-        MAX_CONFIGURED_COUNTER_PATHS
-    );
-    assert_config_error(
-        json!({"perfcounters": [object(MAX_CONFIGURED_COUNTER_PATHS + 1)]}),
-        "must normalize to at most 256 counter paths",
+        Config::from_json(&json!({
+            "perfcounters": [object(257)],
+            "max_expanded_counters": 257
+        }))
+        .unwrap()
+        .counters
+        .len(),
+        257
     );
 }
 
-/// Scenario: Omitted, empty, and explicit instance selections contribute to one configured path total.
-/// Guarantees: Mixed objects accept an exact total of 256 normalized paths and reject a 257th path before expansion.
+/// Scenario: Exact paths exhaust the native budget while an additional wildcard template is configured.
+/// Guarantees: Templates remain configurable without pre-consuming entries, while their concrete expansions cannot exceed the runtime budget.
 #[test]
-fn totals_configured_paths_across_mixed_instance_forms() {
+fn wildcard_templates_do_not_consume_exact_counter_budget() {
     let counters = |prefix: &str, count: usize| {
         (0..count)
             .map(|index| json!({"name": format!("{prefix} {index}")}))
@@ -1320,23 +1323,25 @@ fn totals_configured_paths_across_mixed_instance_forms() {
         "instances": ["worker", "service"],
         "counters": counters("Process", 28)
     });
-    let extra = json!({
+    let wildcard = json!({
         "object": "Processor",
-        "counters": [{"name": "Extra"}]
+        "instances": ["*"],
+        "counters": [{"name": "Wildcard"}]
     });
 
-    assert_eq!(
-        Config::from_json(&json!({
-            "perfcounters": [omitted.clone(), empty.clone(), selected.clone()]
-        }))
-        .unwrap()
-        .counters
-        .len(),
-        MAX_CONFIGURED_COUNTER_PATHS
-    );
-    assert_config_error(
-        json!({"perfcounters": [omitted, empty, selected, extra]}),
-        "must normalize to at most 256 counter paths",
+    let config = Config::from_json(&json!({
+        "perfcounters": [omitted, empty, selected, wildcard],
+        "max_expanded_counters": 256
+    }))
+    .unwrap();
+    assert_eq!(config.counters.len(), 257);
+    assert!(
+        config
+            .counters
+            .last()
+            .unwrap()
+            .instance_config
+            .is_wildcard()
     );
 }
 

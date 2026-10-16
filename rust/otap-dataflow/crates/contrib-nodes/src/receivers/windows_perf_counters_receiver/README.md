@@ -78,16 +78,18 @@ config:
 | `timeout` | No | Disabled | Optional scrape discard deadline; `0s` also disables it |
 | `wildcard_refresh_interval` | No | See below | Wildcard discovery cadence |
 | `max_instances_per_wildcard` | No | `256` | Per-path expansion limit |
-| `max_expanded_counters` | No | `4096` | Receiver-wide expansion limit |
+| `max_expanded_counters` | No | `4096` | Receiver-wide exact plus expanded native-counter limit |
 
 <!-- markdownlint-enable MD013 -->
 
 `wildcard_refresh_interval` defaults to `collection_interval` and must be at
-least that interval. Both expansion limits must be between
+least that interval. Both counter limits must be between
 `1` and `16384`, and the per-wildcard limit cannot exceed the receiver-wide
-limit. Normalization produces between 1 and 256 configured exact or wildcard
-paths, bounding query setup and native handles independently from wildcard
-membership. Zero or negative `initial_delay` starts collection immediately.
+limit. `max_expanded_counters` is retained for configuration compatibility but
+limits the combined exact and expanded native counters owned by the receiver.
+Exact paths reserve entries even while unavailable so later retry cannot exceed
+the limit. Wildcard templates do not consume entries until they resolve to
+concrete paths. Zero or negative `initial_delay` starts collection immediately.
 Sub-second collection intervals are accepted, matching Go, but rate and other
 two-sample counters generally need about one second or more between samples to
 produce meaningful values.
@@ -220,12 +222,12 @@ normalization; descriptions are exempt. Exact references resolve any matching
 definition key, including padded, malformed, alias, or overlong path-shaped
 keys; no match reports an undefined metric. A path-shaped definition that is
 not selected by an implicit configured path/template or an explicit reference
-produces one usage warning. Metric definitions have no receiver-specific count
-limit. At most 256 normalized configured exact or wildcard counter paths are
-accepted; the path total is checked before materialization. Wildcard expansion
-has separate configurable limits. Metric names, units, descriptions, and
-mapping attributes share immutable backing across explicit instance expansions;
-configuration clones preserve that backing.
+produces one usage warning. Metric definitions and configured wildcard
+templates have no separate receiver-specific count limit. Exact paths and
+concrete wildcard expansions share `max_expanded_counters`; exact paths that
+exceed it are rejected during configuration. Metric names, units, descriptions,
+and mapping attributes share immutable backing across explicit instance
+expansions; configuration clones preserve that backing.
 Configured paths are limited to 2047 UTF-16 code units. Expanded paths that
 reach PDH's 2048-unit native limit are omitted and diagnosed.
 

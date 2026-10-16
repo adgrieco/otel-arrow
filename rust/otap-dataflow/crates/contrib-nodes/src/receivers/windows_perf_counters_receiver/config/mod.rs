@@ -10,7 +10,6 @@ use std::time::Duration;
 pub(super) const MIN_SCALE_POWER10: i32 = -18;
 pub(super) const MAX_SCALE_POWER10: i32 = 18;
 
-const MAX_CONFIGURED_COUNTER_PATHS: usize = 256;
 const MAX_INSTANCE_LIMIT: usize = 16_384;
 const MAX_COUNTER_PATH_LEN: usize = 2_047;
 const DEFAULT_MAX_INSTANCES_PER_WILDCARD: usize = 256;
@@ -33,7 +32,7 @@ pub(super) struct Config {
     pub(super) wildcard_refresh_interval: Option<Duration>,
     /// Maximum expanded instances retained for one wildcard path.
     pub(super) max_instances_per_wildcard: usize,
-    /// Maximum expanded wildcard counters retained by this receiver.
+    /// Receiver-wide entries reserved for exact or retained expanded native counters.
     pub(super) max_expanded_counters: usize,
 }
 
@@ -44,8 +43,7 @@ impl Config {
             serde_json::from_value(value.clone()).map_err(|err| invalid(err.to_string()))?;
         validate_user_config(&user)?;
         let metrics = normalize_metrics(&user.metrics)?;
-        let expanded_count = expanded_counter_count(&user.perfcounters)?;
-        let counters = normalize_counters(user.perfcounters, &metrics, expanded_count)?;
+        let counters = normalize_counters(user.perfcounters, &metrics, user.max_expanded_counters)?;
         validate_counter_outputs(&counters)?;
         warn_for_unused_path_metric_definitions(&metrics, &counters);
 
@@ -264,13 +262,6 @@ enum OneOrMany {
 }
 
 impl OneOrMany {
-    fn as_slice(&self) -> &[String] {
-        match self {
-            Self::One(value) => std::slice::from_ref(value),
-            Self::Many(values) => values,
-        }
-    }
-
     fn into_vec(self) -> Vec<String> {
         match self {
             Self::One(value) => vec![value],
@@ -452,35 +443,6 @@ fn normalize_attributes(
     Ok(normalized)
 }
 
-fn expanded_counter_count(objects: &[ObjectConfig]) -> Result<usize, Error> {
-    let too_many = || {
-        invalid(format!(
-            "perfcounters must normalize to at most {MAX_CONFIGURED_COUNTER_PATHS} counter paths"
-        ))
-    };
-    let mut total = 0usize;
-    for object in objects {
-        let paths_per_counter = match &object.instances {
-            None => 1,
-            Some(instances)
-                if instances.as_slice().is_empty()
-                    || instances.as_slice().iter().any(|instance| instance == "*") =>
-            {
-                1
-            }
-            Some(instances) => instances.as_slice().len(),
-        };
-        let paths = paths_per_counter
-            .checked_mul(object.counters.len())
-            .ok_or_else(too_many)?;
-        total = total.checked_add(paths).ok_or_else(too_many)?;
-        if total > MAX_CONFIGURED_COUNTER_PATHS {
-            return Err(too_many());
-        }
-    }
-    Ok(total)
-}
-
 struct NormalizedMetric {
     description: Arc<str>,
     unit: Arc<str>,
@@ -643,15 +605,18 @@ fn warn_for_unused_path_metric_definitions(
 fn normalize_counters(
     objects: Vec<ObjectConfig>,
     metrics: &BTreeMap<Arc<str>, NormalizedMetric>,
-    capacity: usize,
+    max_native_counters: usize,
 ) -> Result<Vec<CounterConfig>, Error> {
-    let mut counters = Vec::with_capacity(capacity);
+    let mut counters = Vec::new();
     let mut source_mapping_index = 0;
+    let mut exact_counter_count = 0;
     for (object_index, object) in objects.into_iter().enumerate() {
         normalize_object(
             object_index,
             object,
             metrics,
+            max_native_counters,
+            &mut exact_counter_count,
             &mut counters,
             &mut source_mapping_index,
         )?;
@@ -663,6 +628,8 @@ fn normalize_object(
     object_index: usize,
     object: ObjectConfig,
     metrics: &BTreeMap<Arc<str>, NormalizedMetric>,
+    max_native_counters: usize,
+    exact_counter_count: &mut usize,
     output: &mut Vec<CounterConfig>,
     source_mapping_index: &mut usize,
 ) -> Result<(), Error> {
@@ -684,7 +651,14 @@ fn normalize_object(
         metrics,
     };
     for (counter_index, mapping) in object.counters.into_iter().enumerate() {
-        normalizer.normalize_mapping(counter_index, mapping, *source_mapping_index, output)?;
+        normalizer.normalize_mapping(
+            counter_index,
+            mapping,
+            *source_mapping_index,
+            max_native_counters,
+            exact_counter_count,
+            output,
+        )?;
         *source_mapping_index += 1;
     }
     Ok(())
@@ -707,6 +681,8 @@ impl ObjectNormalizer<'_> {
         counter_index: usize,
         mapping: CounterMapping,
         source_mapping_index: usize,
+        max_native_counters: usize,
+        exact_counter_count: &mut usize,
         output: &mut Vec<CounterConfig>,
     ) -> Result<(), Error> {
         let counter_field = format!(
@@ -726,6 +702,14 @@ impl ObjectNormalizer<'_> {
             .expand(self.object_name, counter_name, self.aggregation_name)
         {
             let metric = self.resolve_metric(&expanded.configured, explicit_metric.as_ref());
+            if !expanded.instance_config.is_wildcard() {
+                *exact_counter_count = exact_counter_count.saturating_add(1);
+                if *exact_counter_count > max_native_counters {
+                    return Err(invalid(format!(
+                        "perfcounters normalize to {exact_counter_count} exact counter paths, exceeding max_expanded_counters {max_native_counters}"
+                    )));
+                }
+            }
             output.push(CounterConfig {
                 path: expanded.native,
                 name: metric.name,
