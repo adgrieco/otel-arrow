@@ -3,6 +3,63 @@
 
 use super::*;
 
+struct StartupTestPdh {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for StartupTestPdh {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+}
+
+impl PdhApi for StartupTestPdh {
+    type Counter = ();
+
+    fn add(&mut self, _path: &str, _localized: bool) -> Result<Self::Counter, Error> {
+        Ok(())
+    }
+
+    fn remove(&mut self, _counter: &Self::Counter, _path: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn counter_type(&mut self, _counter: &Self::Counter, _path: &str) -> Result<u32, Error> {
+        Ok(0x0001_0100)
+    }
+
+    fn collect(&mut self) -> Result<bool, Error> {
+        Ok(true)
+    }
+
+    fn raw(&mut self, _counter: &Self::Counter, _path: &str) -> Result<Option<RawSample>, Error> {
+        Ok(None)
+    }
+
+    fn formatted(
+        &mut self,
+        _counter: &Self::Counter,
+        _path: &str,
+        _format: ValueFormat,
+    ) -> Result<Option<Number>, Error> {
+        Ok(Some(Number::Integer(42)))
+    }
+
+    fn timestamp(&mut self) -> Result<i64, Error> {
+        Ok(1)
+    }
+
+    fn expand(&mut self, _path: &str) -> Result<Vec<String>, Error> {
+        Ok(Vec::new())
+    }
+
+    fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
+        Err(Error::InvalidCounterToken {
+            path: path.to_owned(),
+        })
+    }
+}
+
 /// Scenario: Shared mappings and independently recreated mappings expand to multiple normalized paths.
 /// Guarantees: Ordinary paths share one query while every opted-in source mapping receives exactly one isolated query.
 #[test]
@@ -384,6 +441,217 @@ fn recreated_query_primes_before_swap_and_preserves_old_query_on_failure() {
         }
     }
     assert_eq!(open_calls.get(), 6);
+}
+
+/// Scenario: One initial native open remains blocked while virtual time advances beyond the former deadline.
+/// Guarantees: Slow provider work cannot become a fatal timeout; readiness waits for the completed initial pass.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn startup_longer_than_thirty_seconds_eventually_succeeds() {
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let factory_dropped = Arc::clone(&dropped);
+    let startup = Worker::start_with(
+        vec![counter(
+            r"\Memory\Available Bytes",
+            "windows.memory.available",
+        )],
+        Duration::from_secs(30),
+        4_096,
+        move |configs, max_expanded_counters| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+            Query::open_with(
+                StartupTestPdh {
+                    dropped: Arc::clone(&factory_dropped),
+                },
+                configs,
+                Duration::from_secs(30),
+                256,
+                max_expanded_counters,
+            )
+        },
+    );
+    tokio::pin!(startup);
+    tokio::select! {
+        biased;
+        _ = &mut startup => panic!("startup completed before the blocked native call"),
+        () = tokio::task::yield_now() => {}
+    }
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("worker did not begin initial query open");
+
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::select! {
+        biased;
+        _ = &mut startup => panic!("startup completed before the blocked native call"),
+        () = tokio::task::yield_now() => {}
+    }
+
+    release_tx.send(()).unwrap();
+    let worker = startup.await.unwrap();
+    tokio::time::resume();
+    drop(worker);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !dropped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("slow startup worker did not release its query");
+}
+
+/// Scenario: Control abandons startup while the first of multiple native initialization units is blocked.
+/// Guarantees: Cancellation requests cleanup and prevents later units from opening, avoiding overlapping orphan work.
+#[tokio::test(flavor = "current_thread")]
+async fn cancelling_startup_stops_between_initialization_units() {
+    let mut isolated = counter(r"\System\Processes", "windows.system.processes");
+    isolated.recreate_query = true;
+    isolated.source_mapping_index = 1;
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let open_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factory_open_calls = Arc::clone(&open_calls);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let factory_dropped = Arc::clone(&dropped);
+    let mut startup = Box::pin(Worker::start_with(
+        vec![
+            counter(r"\Memory\Available Bytes", "windows.memory.available"),
+            isolated,
+        ],
+        Duration::from_secs(30),
+        4_096,
+        move |configs, max_expanded_counters| {
+            let call = factory_open_calls.fetch_add(1, Ordering::AcqRel);
+            if call == 0 {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            }
+            Query::open_with(
+                StartupTestPdh {
+                    dropped: Arc::clone(&factory_dropped),
+                },
+                configs,
+                Duration::from_secs(30),
+                256,
+                max_expanded_counters,
+            )
+        },
+    ));
+    tokio::select! {
+        biased;
+        _ = &mut startup => panic!("startup completed before cancellation"),
+        () = tokio::task::yield_now() => {}
+    }
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("worker did not begin initial query open");
+
+    drop(startup);
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !dropped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled startup did not release its query");
+    assert_eq!(open_calls.load(Ordering::Acquire), 1);
+}
+
+/// Scenario: Initial query opens fail transiently for every slot or beside one healthy isolated slot.
+/// Guarantees: Empty and partial initial state become ready, preserve bounded evidence, and recover without restarting the receiver.
+#[tokio::test(flavor = "current_thread")]
+async fn startup_retains_recoverable_empty_and_partial_slots() {
+    for include_healthy in [false, true] {
+        let failed_path = r"\Unavailable\Value";
+        let mut counters = vec![counter(failed_path, "windows.unavailable")];
+        if include_healthy {
+            let mut healthy = counter(r"\Memory\Available Bytes", "windows.memory.available");
+            healthy.recreate_query = true;
+            healthy.source_mapping_index = 1;
+            counters.push(healthy);
+        }
+        let failed_once = Arc::new(AtomicBool::new(false));
+        let factory_failed_once = Arc::clone(&failed_once);
+        let mut worker = Worker::start_with(
+            counters,
+            Duration::ZERO,
+            4_096,
+            move |configs, max_expanded_counters| {
+                if configs[0].path == failed_path
+                    && !factory_failed_once.swap(true, Ordering::AcqRel)
+                {
+                    return Err(Error::Pdh {
+                        operation: "PdhOpenQueryW",
+                        path: "<query>".to_owned(),
+                        status: 1,
+                    });
+                }
+                Query::open_with(
+                    StartupTestPdh {
+                        dropped: Arc::new(AtomicBool::new(false)),
+                    },
+                    configs,
+                    Duration::from_secs(30),
+                    256,
+                    max_expanded_counters,
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+        let first = worker.collect().await.unwrap();
+        assert_eq!(
+            first
+                .points
+                .iter()
+                .map(|point| point.counter_index)
+                .collect::<Vec<_>>(),
+            if include_healthy { vec![1] } else { Vec::new() }
+        );
+        assert_eq!(first.metadata.failures.len(), 1);
+        assert_eq!(first.metadata.failures[0].counter_index, 0);
+        assert_eq!(first.metadata.failures[0].reason, "PdhOpenQueryW");
+        assert!(first.metadata.failures[0].diagnostic_only);
+        assert_eq!(first.metadata.diagnostics.query_rebuild_attempts, 1);
+        assert_eq!(first.metadata.diagnostics.query_rebuild_recoveries, 1);
+
+        let recovered = worker.collect().await.unwrap();
+        assert_eq!(recovered.points.len(), usize::from(include_healthy) + 1);
+        assert!(
+            worker
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap()
+        );
+    }
+}
+
+/// Scenario: Initial query construction returns a non-availability invariant error.
+/// Guarantees: Permanent startup corruption remains explicit instead of entering an endless recovery loop.
+#[tokio::test(flavor = "current_thread")]
+async fn startup_rejects_nonrecoverable_query_errors() {
+    let result = Worker::start_with::<StartupTestPdh, _>(
+        vec![counter(
+            r"\Memory\Available Bytes",
+            "windows.memory.available",
+        )],
+        Duration::from_secs(30),
+        4_096,
+        |_, _| Err(Error::InvalidSample("injected startup invariant")),
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("nonrecoverable startup error unexpectedly succeeded");
+    };
+
+    assert!(matches!(
+        error,
+        Error::InvalidSample("injected startup invariant")
+    ));
 }
 
 /// Scenario: The worker's startup prime receives a hard query collection failure.

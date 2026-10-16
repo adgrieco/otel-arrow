@@ -14,7 +14,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const QUERY_REBUILD_AFTER_FAILURES: u32 = 3;
 
 pub(super) fn should_rebuild_query(consecutive_failures: u32) -> bool {
@@ -87,25 +86,27 @@ impl Worker {
             })
             .map_err(|err| Error::WorkerStart(err.to_string()))?;
 
-        match tokio::time::timeout(INIT_TIMEOUT, init_rx).await {
-            Ok(Ok(Ok(()))) => Ok(Self {
-                tx,
-                accepted,
-                shutdown_requested,
-                join: Some(join),
-                completion: Some(completion_rx),
-            }),
-            Ok(Ok(Err(error))) => {
-                let _ = join.join();
+        let mut cancellation =
+            StartupCancellation::new(tx.clone(), Arc::clone(&shutdown_requested));
+        match init_rx.await {
+            Ok(Ok(())) => {
+                cancellation.disarm();
+                Ok(Self {
+                    tx,
+                    accepted,
+                    shutdown_requested,
+                    join: Some(join),
+                    completion: Some(completion_rx),
+                })
+            }
+            Ok(Err(error)) => {
+                cancellation.request();
+                await_worker_completion(join, completion_rx).await?;
                 Err(error)
             }
             Err(_) => {
-                shutdown_requested.store(true, Ordering::Release);
-                drop(join);
-                Err(Error::WorkerInitTimeout)
-            }
-            Ok(Err(_)) => {
-                let _ = join.join();
+                cancellation.request();
+                await_worker_completion(join, completion_rx).await?;
                 Err(Error::WorkerInitStopped)
             }
         }
@@ -151,13 +152,72 @@ impl Worker {
         match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), completion).await {
             Ok(_) => {
                 self.completion = None;
-                join.join().map_err(|_| Error::WorkerPanicked)?;
+                join_worker(join).await?;
                 Ok(true)
             }
             Err(_) => {
                 self.join = Some(join);
                 Ok(false)
             }
+        }
+    }
+}
+
+struct StartupCancellation {
+    tx: mpsc::SyncSender<Command>,
+    shutdown_requested: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl StartupCancellation {
+    fn new(tx: mpsc::SyncSender<Command>, shutdown_requested: Arc<AtomicBool>) -> Self {
+        Self {
+            tx,
+            shutdown_requested,
+            armed: true,
+        }
+    }
+
+    fn request(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        let _ = self.tx.try_send(Command::Shutdown);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartupCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.request();
+        }
+    }
+}
+
+async fn await_worker_completion(
+    join: JoinHandle<()>,
+    completion: oneshot::Receiver<()>,
+) -> Result<(), Error> {
+    let completion_result = completion.await;
+    join_worker(join).await?;
+    completion_result.map_err(|_| Error::WorkerStopped)
+}
+
+async fn join_worker(join: JoinHandle<()>) -> Result<(), Error> {
+    tokio::task::spawn_blocking(move || join.join())
+        .await
+        .map_err(|_| Error::WorkerPanicked)?
+        .map_err(|_| Error::WorkerPanicked)
+}
+
+struct CompletionSignal(Option<oneshot::Sender<()>>);
+
+impl Drop for CompletionSignal {
+    fn drop(&mut self) {
+        if let Some(completion) = self.0.take() {
+            let _ = completion.send(());
         }
     }
 }
@@ -177,14 +237,22 @@ fn run_worker_thread<A, F>(
     A: PdhApi,
     F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
 {
-    let mut queries = match open_initial_queries(plans, max_expanded_counters, open) {
-        Ok(queries) => queries,
+    let _completion = CompletionSignal(Some(completion_tx));
+    let mut queries = match open_initial_queries(
+        plans,
+        query_retry_cap,
+        max_expanded_counters,
+        open,
+        &shutdown_requested,
+    ) {
+        Ok(Some(queries)) => queries,
+        Ok(None) => return,
         Err(error) => {
             let _ = init_tx.send(Err(error));
             return;
         }
     };
-    if init_tx.send(Ok(())).is_err() {
+    if shutdown_requested.load(Ordering::Acquire) || init_tx.send(Ok(())).is_err() {
         return;
     }
     run_command_loop(
@@ -196,28 +264,36 @@ fn run_worker_thread<A, F>(
         &accepted,
         &shutdown_requested,
     );
-    drop(queries);
-    let _ = completion_tx.send(());
 }
 
 fn open_initial_queries<A, F>(
     plans: Vec<QueryPlan>,
+    query_retry_cap: Duration,
     max_expanded_counters: usize,
     open: &mut F,
-) -> Result<Vec<QuerySlot<A>>, Error>
+    shutdown_requested: &AtomicBool,
+) -> Result<Option<Vec<QuerySlot<A>>>, Error>
 where
     A: PdhApi,
     F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
 {
     let mut queries = Vec::with_capacity(plans.len());
     for plan in plans {
+        if shutdown_requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let query_limit = remaining_expansion_capacity(
             max_expanded_counters,
             queries.iter().map(QuerySlot::active_expanded_count),
         );
-        queries.push(QuerySlot::open_initial(plan, query_limit, open)?);
+        queries.push(QuerySlot::open_initial_with_retry_cap(
+            plan,
+            query_retry_cap,
+            query_limit,
+            open,
+        )?);
     }
-    Ok(queries)
+    Ok(Some(queries))
 }
 
 fn run_command_loop<A, F>(
@@ -338,6 +414,7 @@ pub(super) struct QuerySlot<A: PdhApi> {
 }
 
 impl<A: PdhApi> QuerySlot<A> {
+    #[cfg(test)]
     pub(super) fn open_initial<F>(
         plan: QueryPlan,
         max_expanded_counters: usize,
@@ -346,7 +423,49 @@ impl<A: PdhApi> QuerySlot<A> {
     where
         F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
     {
-        let mut query = open(plan.configs.clone(), max_expanded_counters)?;
+        Self::open_initial_with_retry_cap(plan, Duration::ZERO, max_expanded_counters, open)
+    }
+
+    fn open_initial_with_retry_cap<F>(
+        plan: QueryPlan,
+        query_retry_cap: Duration,
+        max_expanded_counters: usize,
+        open: &mut F,
+    ) -> Result<Self, Error>
+    where
+        F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
+    {
+        let now = Instant::now();
+        let mut query = match open(plan.configs.clone(), max_expanded_counters) {
+            Ok(query) => query,
+            Err(error) if error.is_recoverable_query_open_failure() => {
+                let reason = error.reason();
+                let detail = error.bounded_detail();
+                return Ok(Self {
+                    pending: PendingMetadata {
+                        failures: plan
+                            .configs
+                            .iter()
+                            .enumerate()
+                            .map(|(counter_index, _)| SampleFailure {
+                                counter_index,
+                                reason,
+                                error: detail.clone(),
+                                diagnostic_only: true,
+                            })
+                            .collect(),
+                        ..Default::default()
+                    },
+                    plan,
+                    query: None,
+                    query_failure_attempts: 0,
+                    next_query_retry: now,
+                    rebuild_attempts: 1,
+                    next_rebuild: now + retry_delay(1, query_retry_cap),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let prime_error = query.prime().err();
         if let Some(error) = &prime_error {
             query.record_prime_failure(error);
@@ -359,11 +478,20 @@ impl<A: PdhApi> QuerySlot<A> {
                     .as_ref()
                     .is_some_and(Error::is_query_collection_failure),
             ),
-            next_query_retry: Instant::now(),
+            next_query_retry: now,
             rebuild_attempts: 0,
-            next_rebuild: Instant::now(),
+            next_rebuild: now,
             pending: PendingMetadata::default(),
         })
+    }
+
+    fn is_recoverable_collection_error(&self, error: &Error) -> bool {
+        if self.query.is_some() {
+            error.is_collection_failure()
+        } else {
+            error.is_recoverable_query_open_failure()
+                || matches!(error, Error::QueryRecoveryPending { .. })
+        }
     }
 
     pub(super) fn collect<F>(
@@ -432,11 +560,12 @@ impl<A: PdhApi> QuerySlot<A> {
         self.pending.diagnostics.query_rebuild_attempts += 1;
         let mut rebuilt = match open(self.plan.configs.clone(), max_expanded_counters) {
             Ok(rebuilt) => rebuilt,
-            Err(error) => {
+            Err(error) if error.is_recoverable_query_open_failure() => {
                 self.rebuild_attempts = self.rebuild_attempts.saturating_add(1);
                 self.next_rebuild = now + retry_delay(self.rebuild_attempts, query_retry_cap);
                 return Err(error);
             }
+            Err(error) => return Err(error),
         };
         self.rebuild_attempts = 0;
         self.query_failure_attempts = 0;
@@ -622,7 +751,7 @@ where
                 collection_succeeded[query_index] = true;
                 samples.push(query.remap_sample(sample)?);
             }
-            Err(error) if error.is_collection_failure() => {
+            Err(error) if query.is_recoverable_collection_error(&error) => {
                 append_query_failures(&mut query_failures, &query.plan, &error);
                 if first_collection_error.is_none() {
                     first_collection_error = Some(error);

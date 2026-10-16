@@ -1,0 +1,5 @@
+change_type: bug_fix
+component: pipeline
+note: Allow slow or temporarily unavailable Windows performance-counter queries to recover without a fixed startup timeout.
+issues: [4074]
+subtext: Startup remains responsive to drain and shutdown. Recoverable query-open failures retain pending slots while permanent configuration and invariant failures remain explicit.

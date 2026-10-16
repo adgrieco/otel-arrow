@@ -40,8 +40,6 @@ pub(in super::super) enum Error {
     Scale { path: String, source: ScaleError },
     #[error("failed to start PDH worker thread: {0}")]
     WorkerStart(String),
-    #[error("PDH worker initialization timed out after 30 seconds")]
-    WorkerInitTimeout,
     #[error("PDH worker stopped before initialization completed")]
     WorkerInitStopped,
     #[error("a performance-counter collection request is already pending")]
@@ -90,6 +88,16 @@ impl Error {
         )
     }
 
+    pub(super) fn is_recoverable_query_open_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Pdh {
+                operation: "PdhOpenQueryW",
+                ..
+            }
+        )
+    }
+
     pub(super) fn is_invalid_counter_handle_read(&self) -> bool {
         matches!(
             self,
@@ -112,7 +120,6 @@ impl Error {
             Self::Calculation { .. } => "calculation",
             Self::Scale { .. } => "scale",
             Self::WorkerStart(_) => "worker_start",
-            Self::WorkerInitTimeout => "worker_init_timeout",
             Self::WorkerInitStopped => "worker_init_stopped",
             Self::WorkerBusy => "worker_busy",
             Self::WorkerStopped => "worker_stopped",

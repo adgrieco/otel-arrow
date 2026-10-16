@@ -311,6 +311,13 @@ scrape. A priming collection, timestamp, or refresh failure is retained as
 bounded diagnostics while the worker starts and follows its normal retry and
 query-rebuild policy. No-data, invalid, or counter-local failures retain their
 normal omission and diagnostic behavior without fabricating readiness.
+The initial pass has no fixed timeout. Drain or shutdown remains responsive and
+requests worker cleanup, but a native call already in progress must return
+before its query resources can be released. A transient `PdhOpenQueryW`
+failure leaves that query slot pending with bounded exponential retry; healthy
+slots can become ready after the same initial pass, and an entirely pending
+set can recover on later scrapes. Thread-start, configuration, and invariant
+failures still reject startup explicitly.
 
 - Wildcards are expanded at startup and then at
   `wildcard_refresh_interval`. Concrete paths are joined by configured counter
