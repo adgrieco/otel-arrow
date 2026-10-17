@@ -148,7 +148,7 @@ fn interleaved_query_plans_remap_points_and_preserve_query_timestamps() {
         sample
             .points
             .iter()
-            .map(|point| point.path.as_str())
+            .map(|point| point.path.as_ref())
             .collect::<Vec<_>>(),
         [
             r"\Shared(first)\Value",
@@ -210,6 +210,7 @@ fn recreated_queries_share_receiver_native_entry_limit() {
                 })
                 .collect(),
             added: Vec::new(),
+            calls: FakeNativeCalls::default(),
             collect_has_data: true,
             collect_error: false,
             timestamp: 100,
@@ -308,6 +309,7 @@ fn exact_reservation_reduces_same_query_expansion_capacity() {
             })
             .collect(),
         added: Vec::new(),
+        calls: FakeNativeCalls::default(),
         collect_has_data: true,
         collect_error: false,
         timestamp: 100,

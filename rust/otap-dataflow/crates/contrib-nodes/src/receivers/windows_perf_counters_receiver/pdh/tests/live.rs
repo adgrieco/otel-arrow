@@ -30,9 +30,9 @@ async fn live_pdh_persistent_worker_reuses_and_closes_query() {
             |point| matches!(point.value, SampleValue::Value(Number::Integer(value)) if value >= 0)
         ));
         assert_eq!(sample.points[0].counter_index, 0);
-        assert_eq!(sample.points[0].path, r"\Memory\Available Bytes");
+        assert_eq!(sample.points[0].path.as_ref(), r"\Memory\Available Bytes");
         assert_eq!(sample.points[1].counter_index, 1);
-        assert_eq!(sample.points[1].path, r"\Memory\Committed Bytes");
+        assert_eq!(sample.points[1].path.as_ref(), r"\Memory\Committed Bytes");
     }
     assert!(
         worker
@@ -310,7 +310,7 @@ async fn live_pdh_collects_exact_and_wildcard_counters() {
         .iter()
         .find(|point| point.counter_index == 0)
         .expect("exact Memory point");
-    assert_eq!(exact.path, r"\Memory\Available Bytes");
+    assert_eq!(exact.path.as_ref(), r"\Memory\Available Bytes");
     assert!(exact.instance.is_none());
     assert!(matches!(
         exact.value,
@@ -330,7 +330,7 @@ async fn live_pdh_collects_exact_and_wildcard_counters() {
     assert_eq!(keys.len(), wildcard.len());
     assert!(wildcard.iter().all(|point| {
         point.instance.is_some()
-            && point.path != r"\Process(*)\Private Bytes"
+            && point.path.as_ref() != r"\Process(*)\Private Bytes"
             && matches!(
                 point.value,
                 SampleValue::Value(Number::Integer(value)) if value >= 0
@@ -451,7 +451,7 @@ async fn live_pdh_unavailable_exact_counter_retries_after_startup() {
         sample
             .points
             .iter()
-            .any(|point| point.path == r"\Memory\Available Bytes")
+            .any(|point| point.path.as_ref() == r"\Memory\Available Bytes")
     );
     assert!(sample.metadata.failures.iter().any(|failure| {
         failure.counter_index == 1 && failure.reason == "PdhAddEnglishCounterW"
@@ -533,7 +533,7 @@ async fn live_pdh_preserves_provider_significant_counter_space() {
     }));
     assert!(sample.points.iter().any(|point| {
         point.counter_index == 2
-            && point.path == r"\Memory\Available Bytes"
+            && point.path.as_ref() == r"\Memory\Available Bytes"
             && matches!(
                 point.value,
                 SampleValue::Value(Number::Integer(value)) if value >= 0
@@ -605,7 +605,7 @@ async fn live_pdh_collects_backslashed_paging_file_instance() {
     );
     assert!(sample.points.iter().any(|point| {
         point.counter_index == 0
-            && point.path == r"\Paging File(C:\pagefile.sys)\% Usage"
+            && point.path.as_ref() == r"\Paging File(C:\pagefile.sys)\% Usage"
             && matches!(
                 point.value,
                 SampleValue::Value(Number::Double(value)) if value.is_finite() && value >= 0.0
@@ -613,7 +613,7 @@ async fn live_pdh_collects_backslashed_paging_file_instance() {
     }));
     assert!(sample.points.iter().any(|point| {
         point.counter_index == 1
-            && point.path == r"\Memory\Available Bytes"
+            && point.path.as_ref() == r"\Memory\Available Bytes"
             && matches!(
                 point.value,
                 SampleValue::Value(Number::Integer(value)) if value >= 0
@@ -812,7 +812,7 @@ impl LiveProcessMembership {
             match point.counter_index {
                 0 => {
                     exact_points += 1;
-                    exact_valid = point.path == r"\Memory\Available Bytes"
+                    exact_valid = point.path.as_ref() == r"\Memory\Available Bytes"
                         && point.instance.is_none()
                         && matches!(
                             point.value,
@@ -821,7 +821,7 @@ impl LiveProcessMembership {
                 }
                 1 => {
                     wildcard_points += 1;
-                    let _ = wildcard_paths.insert(point.path.clone());
+                    let _ = wildcard_paths.insert(point.path.to_string());
                     match point.value {
                         SampleValue::Value(Number::Integer(id)) if id > 0 => {
                             let _ = ids.insert(id);

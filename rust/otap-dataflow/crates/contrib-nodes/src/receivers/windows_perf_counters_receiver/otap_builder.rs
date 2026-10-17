@@ -266,7 +266,7 @@ fn append_attributes(
         append(key, value);
     }
     append("windows.perf_counter.path", &point.path);
-    if point.path != counter.path {
+    if point.path.as_ref() != counter.path {
         append("windows.perf_counter.path_template", &counter.path);
     }
     if let Some(instance) = &point.instance {
@@ -475,7 +475,7 @@ mod tests {
     ) -> SamplePoint {
         SamplePoint {
             counter_index,
-            path: path.to_owned(),
+            path: Arc::from(path),
             instance: None,
             emit_instance_attribute: false,
             timestamp_unix_nano,
@@ -1633,12 +1633,12 @@ mod tests {
                 points: vec![
                     SamplePoint {
                         counter_index: 0,
-                        path: r"\Process(worker)\Private Bytes".to_owned(),
-                        instance: Some(InstanceIdentity {
+                        path: Arc::from(r"\Process(worker)\Private Bytes"),
+                        instance: Some(Arc::new(InstanceIdentity {
                             name: "worker".to_owned(),
                             parent: None,
                             index: 0,
-                        }),
+                        })),
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
@@ -1646,12 +1646,12 @@ mod tests {
                     },
                     SamplePoint {
                         counter_index: 0,
-                        path: r"\Process(worker#1)\Private Bytes".to_owned(),
-                        instance: Some(InstanceIdentity {
+                        path: Arc::from(r"\Process(worker#1)\Private Bytes"),
+                        instance: Some(Arc::new(InstanceIdentity {
                             name: "worker".to_owned(),
                             parent: Some("service".to_owned()),
                             index: 1,
-                        }),
+                        })),
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
@@ -1703,11 +1703,11 @@ mod tests {
         explicitly_included.instance_config = InstanceConfig::Wildcard {
             excluded_aggregation: None,
         };
-        let aggregate = InstanceIdentity {
+        let aggregate = Arc::new(InstanceIdentity {
             name: "_Total".to_owned(),
             parent: None,
             index: 0,
-        };
+        });
         let records = into_otap(
             &[aggregate_alone, explicitly_included],
             Sample {
@@ -1715,7 +1715,7 @@ mod tests {
                 points: vec![
                     SamplePoint {
                         counter_index: 0,
-                        path: r"\Processor(_Total)\Counter".to_owned(),
+                        path: Arc::from(r"\Processor(_Total)\Counter"),
                         instance: Some(aggregate.clone()),
                         emit_instance_attribute: false,
                         timestamp_unix_nano: 1,
@@ -1724,7 +1724,7 @@ mod tests {
                     },
                     SamplePoint {
                         counter_index: 1,
-                        path: r"\Processor(_Total)\Counter".to_owned(),
+                        path: Arc::from(r"\Processor(_Total)\Counter"),
                         instance: Some(aggregate),
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
@@ -1775,12 +1775,12 @@ mod tests {
                 points: vec![
                     SamplePoint {
                         counter_index: 0,
-                        path: r"\Process(worker)\Private Bytes".to_owned(),
-                        instance: Some(InstanceIdentity {
+                        path: Arc::from(r"\Process(worker)\Private Bytes"),
+                        instance: Some(Arc::new(InstanceIdentity {
                             name: "worker".to_owned(),
                             parent: None,
                             index: 0,
-                        }),
+                        })),
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
@@ -1788,12 +1788,12 @@ mod tests {
                     },
                     SamplePoint {
                         counter_index: 0,
-                        path: r"\Process(service)\Private Bytes".to_owned(),
-                        instance: Some(InstanceIdentity {
+                        path: Arc::from(r"\Process(service)\Private Bytes"),
+                        instance: Some(Arc::new(InstanceIdentity {
                             name: "service".to_owned(),
                             parent: None,
                             index: 0,
-                        }),
+                        })),
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,

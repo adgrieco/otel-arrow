@@ -83,6 +83,7 @@ struct FakeCounter {
 struct FakeState {
     counters: Vec<FakeCounter>,
     added: Vec<String>,
+    calls: FakeNativeCalls,
     collect_has_data: bool,
     collect_error: bool,
     timestamp: i64,
@@ -90,6 +91,16 @@ struct FakeState {
     remove_error: bool,
     removed: Vec<usize>,
     expansions: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Default)]
+struct FakeNativeCalls {
+    counter_type: usize,
+    collect: usize,
+    raw: usize,
+    formatted: usize,
+    timestamp: usize,
+    expand: usize,
 }
 
 struct FakePdh(Rc<RefCell<FakeState>>);
@@ -127,11 +138,14 @@ impl PdhApi for FakePdh {
     }
 
     fn counter_type(&mut self, counter: &Self::Counter, _path: &str) -> Result<u32, Error> {
-        Ok(self.0.borrow().counters[*counter].native_type)
+        let mut state = self.0.borrow_mut();
+        state.calls.counter_type += 1;
+        Ok(state.counters[*counter].native_type)
     }
 
     fn collect(&mut self) -> Result<bool, Error> {
-        let state = self.0.borrow();
+        let mut state = self.0.borrow_mut();
+        state.calls.collect += 1;
         if state.collect_error {
             Err(Error::Pdh {
                 operation: "PdhCollectQueryData",
@@ -144,7 +158,8 @@ impl PdhApi for FakePdh {
     }
 
     fn raw(&mut self, counter: &Self::Counter, path: &str) -> Result<Option<RawSample>, Error> {
-        let state = self.0.borrow();
+        let mut state = self.0.borrow_mut();
+        state.calls.raw += 1;
         let counter = &state.counters[*counter];
         if counter.raw_error {
             Err(Error::Pdh {
@@ -166,7 +181,8 @@ impl PdhApi for FakePdh {
         path: &str,
         format: ValueFormat,
     ) -> Result<Option<Number>, Error> {
-        let state = self.0.borrow();
+        let mut state = self.0.borrow_mut();
+        state.calls.formatted += 1;
         let counter = &state.counters[*counter];
         if counter.formatted_error {
             return Err(Error::CounterData {
@@ -186,7 +202,8 @@ impl PdhApi for FakePdh {
     }
 
     fn timestamp(&mut self) -> Result<i64, Error> {
-        let state = self.0.borrow();
+        let mut state = self.0.borrow_mut();
+        state.calls.timestamp += 1;
         if state.timestamp_error {
             Err(Error::InvalidSample("test timestamp failure"))
         } else {
@@ -195,13 +212,9 @@ impl PdhApi for FakePdh {
     }
 
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
-        Ok(self
-            .0
-            .borrow()
-            .expansions
-            .get(path)
-            .cloned()
-            .unwrap_or_default())
+        let mut state = self.0.borrow_mut();
+        state.calls.expand += 1;
+        Ok(state.expansions.get(path).cloned().unwrap_or_default())
     }
 
     fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
@@ -350,6 +363,7 @@ fn fake_query_with_refresh_interval(
     let state = Rc::new(RefCell::new(FakeState {
         counters,
         added: Vec::new(),
+        calls: FakeNativeCalls::default(),
         collect_has_data: true,
         collect_error: false,
         timestamp: 100,

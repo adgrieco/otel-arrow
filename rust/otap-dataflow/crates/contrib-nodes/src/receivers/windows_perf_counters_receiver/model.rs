@@ -4,6 +4,26 @@
 //! Portable values shared by configuration, PDH collection, and OTAP projection.
 
 use super::config::{MAX_SCALE_POWER10, MIN_SCALE_POWER10};
+use std::sync::Arc;
+
+// F6-sized measurements put the dense-index crossover above 128x128 comparisons.
+const METADATA_INDEX_WORK_THRESHOLD: usize = 32_768;
+const MAX_METADATA_INDEX_SPARSITY: usize = 4;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct MetadataKey {
+    counter_index: usize,
+    reason: &'static str,
+}
+
+impl MetadataKey {
+    fn new(counter_index: usize, reason: &'static str) -> Self {
+        Self {
+            counter_index,
+            reason,
+        }
+    }
+}
 
 /// A numeric performance-counter value.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,9 +77,9 @@ pub(super) struct SamplePoint {
     /// Index of the configured counter that defines metric metadata.
     pub(super) counter_index: usize,
     /// Exact configured path or concrete expanded wildcard path.
-    pub(super) path: String,
+    pub(super) path: Arc<str>,
     /// Parsed identity for an expanded wildcard instance.
-    pub(super) instance: Option<InstanceIdentity>,
+    pub(super) instance: Option<Arc<InstanceIdentity>>,
     /// Whether to emit the Go-compatible `instance` attribute for this point.
     pub(super) emit_instance_attribute: bool,
     /// End of this point's observation or delta interval.
@@ -145,43 +165,127 @@ pub(super) struct PendingMetadata {
 impl PendingMetadata {
     pub(super) fn merge(&mut self, delta: Self) {
         merge_diagnostics(&mut self.diagnostics, delta.diagnostics);
-        for failure in delta.failures {
-            if let Some(existing) = self.failures.iter_mut().find(|existing| {
-                existing.counter_index == failure.counter_index && existing.reason == failure.reason
-            }) {
-                *existing = failure;
-            } else {
-                self.failures.push(failure);
-            }
-        }
-        for overflow in delta.overflows {
-            if let Some(existing) = self.overflows.iter_mut().find(|existing| {
-                existing.counter_index == overflow.counter_index
-                    && existing.reason == overflow.reason
-            }) {
-                *existing = overflow;
-            } else {
-                self.overflows.push(overflow);
-            }
-        }
+        merge_latest_by_key(&mut self.failures, delta.failures, |failure| {
+            MetadataKey::new(failure.counter_index, failure.reason)
+        });
+        merge_latest_by_key(&mut self.overflows, delta.overflows, |overflow| {
+            MetadataKey::new(overflow.counter_index, overflow.reason)
+        });
     }
 
     pub(super) fn merge_older(&mut self, older: Self) {
         merge_diagnostics(&mut self.diagnostics, older.diagnostics);
-        for failure in older.failures {
-            if !self.failures.iter().any(|existing| {
-                existing.counter_index == failure.counter_index && existing.reason == failure.reason
-            }) {
-                self.failures.push(failure);
+        merge_older_by_key(&mut self.failures, older.failures, |failure| {
+            MetadataKey::new(failure.counter_index, failure.reason)
+        });
+        merge_older_by_key(&mut self.overflows, older.overflows, |overflow| {
+            MetadataKey::new(overflow.counter_index, overflow.reason)
+        });
+    }
+}
+
+fn merge_latest_by_key<T>(current: &mut Vec<T>, latest: Vec<T>, key: impl Fn(&T) -> MetadataKey) {
+    if latest.is_empty() {
+        return;
+    }
+    if current.len().saturating_mul(latest.len()) <= METADATA_INDEX_WORK_THRESHOLD {
+        merge_latest_linearly(current, latest, key);
+        return;
+    }
+    let Some(mut indices) = dense_metadata_indices(current, &latest, &key) else {
+        merge_latest_linearly(current, latest, key);
+        return;
+    };
+    for item in latest {
+        let item_key = key(&item);
+        let existing_index = indices[item_key.counter_index]
+            .filter(|&index| key(&current[index]) == item_key)
+            .or_else(|| {
+                current
+                    .iter()
+                    .position(|existing| key(existing) == item_key)
+            });
+        if let Some(index) = existing_index {
+            current[index] = item;
+        } else {
+            let index = current.len();
+            current.push(item);
+            if indices[item_key.counter_index].is_none() {
+                indices[item_key.counter_index] = Some(index);
             }
         }
-        for overflow in older.overflows {
-            if !self.overflows.iter().any(|existing| {
-                existing.counter_index == overflow.counter_index
-                    && existing.reason == overflow.reason
-            }) {
-                self.overflows.push(overflow);
+    }
+}
+
+fn merge_older_by_key<T>(current: &mut Vec<T>, older: Vec<T>, key: impl Fn(&T) -> MetadataKey) {
+    if older.is_empty() {
+        return;
+    }
+    if current.len().saturating_mul(older.len()) <= METADATA_INDEX_WORK_THRESHOLD {
+        merge_older_linearly(current, older, key);
+        return;
+    }
+    let Some(mut indices) = dense_metadata_indices(current, &older, &key) else {
+        merge_older_linearly(current, older, key);
+        return;
+    };
+    for item in older {
+        let item_key = key(&item);
+        let existing = indices[item_key.counter_index]
+            .is_some_and(|index| key(&current[index]) == item_key)
+            || current.iter().any(|existing| key(existing) == item_key);
+        if !existing {
+            let index = current.len();
+            current.push(item);
+            if indices[item_key.counter_index].is_none() {
+                indices[item_key.counter_index] = Some(index);
             }
+        }
+    }
+}
+
+fn dense_metadata_indices<T>(
+    current: &[T],
+    incoming: &[T],
+    key: &impl Fn(&T) -> MetadataKey,
+) -> Option<Vec<Option<usize>>> {
+    let entry_count = current.len().saturating_add(incoming.len());
+    let slot_count = current
+        .iter()
+        .chain(incoming)
+        .map(|item| key(item).counter_index)
+        .max()?
+        .checked_add(1)?;
+    if slot_count > entry_count.saturating_mul(MAX_METADATA_INDEX_SPARSITY) {
+        return None;
+    }
+    let mut indices = vec![None; slot_count];
+    for (index, item) in current.iter().enumerate() {
+        let slot = &mut indices[key(item).counter_index];
+        if slot.is_none() {
+            *slot = Some(index);
+        }
+    }
+    Some(indices)
+}
+
+fn merge_latest_linearly<T>(current: &mut Vec<T>, latest: Vec<T>, key: impl Fn(&T) -> MetadataKey) {
+    for item in latest {
+        if let Some(existing) = current
+            .iter_mut()
+            .find(|existing| key(existing) == key(&item))
+        {
+            *existing = item;
+        } else {
+            current.push(item);
+        }
+    }
+}
+
+fn merge_older_linearly<T>(current: &mut Vec<T>, older: Vec<T>, key: impl Fn(&T) -> MetadataKey) {
+    for item in older {
+        if !current.iter().any(|existing| key(existing) == key(&item)) {
+            current.push(item);
         }
     }
 }
@@ -270,6 +374,99 @@ fn scale_factor(power10: i32) -> Result<i64, ScaleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failure(counter_index: usize, detail: &str) -> SampleFailure {
+        SampleFailure {
+            counter_index,
+            reason: "n12",
+            error: detail.to_owned(),
+            diagnostic_only: false,
+        }
+    }
+
+    fn metadata(size: usize, detail: &str) -> PendingMetadata {
+        PendingMetadata {
+            failures: (0..size).map(|index| failure(index, detail)).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Scenario: A high-cardinality merge updates every existing key, repeats one key, and appends one new key.
+    /// Guarantees: Indexed merging preserves first-position ordering while the newest evidence wins, keeping diagnostic output stable and current.
+    #[test]
+    fn metadata_merge_preserves_order_and_latest_values() {
+        let mut current = metadata(256, "current");
+        let mut latest = metadata(256, "latest");
+        latest.failures.push(failure(0, "final"));
+        latest.failures.push(failure(256, "new"));
+
+        current.merge(latest);
+
+        assert_eq!(current.failures.len(), 257);
+        assert_eq!(current.failures[0].counter_index, 0);
+        assert_eq!(current.failures[0].error, "final");
+        assert_eq!(current.failures[255].counter_index, 255);
+        assert_eq!(current.failures[255].error, "latest");
+        assert_eq!(current.failures[256].counter_index, 256);
+        assert_eq!(current.failures[256].error, "new");
+    }
+
+    /// Scenario: Newer and older batches each repeat one key while the destination is empty.
+    /// Guarantees: Initial merges retain the established last-newer and first-older rules so startup evidence stays deterministic.
+    #[test]
+    fn empty_metadata_merge_deduplicates_by_freshness() {
+        let mut latest_target = PendingMetadata::default();
+        latest_target.merge(PendingMetadata {
+            failures: vec![failure(0, "first"), failure(0, "last")],
+            ..Default::default()
+        });
+        assert_eq!(latest_target.failures.len(), 1);
+        assert_eq!(latest_target.failures[0].error, "last");
+
+        let mut older_target = PendingMetadata::default();
+        older_target.merge_older(PendingMetadata {
+            failures: vec![failure(0, "first"), failure(0, "last")],
+            ..Default::default()
+        });
+        assert_eq!(older_target.failures.len(), 1);
+        assert_eq!(older_target.failures[0].error, "first");
+    }
+
+    /// Scenario: High-cardinality pending metadata overlaps current evidence and repeats a previously unseen older key.
+    /// Guarantees: Recovery cannot replace newer diagnostics, and the first retained older detail remains deterministic for operators.
+    #[test]
+    fn older_metadata_never_overwrites_current_values() {
+        let mut current = metadata(256, "current");
+        let mut older = metadata(256, "older");
+        older.failures.push(failure(256, "first older"));
+        older.failures.push(failure(256, "second older"));
+
+        current.merge_older(older);
+
+        assert_eq!(current.failures.len(), 257);
+        assert!(
+            current.failures[..256]
+                .iter()
+                .all(|failure| failure.error == "current")
+        );
+        assert_eq!(current.failures[256].counter_index, 256);
+        assert_eq!(current.failures[256].error, "first older");
+    }
+
+    /// Scenario: Metadata contains a sparse, pathological counter index that cannot use a dense lookup.
+    /// Guarantees: The optimization declines disproportionate storage so malformed evidence cannot trigger an unbounded allocation.
+    #[test]
+    fn metadata_index_rejects_sparse_storage() {
+        let current = vec![failure(usize::MAX, "current")];
+        let incoming = vec![failure(0, "incoming")];
+
+        assert!(
+            dense_metadata_indices(&current, &incoming, &|failure| {
+                MetadataKey::new(failure.counter_index, failure.reason)
+            })
+            .is_none()
+        );
+    }
 
     /// Scenario: Integer values use zero, positive, negative and boundary decimal scales.
     /// Guarantees: Zero scale preserves signed integers; every nonzero scale returns a double.

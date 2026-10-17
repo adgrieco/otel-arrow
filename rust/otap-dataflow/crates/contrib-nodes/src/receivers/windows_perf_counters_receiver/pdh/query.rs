@@ -21,6 +21,7 @@ use super::timing::{
 };
 use super::{PdhApi, ValueFormat};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Performance::PDH_MAX_COUNTER_PATH;
 
@@ -102,11 +103,11 @@ impl<A: PdhApi> Query<A> {
             if self.configs[config_index].instance_config.is_wildcard() {
                 continue;
             }
-            let path = self.configs[config_index].path.clone();
+            let path = Arc::<str>::from(self.configs[config_index].path.as_str());
             let key = CounterKey::new(config_index, &path);
             let instance = if self.configs[config_index].instance_config.has_instance() {
                 match self.api.parse_instance(&path) {
-                    Ok(instance) => Some(instance),
+                    Ok(instance) => Some(Arc::new(instance)),
                     Err(error) => {
                         let mut failure = sample_failure(config_index, &error);
                         failure.diagnostic_only = true;
@@ -384,7 +385,7 @@ impl<A: PdhApi> Query<A> {
                                 && !aggregation_only;
                         let _ = desired.insert(
                             key,
-                            DesiredCounter::new(path, instance, emit_instance_attribute),
+                            DesiredCounter::new(path, Arc::new(instance), emit_instance_attribute),
                         );
                     }
                     Err(error) => {
@@ -424,20 +425,20 @@ impl<A: PdhApi> Query<A> {
             self.counters
                 .iter()
                 .filter_map(|(key, counter)| {
-                    counter.instance.as_ref().map(|instance| (key, instance))
+                    counter.instance.as_deref().map(|instance| (key, instance))
                 })
                 .chain(self.retry_states.iter().filter_map(|(key, state)| {
                     state
                         .target
                         .instance
-                        .as_ref()
+                        .as_deref()
                         .map(|instance| (key, instance))
                 })),
         );
         let wanted_groups = instance_groups(
             desired
                 .iter()
-                .map(|(key, counter)| (key, &counter.instance)),
+                .map(|(key, counter)| (key, counter.instance.as_ref())),
         );
         let (removed, added) = refresh_changes_with_group_resets(
             &live,
@@ -794,15 +795,19 @@ fn validate_positive_multi_base(path: &str, base: u32) -> Result<(), Error> {
 }
 
 struct DesiredCounter {
-    path: String,
-    instance: InstanceIdentity,
+    path: Arc<str>,
+    instance: Arc<InstanceIdentity>,
     emit_instance_attribute: bool,
 }
 
 impl DesiredCounter {
-    fn new(path: String, instance: InstanceIdentity, emit_instance_attribute: bool) -> Self {
+    fn new(
+        path: impl Into<Arc<str>>,
+        instance: Arc<InstanceIdentity>,
+        emit_instance_attribute: bool,
+    ) -> Self {
         Self {
-            path,
+            path: path.into(),
             instance,
             emit_instance_attribute,
         }
@@ -840,9 +845,9 @@ pub(super) fn exact_add_failure_disposition(error: &Error) -> ExactAddFailureDis
 #[derive(Clone)]
 struct CounterTarget {
     config_index: usize,
-    path: String,
+    path: Arc<str>,
     origin: CounterOrigin,
-    instance: Option<InstanceIdentity>,
+    instance: Option<Arc<InstanceIdentity>>,
     emit_instance_attribute: bool,
 }
 
@@ -946,13 +951,13 @@ fn restart_query_pdh_sampling<'a>(histories: impl Iterator<Item = &'a mut Counte
 
 struct CounterHandle<C> {
     config_index: usize,
-    path: String,
+    path: Arc<str>,
     handle: C,
     kind: CounterKind,
     scale_power10: i32,
     history: CounterHistory,
     origin: CounterOrigin,
-    instance: Option<InstanceIdentity>,
+    instance: Option<Arc<InstanceIdentity>>,
     emit_instance_attribute: bool,
 }
 
@@ -1109,7 +1114,7 @@ impl<C> CounterHandle<C> {
             Number::Double(value) => scale_double(value, self.scale_power10),
         }
         .map_err(|source| Error::Scale {
-            path: self.path.clone(),
+            path: self.path.to_string(),
             source,
         })
     }
@@ -1174,13 +1179,13 @@ mod tests {
         let key = CounterKey::new(0, r"\Process(worker)\Private Bytes");
         let target = CounterTarget {
             config_index: 0,
-            path: r"\Process(worker)\Private Bytes".to_owned(),
+            path: Arc::from(r"\Process(worker)\Private Bytes"),
             origin: CounterOrigin::Wildcard,
-            instance: Some(InstanceIdentity {
+            instance: Some(Arc::new(InstanceIdentity {
                 name: "worker".to_owned(),
                 parent: None,
                 index: 0,
-            }),
+            })),
             emit_instance_attribute: true,
         };
         let now = Instant::now();

@@ -610,11 +610,11 @@ fn exact_instance_path_preserves_identity() {
     let sample = query.collect().unwrap();
     assert_eq!(
         sample.points[0].instance,
-        Some(InstanceIdentity {
+        Some(Arc::new(InstanceIdentity {
             name: "worker".to_owned(),
             parent: None,
             index: 1,
-        })
+        }))
     );
 }
 
@@ -649,6 +649,63 @@ fn exact_instance_parse_failure_preserves_value() {
     assert_eq!(sample.metadata.diagnostics.counter_add_failures, 0);
 }
 
+/// Scenario: One wildcard expands to the F6 limit of 256 direct counters and produces one sample.
+/// Guarantees: Sharing point identity changes no PDH work: discovery, setup, collection, reads, and timestamps remain one-for-one with native entries.
+#[test]
+fn high_cardinality_collection_preserves_native_call_counts() {
+    let template = r"\Process(*)\Private Bytes";
+    let paths = (0..256)
+        .map(|index| format!(r"\Process(worker{index})\Private Bytes"))
+        .collect::<Vec<_>>();
+    let state = Rc::new(RefCell::new(FakeState {
+        counters: paths
+            .iter()
+            .map(|path| FakeCounter {
+                path: path.clone(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            })
+            .collect(),
+        added: Vec::new(),
+        calls: FakeNativeCalls::default(),
+        collect_has_data: true,
+        collect_error: false,
+        timestamp: 100,
+        timestamp_error: false,
+        remove_error: false,
+        removed: Vec::new(),
+        expansions: [(template.to_owned(), paths)].into_iter().collect(),
+    }));
+    let mut config = counter(template, "process.private");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let mut query = Query::open_with(
+        FakePdh(Rc::clone(&state)),
+        vec![config],
+        Duration::from_secs(60),
+        256,
+        256,
+    )
+    .unwrap();
+
+    let sample = query.collect().unwrap();
+    let state = state.borrow();
+
+    assert_eq!(sample.points.len(), 256);
+    assert_eq!(state.added.len(), 256);
+    assert_eq!(state.calls.counter_type, 256);
+    assert_eq!(state.calls.collect, 1);
+    assert_eq!(state.calls.raw, 0);
+    assert_eq!(state.calls.formatted, 256);
+    assert_eq!(state.calls.timestamp, 2);
+    assert_eq!(state.calls.expand, 1);
+}
+
 /// Scenario: Counter inspection fails and native cleanup also reports an error.
 /// Guarantees: The counter-local diagnostic preserves both failures instead of silently dropping cleanup evidence.
 #[test]
@@ -665,6 +722,7 @@ fn setup_diagnostic_preserves_cleanup_failure() {
             formatted_error: false,
         }],
         added: Vec::new(),
+        calls: FakeNativeCalls::default(),
         collect_has_data: true,
         collect_error: false,
         timestamp: 100,
