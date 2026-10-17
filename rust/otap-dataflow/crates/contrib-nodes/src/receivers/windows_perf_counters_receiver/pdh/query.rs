@@ -12,7 +12,7 @@ use super::counter_type::{CounterKind, classify_native_type, validate_metric_map
 use super::error::{Error, sample_failure};
 use super::expansion::{
     CounterKey, ExpansionAllocation, cleanup_aggregation_instances, expansion_allocation,
-    instance_groups, limit_expanded_paths, refresh_changes_with_group_resets,
+    instance_groups, keyed_expanded_paths, limit_expanded_paths, refresh_changes_with_group_resets,
 };
 use super::native::NativePdh;
 use super::timing::{
@@ -367,8 +367,7 @@ impl<A: PdhApi> Query<A> {
                 });
                 paths.retain(|path| path.encode_utf16().count() < PDH_MAX_COUNTER_PATH as usize);
             }
-            paths.sort_by_key(|path| path.to_lowercase());
-            paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+            let mut paths = keyed_expanded_paths(config_index, paths);
             let discovered = paths.len();
             let allocation = limit_expanded_paths(
                 &mut paths,
@@ -377,8 +376,7 @@ impl<A: PdhApi> Query<A> {
             );
             metadata.record_expansion_overflows(config_index, discovered, allocation);
             expanded_total += paths.len();
-            for path in paths {
-                let key = CounterKey::new(config_index, &path);
+            for (key, path) in paths {
                 match self.api.parse_instance(&path) {
                     Ok(instance) => {
                         let emit_instance_attribute =

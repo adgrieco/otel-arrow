@@ -330,6 +330,39 @@ async fn live_pdh_collects_exact_and_wildcard_counters() {
     );
 }
 
+/// Scenario: Windows expands canonical and mixed-ASCII-case spellings of the same Process wildcard.
+/// Guarantees: Native case-insensitive lookup returns exactly the same provider-spelled concrete membership.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+async fn live_pdh_ascii_case_variants_share_native_membership() {
+    let _serial = TEST_PDH_LOCK.lock().await;
+    let mut canonical = counter(r"\Process(*)\ID Process", "process.id.canonical");
+    canonical.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let mut variant = counter(r"\pRoCeSs(*)\iD pRoCeSs", "process.id.variant");
+    variant.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let mut query = open_live_query(vec![canonical, variant], "ascii-case");
+    let sample = query.collect().unwrap();
+    assert!(
+        sample.metadata.failures.is_empty(),
+        "{:#?}",
+        sample.metadata
+    );
+    let paths = [0, 1].map(|counter_index| {
+        sample
+            .points
+            .iter()
+            .filter(|point| point.counter_index == counter_index)
+            .map(|point| point.path.clone())
+            .collect::<BTreeSet<_>>()
+    });
+    assert!(!paths[0].is_empty());
+    assert_eq!(paths[0], paths[1]);
+}
+
 /// Scenario: Worker startup primes common disk queue-length and precision-timer counters.
 /// Guarantees: Both two-sample families produce finite values on the first requested scrape.
 #[tokio::test(flavor = "current_thread")]

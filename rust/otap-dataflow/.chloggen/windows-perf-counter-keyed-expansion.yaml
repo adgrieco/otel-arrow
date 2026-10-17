@@ -1,0 +1,5 @@
+change_type: bug_fix
+component: pipeline
+note: Apply Windows counter identity before wildcard sorting, deduplication, and limits.
+issues: [4074]
+subtext: Case-equivalent expanded paths now consume one receiver budget entry while preserving a deterministic native provider spelling.

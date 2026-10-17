@@ -944,6 +944,32 @@ fn stable_keys_do_not_depend_on_expansion_order() {
     );
 }
 
+/// Scenario: Discovery returns two non-ASCII case variants of one path plus one distinct path at the budget limit.
+/// Guarantees: CounterKey identity removes the collision before counting so aliases cannot consume capacity or replace native spelling by order.
+#[test]
+fn non_ascii_case_collisions_share_one_budgeted_key() {
+    let upper = format!(r"\Object({})\Value", "\u{00C4}");
+    let lower = format!(r"\Object({})\Value", "\u{00E4}");
+    let other = r"\Object(worker)\Value".to_owned();
+    assert_eq!(CounterKey::new(0, &upper), CounterKey::new(0, &lower));
+
+    let mut paths = keyed_expanded_paths(0, vec![lower.clone(), other.clone(), upper.clone()]);
+    let allocation = limit_expanded_paths(&mut paths, 2, 2);
+
+    assert_eq!(
+        allocation,
+        ExpansionAllocation {
+            retained: 2,
+            per_wildcard_omitted: 0,
+            total_omitted: 0,
+        }
+    );
+    assert_eq!(paths.len(), 2);
+    assert!(paths.iter().any(|(_, path)| path == &upper));
+    assert!(!paths.iter().any(|(_, path)| path == &lower));
+    assert!(paths.iter().any(|(_, path)| path == &other));
+}
+
 /// Scenario: A refresh reorders retained instances while adding one and removing another.
 /// Guarantees: Only stable-key set differences change handles, so retained history cannot move positionally.
 #[test]

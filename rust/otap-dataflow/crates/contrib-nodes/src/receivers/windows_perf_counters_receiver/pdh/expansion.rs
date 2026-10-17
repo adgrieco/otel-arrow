@@ -26,8 +26,25 @@ impl CounterKey {
     }
 }
 
-pub(super) fn limit_expanded_paths(
-    paths: &mut Vec<String>,
+pub(super) fn keyed_expanded_paths(
+    config_index: usize,
+    paths: Vec<String>,
+) -> Vec<(CounterKey, String)> {
+    let mut keyed = paths
+        .into_iter()
+        .map(|path| (CounterKey::new(config_index, &path), path))
+        .collect::<Vec<_>>();
+    keyed.sort_by(|(left_key, left_path), (right_key, right_path)| {
+        left_key
+            .cmp(right_key)
+            .then_with(|| left_path.cmp(right_path))
+    });
+    keyed.dedup_by(|(left_key, _), (right_key, _)| left_key == right_key);
+    keyed
+}
+
+pub(super) fn limit_expanded_paths<T>(
+    paths: &mut Vec<T>,
     per_wildcard_limit: usize,
     total_remaining: usize,
 ) -> ExpansionAllocation {
