@@ -1,0 +1,5 @@
+change_type: bug_fix
+component: pipeline
+note: "Keep non-recreated Windows performance-counter mappings in one shared query regardless of configuration order."
+issues: [4344]
+subtext: "Interleaving mappings that recreate their query no longer splits persistent mappings into extra queries or separate sampling histories."

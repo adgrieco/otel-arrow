@@ -45,22 +45,24 @@ async fn live_pdh_persistent_worker_reuses_and_closes_query() {
     assert_eq!(after.1 - before.1, 1);
 }
 
-/// Scenario: One live calculated mapping opts into query recreation beside a persistent direct mapping.
-/// Guarantees: Every scrape replaces and primes only the opted-in query, both mappings stay ready, and shutdown closes every opened query.
+/// Scenario: One live calculated mapping opts into query recreation between two persistent direct mappings.
+/// Guarantees: Configuration interleaving cannot split the persistent query, so only the isolated query is replaced and every opened query is closed.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_recreates_and_primes_opted_in_query() {
     let _serial = TEST_PDH_LOCK.lock().await;
     let before = query_counts();
-    let shared = counter(r"\Memory\Available Bytes", "windows.memory.available");
+    let shared_first = counter(r"\Memory\Available Bytes", "windows.memory.available");
     let mut recreated = counter(
         r"\Processor(_Total)\% Processor Time",
         "windows.processor.time",
     );
     recreated.recreate_query = true;
     recreated.source_mapping_index = 1;
+    let mut shared_second = counter(r"\Memory\Committed Bytes", "windows.memory.committed");
+    shared_second.source_mapping_index = 2;
     let mut worker = Worker::start(
-        vec![shared, recreated],
+        vec![shared_first, recreated, shared_second],
         Duration::from_secs(30),
         256,
         4_096,
@@ -72,13 +74,25 @@ async fn live_pdh_recreates_and_primes_opted_in_query() {
     for _ in 0..2 {
         tokio::time::sleep(Duration::from_millis(250)).await;
         let sample = worker.collect().await.unwrap();
-        assert_eq!(sample.points.len(), 2);
+        assert_eq!(sample.points.len(), 3);
         assert!(matches!(
             sample.points[0].value,
             SampleValue::Value(Number::Integer(value)) if value >= 0
         ));
         assert!(
             matches!(sample.points[1].value, SampleValue::Value(Number::Double(value)) if value.is_finite())
+        );
+        assert!(matches!(
+            sample.points[2].value,
+            SampleValue::Value(Number::Integer(value)) if value >= 0
+        ));
+        assert_eq!(
+            sample
+                .points
+                .iter()
+                .map(|point| point.counter_index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
         );
         assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 1);
         assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 0);

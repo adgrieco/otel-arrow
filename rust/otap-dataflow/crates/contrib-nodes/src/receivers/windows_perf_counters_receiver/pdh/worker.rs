@@ -8,6 +8,7 @@ use super::super::model::{PendingMetadata, Sample, SampleDiagnostics, SampleFail
 use super::PdhApi;
 use super::error::Error;
 use super::query::{Query, retry_delay};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -398,22 +399,28 @@ pub(super) struct QueryPlan {
     pub(super) recreate_query: bool,
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum QueryPlanKey {
+    Shared,
+    Recreated(usize),
+}
+
 pub(super) fn query_plans(counters: Vec<CounterConfig>) -> Vec<QueryPlan> {
-    let mut plans = Vec::new();
+    let mut plans = Vec::<QueryPlan>::new();
+    let mut plan_indices = HashMap::<QueryPlanKey, usize>::new();
     for (global_index, counter) in counters.into_iter().enumerate() {
-        let append_to_current = plans.last().is_some_and(|plan: &QueryPlan| {
-            if counter.recreate_query {
-                plan.recreate_query
-                    && plan.configs[0].source_mapping_index == counter.source_mapping_index
-            } else {
-                !plan.recreate_query
-            }
-        });
-        if append_to_current && let Some(plan) = plans.last_mut() {
+        let key = if counter.recreate_query {
+            QueryPlanKey::Recreated(counter.source_mapping_index)
+        } else {
+            QueryPlanKey::Shared
+        };
+        if let Some(&plan_index) = plan_indices.get(&key) {
+            let plan = &mut plans[plan_index];
             plan.configs.push(counter);
             plan.global_indices.push(global_index);
             continue;
         }
+        let _ = plan_indices.insert(key, plans.len());
         plans.push(QueryPlan {
             recreate_query: counter.recreate_query,
             configs: vec![counter],

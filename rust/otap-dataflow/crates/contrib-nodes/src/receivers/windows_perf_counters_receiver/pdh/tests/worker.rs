@@ -60,8 +60,8 @@ impl PdhApi for StartupTestPdh {
     }
 }
 
-/// Scenario: Shared mappings and independently recreated mappings expand to multiple normalized paths.
-/// Guarantees: Ordinary paths share one query while every opted-in source mapping receives exactly one isolated query.
+/// Scenario: Shared and independently recreated source mappings are interleaved after expansion.
+/// Guarantees: Adjacency cannot split logical query ownership, which keeps query count and sampling history stable across configuration order.
 #[test]
 fn query_plans_isolate_recreated_source_mappings() {
     let mut shared_first = counter(r"\Shared(first)\Value", "shared.first");
@@ -80,19 +80,84 @@ fn query_plans_isolate_recreated_source_mappings() {
 
     let plans = query_plans(vec![
         shared_first,
-        shared_second,
         recreated_first,
+        shared_second,
         recreated_second,
         another_recreated,
     ]);
 
     assert_eq!(plans.len(), 3);
-    assert_eq!(plans[0].global_indices, [0, 1]);
+    assert_eq!(plans[0].global_indices, [0, 2]);
     assert!(!plans[0].recreate_query);
-    assert_eq!(plans[1].global_indices, [2, 3]);
+    assert_eq!(plans[1].global_indices, [1, 3]);
     assert!(plans[1].recreate_query);
     assert_eq!(plans[2].global_indices, [4]);
     assert!(plans[2].recreate_query);
+}
+
+/// Scenario: Shared, isolated, and shared mappings collect from interleaved configuration positions.
+/// Guarantees: Stable grouping preserves global point identity and each query's own timestamp, preventing metrics from being attributed to the wrong mapping or scrape time.
+#[test]
+fn interleaved_query_plans_remap_points_and_preserve_query_timestamps() {
+    let mut shared_first = counter(r"\Shared(first)\Value", "shared.first");
+    shared_first.source_mapping_index = 0;
+    let mut isolated = counter(r"\Isolated\Value", "isolated");
+    isolated.recreate_query = true;
+    isolated.source_mapping_index = 1;
+    let mut shared_second = counter(r"\Shared(second)\Value", "shared.second");
+    shared_second.source_mapping_index = 2;
+
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>, _max_expanded_counters: usize| {
+        let counters = configs
+            .iter()
+            .map(|config| FakeCounter {
+                path: config.path.clone(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            })
+            .collect();
+        let (state, query) = fake_query(configs, counters);
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let mut queries = query_plans(vec![shared_first, isolated, shared_second])
+        .into_iter()
+        .map(|plan| QuerySlot::open_initial(plan, 4_096, &mut open).unwrap())
+        .collect::<Vec<_>>();
+    states.borrow()[0].borrow_mut().timestamp = 110;
+    states.borrow()[1].borrow_mut().timestamp = 115;
+
+    let sample = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+
+    assert_eq!(sample.timestamp_unix_nano, 115);
+    assert_eq!(
+        sample
+            .points
+            .iter()
+            .map(|point| (point.counter_index, point.timestamp_unix_nano))
+            .collect::<Vec<_>>(),
+        [(0, 110), (1, 115), (2, 110)]
+    );
+    assert_eq!(
+        sample
+            .points
+            .iter()
+            .map(|point| point.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            r"\Shared(first)\Value",
+            r"\Isolated\Value",
+            r"\Shared(second)\Value"
+        ]
+    );
+    assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 1);
+    assert_eq!(states.borrow().len(), 3);
 }
 
 /// Scenario: One exact mapping and multiple recreated wildcard mappings compete for one receiver-wide native-entry limit.

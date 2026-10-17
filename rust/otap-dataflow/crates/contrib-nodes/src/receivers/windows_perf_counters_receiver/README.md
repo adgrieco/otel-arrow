@@ -167,7 +167,9 @@ receiver creates and primes a replacement before releasing the old query. If
 replacement construction or priming fails, collection continues with the old
 query and reports the bounded mapping failure. Wildcard-expanded instances and
 explicit instance paths from the same mapping share its isolated query;
-unrelated mappings keep their own sampling histories. Each successful
+all mappings without query recreation share one persistent query even when
+isolated mappings appear between them in configuration, and unrelated mappings
+keep their own sampling histories. Each successful
 replacement starts a new cumulative sequence, so cumulative Sum points from a
 mapping with `recreate_query: true` have a new start time on every scrape. For
 monotonic Sums, the first point published from each replacement reports
