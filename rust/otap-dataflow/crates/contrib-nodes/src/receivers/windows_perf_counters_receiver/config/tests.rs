@@ -100,6 +100,7 @@ fn normalizes_structured_configuration() {
     assert_eq!(config.initial_delay, Duration::from_secs(1));
     assert_eq!(config.timeout, None);
     assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(60));
+    assert_eq!(config.query_retry_cap(), Duration::from_secs(60));
 }
 
 /// Scenario: Timeout is omitted, positive, zero, or negative.
@@ -173,6 +174,45 @@ fn accepts_go_timing_range() {
         }),
         "must be at least collection_interval",
     );
+}
+
+/// Scenario: Wildcard refresh is omitted for short, default, and long collection intervals or set explicitly.
+/// Guarantees: Membership scans avoid high-frequency defaults while query recovery remains capped by scrape cadence.
+#[test]
+fn defaults_refresh_independently_of_query_retry() {
+    let config = |collection_interval: &str, refresh_interval: Option<&str>| {
+        let mut value = json!({
+            "perfcounters": [{
+                "object": "Process",
+                "instances": ["*"],
+                "counters": [{"name": "Private Bytes"}]
+            }],
+            "collection_interval": collection_interval
+        });
+        if let Some(refresh_interval) = refresh_interval {
+            value["wildcard_refresh_interval"] = json!(refresh_interval);
+        }
+        Config::from_json(&value).unwrap()
+    };
+
+    let short = config("5s", None);
+    assert_eq!(short.wildcard_refresh_interval(), Duration::from_secs(60));
+    assert_eq!(short.query_retry_cap(), Duration::from_secs(5));
+
+    let default = config("60s", None);
+    assert_eq!(default.wildcard_refresh_interval(), Duration::from_secs(60));
+    assert_eq!(default.query_retry_cap(), Duration::from_secs(60));
+
+    let long = config("2m", None);
+    assert_eq!(long.wildcard_refresh_interval(), Duration::from_secs(120));
+    assert_eq!(long.query_retry_cap(), Duration::from_secs(120));
+
+    let explicit = config("5s", Some("90s"));
+    assert_eq!(
+        explicit.wildcard_refresh_interval(),
+        Duration::from_secs(90)
+    );
+    assert_eq!(explicit.query_retry_cap(), Duration::from_secs(5));
 }
 
 /// Scenario: A cumulative Sum omits its optional monotonic setting.

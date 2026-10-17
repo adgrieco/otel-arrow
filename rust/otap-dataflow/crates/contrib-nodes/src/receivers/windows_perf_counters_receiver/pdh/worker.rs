@@ -30,8 +30,28 @@ pub(in super::super) struct Worker {
 }
 
 impl Worker {
-    pub(in super::super) async fn start(
+    #[cfg(test)]
+    pub(super) async fn start(
         counters: Vec<CounterConfig>,
+        wildcard_refresh_interval: Duration,
+        max_instances_per_wildcard: usize,
+        max_native_counters: usize,
+        node: String,
+    ) -> Result<Self, Error> {
+        Self::start_with_cadences(
+            counters,
+            wildcard_refresh_interval,
+            wildcard_refresh_interval,
+            max_instances_per_wildcard,
+            max_native_counters,
+            node,
+        )
+        .await
+    }
+
+    pub(in super::super) async fn start_with_cadences(
+        counters: Vec<CounterConfig>,
+        query_retry_cap: Duration,
         wildcard_refresh_interval: Duration,
         max_instances_per_wildcard: usize,
         max_native_counters: usize,
@@ -44,7 +64,7 @@ impl Worker {
         };
         Self::start_with(
             counters,
-            wildcard_refresh_interval,
+            query_retry_cap,
             max_native_counters,
             move |counters, query_limit| settings.open(counters, query_limit),
         )

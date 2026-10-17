@@ -1384,8 +1384,8 @@ fn slot_metadata_merge_keeps_newer_failure() {
     assert_eq!(pending.overflows.len(), 0);
 }
 
-/// Scenario: A counter repeatedly fails while the refresh cadence caps recovery delay.
-/// Guarantees: Retry delay grows exponentially, never becomes zero, and never exceeds the refresh cadence.
+/// Scenario: A query repeatedly fails while the collection cadence caps recovery delay.
+/// Guarantees: Query recovery stays responsive even when membership discovery uses a longer interval.
 #[test]
 fn retry_delay_is_exponential_and_capped() {
     let cap = Duration::from_secs(10);
@@ -1399,6 +1399,70 @@ fn retry_delay_is_exponential_and_capped() {
         retry_delay(1, Duration::from_secs(1)),
         Duration::from_secs(1)
     );
+}
+
+/// Scenario: Query collection repeatedly fails with a two-second retry cap and a sixty-second membership refresh.
+/// Guarantees: Recovery rebuilds on collection cadence instead of waiting for the unrelated wildcard discovery clock.
+#[test]
+fn query_recovery_cap_is_independent_of_membership_refresh() {
+    let path = r"\Memory\Available Bytes";
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
+        let (state, query) = fake_query_with_refresh_interval(
+            configs,
+            vec![FakeCounter {
+                path: path.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+            Duration::from_secs(60),
+        );
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let plan = query_plans(vec![counter(path, "system.memory.available")])
+        .pop()
+        .unwrap();
+    let mut query = QuerySlot::open_initial(plan, 4_096, &mut open).unwrap();
+    states.borrow()[0].borrow_mut().collect_error = true;
+    let start = Instant::now();
+    let cap = Duration::from_secs(2);
+
+    assert!(query.collect(start, cap, 4_096, &mut open).is_err());
+    assert!(matches!(
+        query.collect(start + Duration::from_millis(500), cap, 4_096, &mut open),
+        Err(Error::QueryRecoveryPending { .. })
+    ));
+    assert!(
+        query
+            .collect(start + Duration::from_secs(1), cap, 4_096, &mut open)
+            .is_err()
+    );
+    assert!(matches!(
+        query.collect(start + Duration::from_secs(2), cap, 4_096, &mut open),
+        Err(Error::QueryRecoveryPending { .. })
+    ));
+    assert!(
+        query
+            .collect(start + Duration::from_secs(3), cap, 4_096, &mut open)
+            .is_err()
+    );
+    assert!(matches!(
+        query.collect(start + Duration::from_secs(4), cap, 4_096, &mut open),
+        Err(Error::QueryRecoveryPending { .. })
+    ));
+
+    let rebuilt = query
+        .collect(start + Duration::from_secs(5), cap, 4_096, &mut open)
+        .unwrap();
+    assert!(rebuilt.points.is_empty());
+    assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
+    assert_eq!(states.borrow().len(), 2);
 }
 
 /// Scenario: Query collection fails transiently and then remains unavailable.

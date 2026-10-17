@@ -14,6 +14,7 @@ const MAX_INSTANCE_LIMIT: usize = 16_384;
 const MAX_COUNTER_PATH_LEN: usize = 2_047;
 const DEFAULT_MAX_INSTANCES_PER_WILDCARD: usize = 256;
 const DEFAULT_MAX_EXPANDED_COUNTERS: usize = 4_096;
+const DEFAULT_MIN_WILDCARD_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_AGGREGATION_NAME: &str = "_Total";
 const RECEIVER_ATTRIBUTE_PREFIX: &str = "windows.perf_counter.";
 
@@ -28,7 +29,7 @@ pub(super) struct Config {
     pub(super) initial_delay: Duration,
     /// Optional discard deadline for one scrape; `None` waits for completion.
     pub(super) timeout: Option<Duration>,
-    /// Time between wildcard discovery refreshes; defaults to the collection interval.
+    /// Optional time between wildcard discovery refreshes.
     pub(super) wildcard_refresh_interval: Option<Duration>,
     /// Maximum expanded instances retained for one wildcard path.
     pub(super) max_instances_per_wildcard: usize,
@@ -65,8 +66,16 @@ impl Config {
     /// Effective wildcard refresh interval.
     #[must_use]
     pub(super) fn wildcard_refresh_interval(&self) -> Duration {
-        self.wildcard_refresh_interval
-            .unwrap_or(self.collection_interval)
+        self.wildcard_refresh_interval.unwrap_or(
+            self.collection_interval
+                .max(DEFAULT_MIN_WILDCARD_REFRESH_INTERVAL),
+        )
+    }
+
+    /// Maximum query-failure and rebuild retry delay.
+    #[must_use]
+    pub(super) fn query_retry_cap(&self) -> Duration {
+        self.collection_interval
     }
 }
 

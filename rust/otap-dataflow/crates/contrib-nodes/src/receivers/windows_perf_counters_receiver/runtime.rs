@@ -421,8 +421,9 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
             Collection(Result<TerminalState, Error>),
         }
 
-        let worker_start = pdh::Worker::start(
+        let worker_start = pdh::Worker::start_with_cadences(
             self.config.counters.clone(),
+            self.config.query_retry_cap(),
             self.config.wildcard_refresh_interval(),
             self.config.max_instances_per_wildcard,
             self.config.max_expanded_counters,

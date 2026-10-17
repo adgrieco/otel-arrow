@@ -82,8 +82,9 @@ config:
 
 <!-- markdownlint-enable MD013 -->
 
-`wildcard_refresh_interval` defaults to `collection_interval` and must be at
-least that interval. Both counter limits must be between
+`wildcard_refresh_interval` defaults to the greater of `collection_interval`
+and `60s`, and an explicit value must be at least `collection_interval`. Both
+counter limits must be between
 `1` and `16384`, and the per-wildcard limit cannot exceed the receiver-wide
 limit. `max_expanded_counters` is retained for configuration compatibility but
 limits the combined exact and expanded native counters owned by the receiver.
@@ -375,8 +376,9 @@ failures still reject startup explicitly.
   preserving cumulative monotonic Sum sequences. Other query-level collection
   failures and post-collection timestamp failures apply the same reset before
   returning an error. Query collection failures retry the existing query with
-  bounded exponential backoff. Three consecutive failures rebuild the
-  worker-owned query and all counters.
+  bounded exponential backoff capped by `collection_interval`, independently
+  of wildcard discovery. Three consecutive failures rebuild the worker-owned
+  query and all counters.
 - By default, the receiver waits for an accepted scrape and delivers a late
   result with its original point timestamps. A scrape completing after
   `collection_interval` records an overrun but remains successful. Setting a
@@ -386,6 +388,9 @@ failures still reject startup explicitly.
 - Wildcard expansion is sorted before applying the configured limits. Excess
   instances are omitted, reported explicitly, and reconsidered at the next
   discovery refresh; they are never presented as a complete expansion.
+- New or removed wildcard members and terminal wildcard counter failures are
+  reconsidered only at `wildcard_refresh_interval`, so a longer discovery
+  cadence intentionally trades membership latency for lower provider cost.
 
 Each emitted point uses the collection timestamp. Non-monotonic Sum points use
 the current PDH query's opening time as their cumulative start time; a query
