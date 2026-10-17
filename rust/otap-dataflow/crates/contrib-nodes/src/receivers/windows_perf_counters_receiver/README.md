@@ -276,16 +276,18 @@ negative interval but remains ready for the next sample.
 PDH performs rate, timer, fraction, and average calculations and associates
 visible fraction, average, and multi-timer numerators with their
 provider-defined base counters. Configure only the visible numerator path.
+PDH also owns raw-fraction denominator interpretation and status handling; the
+receiver emits or omits its formatted result without a separate raw read.
 Multi-timers require a positive native `MultiCount`; an invalid zero base omits
 the point and reports a counter-local failure. The raw sample still becomes the
 baseline for the next interval because that calculation uses the next sample's
 current `MultiCount`. Standalone base counters are not metrics and are rejected.
 Elapsed-time counters format from the current sample and do not require warm-up.
 
-All mappings emit regular PDH formatted values. Raw reads are used only to
-validate provider-defined bases for fractions and averages. Geneva-specific
-Full or Factored event formats are transport and schema choices outside this
-receiver's OTAP metric contract.
+All mappings emit regular PDH formatted values. Raw reads retain successive
+sample readiness and guard the native `MultiCount` used by multi-timers.
+Geneva-specific Full or Factored event formats are transport and schema choices
+outside this receiver's OTAP metric contract.
 
 Unsupported exact or expanded counter types are omitted and diagnosed without
 suppressing healthy counters. They are not retried because their native type

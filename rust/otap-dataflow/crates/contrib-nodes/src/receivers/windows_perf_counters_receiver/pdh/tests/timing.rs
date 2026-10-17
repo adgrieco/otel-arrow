@@ -335,7 +335,7 @@ fn collection_failures_restart_calculated_readiness() {
 }
 
 /// Scenario: An elapsed-time counter has one valid collected sample.
-/// Guarantees: The receiver emits PDH's formatted seconds immediately without two-sample warm-up.
+/// Guarantees: One-sample native formulas are not delayed by readiness intended only for successive-sample counters.
 #[test]
 fn elapsed_time_emits_from_first_sample() {
     let path = r"\System\System Up Time";
@@ -358,51 +358,97 @@ fn elapsed_time_emits_from_first_sample() {
     );
 }
 
-/// Scenario: A multi-timer warms, receives a zero native multi-counter base, then recovers.
-/// Guarantees: Zero diagnoses only its interval while advancing the raw baseline for the next good sample.
+/// Scenario: A raw fraction emits, receives native omission and non-finite results, then emits again.
+/// Guarantees: PDH alone governs denominator status, while receiver validation isolates bad output without inventing warm-up.
 #[test]
-fn multi_timer_invalid_base_preserves_readiness() {
-    let path = r"\Processor Information(_Total)\% Processor Utility";
+fn raw_fraction_delegates_sampling_and_status_to_pdh() {
+    let path = r"\Memory\% Committed Bytes In Use";
     let (state, mut query) = fake_query(
-        vec![counter(path, "system.cpu.utility")],
+        vec![counter(path, "system.memory.committed")],
         vec![FakeCounter {
             path: path.to_owned(),
-            native_type: 0x2351_0500,
-            raw: Some(10),
-            multi_count: 4,
-            formatted: Some(Number::Double(25.0)),
-            raw_error: false,
+            native_type: 0x2002_0400,
+            raw: Some(0),
+            multi_count: 0,
+            formatted: Some(Number::Double(0.0)),
+            raw_error: true,
             formatted_error: false,
         }],
     );
 
     assert_eq!(
         query.collect().unwrap().points[0].value,
-        SampleValue::Warming
+        SampleValue::Value(Number::Double(0.0))
     );
-    {
-        let mut state = state.borrow_mut();
-        state.counters[0].raw = Some(20);
-        state.counters[0].multi_count = 0;
-    }
+
+    state.borrow_mut().counters[0].formatted = None;
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::NoObservation
+    );
+
+    state.borrow_mut().counters[0].formatted = Some(Number::Double(f64::NAN));
     let sample = query.collect().unwrap();
     assert!(sample.points.is_empty());
     assert_eq!(sample.metadata.failures.len(), 1);
-    assert!(
-        sample.metadata.failures[0]
-            .error
-            .contains("multi-counter base denominator must be positive")
-    );
+    assert!(sample.metadata.failures[0].error.contains("finite"));
 
-    {
-        let mut state = state.borrow_mut();
-        state.counters[0].raw = Some(30);
-        state.counters[0].multi_count = 4;
-    }
+    state.borrow_mut().counters[0].formatted = Some(Number::Double(50.0));
     assert_eq!(
         query.collect().unwrap().points[0].value,
-        SampleValue::Value(Number::Double(25.0))
+        SampleValue::Value(Number::Double(50.0))
     );
+}
+
+/// Scenario: Each multi-timer SDK family warms, receives a zero native MultiCount, then recovers.
+/// Guarantees: The only receiver-side denominator guard covers every multi-timer and preserves the next valid interval.
+#[test]
+fn all_multi_timer_invalid_bases_preserve_readiness() {
+    for native_type in [0x2241_0500, 0x2341_0500, 0x2251_0500, 0x2351_0500] {
+        let path = format!(r"\Fixture\Multi Timer {native_type:08X}");
+        let (state, mut query) = fake_query(
+            vec![counter(&path, "system.cpu.utility")],
+            vec![FakeCounter {
+                path: path.clone(),
+                native_type,
+                raw: Some(10),
+                multi_count: 4,
+                formatted: Some(Number::Double(25.0)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+        );
+
+        assert_eq!(
+            query.collect().unwrap().points[0].value,
+            SampleValue::Warming
+        );
+        {
+            let mut state = state.borrow_mut();
+            state.counters[0].raw = Some(20);
+            state.counters[0].multi_count = 0;
+        }
+        let sample = query.collect().unwrap();
+        assert!(sample.points.is_empty());
+        assert_eq!(sample.metadata.failures.len(), 1);
+        assert!(
+            sample.metadata.failures[0]
+                .error
+                .contains("multi-counter base denominator must be positive"),
+            "native type 0x{native_type:08X}"
+        );
+
+        {
+            let mut state = state.borrow_mut();
+            state.counters[0].raw = Some(30);
+            state.counters[0].multi_count = 4;
+        }
+        assert_eq!(
+            query.collect().unwrap().points[0].value,
+            SampleValue::Value(Number::Double(25.0)),
+            "native type 0x{native_type:08X}"
+        );
+    }
 }
 
 /// Scenario: A monotonic value decreases from a large value to a small value.

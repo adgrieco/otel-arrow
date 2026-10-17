@@ -777,7 +777,7 @@ mod tests {
     }
 
     /// Scenario: Windows formats successive rate, delta, timer, fraction and average samples.
-    /// Guarantees: Native formulas preserve delta differences, CPU above 100 percent, and no display scaling.
+    /// Guarantees: Native formulas, rather than receiver approximations, preserve provider semantics and uncapped values.
     #[test]
     fn native_formulas_from_raw_fixtures() {
         for (native_type, first, second, previous_first, previous_second, time_base, expected) in [
@@ -823,6 +823,27 @@ mod tests {
         }
     }
 
+    /// Scenario: Windows formats a raw-fraction fixture whose current denominator is zero.
+    /// Guarantees: The receiver preserves PDH's defined zero result instead of rejecting a valid native observation.
+    #[test]
+    fn native_raw_fraction_zero_base_formats_as_zero() {
+        let current = PDH_RAW_COUNTER {
+            CStatus: PDH_CSTATUS_VALID_DATA,
+            FirstValue: 25,
+            SecondValue: 0,
+            ..Default::default()
+        };
+        let time_base = 1;
+        let value = NativePdh::formatted_with("fixture", ValueFormat::Double, |flags, value| {
+            // SAFETY: Current and output point to initialized storage; raw fractions need no older sample.
+            unsafe {
+                PdhFormatFromRawValue(0x2002_0400, flags, &time_base, &current, null(), value)
+            }
+        })
+        .unwrap();
+        assert_eq!(value, Some(Number::Double(0.0)));
+    }
+
     /// Scenario: Windows formats elapsed time from one raw sample and no previous sample.
     /// Guarantees: PERF_ELAPSED_TIME uses the current object timestamp and frequency without two-sample warm-up.
     #[test]
@@ -844,8 +865,8 @@ mod tests {
         assert_eq!(value, Some(Number::Double(15.0)));
     }
 
-    /// Scenario: Windows formats normal and inverse system-clock and 100-nanosecond multi-timers.
-    /// Guarantees: PDH consumes each current native MultiCount without capping percentages above 100.
+    /// Scenario: Windows formats all four normal/inverse system-clock and 100-nanosecond multi-timer SDK types.
+    /// Guarantees: Fixture coverage protects every supported formula even when the local provider exposes only a subset.
     #[test]
     fn native_multi_timer_formulas_from_raw_fixtures() {
         for (

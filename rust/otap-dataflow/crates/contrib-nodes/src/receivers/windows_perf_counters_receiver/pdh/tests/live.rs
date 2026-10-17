@@ -1043,8 +1043,8 @@ async fn live_pdh_direct_queries() {
     assert!(second.collect().unwrap().metadata.failures.is_empty());
 }
 
-/// Scenario: Live PDH reads exact rates, timers, queues, fractions, and averages.
-/// Guarantees: Calculated types warm independently and later emit finite values or valid omissions.
+/// Scenario: The local Windows providers expose representative rates, timers, queues, fractions, and averages.
+/// Guarantees: Available live families follow their readiness without substituting for complete SDK fixture coverage.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_calculated_counters() {
@@ -1081,6 +1081,10 @@ async fn live_pdh_calculated_counters() {
     for index in [0, 1, 2, 4] {
         assert_eq!(warming.points[index].value, SampleValue::Warming);
     }
+    assert!(matches!(
+        warming.points[3].value,
+        SampleValue::Value(Number::Double(value)) if value.is_finite() && value >= 0.0
+    ));
     std::thread::sleep(Duration::from_millis(250));
     let sample = query.collect().unwrap();
     assert!(
@@ -1098,8 +1102,8 @@ async fn live_pdh_calculated_counters() {
     assert!(into_otap(&configs, sample).unwrap().is_some());
 }
 
-/// Scenario: Live Windows PDH reads system elapsed time and a processor multi-timer.
-/// Guarantees: Elapsed time emits on the first collection while the multi-timer warms and later emits a finite value.
+/// Scenario: The local Windows providers expose system elapsed time and one processor multi-timer.
+/// Guarantees: Live readiness is verified for available counters while fixtures protect all four multi-timer formulas.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_elapsed_and_multi_timer_counters() {

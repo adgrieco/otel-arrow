@@ -784,17 +784,6 @@ fn setup_error_with_cleanup<A: PdhApi>(
     }
 }
 
-fn validate_positive_base(path: &str, base: i64) -> Result<(), Error> {
-    if base > 0 {
-        Ok(())
-    } else {
-        Err(Error::Calculation {
-            path: path.to_owned(),
-            message: format!("base denominator must be positive, got {base}"),
-        })
-    }
-}
-
 fn validate_positive_multi_base(path: &str, base: u32) -> Result<(), Error> {
     if base > 0 {
         Ok(())
@@ -1029,7 +1018,7 @@ impl<C> CounterHandle<C> {
     ) -> Result<Option<SampleValue>, Error> {
         if matches!(
             self.kind,
-            CounterKind::Direct | CounterKind::FormattedSingleSample
+            CounterKind::Direct | CounterKind::FormattedSingleSample | CounterKind::RawFraction
         ) {
             return Ok(None);
         }
@@ -1044,11 +1033,6 @@ impl<C> CounterHandle<C> {
                 return Err(error);
             }
         };
-        if self.kind == CounterKind::RawFraction {
-            validate_positive_base(&self.path, raw.second_value)?;
-            return Ok(None);
-        }
-
         let previous = self.history.previous_base.replace(raw.second_value);
         if self.kind == CounterKind::CalculatedTwoSampleWithMultiBase {
             validate_positive_multi_base(&self.path, raw.multi_count)?;
