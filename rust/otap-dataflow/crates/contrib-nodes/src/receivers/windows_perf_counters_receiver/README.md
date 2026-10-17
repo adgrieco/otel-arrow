@@ -185,7 +185,9 @@ Configure performance object and counter names in English. Exact paths are
 added through PDH's language-neutral English API. Before wildcard expansion,
 the receiver asks PDH to translate the English template to its localized full
 path, expands that localized template, and adds the resulting concrete paths
-through the localized API.
+through the localized API. Localized exact object, instance, or counter names
+are not accepted as configuration aliases, and exact-path collection does not
+fall back to the localized API.
 
 Omit `instances`, or use an empty list, for objects without instances. Specify
 one name or a list for exact instances. Partial patterns such as `"worker*"` are
@@ -208,7 +210,13 @@ aggregate explicitly included with `"*"` retains it. The receiver also emits
 
 Explicit PDH duplicate-instance indexes are canonicalized before path and
 duplicate checks: the first occurrence omits `#0`, and leading zeroes are
-removed from later indexes.
+removed from later indexes. These indexes are positional, not durable entity
+identifiers. If same-named processes churn while their count stays unchanged,
+PDH can reuse `name#n` for a different process and a two-sample calculation can
+span the old and new process. The receiver does not infer a reset from counter
+values. Where the target host provides it, prefer `Process V2`, whose instances
+include the process ID as `name:PID`; provider availability varies by Windows
+version and installed performance-counter set.
 
 Unknown fields, explicit references to undefined metrics, duplicate instances,
 invalid intervals, unsupported scales, and duplicate outputs are configuration
@@ -339,7 +347,9 @@ failures still reject startup explicitly.
 - Removed instances stop emitting after the next discovery refresh.
 - When a sample-fraction or average base does not advance, no relevant
   operation occurred; that value is omitted rather than replaced with zero. A
-  decreasing base also omits the point and resets its baseline.
+  decreasing base also omits the point and resets its baseline. This differs
+  from the Go receiver and Windows Performance Monitor, which report an idle
+  average as zero.
 - `PDH_INVALID_DATA`, `PDH_NO_DATA`, and `PDH_CALC_NEGATIVE_*` statuses mean
   no observation. They emit no point, do not count as failures, and preserve
   the counter handle and monotonic Sum sequence. Saved PDH base history is
@@ -414,6 +424,16 @@ example combines an exact Memory counter with
 `\Process(*)\Private Bytes` and refreshes discovery every five seconds. It
 uses only built-in Windows performance counters and demonstrates bounded
 per-process expansion without requiring a separate test executable.
+
+On hosts that expose `Process V2`, using that object instead gives each process
+instance a `name:PID` identity that avoids positional duplicate-name reuse.
+Verify availability and collection on the target host before changing the
+example:
+
+```powershell
+Get-Counter -ListSet 'Process V2'
+Get-Counter '\Process V2(*)\Private Bytes' -SampleInterval 1 -MaxSamples 1
+```
 
 To check the configuration structure without starting collection:
 
