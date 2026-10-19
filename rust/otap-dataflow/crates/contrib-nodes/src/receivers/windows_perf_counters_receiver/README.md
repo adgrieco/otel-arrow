@@ -367,7 +367,8 @@ failures still reject startup explicitly.
   delivered in the same batch establish their own starts independently. Broken
   sample/configuration identity and Arrow schema errors remain fatal receiver
   invariants.
-- Counter add failures retry with exponential backoff capped by
+- Exact counter add failures retry with exponential backoff capped by
+  `collection_interval`; wildcard-expanded add failures are capped by
   `wildcard_refresh_interval`. Counter read failures omit only the affected
   point and retain the existing handle for the next scheduled collection.
 - Counter availability does not fail startup. An empty active set emits no

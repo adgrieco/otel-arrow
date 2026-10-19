@@ -34,6 +34,7 @@ pub(super) struct Query<A: PdhApi = NativePdh> {
     counters: BTreeMap<CounterKey, CounterHandle<A::Counter>>,
     retry_states: BTreeMap<CounterKey, RetryState>,
     pub(super) pending: PendingMetadata,
+    exact_retry_cap: Duration,
     wildcard_refresh_interval: Duration,
     max_instances_per_wildcard: usize,
     max_native_counters: usize,
@@ -44,14 +45,16 @@ pub(super) struct Query<A: PdhApi = NativePdh> {
 impl Query {
     pub(super) fn open(
         configs: Vec<CounterConfig>,
+        exact_retry_cap: Duration,
         wildcard_refresh_interval: Duration,
         max_instances_per_wildcard: usize,
         max_native_counters: usize,
         node: String,
     ) -> Result<Self, Error> {
-        Self::open_with(
+        Self::open_with_cadences(
             NativePdh::open(node)?,
             configs,
+            exact_retry_cap,
             wildcard_refresh_interval,
             max_instances_per_wildcard,
             max_native_counters,
@@ -60,9 +63,28 @@ impl Query {
 }
 
 impl<A: PdhApi> Query<A> {
+    #[cfg(test)]
     pub(super) fn open_with(
+        api: A,
+        configs: Vec<CounterConfig>,
+        wildcard_refresh_interval: Duration,
+        max_instances_per_wildcard: usize,
+        max_native_counters: usize,
+    ) -> Result<Self, Error> {
+        Self::open_with_cadences(
+            api,
+            configs,
+            wildcard_refresh_interval,
+            wildcard_refresh_interval,
+            max_instances_per_wildcard,
+            max_native_counters,
+        )
+    }
+
+    pub(super) fn open_with_cadences(
         mut api: A,
         configs: Vec<CounterConfig>,
+        exact_retry_cap: Duration,
         wildcard_refresh_interval: Duration,
         max_instances_per_wildcard: usize,
         max_native_counters: usize,
@@ -85,6 +107,7 @@ impl<A: PdhApi> Query<A> {
             counters: BTreeMap::new(),
             retry_states: BTreeMap::new(),
             pending: PendingMetadata::default(),
+            exact_retry_cap,
             wildcard_refresh_interval,
             max_instances_per_wildcard,
             max_native_counters,
@@ -189,13 +212,10 @@ impl<A: PdhApi> Query<A> {
     }
 
     fn schedule_retry(&mut self, key: CounterKey, target: CounterTarget, now: Instant) {
-        schedule_retry_state(
-            &mut self.retry_states,
-            key,
-            target,
-            now,
-            self.wildcard_refresh_interval,
-        );
+        let cap = target
+            .origin
+            .retry_cap(self.exact_retry_cap, self.wildcard_refresh_interval);
+        schedule_retry_state(&mut self.retry_states, key, target, now, cap);
     }
 
     fn try_add_target(
@@ -886,6 +906,13 @@ impl CounterOrigin {
     fn is_wildcard(self) -> bool {
         matches!(self, Self::Wildcard)
     }
+
+    fn retry_cap(self, exact_retry_cap: Duration, wildcard_retry_cap: Duration) -> Duration {
+        match self {
+            Self::Exact => exact_retry_cap,
+            Self::Wildcard => wildcard_retry_cap,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1235,5 +1262,22 @@ mod tests {
         let state = states.get(&key).unwrap();
         assert_eq!(state.attempts, 2);
         assert_eq!(state.next_attempt, now + Duration::from_secs(2));
+    }
+
+    /// Scenario: Exact and wildcard counter-add failures use distinct retry clocks.
+    /// Guarantees: Exact targets cap backoff at the collection retry cadence while wildcard targets retain the discovery refresh cap.
+    #[test]
+    fn retry_cap_follows_counter_origin() {
+        let exact_retry_cap = Duration::from_secs(2);
+        let wildcard_retry_cap = Duration::from_secs(60);
+
+        assert_eq!(
+            CounterOrigin::Exact.retry_cap(exact_retry_cap, wildcard_retry_cap),
+            exact_retry_cap
+        );
+        assert_eq!(
+            CounterOrigin::Wildcard.retry_cap(exact_retry_cap, wildcard_retry_cap),
+            wildcard_retry_cap
+        );
     }
 }

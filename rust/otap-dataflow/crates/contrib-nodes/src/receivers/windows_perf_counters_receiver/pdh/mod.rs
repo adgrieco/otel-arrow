@@ -15,7 +15,7 @@ mod timing;
 mod worker;
 
 pub(super) use error::Error;
-pub(super) use worker::Worker;
+pub(super) use worker::{QueryCadence, Worker};
 
 #[cfg(test)]
 static QUERY_OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

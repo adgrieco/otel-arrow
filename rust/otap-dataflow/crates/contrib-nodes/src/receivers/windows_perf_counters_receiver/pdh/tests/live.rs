@@ -16,7 +16,7 @@ async fn live_pdh_persistent_worker_reuses_and_closes_query() {
     ];
     let mut worker = Worker::start(
         counters,
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "test".to_owned(),
@@ -63,7 +63,7 @@ async fn live_pdh_recreates_and_primes_opted_in_query() {
     shared_second.source_mapping_index = 2;
     let mut worker = Worker::start(
         vec![shared_first, recreated, shared_second],
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "test".to_owned(),
@@ -121,7 +121,7 @@ async fn live_pdh_independent_workers_can_collect_concurrently() {
     )];
     let mut first = Worker::start(
         counters.clone(),
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "first".to_owned(),
@@ -130,7 +130,7 @@ async fn live_pdh_independent_workers_can_collect_concurrently() {
     .unwrap();
     let mut second = Worker::start(
         counters,
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "second".to_owned(),
@@ -175,7 +175,7 @@ async fn live_pdh_startup_prime_enables_first_calculated_scrape() {
     ];
     let mut worker = Worker::start(
         counters,
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "test".to_owned(),
@@ -214,7 +214,7 @@ async fn live_pdh_collects_first_monotonic_direct_value() {
             "windows.tcp.connection_failures",
             "{failure}",
         )],
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "test".to_owned(),
@@ -253,7 +253,7 @@ async fn live_pdh_isolates_ineligible_monotonic_mapping_at_startup() {
                 "%",
             ),
         ],
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "test".to_owned(),
@@ -290,7 +290,7 @@ async fn live_pdh_collects_exact_and_wildcard_counters() {
     ];
     let mut worker = Worker::start(
         counters,
-        Duration::from_millis(100),
+        QueryCadence::uniform(Duration::from_millis(100)),
         256,
         4_096,
         "test".to_owned(),
@@ -392,7 +392,7 @@ async fn live_pdh_collects_common_calculated_disk_counters() {
     ];
     let mut worker = Worker::start(
         counters,
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "test".to_owned(),
@@ -439,7 +439,7 @@ async fn live_pdh_unavailable_exact_counter_retries_after_startup() {
     ];
     let mut worker = Worker::start(
         counters,
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "test".to_owned(),
@@ -539,7 +539,7 @@ async fn live_pdh_preserves_provider_significant_counter_space() {
     );
     let mut worker = Worker::start(
         config.counters,
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "native-spelling".to_owned(),
@@ -630,7 +630,7 @@ async fn live_pdh_collects_backslashed_paging_file_instance() {
     assert_eq!(config.counters[0].path, expected_path);
     let mut worker = Worker::start(
         config.counters,
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "native-delimiter".to_owned(),
@@ -678,7 +678,7 @@ async fn live_pdh_entirely_unavailable_counter_set_starts_empty() {
             r"\Missing Object\Missing Counter",
             "windows.missing.counter",
         )],
-        Duration::from_secs(30),
+        QueryCadence::uniform(Duration::from_secs(30)),
         256,
         4_096,
         "test".to_owned(),
@@ -700,6 +700,7 @@ async fn live_pdh_entirely_unavailable_counter_set_starts_empty() {
 fn open_live_query(configs: Vec<CounterConfig>, node: &str) -> Query {
     Query::open(
         configs,
+        Duration::from_secs(30),
         Duration::from_secs(30),
         256,
         4_096,
@@ -952,6 +953,7 @@ async fn live_pdh_refreshes_process_membership_after_duplicate_renumbering() {
             counter(r"\Memory\Available Bytes", "windows.memory.available"),
             wildcard,
         ],
+        Duration::from_millis(100),
         Duration::from_millis(100),
         16,
         16,

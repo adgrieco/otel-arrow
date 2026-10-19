@@ -1902,66 +1902,84 @@ fn retry_delay_is_exponential_and_capped() {
 
 /// Scenario: Query collection repeatedly fails with a two-second retry cap and a sixty-second membership refresh.
 /// Guarantees: Recovery rebuilds on collection cadence instead of waiting for the unrelated wildcard discovery clock.
-#[test]
-fn query_recovery_cap_is_independent_of_membership_refresh() {
+#[tokio::test(flavor = "current_thread")]
+async fn query_recovery_cap_is_independent_of_membership_refresh() {
     let path = r"\Memory\Available Bytes";
-    let states = Rc::new(RefCell::new(Vec::new()));
-    let factory_states = Rc::clone(&states);
-    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
-        let (state, query) = fake_query_with_refresh_interval(
-            configs,
-            vec![FakeCounter {
-                path: path.to_owned(),
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(42)),
-                raw_error: false,
-                formatted_error: false,
-            }],
-            Duration::from_secs(60),
-        );
-        factory_states.borrow_mut().push(state);
-        Ok(query)
-    };
-    let plan = query_plans(vec![counter(path, "system.memory.available")])
-        .pop()
-        .unwrap();
-    let mut query = QuerySlot::open_initial(plan, 4_096, &mut open).unwrap();
-    states.borrow()[0].borrow_mut().collect_error = true;
-    let start = Instant::now();
-    let cap = Duration::from_secs(2);
+    let fail_collect = Arc::new(AtomicBool::new(false));
+    let factory_fail_collect = Arc::clone(&fail_collect);
+    let open_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factory_open_calls = Arc::clone(&open_calls);
+    let observed_refreshes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factory_refreshes = Arc::clone(&observed_refreshes);
+    let cadence = QueryCadence::new(Duration::from_secs(2), Duration::from_secs(60));
+    let mut worker = Worker::start_with_cadence_and(
+        vec![counter(path, "system.memory.available")],
+        cadence,
+        4_096,
+        move |configs, max_native_counters, cadence| {
+            let _ = factory_open_calls.fetch_add(1, Ordering::AcqRel);
+            factory_refreshes
+                .lock()
+                .unwrap()
+                .push(cadence.wildcard_refresh());
+            Query::open_with_cadences(
+                RebuildPrimePdh {
+                    fail_collect: Arc::clone(&factory_fail_collect),
+                    collect_calls: 0,
+                },
+                configs,
+                cadence.retry_cap(),
+                cadence.wildcard_refresh(),
+                256,
+                max_native_counters,
+            )
+        },
+    )
+    .await
+    .unwrap();
+    fail_collect.store(true, Ordering::Release);
 
-    assert!(query.collect(start, cap, 4_096, &mut open).is_err());
     assert!(matches!(
-        query.collect(start + Duration::from_millis(500), cap, 4_096, &mut open),
-        Err(Error::QueryRecoveryPending { .. })
+        worker.collect().await,
+        Err(Error::Pdh {
+            operation: "PdhCollectQueryData",
+            ..
+        })
     ));
-    assert!(
-        query
-            .collect(start + Duration::from_secs(1), cap, 4_096, &mut open)
-            .is_err()
-    );
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     assert!(matches!(
-        query.collect(start + Duration::from_secs(2), cap, 4_096, &mut open),
-        Err(Error::QueryRecoveryPending { .. })
+        worker.collect().await,
+        Err(Error::Pdh {
+            operation: "PdhCollectQueryData",
+            ..
+        })
     ));
-    assert!(
-        query
-            .collect(start + Duration::from_secs(3), cap, 4_096, &mut open)
-            .is_err()
-    );
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
     assert!(matches!(
-        query.collect(start + Duration::from_secs(4), cap, 4_096, &mut open),
-        Err(Error::QueryRecoveryPending { .. })
+        worker.collect().await,
+        Err(Error::Pdh {
+            operation: "PdhCollectQueryData",
+            ..
+        })
     ));
+    fail_collect.store(false, Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
 
-    let rebuilt = query
-        .collect(start + Duration::from_secs(5), cap, 4_096, &mut open)
-        .unwrap();
+    let rebuilt = worker.collect().await.unwrap();
+
     assert!(rebuilt.points.is_empty());
     assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
-    assert_eq!(states.borrow().len(), 2);
+    assert_eq!(open_calls.load(Ordering::Acquire), 2);
+    assert_eq!(
+        observed_refreshes.lock().unwrap().as_slice(),
+        [Duration::from_secs(60), Duration::from_secs(60)]
+    );
+    assert!(
+        worker
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap()
+    );
 }
 
 /// Scenario: Query collection fails transiently and then remains unavailable.

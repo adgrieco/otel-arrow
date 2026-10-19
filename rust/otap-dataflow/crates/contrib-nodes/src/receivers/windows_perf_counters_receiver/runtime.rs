@@ -473,10 +473,12 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
         }
 
         let worker_start = initialize_and_signal_ready(
-            pdh::Worker::start_with_cadences(
+            pdh::Worker::start_with_cadence(
                 self.config.counters.clone(),
-                self.config.query_retry_cap(),
-                self.config.wildcard_refresh_interval(),
+                pdh::QueryCadence::new(
+                    self.config.query_retry_cap(),
+                    self.config.wildcard_refresh_interval(),
+                ),
                 self.config.max_instances_per_wildcard,
                 self.config.max_expanded_counters,
                 self.node.clone(),

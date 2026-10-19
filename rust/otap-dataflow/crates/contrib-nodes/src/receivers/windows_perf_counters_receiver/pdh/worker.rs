@@ -19,6 +19,36 @@ use tokio::sync::oneshot;
 
 pub(super) const QUERY_REBUILD_AFTER_FAILURES: u32 = 3;
 
+#[derive(Clone, Copy)]
+pub(in super::super) struct QueryCadence {
+    retry_cap: Duration,
+    wildcard_refresh: Duration,
+}
+
+impl QueryCadence {
+    pub(in super::super) fn new(retry_cap: Duration, wildcard_refresh: Duration) -> Self {
+        Self {
+            retry_cap,
+            wildcard_refresh,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn uniform(cadence: Duration) -> Self {
+        Self::new(cadence, cadence)
+    }
+
+    #[cfg(test)]
+    pub(super) fn retry_cap(self) -> Duration {
+        self.retry_cap
+    }
+
+    #[cfg(test)]
+    pub(super) fn wildcard_refresh(self) -> Duration {
+        self.wildcard_refresh
+    }
+}
+
 pub(super) fn should_rebuild_query(consecutive_failures: u32) -> bool {
     consecutive_failures >= QUERY_REBUILD_AFTER_FAILURES
 }
@@ -36,15 +66,14 @@ impl Worker {
     #[cfg(test)]
     pub(super) async fn start(
         counters: Vec<CounterConfig>,
-        wildcard_refresh_interval: Duration,
+        cadence: QueryCadence,
         max_instances_per_wildcard: usize,
         max_native_counters: usize,
         node: String,
     ) -> Result<Self, Error> {
-        Self::start_with_cadences(
+        Self::start_with_cadence(
             counters,
-            wildcard_refresh_interval,
-            wildcard_refresh_interval,
+            cadence,
             max_instances_per_wildcard,
             max_native_counters,
             node,
@@ -52,24 +81,45 @@ impl Worker {
         .await
     }
 
-    pub(in super::super) async fn start_with_cadences(
+    pub(in super::super) async fn start_with_cadence(
         counters: Vec<CounterConfig>,
-        query_retry_cap: Duration,
-        wildcard_refresh_interval: Duration,
+        cadence: QueryCadence,
         max_instances_per_wildcard: usize,
         max_native_counters: usize,
         node: String,
     ) -> Result<Self, Error> {
         let settings = QuerySettings {
-            wildcard_refresh_interval,
+            cadence,
             max_instances_per_wildcard,
             node,
         };
         Self::start_with(
             counters,
-            query_retry_cap,
+            cadence.retry_cap,
             max_native_counters,
             move |counters, query_limit| settings.open(counters, query_limit),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn start_with_cadence_and<A, F>(
+        counters: Vec<CounterConfig>,
+        cadence: QueryCadence,
+        max_native_counters: usize,
+        mut open: F,
+    ) -> Result<Self, Error>
+    where
+        A: PdhApi + 'static,
+        F: FnMut(Vec<CounterConfig>, usize, QueryCadence) -> Result<Query<A>, Error>
+            + Send
+            + 'static,
+    {
+        Self::start_with(
+            counters,
+            cadence.retry_cap,
+            max_native_counters,
+            move |counters, query_limit| open(counters, query_limit, cadence),
         )
         .await
     }
@@ -405,7 +455,7 @@ impl Drop for AcceptedCollectGuard {
 
 #[derive(Clone)]
 pub(super) struct QuerySettings {
-    wildcard_refresh_interval: Duration,
+    cadence: QueryCadence,
     max_instances_per_wildcard: usize,
     node: String,
 }
@@ -418,7 +468,8 @@ impl QuerySettings {
     ) -> Result<Query, Error> {
         Query::open(
             counters,
-            self.wildcard_refresh_interval,
+            self.cadence.retry_cap,
+            self.cadence.wildcard_refresh,
             self.max_instances_per_wildcard,
             max_native_counters,
             self.node.clone(),

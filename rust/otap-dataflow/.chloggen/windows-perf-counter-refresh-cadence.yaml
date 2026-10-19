@@ -2,4 +2,4 @@ change_type: enhancement
 component: pipeline
 note: Reduce default Windows wildcard discovery frequency without slowing query failure recovery.
 issues: [4074]
-subtext: Wildcards now refresh at max(collection_interval, 60s) unless configured; query and rebuild backoff remains capped by collection_interval.
+subtext: Wildcards refresh at max(collection_interval, 60s) unless configured. Exact add, query, and rebuild retries use collection_interval; wildcard add retries use the refresh cadence.

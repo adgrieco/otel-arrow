@@ -29,7 +29,8 @@ pub(super) struct Config {
     pub(super) initial_delay: Duration,
     /// Optional discard deadline for one scrape; `None` waits for completion.
     pub(super) timeout: Option<Duration>,
-    /// Optional time between wildcard discovery refreshes.
+    /// Time between wildcard discovery refreshes. Defaults to the greater of
+    /// `collection_interval` and 60s. Must be at least `collection_interval`.
     pub(super) wildcard_refresh_interval: Option<Duration>,
     /// Maximum expanded instances retained for one wildcard path.
     pub(super) max_instances_per_wildcard: usize,
@@ -72,7 +73,7 @@ impl Config {
         )
     }
 
-    /// Maximum query-failure and rebuild retry delay.
+    /// Maximum exact-counter add, query-failure, and rebuild retry delay.
     #[must_use]
     pub(super) fn query_retry_cap(&self) -> Duration {
         self.collection_interval
@@ -179,6 +180,8 @@ struct UserConfig {
     initial_delay: Duration,
     #[serde(default, with = "humantime_serde")]
     timeout: Option<Duration>,
+    /// Time between wildcard discovery refreshes. Defaults to the greater of
+    /// `collection_interval` and 60s. Must be at least `collection_interval`.
     #[serde(default, with = "humantime_serde")]
     wildcard_refresh_interval: Option<Duration>,
     #[serde(default = "default_max_instances_per_wildcard")]
