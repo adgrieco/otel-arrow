@@ -173,8 +173,8 @@ keep their own sampling histories. Each successful
 replacement starts a new cumulative sequence, so cumulative Sum points from a
 mapping with `recreate_query: true` have a new start time on every scrape. For
 monotonic Sums, the first point published from each replacement reports
-`start_time_unix_nano == time_unix_nano`; priming does not expose an earlier
-unpublished start.
+`start_time_unix_nano == time_unix_nano` after it is successfully delivered;
+priming and discarded scrapes do not expose an earlier unpublished start.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
 Object, instance, aggregation, and counter components preserve their configured
@@ -362,11 +362,10 @@ failures still reject startup explicitly.
   failures omit only that point; healthy peers remain in the batch.
 - Projection validates every ready point before mutating the Arrow batch.
   Invalid point timestamps, Sum start times, or non-finite values omit only
-  that point. Broken sample/configuration identity and Arrow schema errors
-  remain fatal receiver invariants.
-- An Arrow memory or computation failure while finishing a batch drops only
-  that scrape. The receiver records a failed scrape and attempts the next
-  scheduled collection without retaining partial projection state.
+  that point and do not establish its monotonic cumulative start. Healthy peers
+  delivered in the same batch establish their own starts independently. Broken
+  sample/configuration identity and Arrow schema errors remain fatal receiver
+  invariants.
 - Counter add failures retry with exponential backoff capped by
   `wildcard_refresh_interval`. Counter read failures omit only the affected
   point and retain the existing handle for the next scheduled collection.
@@ -385,8 +384,10 @@ failures still reject startup explicitly.
   result with its original point timestamps. A scrape completing after
   `collection_interval` records an overrun but remains successful. Setting a
   positive `timeout` opts into discarding a late result; `0s` also leaves the
-  deadline disabled. The native call continues to own the capacity-one worker,
-  so later ticks fail fast while it is busy and no additional request is queued.
+  deadline disabled. A discarded result does not establish any monotonic
+  cumulative start. The native call continues to own the capacity-one worker,
+  so later ticks fail fast while it is busy and no additional request is
+  queued.
 - Wildcard expansion is sorted before applying the configured limits. Excess
   instances are omitted, reported explicitly, and reconsidered at the next
   discovery refresh; they are never presented as a complete expansion.
@@ -398,14 +399,15 @@ Each emitted point uses the collection timestamp. Non-monotonic Sum points use
 the current PDH query's opening time as their cumulative start time; a query
 rebuild or backward wall-clock adjustment starts a new cumulative sequence.
 Monotonic Sum points track sequence start independently for each exact or
-expanded handle. The first point published after open, recreation, or rebuild
-uses its own timestamp as the unknown cumulative start; later points retain that
-start. A decrease, handle recreation, newly discovered instance, or backward
-wall-clock adjustment relative to that series' previous observation starts a
-new sequence for only that point. Query-level clock rollback clears all
-monotonic Sum sequences; an omitted series starts fresh at its next valid
-observation. Equal timestamps do not reset a sequence. A value wrap is treated
-as a decrease; the receiver does not compensate for it. Negative monotonic Sum
+expanded handle. The first point successfully delivered after open, recreation,
+or rebuild uses its own timestamp as the unknown cumulative start; later
+delivered points retain that start. A decrease, handle recreation, newly
+discovered instance, or backward wall-clock adjustment relative to that
+series' previous observation starts a new sequence for only that point.
+Query-level clock rollback clears all monotonic Sum sequences; a discarded or
+omitted series starts fresh at its next successfully delivered observation.
+Equal timestamps do not reset a sequence. A value wrap is treated as a
+decrease; the receiver does not compensate for it. Negative monotonic Sum
 values are omitted as invalid. Gauge points do not use or validate cumulative
 start time.
 

@@ -31,6 +31,7 @@ pub(super) struct MonotonicSequence {
     pub(super) previous_timestamp_unix_nano: Option<i64>,
 }
 
+#[cfg(test)]
 pub(super) fn monotonic_start_time(
     path: &str,
     sequence: &mut MonotonicSequence,
@@ -40,6 +41,34 @@ pub(super) fn monotonic_start_time(
     update_monotonic_sequence(path, sequence, value, timestamp_unix_nano, true)?.ok_or(
         Error::InvalidSample("monotonic Sum start time was not initialized"),
     )
+}
+
+pub(super) fn pending_monotonic_start_time(
+    path: &str,
+    sequence: &mut MonotonicSequence,
+    value: i64,
+    timestamp_unix_nano: i64,
+) -> Result<i64, Error> {
+    Ok(
+        update_monotonic_sequence(path, sequence, value, timestamp_unix_nano, false)?
+            .unwrap_or(timestamp_unix_nano),
+    )
+}
+
+pub(super) fn publish_monotonic_start(
+    sequence: &mut MonotonicSequence,
+    value: i64,
+    timestamp_unix_nano: i64,
+) -> bool {
+    if sequence.start_time_unix_nano.is_none()
+        && sequence.previous_value == Some(value)
+        && sequence.previous_timestamp_unix_nano == Some(timestamp_unix_nano)
+    {
+        sequence.start_time_unix_nano = Some(timestamp_unix_nano);
+        true
+    } else {
+        false
+    }
 }
 
 pub(super) fn prime_monotonic_sequence(

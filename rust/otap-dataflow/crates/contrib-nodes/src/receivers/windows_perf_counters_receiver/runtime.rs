@@ -5,7 +5,7 @@
 
 use super::config::Config;
 use super::metrics::WindowsPerfCountersReceiverMetrics;
-use super::model::{Sample, SampleFailure};
+use super::model::{MonotonicPublication, Sample, SampleFailure};
 use super::otap_builder::{ProjectionInvariantError, project_sample};
 use super::pdh;
 use async_trait::async_trait;
@@ -318,7 +318,7 @@ impl WindowsPerfCountersReceiver {
         overrun: bool,
         failure_logs: &mut FailureLogState,
         send: F,
-    ) -> Result<(), ProcessSampleError>
+    ) -> Result<Vec<MonotonicPublication>, ProcessSampleError>
     where
         F: FnOnce(OtapPdata) -> Fut,
         Fut: Future<Output = Result<(), Error>>,
@@ -338,11 +338,12 @@ impl WindowsPerfCountersReceiver {
             .log_counter_failures(self, &sample)
             .map_err(ProcessSampleError::MissingCounter)?;
         let Some(records) = projection.records else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         send(OtapPdata::new(Context::default(), records.into()))
             .await
-            .map_err(ProcessSampleError::Send)
+            .map_err(ProcessSampleError::Send)?;
+        Ok(projection.monotonic_publications)
     }
 
     fn handle_control_message(&self, message: NodeControlMsg<OtapPdata>) -> Option<ControlExit> {
@@ -366,16 +367,19 @@ impl WindowsPerfCountersReceiver {
         }
     }
 
-    async fn collect_and_send_with<C, CFut, S, SFut>(
+    async fn collect_and_send_with<C, CFut, S, SFut, P, PFut>(
         &self,
         mut collect: C,
         mut send: S,
+        mut publish: P,
     ) -> Result<TerminalState, CollectionLoopError>
     where
         C: FnMut() -> CFut,
         CFut: Future<Output = Result<Sample, pdh::Error>>,
         S: FnMut(OtapPdata) -> SFut,
         SFut: Future<Output = Result<(), Error>>,
+        P: FnMut(Vec<MonotonicPublication>) -> PFut,
+        PFut: Future<Output = Result<(), pdh::Error>>,
     {
         wait_initial_delay(self.config.initial_delay).await;
         let mut interval = tokio::time::interval(self.config.collection_interval);
@@ -405,15 +409,19 @@ impl WindowsPerfCountersReceiver {
                 }
             };
             let overrun = scrape_overran(self.config.collection_interval, scrape_start.elapsed());
-            self.process_collected_sample(
-                sample,
-                scrape_start,
-                overrun,
-                &mut failure_logs,
-                &mut send,
-            )
-            .await
-            .map_err(CollectionLoopError::Sample)?;
+            let publications = self
+                .process_collected_sample(
+                    sample,
+                    scrape_start,
+                    overrun,
+                    &mut failure_logs,
+                    &mut send,
+                )
+                .await
+                .map_err(CollectionLoopError::Sample)?;
+            publish(publications)
+                .await
+                .map_err(CollectionLoopError::Native)?;
         }
     }
 
@@ -430,6 +438,7 @@ impl WindowsPerfCountersReceiver {
                     .await
                     .map_err(Error::from)
             },
+            |publications| worker.publish_monotonic_starts(publications),
         )
         .await
         .map_err(|error| match error {
@@ -554,7 +563,7 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
 mod tests {
     use super::*;
     use crate::receivers::windows_perf_counters_receiver::config::{
-        CounterConfig, InstanceConfig, MetricKind,
+        Aggregation, CounterConfig, InstanceConfig, MetricKind,
     };
     use crate::receivers::windows_perf_counters_receiver::model::{
         Number, SamplePoint, SampleValue,
@@ -611,6 +620,7 @@ mod tests {
             emit_instance_attribute: false,
             timestamp_unix_nano: timestamp,
             start_time_unix_nano: None,
+            monotonic_publication_generation: None,
             value: SampleValue::Value(value),
         }
     }
@@ -727,7 +737,7 @@ mod tests {
         )]))]);
         let sent = Rc::new(RefCell::new(Vec::new()));
         let capture = Rc::clone(&sent);
-        receiver
+        let _ = receiver
             .process_collected_sample(
                 Sample {
                     timestamp_unix_nano: 10,
@@ -807,7 +817,7 @@ mod tests {
 
         for (timestamp, value) in [(0, 99), (20, 42)] {
             let capture = Rc::clone(&sent);
-            receiver
+            let _ = receiver
                 .process_collected_sample(
                     Sample {
                         timestamp_unix_nano: if timestamp == 0 { 10 } else { timestamp },
@@ -906,13 +916,17 @@ mod tests {
         };
         let sent = Rc::new(RefCell::new(Vec::new()));
         let capture = Rc::clone(&sent);
-        let run = receiver.collect_and_send_with(collect, move |pdata| {
-            let capture = Rc::clone(&capture);
-            async move {
-                capture.borrow_mut().push(pdata);
-                Ok(())
-            }
-        });
+        let run = receiver.collect_and_send_with(
+            collect,
+            move |pdata| {
+                let capture = Rc::clone(&capture);
+                async move {
+                    capture.borrow_mut().push(pdata);
+                    Ok(())
+                }
+            },
+            |_| async { Ok(()) },
+        );
         tokio::pin!(run);
 
         let wait_for_following_scrape = async {
@@ -958,6 +972,117 @@ mod tests {
         assert_eq!(metrics.health.scrapes.get(), 2);
         assert_eq!(metrics.health.scrape_failures.get(), 0);
         assert_eq!(metrics.health.scrape_overruns.get(), 2);
+    }
+
+    /// Scenario: A positive timeout discards one monotonic candidate before the next scrape is projected, sent, and acknowledged.
+    /// Guarantees: Runtime acknowledges only the delivered point, whose unknown cumulative start equals its own timestamp rather than the discarded scrape's timestamp.
+    #[tokio::test]
+    async fn timeout_does_not_publish_discarded_monotonic_start() {
+        let mut counter = test_counter(BTreeMap::new());
+        counter.metric_kind = MetricKind::Sum {
+            aggregation: Aggregation::Cumulative,
+            monotonic: true,
+        };
+        let mut receiver = test_receiver(vec![counter]);
+        receiver.config.timeout = Some(Duration::from_millis(10));
+        receiver.config.collection_interval = Duration::from_millis(10);
+
+        let published_start = Rc::new(std::cell::Cell::new(None::<i64>));
+        let collect_published_start = Rc::clone(&published_start);
+        let collect_calls = Rc::new(std::cell::Cell::new(0_usize));
+        let collect_state = Rc::clone(&collect_calls);
+        let collect = move || {
+            let call = collect_state.get();
+            collect_state.set(call + 1);
+            let start = Rc::clone(&collect_published_start);
+            async move {
+                if call >= 2 {
+                    return std::future::pending::<Result<Sample, pdh::Error>>().await;
+                }
+                let timestamp = if call == 0 { 100 } else { 200 };
+                let sample = Sample {
+                    timestamp_unix_nano: timestamp,
+                    points: vec![SamplePoint {
+                        counter_index: 0,
+                        path: Arc::from(r"\Memory\Available Bytes"),
+                        instance: None,
+                        emit_instance_attribute: false,
+                        timestamp_unix_nano: timestamp,
+                        start_time_unix_nano: Some(start.get().unwrap_or(timestamp)),
+                        monotonic_publication_generation: Some(0),
+                        value: SampleValue::Value(Number::Integer(call as i64 + 1)),
+                    }],
+                    metadata: Default::default(),
+                };
+                if call == 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok(sample)
+            }
+        };
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let capture = Rc::clone(&sent);
+        let publish_start = Rc::clone(&published_start);
+        let run = receiver.collect_and_send_with(
+            collect,
+            move |pdata| {
+                let capture = Rc::clone(&capture);
+                async move {
+                    capture.borrow_mut().push(pdata);
+                    Ok(())
+                }
+            },
+            move |publications| {
+                let publish_start = Rc::clone(&publish_start);
+                async move {
+                    assert_eq!(publications.len(), 1);
+                    publish_start.set(Some(publications[0].timestamp_unix_nano));
+                    Ok(())
+                }
+            },
+        );
+        tokio::pin!(run);
+
+        let wait_for_following_scrape = async {
+            while collect_calls.get() < 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = &mut run => panic!("collection loop stopped after timeout recovery"),
+            result = timeout(Duration::from_secs(1), wait_for_following_scrape) => {
+                result.expect("following scrape did not start");
+            }
+        }
+
+        assert_eq!(sent.borrow().len(), 1);
+        let pdata = sent.borrow_mut().pop().unwrap();
+        let (_, payload) = pdata.into_parts();
+        let PayloadData::OtapRecords(records) = payload.into_data() else {
+            panic!("expected native OTAP records");
+        };
+        let points = records
+            .get(ArrowPayloadType::NumberDataPoints)
+            .expect("number data points");
+        for column in ["start_time_unix_nano", "time_unix_nano"] {
+            assert_eq!(
+                points
+                    .column_by_name(column)
+                    .expect(column)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .expect("nanosecond timestamp array")
+                    .value(0),
+                200
+            );
+        }
+        assert_eq!(published_start.get(), Some(200));
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(metrics.scrape_attempts(Outcome::Success), 1);
+        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
+        assert_eq!(metrics.health.scrapes.get(), 1);
+        assert_eq!(metrics.health.scrape_failures.get(), 1);
     }
 
     /// Scenario: Collection has a nonzero initial delay before its first request.

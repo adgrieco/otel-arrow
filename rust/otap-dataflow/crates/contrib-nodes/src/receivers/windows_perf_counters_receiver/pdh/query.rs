@@ -16,8 +16,8 @@ use super::expansion::{
 };
 use super::native::NativePdh;
 use super::timing::{
-    MonotonicSequence, advance_collection_time, delta_interval_start, monotonic_start_time,
-    positive_timestamp, prime_monotonic_sequence,
+    MonotonicSequence, advance_collection_time, delta_interval_start, pending_monotonic_start_time,
+    positive_timestamp, prime_monotonic_sequence, publish_monotonic_start,
 };
 use super::{PdhApi, ValueFormat};
 use std::collections::{BTreeMap, BTreeSet};
@@ -572,6 +572,23 @@ impl<A: PdhApi> Query<A> {
         self.exact_counter_reservations + self.reserved_expanded_count()
     }
 
+    pub(super) fn publish_monotonic_start(
+        &mut self,
+        config_index: usize,
+        path: &Arc<str>,
+        value: i64,
+        timestamp_unix_nano: i64,
+    ) -> bool {
+        let key = CounterKey::new(config_index, path);
+        self.counters.get_mut(&key).is_some_and(|counter| {
+            publish_monotonic_start(
+                &mut counter.history.monotonic_sequence,
+                value,
+                timestamp_unix_nano,
+            )
+        })
+    }
+
     pub(super) fn set_max_native_counters(
         &mut self,
         max_native_counters: usize,
@@ -586,7 +603,7 @@ impl<A: PdhApi> Query<A> {
     }
 
     pub(super) fn prime(&mut self) -> Result<(), Error> {
-        let sample = self.collect_with_monotonic_publication(false)?;
+        let sample = self.collect_with_monotonic_candidate(false)?;
         self.pending.merge(sample.metadata);
         Ok(())
     }
@@ -626,12 +643,12 @@ impl<A: PdhApi> Query<A> {
     }
 
     pub(super) fn collect(&mut self) -> Result<Sample, Error> {
-        self.collect_with_monotonic_publication(true)
+        self.collect_with_monotonic_candidate(true)
     }
 
-    fn collect_with_monotonic_publication(
+    fn collect_with_monotonic_candidate(
         &mut self,
-        publish_monotonic_start: bool,
+        emit_monotonic_candidate: bool,
     ) -> Result<Sample, Error> {
         let mut metadata = std::mem::take(&mut self.pending);
         if self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval
@@ -686,7 +703,7 @@ impl<A: PdhApi> Query<A> {
             has_data,
             start_time_unix_nano,
             timestamp_unix_nano,
-            publish_monotonic_start,
+            emit_monotonic_candidate,
             &mut metadata,
         ) {
             Ok(points) => points,
@@ -705,7 +722,7 @@ impl<A: PdhApi> Query<A> {
         has_data: bool,
         start_time_unix_nano: i64,
         timestamp_unix_nano: i64,
-        publish_monotonic_start: bool,
+        emit_monotonic_candidate: bool,
         metadata: &mut PendingMetadata,
     ) -> Result<Vec<SamplePoint>, Error> {
         let mut points = Vec::with_capacity(self.counters.len());
@@ -718,7 +735,7 @@ impl<A: PdhApi> Query<A> {
                     metric_kind,
                     start_time_unix_nano,
                     timestamp_unix_nano,
-                    publish_monotonic_start,
+                    emit_monotonic_candidate,
                 )
             } else {
                 Ok((SampleValue::NoObservation, None))
@@ -746,6 +763,14 @@ impl<A: PdhApi> Query<A> {
                 emit_instance_attribute: counter.emit_instance_attribute,
                 timestamp_unix_nano,
                 start_time_unix_nano: point_start_time,
+                monotonic_publication_generation: matches!(
+                    metric_kind,
+                    MetricKind::Sum {
+                        aggregation: Aggregation::Cumulative,
+                        monotonic: true,
+                    }
+                )
+                .then_some(0),
                 value,
             });
         }
@@ -982,7 +1007,7 @@ impl<C> CounterHandle<C> {
         metric_kind: MetricKind,
         query_start_time_unix_nano: i64,
         timestamp_unix_nano: i64,
-        publish_monotonic_start: bool,
+        emit_monotonic_candidate: bool,
     ) -> Result<(SampleValue, Option<i64>), Error> {
         if let Some(value) = self.prepare_raw_sample(api, timestamp_unix_nano)? {
             return Ok((value, None));
@@ -1009,7 +1034,7 @@ impl<C> CounterHandle<C> {
             delta_start_time,
             query_start_time_unix_nano,
             timestamp_unix_nano,
-            publish_monotonic_start,
+            emit_monotonic_candidate,
         )?;
         Ok((SampleValue::Value(scaled), point_start_time))
     }
@@ -1126,7 +1151,7 @@ impl<C> CounterHandle<C> {
         delta_start_time: Option<i64>,
         query_start_time_unix_nano: i64,
         timestamp_unix_nano: i64,
-        publish_monotonic_start: bool,
+        emit_monotonic_candidate: bool,
     ) -> Result<Option<i64>, Error> {
         Ok(match metric_kind {
             MetricKind::Sum {
@@ -1138,8 +1163,8 @@ impl<C> CounterHandle<C> {
                         "monotonic Sum was not backed by a direct formatted value",
                     ));
                 };
-                if publish_monotonic_start {
-                    Some(monotonic_start_time(
+                if emit_monotonic_candidate {
+                    Some(pending_monotonic_start_time(
                         &self.path,
                         &mut self.history.monotonic_sequence,
                         direct_value,

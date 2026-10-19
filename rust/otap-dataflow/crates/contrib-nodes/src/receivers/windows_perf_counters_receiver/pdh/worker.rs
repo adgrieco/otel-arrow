@@ -4,7 +4,9 @@
 //! Bounded worker-thread query ownership, recovery, recreation, and command lifecycle.
 
 use super::super::config::CounterConfig;
-use super::super::model::{PendingMetadata, Sample, SampleDiagnostics, SampleFailure};
+use super::super::model::{
+    MonotonicPublication, PendingMetadata, Sample, SampleDiagnostics, SampleFailure,
+};
 use super::PdhApi;
 use super::error::Error;
 use super::query::{Query, retry_delay};
@@ -154,6 +156,23 @@ impl Worker {
             }
         }
         response_rx.await.map_err(|_| Error::WorkerStopped)?
+    }
+
+    pub(in super::super) async fn publish_monotonic_starts(
+        &self,
+        publications: Vec<MonotonicPublication>,
+    ) -> Result<(), Error> {
+        if publications.is_empty() {
+            return Ok(());
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .try_send(Command::PublishMonotonic(publications, response_tx))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => Error::WorkerBusy,
+                mpsc::TrySendError::Disconnected(_) => Error::WorkerStopped,
+            })?;
+        response_rx.await.map_err(|_| Error::WorkerStopped)
     }
 
     /// Request shutdown and return `false` if the worker outlives the deadline.
@@ -346,6 +365,10 @@ fn run_command_loop<A, F>(
                 drop(accepted);
                 let _ = response.send(result);
             }
+            Ok(Command::PublishMonotonic(publications, response)) => {
+                publish_monotonic_starts(queries, publications);
+                let _ = response.send(());
+            }
             Ok(Command::Shutdown) | Err(_) => break,
         }
     }
@@ -360,6 +383,7 @@ impl Drop for Worker {
 
 pub(super) enum Command {
     Collect(oneshot::Sender<Result<Sample, Error>>),
+    PublishMonotonic(Vec<MonotonicPublication>, oneshot::Sender<()>),
     Shutdown,
 }
 
@@ -452,6 +476,7 @@ pub(super) struct QuerySlot<A: PdhApi> {
     pub(super) plan: QueryPlan,
     pub(super) query: Option<Query<A>>,
     exact_counter_reservations: usize,
+    query_generation: u64,
     query_failure_attempts: u32,
     next_query_retry: Instant,
     rebuild_attempts: u32,
@@ -506,6 +531,7 @@ impl<A: PdhApi> QuerySlot<A> {
                     plan,
                     query: None,
                     exact_counter_reservations,
+                    query_generation: 0,
                     query_failure_attempts: 0,
                     next_query_retry: now,
                     rebuild_attempts: 1,
@@ -522,6 +548,7 @@ impl<A: PdhApi> QuerySlot<A> {
             plan,
             query: Some(query),
             exact_counter_reservations,
+            query_generation: 0,
             query_failure_attempts: u32::from(
                 prime_error
                     .as_ref()
@@ -620,12 +647,14 @@ impl<A: PdhApi> QuerySlot<A> {
         self.query_failure_attempts = 0;
         self.next_query_retry = now;
         if let Err(error) = rebuilt.prime() {
+            self.query_generation = self.query_generation.wrapping_add(1);
             self.query = Some(rebuilt);
             return Err(error);
         }
         self.pending.diagnostics.query_rebuild_recoveries += 1;
         let mut sample = Sample::empty(rebuilt.previous_timestamp_unix_nano);
         rebuilt.move_pending_metadata_to(&mut sample.metadata);
+        self.query_generation = self.query_generation.wrapping_add(1);
         self.query = Some(rebuilt);
         Ok(sample)
     }
@@ -697,6 +726,7 @@ impl<A: PdhApi> QuerySlot<A> {
         };
         match replacement {
             Ok(query) => {
+                self.query_generation = self.query_generation.wrapping_add(1);
                 self.query = Some(query);
                 self.query_failure_attempts = 0;
                 self.next_query_retry = now;
@@ -737,6 +767,9 @@ impl<A: PdhApi> QuerySlot<A> {
         };
         for point in &mut sample.points {
             point.counter_index = remap(point.counter_index)?;
+            if point.monotonic_publication_generation.is_some() {
+                point.monotonic_publication_generation = Some(self.query_generation);
+            }
         }
         for failure in &mut sample.metadata.failures {
             failure.counter_index = remap(failure.counter_index)?;
@@ -757,6 +790,38 @@ impl<A: PdhApi> QuerySlot<A> {
             self.exact_counter_reservations,
             Query::reserved_native_entry_count,
         )
+    }
+
+    fn publish_monotonic_start(&mut self, publication: &MonotonicPublication) -> bool {
+        if publication.query_generation != self.query_generation {
+            return false;
+        }
+        let Ok(config_index) = self
+            .plan
+            .global_indices
+            .binary_search(&publication.counter_index)
+        else {
+            return false;
+        };
+        self.query.as_mut().is_some_and(|query| {
+            query.publish_monotonic_start(
+                config_index,
+                &publication.path,
+                publication.value,
+                publication.timestamp_unix_nano,
+            )
+        })
+    }
+}
+
+pub(super) fn publish_monotonic_starts<A: PdhApi>(
+    queries: &mut [QuerySlot<A>],
+    publications: Vec<MonotonicPublication>,
+) {
+    for publication in publications {
+        let _ = queries
+            .iter_mut()
+            .any(|query| query.publish_monotonic_start(&publication));
     }
 }
 

@@ -599,6 +599,196 @@ fn query_rejects_limit_below_exact_reservation() {
     ));
 }
 
+/// Scenario: A monotonic collection is discarded before delivery, as with a positive runtime timeout, and a later scrape succeeds.
+/// Guarantees: The discarded point does not consume the unknown start, so the next delivered candidate starts at its own timestamp and only its acknowledgement establishes the sequence.
+#[test]
+fn discarded_monotonic_collection_does_not_consume_start() {
+    let path = r"\TCPv4\Connection Failures";
+    let config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
+        let (state, query) = fake_query(
+            configs,
+            vec![FakeCounter {
+                path: path.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(10)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+        );
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let mut queries = query_plans(vec![config])
+        .into_iter()
+        .map(|plan| QuerySlot::open_initial(plan, 4_096, &mut open).unwrap())
+        .collect::<Vec<_>>();
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 110;
+        state.counters[0].formatted = Some(Number::Integer(20));
+    }
+    let discarded =
+        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    assert_eq!(discarded.points[0].start_time_unix_nano, Some(110));
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 120;
+        state.counters[0].formatted = Some(Number::Integer(30));
+    }
+    let delivered =
+        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    assert_eq!(delivered.points[0].start_time_unix_nano, Some(120));
+    publish_monotonic_starts(&mut queries, collected_monotonic_publications(&delivered));
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 130;
+        state.counters[0].formatted = Some(Number::Integer(40));
+    }
+    let retained =
+        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    assert_eq!(retained.points[0].start_time_unix_nano, Some(120));
+}
+
+/// Scenario: Projection rejects the only monotonic point, leaving no Arrow records to send for that scrape.
+/// Guarantees: An all-point projection drop acknowledges nothing, so the next valid point starts a fresh exported sequence at its own timestamp.
+#[test]
+fn all_point_projection_drop_does_not_consume_monotonic_start() {
+    let path = r"\TCPv4\Connection Failures";
+    let config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
+    let projection_config = config.clone();
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
+        let (state, query) = fake_query(
+            configs,
+            vec![FakeCounter {
+                path: path.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(10)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+        );
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let mut queries = query_plans(vec![config])
+        .into_iter()
+        .map(|plan| QuerySlot::open_initial(plan, 4_096, &mut open).unwrap())
+        .collect::<Vec<_>>();
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 110;
+        state.counters[0].formatted = Some(Number::Integer(20));
+    }
+    let mut dropped =
+        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    dropped.points[0].start_time_unix_nano = Some(0);
+    let projection = project_sample(std::slice::from_ref(&projection_config), &dropped).unwrap();
+    assert!(projection.records.is_none());
+    assert_eq!(projection.point_failures.len(), 1);
+    assert!(projection.monotonic_publications.is_empty());
+    publish_monotonic_starts(&mut queries, projection.monotonic_publications);
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 120;
+        state.counters[0].formatted = Some(Number::Integer(30));
+    }
+    let delivered =
+        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    assert_eq!(delivered.points[0].start_time_unix_nano, Some(120));
+}
+
+/// Scenario: Projection accepts one monotonic point and rejects its peer before a successful batch send.
+/// Guarantees: Delivery acknowledges only the projected point; its sequence retains the earlier start while the rejected peer starts fresh on its next valid output.
+#[test]
+fn per_point_projection_drop_commits_only_delivered_monotonic_start() {
+    let first_path = r"\TCPv4\Connection Failures";
+    let second_path = r"\TCPv4\Connections Reset";
+    let configs = vec![
+        monotonic_sum(first_path, "windows.tcp.connection_failures", "{failure}"),
+        monotonic_sum(second_path, "windows.tcp.connections_reset", "{reset}"),
+    ];
+    let projection_configs = configs.clone();
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
+        let (state, query) = fake_query(
+            configs,
+            [first_path, second_path]
+                .into_iter()
+                .map(|path| FakeCounter {
+                    path: path.to_owned(),
+                    native_type: 0x0001_0100,
+                    raw: None,
+                    multi_count: 1,
+                    formatted: Some(Number::Integer(10)),
+                    raw_error: false,
+                    formatted_error: false,
+                })
+                .collect(),
+        );
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let mut queries = query_plans(configs)
+        .into_iter()
+        .map(|plan| QuerySlot::open_initial(plan, 4_096, &mut open).unwrap())
+        .collect::<Vec<_>>();
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 110;
+        for counter in &mut state.counters {
+            counter.formatted = Some(Number::Integer(20));
+        }
+    }
+    let mut mixed =
+        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    mixed.points[1].start_time_unix_nano = Some(0);
+    let projection = project_sample(&projection_configs, &mixed).unwrap();
+    assert!(projection.records.is_some());
+    assert_eq!(projection.point_failures.len(), 1);
+    assert_eq!(projection.monotonic_publications.len(), 1);
+    assert_eq!(projection.monotonic_publications[0].counter_index, 0);
+    publish_monotonic_starts(&mut queries, projection.monotonic_publications);
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 120;
+        for counter in &mut state.counters {
+            counter.formatted = Some(Number::Integer(30));
+        }
+    }
+    let next = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    assert_eq!(
+        next.points
+            .iter()
+            .map(|point| point.start_time_unix_nano)
+            .collect::<Vec<_>>(),
+        [Some(110), Some(120)]
+    );
+}
+
 /// Scenario: A delta mapping and a recreated peer collect through separate queries with different clocks.
 /// Guarantees: Each delta interval starts exactly at that series' previous point timestamp without overlap from the later peer timestamp.
 #[test]
@@ -857,12 +1047,13 @@ fn recreated_query_primes_before_swap_and_preserves_old_query_on_failure() {
                 assert!(sample.metadata.failures.is_empty());
             }
         }
+        publish_monotonic_starts(&mut queries, collected_monotonic_publications(&sample));
     }
     assert_eq!(open_calls.get(), 6);
 }
 
-/// Scenario: A recreated monotonic direct-count query is primed before each of two scrapes.
-/// Guarantees: Every replacement's first exported point uses start equal to time, including in decoded OTAP, rather than exposing the prime timestamp.
+/// Scenario: A recreated monotonic direct-count query is primed before each of two scrapes and receives the prior query's delivery acknowledgement.
+/// Guarantees: Generation checks ignore the stale acknowledgement, so every replacement's first exported point uses start equal to time, including in decoded OTAP.
 #[test]
 fn recreated_monotonic_query_defers_start_until_publication() {
     let path = r"\TCPv4\Connection Failures";
@@ -909,9 +1100,9 @@ fn recreated_monotonic_query_defers_start_until_publication() {
         assert_eq!(sample.points[0].start_time_unix_nano, Some(timestamp));
 
         if scrape_index == 0 {
-            let records = into_otap(std::slice::from_ref(&projection_config), sample)
-                .unwrap()
-                .unwrap();
+            let projection =
+                project_sample(std::slice::from_ref(&projection_config), &sample).unwrap();
+            let records = projection.records.unwrap();
             let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
             let starts = points
                 .column_by_name("start_time_unix_nano")
@@ -926,6 +1117,7 @@ fn recreated_monotonic_query_defers_start_until_publication() {
                 .downcast_ref::<arrow::array::TimestampNanosecondArray>()
                 .unwrap();
             assert_eq!(starts.value(0), times.value(0));
+            publish_monotonic_starts(&mut queries, projection.monotonic_publications);
         }
     }
     assert_eq!(open_calls.get(), 3);
@@ -1467,6 +1659,9 @@ fn controlled_worker() -> (
                         drop(accepted);
                         let _ = response.send(Ok(empty_sample()));
                     }
+                }
+                Ok(Command::PublishMonotonic(_, response)) => {
+                    let _ = response.send(());
                 }
                 Ok(Command::Shutdown) | Err(_) => break,
             }

@@ -2,4 +2,4 @@ change_type: bug_fix
 component: pipeline
 note: Keep the Windows performance-counter receiver running when one point or Arrow batch cannot be projected.
 issues: [4074]
-subtext: Invalid point data omits only that point. Recoverable Arrow batch failures drop one scrape; invariants remain fatal. Case-collision warnings list every spelling once per group.
+subtext: Invalid point data omits only that point. Broken sample identity and Arrow schema failures remain fatal. Case-collision warnings list every spelling once per group.

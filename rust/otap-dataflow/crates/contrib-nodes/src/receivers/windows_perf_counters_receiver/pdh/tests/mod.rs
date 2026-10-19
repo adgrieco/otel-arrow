@@ -3,10 +3,14 @@
 
 use super::super::config::{Aggregation, CounterConfig, InstanceConfig, MetricKind};
 use super::super::model::{
-    ExpansionOverflow, InstanceIdentity, Number, PendingMetadata, Sample, SampleDiagnostics,
-    SampleFailure, SampleValue, merge_diagnostics, scale_integer,
+    ExpansionOverflow, InstanceIdentity, MonotonicPublication, Number, PendingMetadata, Sample,
+    SampleDiagnostics, SampleFailure, SampleValue, merge_diagnostics, scale_integer,
 };
-use super::super::{TEST_PDH_LOCK, config::Config, otap_builder::into_otap};
+use super::super::{
+    TEST_PDH_LOCK,
+    config::Config,
+    otap_builder::{into_otap, project_sample},
+};
 use super::counter_type::*;
 use super::expansion::*;
 use super::native::NativePdh;
@@ -393,6 +397,26 @@ fn advance_fake_queries(states: &Rc<RefCell<Vec<Rc<RefCell<FakeState>>>>>) {
             }
         }
     }
+}
+
+fn collected_monotonic_publications(sample: &Sample) -> Vec<MonotonicPublication> {
+    sample
+        .points
+        .iter()
+        .filter_map(|point| {
+            let query_generation = point.monotonic_publication_generation?;
+            let SampleValue::Value(Number::Integer(value)) = point.value else {
+                return None;
+            };
+            Some(MonotonicPublication {
+                counter_index: point.counter_index,
+                path: Arc::clone(&point.path),
+                query_generation,
+                value,
+                timestamp_unix_nano: point.timestamp_unix_nano,
+            })
+        })
+        .collect()
 }
 
 mod live;

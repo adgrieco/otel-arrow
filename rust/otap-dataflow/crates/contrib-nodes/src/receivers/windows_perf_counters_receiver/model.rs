@@ -86,8 +86,20 @@ pub(super) struct SamplePoint {
     pub(super) timestamp_unix_nano: i64,
     /// Start of this point's cumulative sequence or delta interval.
     pub(super) start_time_unix_nano: Option<i64>,
+    /// Query generation that can consume this monotonic cumulative start after delivery.
+    pub(super) monotonic_publication_generation: Option<u64>,
     /// Ready value or expected omission.
     pub(super) value: SampleValue,
+}
+
+/// One delivered monotonic cumulative point whose start can be committed by the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MonotonicPublication {
+    pub(super) counter_index: usize,
+    pub(super) path: Arc<str>,
+    pub(super) query_generation: u64,
+    pub(super) value: i64,
+    pub(super) timestamp_unix_nano: i64,
 }
 
 /// One counter-local failure omitted from an otherwise successful collection.

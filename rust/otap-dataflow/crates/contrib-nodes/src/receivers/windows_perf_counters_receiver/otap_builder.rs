@@ -4,7 +4,9 @@
 #[cfg(test)]
 use super::config::InstanceConfig;
 use super::config::{Aggregation, CounterConfig, MetricKind};
-use super::model::{InstanceIdentity, Number, Sample, SampleFailure, SamplePoint, SampleValue};
+use super::model::{
+    InstanceIdentity, MonotonicPublication, Number, Sample, SampleFailure, SamplePoint, SampleValue,
+};
 use arrow::error::ArrowError;
 use otel_arrow_dfe_pdata::encode::record::attributes::StrKeysAttributesRecordBatchBuilder;
 use otel_arrow_dfe_pdata::encode::record::metrics::{
@@ -47,6 +49,7 @@ struct ProjectionBuilder {
 pub(super) struct ProjectionOutcome {
     pub(super) records: Option<OtapArrowRecords>,
     pub(super) point_failures: Vec<SampleFailure>,
+    pub(super) monotonic_publications: Vec<MonotonicPublication>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +61,28 @@ struct PreparedPoint<'a> {
     point: &'a SamplePoint,
     value: Number,
     start_time_unix_nano: Option<i64>,
+}
+
+impl PreparedPoint<'_> {
+    fn monotonic_publication(
+        &self,
+    ) -> Result<Option<MonotonicPublication>, ProjectionInvariantError> {
+        let Some(query_generation) = self.point.monotonic_publication_generation else {
+            return Ok(None);
+        };
+        let Number::Integer(value) = self.value else {
+            return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
+                "monotonic publication was not backed by an integer value".to_owned(),
+            )));
+        };
+        Ok(Some(MonotonicPublication {
+            counter_index: self.point.counter_index,
+            path: Arc::clone(&self.point.path),
+            query_generation,
+            value,
+            timestamp_unix_nano: self.point.timestamp_unix_nano,
+        }))
+    }
 }
 
 enum PointPreparationError {
@@ -327,6 +352,7 @@ fn project(
     }
     let mut builder = ProjectionBuilder::new();
     let mut point_failures = Vec::new();
+    let mut monotonic_publications = Vec::new();
     let mut point_count = 0_usize;
     let ready = sample.points.iter().filter_map(|point| match point.value {
         SampleValue::Value(value) => Some((point, value)),
@@ -346,13 +372,16 @@ fn project(
                 "too many counter values".to_owned(),
             ))
         })?;
+        let publication = prepared.monotonic_publication()?;
         builder.append_point(point_id, prepared)?;
+        monotonic_publications.extend(publication);
         point_count += 1;
     }
     if builder.metric_ids.is_empty() {
         return Ok(ProjectionOutcome {
             records: None,
             point_failures,
+            monotonic_publications,
         });
     }
     // Projection supplies valid UTF-8 and keeps every builder column aligned, so a finish error
@@ -361,6 +390,7 @@ fn project(
     Ok(ProjectionOutcome {
         records: Some(records),
         point_failures,
+        monotonic_publications,
     })
 }
 
@@ -380,6 +410,7 @@ pub(super) fn into_otap(
     let ProjectionOutcome {
         records,
         point_failures,
+        monotonic_publications: _,
     } = project_sample(counters, &sample).map_err(|error| error.0)?;
     if point_failures.is_empty() {
         Ok(records)
@@ -460,6 +491,7 @@ mod tests {
             emit_instance_attribute: false,
             timestamp_unix_nano,
             start_time_unix_nano: None,
+            monotonic_publication_generation: None,
             value,
         }
     }
@@ -1465,6 +1497,7 @@ mod tests {
         let ProjectionOutcome {
             records: Some(records),
             point_failures,
+            ..
         } = outcome
         else {
             panic!("expected a projected batch");
@@ -1552,6 +1585,7 @@ mod tests {
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
+                        monotonic_publication_generation: None,
                         value: SampleValue::Value(Number::Integer(10)),
                     },
                     SamplePoint {
@@ -1565,6 +1599,7 @@ mod tests {
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
+                        monotonic_publication_generation: None,
                         value: SampleValue::Value(Number::Integer(20)),
                     },
                 ],
@@ -1630,6 +1665,7 @@ mod tests {
                         emit_instance_attribute: false,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
+                        monotonic_publication_generation: None,
                         value: SampleValue::Value(Number::Integer(10)),
                     },
                     SamplePoint {
@@ -1639,6 +1675,7 @@ mod tests {
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
+                        monotonic_publication_generation: None,
                         value: SampleValue::Value(Number::Integer(20)),
                     },
                 ],
@@ -1694,6 +1731,7 @@ mod tests {
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
+                        monotonic_publication_generation: None,
                         value: SampleValue::Value(Number::Integer(10)),
                     },
                     SamplePoint {
@@ -1707,6 +1745,7 @@ mod tests {
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
+                        monotonic_publication_generation: None,
                         value: SampleValue::Value(Number::Integer(20)),
                     },
                 ],
