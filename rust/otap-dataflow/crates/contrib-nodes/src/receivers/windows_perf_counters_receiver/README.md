@@ -216,10 +216,11 @@ duplicate checks: the first occurrence omits `#0`, and leading zeroes are
 removed from later indexes. These indexes are positional, not durable entity
 identifiers. If same-named processes churn while their count stays unchanged,
 PDH can reuse `name#n` for a different process and a two-sample calculation can
-span the old and new process. The receiver does not infer a reset from counter
-values. Where the target host provides it, prefer `Process V2`, whose instances
-include the process ID as `name:PID`; provider availability varies by Windows
-version and installed performance-counter set.
+span the old and new process. The receiver cannot detect that entity change
+from the reused instance identity alone. Where the target host provides it,
+prefer `Process V2`, whose instances include the process ID as `name:PID`;
+provider availability varies by Windows version and installed
+performance-counter set.
 
 Unknown fields, explicit references to undefined metrics, duplicate instances,
 invalid intervals, unsupported scales, and duplicate outputs are configuration
