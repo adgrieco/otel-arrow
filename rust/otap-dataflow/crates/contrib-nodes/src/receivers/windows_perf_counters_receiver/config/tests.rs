@@ -941,7 +941,7 @@ fn rejects_controls_remaining_after_metric_normalization() {
 /// Guarantees: Only raw path-shaped definitions unused by every mapping produce one usage-warning candidate.
 #[test]
 fn identifies_unused_path_metric_definitions() {
-    let config = Config::from_json(&json!({
+    let value = json!({
         "metrics": {
             r"\Memory\Available Bytes": {"unit": "By"},
             r"\Process(worker*)\Private Bytes": {"unit": "By"},
@@ -964,19 +964,15 @@ fn identifies_unused_path_metric_definitions() {
                 "counters": [{"name": "Private Bytes"}]
             }
         ]
-    }))
-    .unwrap();
-    let definitions = [
-        (r"\Memory\Available Bytes", true),
-        (r"\Process(worker*)\Private Bytes", true),
-        (r"\alias", true),
-        (r"\unused", true),
-        (r"\ordinary-after-trim", false),
-        ("ordinary", false),
-    ];
+    });
+    let user: UserConfig = serde_json::from_value(value.clone()).unwrap();
+    let metrics = normalize_metrics(&user.metrics).unwrap();
+    let config = Config::from_json(&value).unwrap();
     assert_eq!(
         unused_path_metric_definitions(
-            definitions,
+            metrics
+                .iter()
+                .map(|(name, metric)| (name.as_ref(), metric.path_shaped)),
             config.counters.iter().map(|counter| counter.name.as_ref())
         ),
         [r"\unused"]

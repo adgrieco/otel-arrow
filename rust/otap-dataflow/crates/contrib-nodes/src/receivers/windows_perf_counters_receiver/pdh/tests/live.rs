@@ -474,6 +474,30 @@ async fn live_pdh_unavailable_exact_counter_retries_after_startup() {
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_preserves_provider_significant_counter_space() {
     let _serial = TEST_PDH_LOCK.lock().await;
+    let exact_template = r"\Hyper-V Virtual Switch Port(*)\IPsec SAs Offloaded ";
+    let trimmed_template = r"\Hyper-V Virtual Switch Port(*)\IPsec SAs Offloaded";
+    let mut probe = NativePdh::open("native-spelling-preflight".to_owned()).unwrap();
+    let exact_paths = match probe.expand(exact_template) {
+        Ok(paths) if !paths.is_empty() => paths,
+        result => {
+            eprintln!(
+                "skipping significant-space control: provider or instances unavailable: {result:?}"
+            );
+            return;
+        }
+    };
+    if probe
+        .expand(trimmed_template)
+        .is_ok_and(|paths| !paths.is_empty())
+    {
+        eprintln!(
+            "skipping significant-space control: trimmed spelling resolves and is not a negative control"
+        );
+        return;
+    }
+    drop(probe);
+    assert!(exact_paths.iter().all(|path| path.ends_with(" ")));
+
     let config = Config::from_json(&serde_json::json!({
         "metrics": {
             "provider.exact": {"unit": "1"},
@@ -563,6 +587,25 @@ async fn live_pdh_preserves_provider_significant_counter_space() {
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_collects_backslashed_paging_file_instance() {
     let _serial = TEST_PDH_LOCK.lock().await;
+    let mut probe = NativePdh::open("native-delimiter-preflight".to_owned()).unwrap();
+    let expanded = match probe.expand(r"\Paging File(*)\% Usage") {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("skipping paging-file delimiter control: expansion unavailable: {error}");
+            return;
+        }
+    };
+    let Some((selected_path, selected_instance)) = expanded.into_iter().find_map(|path| {
+        let instance = probe.parse_instance(&path).ok()?;
+        (instance.name != "_Total" && instance.name.contains('\\')).then_some((path, instance.name))
+    }) else {
+        eprintln!("skipping paging-file delimiter control: no backslashed instance is available");
+        return;
+    };
+    drop(probe);
+    let expected_path = format!(r"\Paging File({selected_instance})\% Usage");
+    assert!(selected_path.ends_with(&expected_path));
+
     let config = Config::from_json(&serde_json::json!({
         "metrics": {
             "paging.usage": {"unit": "%"},
@@ -571,7 +614,7 @@ async fn live_pdh_collects_backslashed_paging_file_instance() {
         "perfcounters": [
             {
                 "object": "Paging File",
-                "instances": r"C:\pagefile.sys",
+                "instances": selected_instance,
                 "counters": [{"name": "% Usage", "metric": "paging.usage"}]
             },
             {
@@ -584,10 +627,7 @@ async fn live_pdh_collects_backslashed_paging_file_instance() {
         ]
     }))
     .unwrap();
-    assert_eq!(
-        config.counters[0].path,
-        r"\Paging File(C:\pagefile.sys)\% Usage"
-    );
+    assert_eq!(config.counters[0].path, expected_path);
     let mut worker = Worker::start(
         config.counters,
         Duration::from_secs(30),
@@ -605,7 +645,7 @@ async fn live_pdh_collects_backslashed_paging_file_instance() {
     );
     assert!(sample.points.iter().any(|point| {
         point.counter_index == 0
-            && point.path.as_ref() == r"\Paging File(C:\pagefile.sys)\% Usage"
+            && point.path.as_ref() == expected_path
             && matches!(
                 point.value,
                 SampleValue::Value(Number::Double(value)) if value.is_finite() && value >= 0.0
