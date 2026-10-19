@@ -321,8 +321,8 @@ fn defaults_metricless_mapping_to_path_named_gauge() {
     assert!(counter.attributes.is_empty());
 }
 
-/// Scenario: Metric definitions are omitted or empty and references are omitted or blank.
-/// Guarantees: Every form produces path-named Gauges with configured spelling and canonical native paths.
+/// Scenario: Metric definitions are omitted or empty and references are omitted or literal empty strings.
+/// Guarantees: Every implicit form produces path-named Gauges with configured spelling and canonical native paths.
 #[test]
 fn defaults_path_metrics_without_definitions_or_references() {
     for definitions in [None, Some(json!({}))] {
@@ -336,7 +336,7 @@ fn defaults_path_metrics_without_definitions_or_references() {
         if let Some(definitions) = definitions {
             value["metrics"] = definitions;
         }
-        for reference in [None, Some(""), Some(" \t ")] {
+        for reference in [None, Some("")] {
             if let Some(reference) = reference {
                 value["perfcounters"][0]["counters"][0]["metric"] = json!(reference);
             }
@@ -460,19 +460,34 @@ fn defaults_optional_metric_metadata_and_allows_unused_definitions() {
     assert_eq!(counter.metric_kind, MetricKind::Gauge);
 }
 
-/// Scenario: A counter supplies an empty metric name.
-/// Guarantees: Go's zero-value mapping behavior treats it as an implicit path-named Gauge.
+/// Scenario: A counter supplies a literal empty metric reference.
+/// Guarantees: Go's zero-value mapping behavior treats only the empty string as an implicit path-named Gauge.
 #[test]
 fn treats_empty_metric_name_as_omitted() {
     let config = Config::from_json(&json!({
         "perfcounters": [{
             "object": "Memory",
-            "counters": [{"name": "Available Bytes", "metric": "  "}]
+            "counters": [{"name": "Available Bytes", "metric": ""}]
         }]
     }))
     .unwrap();
 
     assert_eq!(config.counters[0].name.as_ref(), r"\Memory\Available Bytes");
+}
+
+/// Scenario: A counter supplies a whitespace-only metric reference.
+/// Guarantees: Padding cannot silently select implicit path naming.
+#[test]
+fn rejects_whitespace_only_metric_reference() {
+    assert_config_error(
+        json!({
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [{"name": "Available Bytes", "metric": " \t "}]
+            }]
+        }),
+        "metric name must not be empty",
+    );
 }
 
 /// Scenario: Null metric references appear at each object/counter position or replace the definitions map.
@@ -723,10 +738,10 @@ fn preserves_native_component_delimiters() {
     );
 }
 
-/// Scenario: Ordinary metadata and native path components contain surrounding whitespace.
-/// Guarantees: Ordinary labels are trimmed while nonblank object and counter spelling remains native identity.
+/// Scenario: Metric identities, attributes, metadata, and native path components contain surrounding whitespace.
+/// Guarantees: Metric and attribute identities remain verbatim while description and unit metadata are trimmed.
 #[test]
-fn trims_metadata_but_preserves_native_component_spelling() {
+fn preserves_configured_identities_and_trims_metadata() {
     let config = Config::from_json(&json!({
         "metrics": {" windows.memory.available ": {
             "description": " Available memory. ",
@@ -737,7 +752,7 @@ fn trims_metadata_but_preserves_native_component_spelling() {
             "object": " Memory ",
             "counters": [{
                 "name": " Available Bytes ",
-                "metric": "windows.memory.available ",
+                "metric": " windows.memory.available ",
                 "attributes": {" state ": " free "}
             }]
         }]
@@ -745,12 +760,12 @@ fn trims_metadata_but_preserves_native_component_spelling() {
     .unwrap();
     let counter = &config.counters[0];
     assert_eq!(counter.path, r"\ Memory \ Available Bytes ");
-    assert_eq!(counter.name.as_ref(), "windows.memory.available");
+    assert_eq!(counter.name.as_ref(), " windows.memory.available ");
     assert_eq!(&*counter.description, "Available memory.");
     assert_eq!(counter.unit.as_ref(), "By");
     assert_eq!(
         *counter.attributes,
-        BTreeMap::from([("state".to_owned(), " free ".to_owned())])
+        BTreeMap::from([(" state ".to_owned(), " free ".to_owned())])
     );
 
     let instances = Config::from_json(&json!({
@@ -786,10 +801,10 @@ fn preserves_significant_instance_spaces() {
     assert_eq!(counter.name.as_ref(), r"\Process( worker )\Private Bytes");
 }
 
-/// Scenario: A leading-padded metric key and reference are ordinary labels before normalization.
-/// Guarantees: Both trim once and resolve exactly without being reclassified as raw path-shaped input.
+/// Scenario: A leading-padded ordinary metric key is selected by the same exact reference.
+/// Guarantees: Padding remains part of the case-sensitive metric identity and does not trigger path diagnostics.
 #[test]
-fn resolves_leading_padded_ordinary_reference() {
+fn preserves_leading_padded_ordinary_reference() {
     let configured = r" \Memory\Available Bytes";
     let config = Config::from_json(&json!({
         "metrics": {
@@ -805,7 +820,7 @@ fn resolves_leading_padded_ordinary_reference() {
     }))
     .unwrap();
     let counter = &config.counters[0];
-    assert_eq!(counter.name.as_ref(), r"\Memory\Available Bytes");
+    assert_eq!(counter.name.as_ref(), configured);
     assert_eq!(counter.unit.as_ref(), "By");
     assert_eq!(counter.description.as_ref(), "Selected.");
 }
@@ -878,10 +893,10 @@ fn accepts_otlp_metric_names_and_units() {
     assert_config_error(config(" ", "By"), "metric name must not be empty");
 }
 
-/// Scenario: Normalized metric names, units, references, or generated path names retain controls.
-/// Guarantees: Remaining controls are rejected, while controls removed by trimming keep existing defaults.
+/// Scenario: Metric names, units, references, or generated path names contain control characters.
+/// Guarantees: Identity controls are rejected, while unit-only whitespace still selects the documented default.
 #[test]
-fn rejects_controls_remaining_after_metric_normalization() {
+fn rejects_metric_controls_and_defaults_blank_units() {
     let config = |metrics, metric: &str| {
         json!({
             "metrics": metrics,
@@ -928,11 +943,8 @@ fn rejects_controls_remaining_after_metric_normalization() {
         "perfcounters[0].object must not contain control characters",
     );
 
-    let normalized = Config::from_json(&config(
-        json!({" selected\t": {"unit": " \t "}}),
-        " selected\t",
-    ))
-    .unwrap();
+    let normalized =
+        Config::from_json(&config(json!({"selected": {"unit": " \t "}}), "selected")).unwrap();
     assert_eq!(normalized.counters[0].name.as_ref(), "selected");
     assert_eq!(normalized.counters[0].unit.as_ref(), "1");
 }
@@ -947,7 +959,7 @@ fn identifies_unused_path_metric_definitions() {
             r"\Process(worker*)\Private Bytes": {"unit": "By"},
             r"\alias": {"unit": "By"},
             r"\unused": {"unit": "1"},
-            r" \ordinary-after-trim": {"unit": "1"},
+            r" \ordinary-leading-space": {"unit": "1"},
             "ordinary": {"unit": "1"}
         },
         "perfcounters": [
@@ -1049,36 +1061,62 @@ fn allows_metric_definitions_beyond_native_counter_limit() {
     assert_eq!(config.counters.len(), 1);
 }
 
-/// Scenario: Normalized metric names or attribute keys collide.
-/// Guarantees: Metric errors identify both configured keys and normalized identities never merge.
+/// Scenario: Metric names and attribute keys differ only by surrounding spaces.
+/// Guarantees: Exact configured identities coexist and references resolve only the matching spelling.
 #[test]
-fn rejects_normalized_identity_collisions() {
+fn preserves_space_distinct_metric_and_attribute_keys() {
     let definition = json!({"description": "Value.", "unit": "By", "gauge": {}});
-    let error = Config::from_json(&json!({
+    let config = Config::from_json(&json!({
         "metrics": {"cpu": definition.clone(), " cpu ": definition},
         "perfcounters": [{
             "object": "Processor",
-            "counters": [{"name": "% Processor Time", "metric": "cpu"}]
+            "counters": [
+                {
+                    "name": "% Processor Time",
+                    "metric": "cpu",
+                    "attributes": {"host": "a", " host": " b "}
+                },
+                {"name": "% Idle Time", "metric": " cpu "}
+            ]
         }]
     }))
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains(r#"" cpu ""#), "{error:?}");
-    assert!(error.contains(r#""cpu""#), "{error:?}");
-    assert!(error.contains(r#"duplicate "cpu""#), "{error:?}");
+    .unwrap();
+    assert_eq!(config.counters[0].name.as_ref(), "cpu");
+    assert_eq!(config.counters[1].name.as_ref(), " cpu ");
+    assert_eq!(
+        *config.counters[0].attributes,
+        BTreeMap::from([
+            (" host".to_owned(), " b ".to_owned()),
+            ("host".to_owned(), "a".to_owned()),
+        ])
+    );
+
     assert_config_error(
         json!({
-            "metrics": {"test": metric()},
+            "metrics": {"cpu": metric()},
             "perfcounters": [{
-                "object": "Memory",
+                "object": "Processor",
                 "counters": [{
-                    "name": "Available Bytes",
-                    "metric": "test",
-                    "attributes": {"state": "a", " state": "b"}
+                    "name": "% Processor Time",
+                    "metric": " cpu "
                 }]
             }]
         }),
-        "contains duplicate attribute key",
+        "references undefined metric",
+    );
+    assert_config_error(
+        json!({
+            "metrics": {"cpu": metric()},
+            "perfcounters": [{
+                "object": "Processor",
+                "counters": [{
+                    "name": "% Processor Time",
+                    "metric": "cpu",
+                    "attributes": {" ": "blank"}
+                }]
+            }]
+        }),
+        "attribute key must not be empty",
     );
 }
 

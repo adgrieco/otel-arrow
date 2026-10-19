@@ -103,15 +103,16 @@ one `gauge: {}` or `sum:` object; omitting both defaults to Gauge. A Sum
 requires `aggregation: cumulative` or `aggregation: delta`; `monotonic`
 defaults to `false`. Empty and null Sum configurations are rejected. Metrics
 that configure both Gauge and Sum are also rejected. Gauge may use YAML
-shorthand such as `gauge:`. Ordinary metric names are trimmed and must remain
-non-empty. Path-shaped definition keys are retained unchanged. Names are OTLP
-stream names rather than SDK instrument names, so names such as
-`\Memory\Available Bytes` are accepted. Metric identity and lookup are
-case-sensitive, so definitions such as `cpu` and `CPU` remain distinct. Every
-valid group that differs only by Unicode lowercase identity emits one
-configuration warning because it may be a typo. Units are trimmed, blank units
-default to `"1"`, and non-empty units have no receiver-specific length limit.
-Metric names and units may not contain control characters after normalization.
+shorthand such as `gauge:`. Metric definition names preserve their exact
+configured spelling, including leading and trailing spaces, and must not be
+empty or whitespace-only. Names are OTLP stream names rather than SDK
+instrument names, so names such as `\Memory\Available Bytes` are accepted.
+Metric identity and lookup are case-sensitive, so definitions such as `cpu`
+and `CPU` remain distinct. Every valid group that differs only by Unicode
+lowercase identity emits one configuration warning because it may be a typo.
+Units are trimmed, blank units default to `"1"`, and non-empty units have no
+receiver-specific length limit. Metric names and units may not contain control
+characters.
 Multiple counter mappings may reference one metric and contribute points
 distinguished by their configured attributes. Gauges have point-in-time
 semantics and no start timestamp. Cumulative monotonic Sums are limited to
@@ -147,14 +148,16 @@ emits a Gauge with unit `"1"` and an empty description. Mapping `attributes`
 are ignored in either implicit mode.
 
 For mappings that reference a metric, optional `attributes` contains static
-string key/value pairs added to each emitted point. The `instance` key is
-allowed and overwrites the receiver-generated Go-compatible value. On an
-object with multiple or wildcard instances, this override produces a
-configuration warning because a fixed value can collapse distinct points into
-the same OTel series when no other attributes distinguish them. This is a
-series collision, not automatic summation; internal counter histories and
-point values remain independent. Metric-less mappings do not warn because
-their configured attributes are ignored.
+string key/value pairs added to each emitted point. Attribute keys and values
+preserve their exact configured spelling; blank keys are invalid, while keys
+such as "host" and " host" remain distinct. The `instance` key is allowed and
+overwrites the receiver-generated Go-compatible value. On an object with
+multiple or wildcard instances, this override produces a configuration warning
+because a fixed value can collapse distinct points into the same OTel series
+when no other attributes distinguish them. This is a series collision, not
+automatic summation; internal counter histories and point values remain
+independent. Metric-less mappings do not warn because their configured
+attributes are ignored.
 One normalized PDH path may feed multiple distinct metric mappings. The
 receiver opens an independent handle for each mapping and routes each sample by
 its configured mapping identity. Repeating the same path, metric name, and
@@ -226,14 +229,14 @@ Unknown fields, explicit references to undefined metrics, duplicate instances,
 invalid intervals, unsupported scales, and duplicate outputs are configuration
 errors. A duplicate output has the same path ignoring case, the same metric
 name, and the same static attributes. Optional metadata may be empty and metric
-definitions may be unused. Ordinary metric names and references, metadata,
-units, and attribute keys are trimmed. A definition or reference is path-shaped
-only when its first configured character is `\`; such values retain exact
-spelling. Leading whitespace therefore makes a value ordinary, and ordinary
-normalization does not reclassify it afterward. If ordinary definition keys
-collide after trimming, the error identifies both configured keys. Metric names,
-units, and references may not contain control characters after their documented
-normalization; descriptions are exempt. Exact references resolve any matching
+definitions may be unused. Metric definition names, explicit references, and
+attribute keys and values preserve their exact configured spelling. Lookup is
+case-sensitive and does not trim, so "cpu" and " cpu" are distinct names.
+Omitted or literal empty references select implicit path naming;
+whitespace-only references are invalid. Units and descriptions are trimmed,
+blank units default to `"1"`, and descriptions are exempt from control-character
+validation. A definition is path-shaped for usage diagnostics only when its
+first configured character is `\`. Exact references resolve any matching
 definition key, including padded, malformed, alias, or overlong path-shaped
 keys; no match reports an undefined metric. A path-shaped definition that is
 not selected by an implicit configured path/template or an explicit reference

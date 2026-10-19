@@ -411,10 +411,7 @@ fn is_path_metric_name(name: &str) -> bool {
 
 fn normalize_metric_name(name: &str) -> Result<(&str, bool), Error> {
     let path_shaped = is_path_metric_name(name);
-    let trimmed = name.trim();
-    require_name("metric name", trimmed)?;
-    // Some Windows counter names end in a space, so a trimmed path may not resolve.
-    let name = if path_shaped { name } else { trimmed };
+    require_name("metric name", name)?;
     validate_no_control_characters("metric name", name)?;
     Ok((name, path_shaped))
 }
@@ -437,22 +434,15 @@ fn normalize_attributes(
     field: &str,
     attributes: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, Error> {
-    let mut normalized = BTreeMap::new();
-    for (key, value) in attributes {
-        let key = key.trim();
+    for key in attributes.keys() {
         require_name(&format!("{field} attribute key"), key)?;
         if key.starts_with(RECEIVER_ATTRIBUTE_PREFIX) {
             return Err(invalid(format!(
                 "{field} attribute {key:?} conflicts with receiver-generated attributes"
             )));
         }
-        if normalized.insert(key.to_owned(), value.clone()).is_some() {
-            return Err(invalid(format!(
-                "{field} contains duplicate attribute key {key:?}"
-            )));
-        }
     }
-    Ok(normalized)
+    Ok(attributes.clone())
 }
 
 struct NormalizedMetric {
@@ -543,16 +533,8 @@ fn normalize_metrics(
     configured: &BTreeMap<String, MetricConfig>,
 ) -> Result<BTreeMap<Arc<str>, NormalizedMetric>, Error> {
     let mut metrics = BTreeMap::new();
-    let mut configured_by_identity = BTreeMap::new();
     for (configured_name, metric) in configured {
         let (name, path_shaped) = normalize_metric_name(configured_name)?;
-        if let Some(first) =
-            configured_by_identity.insert(name.to_owned(), configured_name.as_str())
-        {
-            return Err(invalid(format!(
-                "metrics keys {first:?} and {configured_name:?} normalize to duplicate {name:?}"
-            )));
-        }
         let _ = metrics.insert(
             Arc::from(name),
             NormalizedMetric {
@@ -807,7 +789,7 @@ fn normalize_metric_reference<'a>(
     match configured {
         None => Ok(None),
         Some(Some(name)) => {
-            if name.trim().is_empty() {
+            if name.is_empty() {
                 return Ok(None);
             }
             let (name, _) = normalize_metric_name(name)?;
