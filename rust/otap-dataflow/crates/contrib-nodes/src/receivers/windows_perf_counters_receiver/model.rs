@@ -6,7 +6,7 @@
 use super::config::{MAX_SCALE_POWER10, MIN_SCALE_POWER10};
 use std::sync::Arc;
 
-// F6-sized measurements put the dense-index crossover above 128x128 comparisons.
+// F6-sized measurements put the metadata-index crossover above 128x128 comparisons.
 const METADATA_INDEX_WORK_THRESHOLD: usize = 32_768;
 const MAX_METADATA_INDEX_SPARSITY: usize = 4;
 
@@ -210,21 +210,12 @@ fn merge_latest_by_key<T>(current: &mut Vec<T>, latest: Vec<T>, key: impl Fn(&T)
     };
     for item in latest {
         let item_key = key(&item);
-        let existing_index = indices[item_key.counter_index]
-            .filter(|&index| key(&current[index]) == item_key)
-            .or_else(|| {
-                current
-                    .iter()
-                    .position(|existing| key(existing) == item_key)
-            });
-        if let Some(index) = existing_index {
+        if let Some(index) = indices.get(item_key) {
             current[index] = item;
         } else {
             let index = current.len();
             current.push(item);
-            if indices[item_key.counter_index].is_none() {
-                indices[item_key.counter_index] = Some(index);
-            }
+            indices.insert(item_key, index);
         }
     }
 }
@@ -243,16 +234,36 @@ fn merge_older_by_key<T>(current: &mut Vec<T>, older: Vec<T>, key: impl Fn(&T) -
     };
     for item in older {
         let item_key = key(&item);
-        let existing = indices[item_key.counter_index]
-            .is_some_and(|index| key(&current[index]) == item_key)
-            || current.iter().any(|existing| key(existing) == item_key);
-        if !existing {
+        if indices.get(item_key).is_none() {
             let index = current.len();
             current.push(item);
-            if indices[item_key.counter_index].is_none() {
-                indices[item_key.counter_index] = Some(index);
-            }
+            indices.insert(item_key, index);
         }
+    }
+}
+
+struct DenseMetadataIndices {
+    reasons: Vec<&'static str>,
+    indices: Vec<Option<usize>>,
+}
+
+impl DenseMetadataIndices {
+    fn slot(&self, key: MetadataKey) -> usize {
+        let reason_index = self
+            .reasons
+            .iter()
+            .position(|reason| *reason == key.reason)
+            .expect("metadata reason was indexed");
+        key.counter_index * self.reasons.len() + reason_index
+    }
+
+    fn get(&self, key: MetadataKey) -> Option<usize> {
+        self.indices[self.slot(key)]
+    }
+
+    fn insert(&mut self, key: MetadataKey, index: usize) {
+        let slot = self.slot(key);
+        self.indices[slot] = Some(index);
     }
 }
 
@@ -260,25 +271,37 @@ fn dense_metadata_indices<T>(
     current: &[T],
     incoming: &[T],
     key: &impl Fn(&T) -> MetadataKey,
-) -> Option<Vec<Option<usize>>> {
+) -> Option<DenseMetadataIndices> {
     let entry_count = current.len().saturating_add(incoming.len());
-    let slot_count = current
-        .iter()
-        .chain(incoming)
-        .map(|item| key(item).counter_index)
-        .max()?
-        .checked_add(1)?;
+    let mut reasons = Vec::new();
+    let mut max_counter_index = None::<usize>;
+    for item in current.iter().chain(incoming) {
+        let item_key = key(item);
+        max_counter_index = Some(
+            max_counter_index.map_or(item_key.counter_index, |current_max| {
+                current_max.max(item_key.counter_index)
+            }),
+        );
+        if !reasons.contains(&item_key.reason) {
+            reasons.push(item_key.reason);
+        }
+    }
+    let counter_slots = max_counter_index?.checked_add(1)?;
+    let slot_count = counter_slots.checked_mul(reasons.len())?;
     if slot_count > entry_count.saturating_mul(MAX_METADATA_INDEX_SPARSITY) {
         return None;
     }
-    let mut indices = vec![None; slot_count];
+    let mut dense = DenseMetadataIndices {
+        reasons,
+        indices: vec![None; slot_count],
+    };
     for (index, item) in current.iter().enumerate() {
-        let slot = &mut indices[key(item).counter_index];
-        if slot.is_none() {
-            *slot = Some(index);
+        let item_key = key(item);
+        if dense.get(item_key).is_none() {
+            dense.insert(item_key, index);
         }
     }
-    Some(indices)
+    Some(dense)
 }
 
 fn merge_latest_linearly<T>(current: &mut Vec<T>, latest: Vec<T>, key: impl Fn(&T) -> MetadataKey) {
@@ -387,13 +410,21 @@ fn scale_factor(power10: i32) -> Result<i64, ScaleError> {
 mod tests {
     use super::*;
 
-    fn failure(counter_index: usize, detail: &str) -> SampleFailure {
+    fn failure_with_reason(
+        counter_index: usize,
+        reason: &'static str,
+        detail: &str,
+    ) -> SampleFailure {
         SampleFailure {
             counter_index,
-            reason: "n12",
+            reason,
             error: detail.to_owned(),
             diagnostic_only: false,
         }
+    }
+
+    fn failure(counter_index: usize, detail: &str) -> SampleFailure {
+        failure_with_reason(counter_index, "n12", detail)
     }
 
     fn metadata(size: usize, detail: &str) -> PendingMetadata {
@@ -465,10 +496,10 @@ mod tests {
         assert_eq!(current.failures[256].error, "first older");
     }
 
-    /// Scenario: Metadata contains a sparse, pathological counter index that cannot use a dense lookup.
-    /// Guarantees: The optimization declines disproportionate storage so malformed evidence cannot trigger an unbounded allocation.
+    /// Scenario: Metadata contains a sparse, pathological counter index.
+    /// Guarantees: Index storage remains proportional to evidence count rather than the largest configured-counter index.
     #[test]
-    fn metadata_index_rejects_sparse_storage() {
+    fn metadata_index_bounds_sparse_storage() {
         let current = vec![failure(usize::MAX, "current")];
         let incoming = vec![failure(0, "incoming")];
 
@@ -478,6 +509,34 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    /// Scenario: Every configured index has two failure reasons while older evidence partially overlaps and partially extends current metadata.
+    /// Guarantees: Indexed merge_older matches the linear freshness and ordering semantics for the full (counter_index, reason) key.
+    #[test]
+    fn metadata_index_matches_linear_merge_for_two_reasons_per_index() {
+        let reasons = ["prime", "read"];
+        let mut indexed = (0..256)
+            .flat_map(|counter_index| {
+                reasons.map(|reason| failure_with_reason(counter_index, reason, "current"))
+            })
+            .collect::<Vec<_>>();
+        let older = (128..384)
+            .flat_map(|counter_index| {
+                reasons.map(|reason| failure_with_reason(counter_index, reason, "older"))
+            })
+            .collect::<Vec<_>>();
+        let mut linear = indexed.clone();
+
+        merge_older_by_key(&mut indexed, older.clone(), |failure| {
+            MetadataKey::new(failure.counter_index, failure.reason)
+        });
+        merge_older_linearly(&mut linear, older, |failure| {
+            MetadataKey::new(failure.counter_index, failure.reason)
+        });
+
+        assert_eq!(indexed, linear);
+        assert_eq!(indexed.len(), 768);
     }
 
     /// Scenario: Integer values use zero, positive, negative and boundary decimal scales.
