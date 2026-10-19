@@ -996,7 +996,7 @@ async fn live_pdh_refreshes_process_membership_after_duplicate_renumbering() {
 }
 
 /// Scenario: Parsed configuration names duplicate live process instances using #0 and #1.
-/// Guarantees: Normalized paths collect exactly the fixture process IDs without unrelated instances.
+/// Guarantees: Configured suffix spelling reaches PDH unchanged and collects exactly the fixture process IDs.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_collects_parsed_instance_paths() {
@@ -1033,7 +1033,7 @@ async fn live_pdh_collects_parsed_instance_paths() {
     .unwrap();
     assert_eq!(
         config.counters[0].path,
-        format!(r"\Process({instance})\ID Process")
+        format!(r"\Process({instance}#0)\ID Process")
     );
     assert_eq!(
         config.counters[1].path,
@@ -1068,36 +1068,102 @@ async fn live_pdh_collects_parsed_instance_paths() {
     std::fs::remove_dir(directory).unwrap();
 }
 
-/// Scenario: Two metric mappings open the same exact native counter in one query.
-/// Guarantees: PDH accepts both handles and collection routes a ready point to each mapping.
+/// Scenario: One live PDH query maps Available Bytes to two metrics with different attributes.
+/// Guarantees: Both mappings emit integers on two collections, and OTAP preserves each metric's name, value, path, and attributes.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
-async fn live_pdh_collects_one_path_for_multiple_mappings() {
+async fn live_pdh_collects_distinct_mappings_of_one_native_path() {
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{metric, number_data_point};
+    use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryIntoWithOptions};
+    use otel_arrow_dfe_pdata_codec::OtapPayload;
+    use prost::Message;
+
     let _serial = TEST_PDH_LOCK.lock().await;
     let path = r"\Memory\Available Bytes";
-    let configs = vec![
-        counter(path, "windows.memory.available"),
-        counter(path, "windows.memory.available_copy"),
-    ];
-    let mut query = open_live_query(configs, "same-path-mappings");
+    let config = Config::from_json(&serde_json::json!({
+        "metrics": {
+            "memory.available": {"unit": "By", "gauge": {}},
+            "memory.free": {"unit": "By", "gauge": {}}
+        },
+        "perfcounters": [{
+            "object": "Memory",
+            "counters": [
+                {"name": "Available Bytes", "metric": "memory.available"},
+                {
+                    "name": "Available Bytes",
+                    "metric": "memory.free",
+                    "attributes": {"state": "free"}
+                }
+            ]
+        }]
+    }))
+    .unwrap();
+    assert_eq!(config.counters.len(), 2);
+    assert!(config.counters.iter().all(|counter| counter.path == path));
+    let mut query = open_live_query(config.counters.clone(), "distinct-mappings");
 
-    let sample = query.collect().unwrap();
-    assert!(
-        sample.metadata.failures.is_empty(),
-        "{:?}",
-        sample.metadata.failures
-    );
-    assert_eq!(
-        sample
+    for _ in 0..2 {
+        let sample = query.collect().unwrap();
+        assert!(
+            sample.metadata.failures.is_empty(),
+            "{:?}",
+            sample.metadata.failures
+        );
+        assert_eq!(sample.points.len(), 2);
+        let values = sample
             .points
             .iter()
-            .map(|point| point.counter_index)
-            .collect::<Vec<_>>(),
-        [0, 1]
-    );
-    assert!(sample.points.iter().all(
-        |point| matches!(point.value, SampleValue::Value(Number::Integer(value)) if value >= 0)
-    ));
+            .enumerate()
+            .map(|(index, point)| {
+                assert_eq!(point.counter_index, index);
+                match point.value {
+                    SampleValue::Value(Number::Integer(value)) if value >= 0 => value,
+                    value => panic!("expected non-negative available bytes, got {value:?}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        let records = into_otap(&config.counters, sample).unwrap().unwrap();
+        let bytes: OtlpProtoBytes = OtapPayload::from_otap(records)
+            .try_into_with_default()
+            .unwrap();
+        let decoded = ExportMetricsServiceRequest::decode(bytes.as_bytes()).unwrap();
+        let metrics = &decoded.resource_metrics[0].scope_metrics[0].metrics;
+        assert_eq!(metrics.len(), 2);
+        for ((metric, (name, state)), value) in metrics
+            .iter()
+            .zip([("memory.available", None), ("memory.free", Some("free"))])
+            .zip(values)
+        {
+            assert_eq!(metric.name, name);
+            let Some(metric::Data::Gauge(gauge)) = &metric.data else {
+                panic!("expected a Gauge");
+            };
+            assert_eq!(gauge.data_points.len(), 1);
+            let point = &gauge.data_points[0];
+            assert_eq!(point.value, Some(number_data_point::Value::AsInt(value)));
+            let attributes = point
+                .attributes
+                .iter()
+                .map(|attribute| {
+                    let Some(any_value::Value::StringValue(value)) = attribute
+                        .value
+                        .as_ref()
+                        .and_then(|value| value.value.as_ref())
+                    else {
+                        panic!("expected a string attribute");
+                    };
+                    (attribute.key.as_str(), value.as_str())
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut expected = BTreeMap::from([("windows.perf_counter.path", path)]);
+            if let Some(state) = state {
+                let _ = expected.insert("state", state);
+            }
+            assert_eq!(attributes, expected);
+        }
+    }
 }
 
 /// Scenario: Two native queries collect exact direct counters repeatedly and are dropped independently.

@@ -104,15 +104,15 @@ requires `aggregation: cumulative` or `aggregation: delta`; `monotonic`
 defaults to `false`. Empty and null Sum configurations are rejected. Metrics
 that configure both Gauge and Sum are also rejected. Gauge may use YAML
 shorthand such as `gauge:`. Metric definition names preserve their exact
-configured spelling, including leading and trailing spaces, and must not be
-empty or whitespace-only. Names are OTLP stream names rather than SDK
+configured spelling, including whitespace and control characters, and only the
+literal empty name is invalid. Names are OTLP stream names rather than SDK
 instrument names, so names such as `\Memory\Available Bytes` are accepted.
 Metric identity and lookup are case-sensitive, so definitions such as `cpu`
 and `CPU` remain distinct. Every valid group that differs only by Unicode
 lowercase identity emits one configuration warning because it may be a typo.
-Units are trimmed, blank units default to `"1"`, and non-empty units have no
-receiver-specific length limit. Metric names and units may not contain control
-characters.
+Only a literal empty unit defaults to `"1"`; every other unit and every
+description remains exactly as configured, including whitespace and control
+characters. Non-empty units have no receiver-specific length limit.
 Multiple counter mappings may reference one metric and contribute points
 distinguished by their configured attributes. Gauges have point-in-time
 semantics and no start timestamp. Cumulative monotonic Sums are limited to
@@ -149,7 +149,8 @@ are ignored in either implicit mode.
 
 For mappings that reference a metric, optional `attributes` contains static
 string key/value pairs added to each emitted point. Attribute keys and values
-preserve their exact configured spelling; blank keys are invalid, while keys
+preserve their exact configured spelling; only a literal empty key is invalid,
+so whitespace-only and control-character keys remain configured identity. Keys
 such as "host" and " host" remain distinct. The `instance` key is allowed and
 overwrites the receiver-generated Go-compatible value. On an object with
 multiple or wildcard instances, this override produces a configuration warning
@@ -181,11 +182,14 @@ priming and discarded scrapes do not expose an earlier unpublished start.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
 Object, instance, aggregation, and counter components preserve their configured
-spelling, including leading or trailing spaces. Blank components and control
-characters are rejected, but delimiters such as backslashes and parentheses are
-passed to PDH because providers may use them as part of valid native identity.
-An invalid or unavailable constructed path is diagnosed for that counter
-without rejecting unrelated mappings.
+spelling, including whitespace and non-NUL control characters. Object, explicit
+instance, aggregation, and counter components reject only the literal empty
+value where required; an empty `aggregation_name` selects its default. Embedded
+NUL is rejected before the native call because a null-terminated PDH path cannot
+represent it. Delimiters such as backslashes and parentheses are passed to PDH
+because providers may use them as part of valid native identity. An invalid or
+unavailable constructed path is diagnosed for that counter without rejecting
+unrelated mappings.
 
 Configure performance object and counter names in English. Exact paths are
 added through PDH's language-neutral English API. Before wildcard expansion,
@@ -200,10 +204,11 @@ one name or a list for exact instances. Partial patterns such as `"worker*"` are
 expanded independently. If a list contains `"*"`, Go-compatible selection uses
 the full wildcard and ignores other explicit non-aggregate names. Specify
 `["*", "_Total"]` to retain `_Total`, or select `"_Total"` alone to collect only
-that exact instance. Aggregate names are matched case-sensitively. Empty
-`aggregation_name` uses `_Total`; set another value when a provider uses a name
-such as `_Global_`. Filtering occurs before expansion limits, and explicit
-wildcard inclusion does not create a duplicate aggregate query.
+that exact instance. Aggregate names are matched case-sensitively. Only a
+literal empty `aggregation_name` uses `_Total`; whitespace-only and every other
+nonempty value remain configured identity. Filtering occurs before expansion
+limits, and explicit wildcard inclusion does not create a duplicate aggregate
+query.
 
 Points for named instances emit `instance=<name>`. Duplicate PDH instances use
 the canonical suffix, such as `instance=process#1`; index zero omits `#0`.
@@ -214,17 +219,18 @@ aggregate explicitly included with `"*"` retains it. The receiver also emits
 `windows.perf_counter.parent_instance`, and
 `windows.perf_counter.instance_index` for lossless PDH identity.
 
-Explicit PDH duplicate-instance indexes are canonicalized before path and
-duplicate checks: the first occurrence omits `#0`, and leading zeroes are
-removed from later indexes. A suffix is an index only when a nonempty instance
-name precedes `#`, so an instance such as `#5` keeps that literal native name.
-These indexes are positional, not durable entity identifiers. If same-named
-processes churn while their count stays unchanged, PDH can reuse `name#n` for a
-different process and a two-sample calculation can span the old and new
-process. The receiver cannot detect that entity change from the reused instance
-identity alone. Where the target host provides it, prefer `Process V2`, whose
-instances include the process ID as `name:PID`; provider availability varies by
-Windows version and installed performance-counter set.
+Explicit PDH duplicate-instance selectors preserve their configured spelling:
+`name`, `name#0`, `name#00`, and `name#01` remain distinct native paths and
+lookup identities. Returned PDH identity still determines emitted instance
+labels, so a provider may report a canonical name for one of these selectors.
+An instance such as `#5` also keeps that literal native name. Numeric indexes
+are positional, not durable entity identifiers. If same-named processes churn
+while their count stays unchanged, PDH can reuse `name#n` for a different
+process and a two-sample calculation can span the old and new process. The
+receiver cannot detect that entity change from the reused instance identity
+alone. Where the target host provides it, prefer `Process V2`, whose instances
+include the process ID as `name:PID`; provider availability varies by Windows
+version and installed performance-counter set.
 
 Unknown fields, explicit references to undefined metrics, duplicate instances,
 invalid intervals, unsupported scales, and duplicate outputs are configuration
@@ -235,8 +241,8 @@ attribute keys and values preserve their exact configured spelling. Lookup is
 case-sensitive and does not trim, so "cpu" and " cpu" are distinct names.
 Omitted or literal empty references select implicit path naming;
 every other reference uses exact lookup, so whitespace-only references report
-an undefined metric. Units and descriptions are trimmed, blank units default to
-`"1"`, and descriptions are exempt from control-character validation. A
+an undefined metric unless an identical definition exists. Literal empty units
+default to `"1"`; every nonempty unit and every description remains verbatim. A
 definition is path-shaped for usage diagnostics only when its first configured
 character is `\`. Exact references resolve any matching definition key,
 including padded, malformed, alias, or overlong path-shaped keys; no match

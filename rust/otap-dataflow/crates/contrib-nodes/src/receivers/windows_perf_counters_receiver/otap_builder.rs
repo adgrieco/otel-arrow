@@ -577,11 +577,11 @@ mod tests {
     }
 
     /// Scenario: An implicit path metric uses a configured instance index with leading zeros.
-    /// Guarantees: OTAP uses the configured metric name while retaining the canonical native path attribute.
+    /// Guarantees: OTAP uses the configured metric name and preserves the same native path attribute spelling.
     #[test]
     fn projects_configured_instance_spelling_for_path_metric() {
         let configured_name = r"\Process(app#001)\Private Bytes";
-        let native_path = r"\Process(app#1)\Private Bytes";
+        let native_path = configured_name;
         let config = Config::from_json(&serde_json::json!({
             "metrics": {
                 configured_name: {

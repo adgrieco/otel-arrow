@@ -8,7 +8,7 @@ change_type: bug_fix
 component: pipeline
 
 # A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
-note: Preserve exact Windows performance-counter component spelling and defer native path admission to PDH.
+note: Preserve exact Windows performance-counter configuration spelling except empty defaults and embedded NUL native selectors.
 
 # Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
 issues: [4074]
@@ -18,4 +18,4 @@ issues: [4074]
 # Use pipe (|) for multiline entries. Breaking entries must include a `Migration:`
 # section with the specific action consumers must take. Keep notes to 200
 # characters and subtext to 300 characters.
-subtext: Exact path-shaped metric references now use definition identity without native syntax checks. Unselected path-shaped definitions produce usage warnings instead of malformed-path warnings.
+subtext: Metric metadata and non-NUL native components keep whitespace and controls; numeric instance suffixes are not canonicalized. Exact path references bypass native syntax checks, and unused path definitions warn.

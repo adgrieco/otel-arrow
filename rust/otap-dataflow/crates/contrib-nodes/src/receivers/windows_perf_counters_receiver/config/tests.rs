@@ -313,7 +313,7 @@ fn defaults_metricless_mapping_to_path_named_gauge() {
     .unwrap();
 
     let counter = &config.counters[0];
-    assert_eq!(counter.path, r"\Process(app#1)\Private Bytes");
+    assert_eq!(counter.path, r"\Process(app#001)\Private Bytes");
     assert_eq!(counter.name.as_ref(), r"\Process(app#001)\Private Bytes");
     assert_eq!(counter.unit.as_ref(), "1");
     assert!(counter.description.is_empty());
@@ -322,7 +322,7 @@ fn defaults_metricless_mapping_to_path_named_gauge() {
 }
 
 /// Scenario: Metric definitions are omitted or empty and references are omitted or literal empty strings.
-/// Guarantees: Every implicit form produces path-named Gauges with configured spelling and canonical native paths.
+/// Guarantees: Every implicit form produces path-named Gauges with configured spelling preserved in native paths.
 #[test]
 fn defaults_path_metrics_without_definitions_or_references() {
     for definitions in [None, Some(json!({}))] {
@@ -345,12 +345,12 @@ fn defaults_path_metrics_without_definitions_or_references() {
                 (
                     &config.counters[0],
                     r"\Process(app#00)\Private Bytes",
-                    r"\Process(app)\Private Bytes",
+                    r"\Process(app#00)\Private Bytes",
                 ),
                 (
                     &config.counters[1],
                     r"\Process(worker#001)\Private Bytes",
-                    r"\Process(worker#1)\Private Bytes",
+                    r"\Process(worker#001)\Private Bytes",
                 ),
             ] {
                 assert_eq!(counter.name.as_ref(), name);
@@ -405,7 +405,7 @@ fn resolves_implicit_path_name_to_metric_definition() {
 }
 
 /// Scenario: Implicit exact and wildcard paths match definitions using configured spelling.
-/// Guarantees: Metric lookup preserves configured instance indexes while native exact paths are canonical.
+/// Guarantees: Metric lookup and native exact paths preserve configured instance indexes.
 #[test]
 fn resolves_configured_path_spelling_to_metric_definitions() {
     let config = Config::from_json(&json!({
@@ -424,7 +424,7 @@ fn resolves_configured_path_spelling_to_metric_definitions() {
     }))
     .unwrap();
 
-    assert_eq!(config.counters[0].path, r"\Process(app#1)\Private Bytes");
+    assert_eq!(config.counters[0].path, r"\Process(app#001)\Private Bytes");
     assert_eq!(
         config.counters[0].name.as_ref(),
         r"\Process(app#001)\Private Bytes"
@@ -723,49 +723,57 @@ fn preserves_native_component_delimiters() {
     );
 }
 
-/// Scenario: Metric identities, attributes, metadata, and native path components contain surrounding whitespace.
-/// Guarantees: Metric and attribute identities remain verbatim while description and unit metadata are trimmed.
+/// Scenario: Metric identities, metadata, and attribute keys contain whitespace-only or control-character spellings.
+/// Guarantees: Every nonempty metric name, unit, description, attribute key, and value remains verbatim.
 #[test]
-fn preserves_configured_identities_and_trims_metadata() {
+fn preserves_metric_identities_and_metadata() {
     let config = Config::from_json(&json!({
-        "metrics": {" windows.memory.available ": {
-            "description": " Available memory. ",
-            "unit": " By ",
-            "gauge": {}
-        }},
+        "metrics": {
+            " ": {
+                "description": "\n",
+                "unit": " ",
+                "gauge": {}
+            },
+            "control\0name": {
+                "description": " Available\tmemory.\n",
+                "unit": "B\0y",
+                "gauge": {}
+            }
+        },
         "perfcounters": [{
-            "object": " Memory ",
-            "counters": [{
-                "name": " Available Bytes ",
-                "metric": " windows.memory.available ",
-                "attributes": {" state ": " free "}
-            }]
+            "object": "Memory",
+            "counters": [
+                {
+                    "name": "Available Bytes",
+                    "metric": " ",
+                    "attributes": {" ": " whitespace "}
+                },
+                {
+                    "name": "Committed Bytes",
+                    "metric": "control\0name",
+                    "attributes": {"control\0key": "control\0value"}
+                }
+            ]
         }]
     }))
     .unwrap();
-    let counter = &config.counters[0];
-    assert_eq!(counter.path, r"\ Memory \ Available Bytes ");
-    assert_eq!(counter.name.as_ref(), " windows.memory.available ");
-    assert_eq!(&*counter.description, "Available memory.");
-    assert_eq!(counter.unit.as_ref(), "By");
+
+    let whitespace = &config.counters[0];
+    assert_eq!(whitespace.name.as_ref(), " ");
+    assert_eq!(whitespace.description.as_ref(), "\n");
+    assert_eq!(whitespace.unit.as_ref(), " ");
     assert_eq!(
-        *counter.attributes,
-        BTreeMap::from([(" state ".to_owned(), " free ".to_owned())])
+        *whitespace.attributes,
+        BTreeMap::from([(" ".to_owned(), " whitespace ".to_owned())])
     );
 
-    let instances = Config::from_json(&json!({
-        "perfcounters": [{
-            "object": "Process",
-            "instances": [" worker ", "*"],
-            "aggregation_name": " _Total ",
-            "counters": [{"name": "Private Bytes"}]
-        }]
-    }))
-    .unwrap();
-    assert_eq!(instances.counters[0].path, r"\Process(*)\Private Bytes");
+    let controlled = &config.counters[1];
+    assert_eq!(controlled.name.as_ref(), "control\0name");
+    assert_eq!(controlled.description.as_ref(), " Available\tmemory.\n");
+    assert_eq!(controlled.unit.as_ref(), "B\0y");
     assert_eq!(
-        instances.counters[0].instance_config.excluded_aggregation(),
-        Some(" _Total ")
+        *controlled.attributes,
+        BTreeMap::from([("control\0key".to_owned(), "control\0value".to_owned())])
     );
 }
 
@@ -848,8 +856,8 @@ fn rejects_undefined_padded_path_reference() {
     );
 }
 
-/// Scenario: Metric names and units use unrestricted printable OTLP text or path-shaped names.
-/// Guarantees: Every non-empty printable value survives normalization without SDK-style limits.
+/// Scenario: Metric names and units use unrestricted nonempty OTLP text or path-shaped names.
+/// Guarantees: Every nonempty value survives normalization without SDK-style limits or character guards.
 #[test]
 fn accepts_otlp_metric_names_and_units() {
     let config = |name: &str, unit: &str| {
@@ -868,6 +876,8 @@ fn accepts_otlp_metric_names_and_units() {
         (r"\Memory\Available Bytes", "By"),
         ("1 value", "\u{b5}s"),
         ("\u{e9}", "B y"),
+        (" ", " "),
+        ("metric\nname", "B\ty"),
         (long_name.as_str(), long_unit.as_str()),
         (overlong_path_name.as_str(), "1"),
     ] {
@@ -875,63 +885,33 @@ fn accepts_otlp_metric_names_and_units() {
         assert_eq!(normalized.counters[0].name.as_ref(), name);
         assert_eq!(normalized.counters[0].unit.as_ref(), unit);
     }
-    assert_config_error(config(" ", "By"), "metric name must not be empty");
+    assert_config_error(config("", "By"), "metric name must not be empty");
 }
 
-/// Scenario: Metric definitions, units, references, or generated path names contain control characters.
-/// Guarantees: Definition identity controls are rejected, unmatched references remain exact, and unit-only whitespace still selects the documented default.
+/// Scenario: Metric units are omitted, empty, whitespace-only, or contain control characters.
+/// Guarantees: Only the literal empty unit defaults to `1`; every other configured unit remains verbatim.
 #[test]
-fn rejects_metric_controls_and_defaults_blank_units() {
-    let config = |metrics, metric: &str| {
-        json!({
-            "metrics": metrics,
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": metric}]
-            }]
-        })
-    };
+fn defaults_only_empty_metric_units() {
+    let config = Config::from_json(&json!({
+        "metrics": {
+            "empty": {"unit": ""},
+            "whitespace": {"unit": " \t "},
+            "control": {"unit": "B\ny"}
+        },
+        "perfcounters": [{
+            "object": "Memory",
+            "counters": [
+                {"name": "Available Bytes", "metric": "empty"},
+                {"name": "Committed Bytes", "metric": "whitespace"},
+                {"name": "Cache Bytes", "metric": "control"}
+            ]
+        }]
+    }))
+    .unwrap();
 
-    assert_config_error(
-        config(json!({"metric\nname": {"unit": "By"}}), "metric\nname"),
-        "metric name must not contain control characters",
-    );
-    assert_config_error(
-        config(json!({"selected": {"unit": "B\ty"}}), "selected"),
-        "metric unit must not contain control characters",
-    );
-    assert_config_error(
-        config(json!({"selected": metric()}), "selected\nname"),
-        "references undefined metric",
-    );
-    assert_config_error(
-        config(json!({"selected": metric()}), "\\Memory\\Available Bytes\t"),
-        "references undefined metric",
-    );
-    assert_config_error(
-        config(
-            json!({
-                "selected": metric(),
-                "\\Memory\\Available Bytes\t": {"unit": "By"}
-            }),
-            "selected",
-        ),
-        "metric name must not contain control characters",
-    );
-    assert_config_error(
-        json!({
-            "perfcounters": [{
-                "object": "Mem\nory",
-                "counters": [{"name": "Available Bytes"}]
-            }]
-        }),
-        "perfcounters[0].object must not contain control characters",
-    );
-
-    let normalized =
-        Config::from_json(&config(json!({"selected": {"unit": " \t "}}), "selected")).unwrap();
-    assert_eq!(normalized.counters[0].name.as_ref(), "selected");
-    assert_eq!(normalized.counters[0].unit.as_ref(), "1");
+    assert_eq!(config.counters[0].unit.as_ref(), "1");
+    assert_eq!(config.counters[1].unit.as_ref(), " \t ");
+    assert_eq!(config.counters[2].unit.as_ref(), "B\ny");
 }
 
 /// Scenario: Path-shaped definitions are selected implicitly, by a wildcard template, or by an explicit alias.
@@ -995,8 +975,8 @@ fn resolves_exact_malformed_and_overlong_path_references() {
     }
 }
 
-/// Scenario: Metric units are blank or contain printable OTLP unit text.
-/// Guarantees: Blank defaults to "1"; non-empty printable values are trimmed but unrestricted.
+/// Scenario: Metric units are empty or contain unrestricted OTLP unit text.
+/// Guarantees: Literal empty defaults to "1"; every nonempty value remains verbatim.
 #[test]
 fn normalizes_unrestricted_metric_units() {
     let config = |unit: &str| {
@@ -1008,16 +988,22 @@ fn normalizes_unrestricted_metric_units() {
             }]
         })
     };
-    for unit in ["", " \t "] {
-        assert_eq!(
-            Config::from_json(&config(unit)).unwrap().counters[0]
-                .unit
-                .as_ref(),
-            "1"
-        );
-    }
+    assert_eq!(
+        Config::from_json(&config("")).unwrap().counters[0]
+            .unit
+            .as_ref(),
+        "1"
+    );
     let long_unit = format!("{{{}}}", "u".repeat(128));
-    for unit in ["By", "{packets}/s", "\u{b5}s", "B y", long_unit.as_str()] {
+    for unit in [
+        "By",
+        "{packets}/s",
+        "\u{b5}s",
+        "B y",
+        " \t ",
+        "B\ny",
+        long_unit.as_str(),
+    ] {
         assert_eq!(
             Config::from_json(&config(unit)).unwrap().counters[0]
                 .unit
@@ -1059,7 +1045,7 @@ fn preserves_space_distinct_metric_and_attribute_keys() {
                 {
                     "name": "% Processor Time",
                     "metric": "cpu",
-                    "attributes": {"host": "a", " host": " b "}
+                    "attributes": {"host": "a", " host": " b ", " ": "blank"}
                 },
                 {"name": "% Idle Time", "metric": " cpu "}
             ]
@@ -1071,6 +1057,7 @@ fn preserves_space_distinct_metric_and_attribute_keys() {
     assert_eq!(
         *config.counters[0].attributes,
         BTreeMap::from([
+            (" ".to_owned(), "blank".to_owned()),
             (" host".to_owned(), " b ".to_owned()),
             ("host".to_owned(), "a".to_owned()),
         ])
@@ -1097,7 +1084,7 @@ fn preserves_space_distinct_metric_and_attribute_keys() {
                 "counters": [{
                     "name": "% Processor Time",
                     "metric": "cpu",
-                    "attributes": {" ": "blank"}
+                    "attributes": {"": "invalid"}
                 }]
             }]
         }),
@@ -1228,6 +1215,7 @@ fn rejects_nul_in_path_segments() {
     for (field, value) in [
         ("object", "Mem\0ory"),
         ("instance", "app\0worker"),
+        ("aggregation", "_To\0tal"),
         ("counter", "Available\0Bytes"),
     ] {
         let object = match field {
@@ -1240,6 +1228,12 @@ fn rejects_nul_in_path_segments() {
                 "instances": value,
                 "counters": [{"name": "Private Bytes", "metric": "test"}]
             }),
+            "aggregation" => json!({
+                "object": "Process",
+                "instances": "*",
+                "aggregation_name": value,
+                "counters": [{"name": "Private Bytes", "metric": "test"}]
+            }),
             _ => json!({
                 "object": "Memory",
                 "counters": [{"name": value, "metric": "test"}]
@@ -1247,54 +1241,92 @@ fn rejects_nul_in_path_segments() {
         };
         assert_config_error(
             json!({"metrics": {"test": metric()}, "perfcounters": [object]}),
-            "must not contain control characters",
+            "must not contain NUL",
         );
     }
 }
 
-/// Scenario: Native object, instance, and counter components are blank, or the optional aggregation name is blank.
-/// Guarantees: Required blanks fail without trimming nonblank spelling, while blank aggregation retains its documented default.
+/// Scenario: Native object, instance, and counter components are empty, or aggregation names are empty or whitespace-only.
+/// Guarantees: Required literal empties fail, only an empty aggregation defaults, and whitespace-only spellings remain configured identity.
 #[test]
-fn handles_blank_native_components_and_aggregation() {
+fn handles_empty_native_components_and_aggregation() {
     for value in [
         json!({
             "perfcounters": [{
-                "object": " ",
+                "object": "",
                 "counters": [{"name": "Available Bytes"}]
             }]
         }),
         json!({
             "perfcounters": [{
                 "object": "Process",
-                "instances": " ",
+                "instances": "",
                 "counters": [{"name": "Private Bytes"}]
             }]
         }),
         json!({
             "perfcounters": [{
                 "object": "Memory",
-                "counters": [{"name": " "}]
-            }]
-        }),
-        json!({
-            "perfcounters": [{
-                "object": "Process",
-                "instances": "*",
-                "aggregation_name": " ",
-                "counters": [{"name": "Private Bytes"}]
+                "counters": [{"name": ""}]
             }]
         }),
     ] {
-        if value["perfcounters"][0]["aggregation_name"].is_string() {
-            let config = Config::from_json(&value).unwrap();
-            assert_eq!(
-                config.counters[0].instance_config.excluded_aggregation(),
-                Some("_Total")
-            );
-        } else {
-            assert_config_error(value, "must not be empty");
-        }
+        assert_config_error(value, "must not be empty");
     }
+
+    let defaulted = Config::from_json(&json!({
+        "perfcounters": [{
+            "object": "Process",
+            "instances": "*",
+            "aggregation_name": "",
+            "counters": [{"name": "Private Bytes"}]
+        }]
+    }))
+    .unwrap();
+    assert_eq!(
+        defaulted.counters[0].instance_config.excluded_aggregation(),
+        Some("_Total")
+    );
+
+    let whitespace = Config::from_json(&json!({
+        "perfcounters": [{
+            "object": " ",
+            "instances": "*",
+            "aggregation_name": " ",
+            "counters": [{"name": " "}]
+        }]
+    }))
+    .unwrap();
+    assert_eq!(whitespace.counters[0].path, r"\ (*)\ ");
+    assert_eq!(
+        whitespace.counters[0]
+            .instance_config
+            .excluded_aggregation(),
+        Some(" ")
+    );
+}
+
+/// Scenario: Native object, instance, and counter components contain whitespace or non-NUL control characters.
+/// Guarantees: Every nonempty native component reaches the constructed PDH path without receiver rewriting or rejection.
+#[test]
+fn preserves_non_nul_native_component_controls() {
+    let config = Config::from_json(&json!({
+        "perfcounters": [{
+            "object": "Mem\tory",
+            "instances": "work\ner",
+            "counters": [{"name": "Private\rBytes"}]
+        }]
+    }))
+    .unwrap();
+
+    assert_eq!(
+        config.counters[0].path,
+        "\\Mem\tory(work\ner)\\Private\rBytes"
+    );
+    assert_eq!(
+        config.counters[0].name.as_ref(),
+        "\\Mem\tory(work\ner)\\Private\rBytes"
+    );
 }
 
 /// Scenario: Explicit instances and counter mappings produce more exact paths than the configured native-entry budget.
@@ -1561,34 +1593,38 @@ fn allows_one_path_to_feed_multiple_mappings() {
     );
 }
 
-/// Scenario: Explicit instance indexes use omitted, zero, or leading-zero spellings.
-/// Guarantees: Equivalent PDH indexes normalize before duplicate and path checks.
+/// Scenario: Explicit instances and the aggregation name contain zero or leading-zero numeric suffixes.
+/// Guarantees: Every configured suffix remains distinct and reaches the native path or wildcard filter unchanged.
 #[test]
-fn canonicalizes_explicit_instance_indexes() {
-    for instances in [["app", "app#0"], ["app#1", "app#01"]] {
-        assert_config_error(
-            json!({
-                "metrics": {"test": metric()},
-                "perfcounters": [{
-                    "object": "Process",
-                    "instances": instances,
-                    "counters": [{"name": "Private Bytes", "metric": "test"}]
-                }]
-            }),
-            "instances contains duplicate",
-        );
-    }
-
+fn preserves_explicit_instance_indexes() {
     let config = Config::from_json(&json!({
         "metrics": {"test": metric()},
         "perfcounters": [{
             "object": "Process",
-            "instances": "app#001",
+            "instances": ["app", "app#0", "app#1", "app#01", "worker*"],
+            "aggregation_name": "_Total#00",
             "counters": [{"name": "Private Bytes", "metric": "test"}]
         }]
     }))
     .unwrap();
-    assert_eq!(config.counters[0].path, r"\Process(app#1)\Private Bytes");
+    assert_eq!(
+        config
+            .counters
+            .iter()
+            .map(|counter| counter.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            r"\Process(app)\Private Bytes",
+            r"\Process(app#0)\Private Bytes",
+            r"\Process(app#1)\Private Bytes",
+            r"\Process(app#01)\Private Bytes",
+            r"\Process(worker*)\Private Bytes",
+        ]
+    );
+    assert_eq!(
+        config.counters[4].instance_config.excluded_aggregation(),
+        Some("_Total#00")
+    );
 }
 
 /// Scenario: An instance name starts with `#` and otherwise resembles a PDH duplicate suffix.

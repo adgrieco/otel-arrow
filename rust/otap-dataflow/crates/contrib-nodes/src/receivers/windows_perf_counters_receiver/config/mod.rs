@@ -340,37 +340,23 @@ fn invalid(error: impl Into<String>) -> Error {
     }
 }
 
-fn require_name(field: &str, value: &str) -> Result<(), Error> {
-    if value.trim().is_empty() {
+fn require_nonempty(field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
         return Err(invalid(format!("{field} must not be empty")));
     }
     Ok(())
 }
 
-fn validate_no_control_characters(field: &str, value: &str) -> Result<(), Error> {
-    if value.chars().any(char::is_control) {
-        return Err(invalid(format!(
-            "{field} must not contain control characters"
-        )));
-    }
-    Ok(())
-}
-
 fn validate_native_component<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
-    require_name(field, value)?;
-    validate_no_control_characters(field, value)?;
+    require_nonempty(field, value)?;
+    if value.contains('\0') {
+        return Err(invalid(format!("{field} must not contain NUL")));
+    }
     Ok(value)
 }
 
 fn validate_object<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
     validate_native_component(field, value)
-}
-
-/// Splits a PDH duplicate-instance suffix, such as `app#2`, into name and index.
-fn instance_index(value: &str) -> Option<(&str, &str)> {
-    value.rsplit_once('#').filter(|(name, index)| {
-        !name.is_empty() && !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())
-    })
 }
 
 fn validate_instance<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
@@ -379,20 +365,6 @@ fn validate_instance<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> 
 
 fn validate_instance_pattern<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
     validate_native_component(field, value)
-}
-
-/// Canonicalizes PDH's decimal instance index, where the first occurrence omits `#0`.
-/// Returns `(canonical, configured)`.
-fn normalize_instance<'a>(field: &str, value: &'a str) -> Result<(String, &'a str), Error> {
-    let value = validate_instance(field, value)?;
-    let canonical = match instance_index(value) {
-        Some((name, index)) => match index.trim_start_matches('0') {
-            "" => name.to_owned(),
-            index => format!("{name}#{index}"),
-        },
-        None => value.to_owned(),
-    };
-    Ok((canonical, value))
 }
 
 fn validate_counter_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
@@ -405,16 +377,12 @@ fn is_path_metric_name(name: &str) -> bool {
 
 fn normalize_metric_name(name: &str) -> Result<(&str, bool), Error> {
     let path_shaped = is_path_metric_name(name);
-    require_name("metric name", name)?;
-    validate_no_control_characters("metric name", name)?;
+    require_nonempty("metric name", name)?;
     Ok((name, path_shaped))
 }
 
-fn normalize_metric_unit(unit: &str) -> Result<&str, Error> {
-    let unit = unit.trim();
-    let unit = if unit.is_empty() { "1" } else { unit };
-    validate_no_control_characters("metric unit", unit)?;
-    Ok(unit)
+fn normalize_metric_unit(unit: &str) -> &str {
+    if unit.is_empty() { "1" } else { unit }
 }
 
 fn should_warn_instance_override(
@@ -429,7 +397,7 @@ fn validate_attribute_keys(
     attributes: &BTreeMap<String, String>,
 ) -> Result<(), Error> {
     for key in attributes.keys() {
-        require_name(&format!("{field} attribute key"), key)?;
+        require_nonempty(&format!("{field} attribute key"), key)?;
         if key.starts_with(RECEIVER_ATTRIBUTE_PREFIX) {
             return Err(invalid(format!(
                 "{field} attribute {key:?} conflicts with receiver-generated attributes"
@@ -473,7 +441,7 @@ enum NormalizedInstances {
 }
 
 enum InstanceSegment {
-    Exact { native: String, configured: String },
+    Exact(String),
     Wildcard(String),
 }
 
@@ -532,8 +500,8 @@ fn normalize_metrics(
         let _ = metrics.insert(
             Arc::from(name),
             NormalizedMetric {
-                description: Arc::from(metric.description.trim()),
-                unit: Arc::from(normalize_metric_unit(&metric.unit)?),
+                description: Arc::from(metric.description.as_str()),
+                unit: Arc::from(normalize_metric_unit(&metric.unit)),
                 kind: metric.kind(name)?,
                 path_shaped,
             },
@@ -657,10 +625,9 @@ fn normalize_aggregation_name(
     configured: Option<String>,
 ) -> Result<String, Error> {
     let configured = configured
-        .filter(|name| !name.trim().is_empty())
+        .filter(|name| !name.is_empty())
         .unwrap_or_else(|| DEFAULT_AGGREGATION_NAME.to_owned());
-    normalize_instance(&format!("{object_field}.aggregation_name"), &configured)
-        .map(|(canonical, _)| canonical)
+    validate_instance(&format!("{object_field}.aggregation_name"), &configured).map(str::to_owned)
 }
 
 impl ObjectNormalizer<'_> {
@@ -812,10 +779,10 @@ impl NormalizedInstances {
         let mut segments = Vec::with_capacity(configured.len());
         for configured in configured {
             let segment = InstanceSegment::from_config(&field, configured)?;
-            if !identities.insert(segment.native().to_lowercase()) {
+            if !identities.insert(segment.value().to_lowercase()) {
                 return Err(invalid(format!(
                     "{object_field}.instances contains duplicate {:?}",
-                    segment.configured()
+                    segment.value()
                 )));
             }
             segments.push(segment);
@@ -860,8 +827,8 @@ impl NormalizedInstances {
             Self::Selected(segments) => segments
                 .iter()
                 .map(|segment| ExpandedPath {
-                    native: counter_path(object, Some(segment.native()), counter),
-                    configured: counter_path(object, Some(segment.configured()), counter),
+                    native: counter_path(object, Some(segment.value()), counter),
+                    configured: counter_path(object, Some(segment.value()), counter),
                     instance_config: if segment.is_wildcard() {
                         InstanceConfig::Wildcard {
                             excluded_aggregation: Some(aggregation_name.to_owned()),
@@ -884,24 +851,14 @@ impl InstanceSegment {
                 validate_instance_pattern(field, &configured)?.to_owned(),
             ))
         } else {
-            let (native, configured) = normalize_instance(field, &configured)?;
-            Ok(Self::Exact {
-                native,
-                configured: configured.to_owned(),
-            })
+            let configured = validate_instance(field, &configured)?.to_owned();
+            Ok(Self::Exact(configured))
         }
     }
 
-    fn native(&self) -> &str {
+    fn value(&self) -> &str {
         match self {
-            Self::Exact { native, .. } => native,
-            Self::Wildcard(configured) => configured,
-        }
-    }
-
-    fn configured(&self) -> &str {
-        match self {
-            Self::Exact { configured, .. } | Self::Wildcard(configured) => configured,
+            Self::Exact(configured) | Self::Wildcard(configured) => configured,
         }
     }
 
@@ -914,7 +871,7 @@ impl InstanceSegment {
     }
 
     fn is_exact(&self, expected: &str) -> bool {
-        matches!(self, Self::Exact { native, .. } if native == expected)
+        matches!(self, Self::Exact(configured) if configured == expected)
     }
 }
 
@@ -959,8 +916,6 @@ fn validate_path_length(field: &str, path: &str) -> Result<(), Error> {
 
 fn validate_counter(counter: &CounterConfig) -> Result<(), Error> {
     validate_path_length("counter path", &counter.path)?;
-    validate_no_control_characters("metric name", &counter.name)?;
-    validate_no_control_characters("metric unit", &counter.unit)?;
     if !(MIN_SCALE_POWER10..=MAX_SCALE_POWER10).contains(&counter.scale_power10) {
         return Err(invalid(format!(
             "counter path {:?} scale_power10 must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}",
