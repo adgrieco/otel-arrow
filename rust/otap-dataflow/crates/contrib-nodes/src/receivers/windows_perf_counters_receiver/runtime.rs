@@ -150,6 +150,16 @@ async fn wait_initial_delay(delay: Duration) {
     tokio::time::sleep(delay).await;
 }
 
+async fn initialize_and_signal_ready<F, T, E, S>(startup: F, signal_ready: S) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+    S: FnOnce(),
+{
+    let initialized = startup.await?;
+    signal_ready();
+    Ok(initialized)
+}
+
 async fn with_optional_timeout<F>(
     duration: Option<Duration>,
     future: F,
@@ -206,12 +216,10 @@ pub static WINDOWSPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFa
             node: node.name.to_string(),
             metrics: Rc::new(RefCell::new(metrics)),
         };
-        Ok(ReceiverWrapper::local(
-            receiver,
-            node,
-            node_config,
-            receiver_config,
-        ))
+        Ok(
+            ReceiverWrapper::local(receiver, node, node_config, receiver_config)
+                .with_startup_readiness(),
+        )
     },
     context_declarations: None,
     wiring_contract: otel_arrow_dfe_engine::wiring_contract::WiringContract::UNRESTRICTED,
@@ -425,13 +433,16 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
             Collection(Result<TerminalState, Error>),
         }
 
-        let worker_start = pdh::Worker::start_with_cadences(
-            self.config.counters.clone(),
-            self.config.query_retry_cap(),
-            self.config.wildcard_refresh_interval(),
-            self.config.max_instances_per_wildcard,
-            self.config.max_expanded_counters,
-            self.node.clone(),
+        let worker_start = initialize_and_signal_ready(
+            pdh::Worker::start_with_cadences(
+                self.config.counters.clone(),
+                self.config.query_retry_cap(),
+                self.config.wildcard_refresh_interval(),
+                self.config.max_instances_per_wildcard,
+                self.config.max_expanded_counters,
+                self.node.clone(),
+            ),
+            || effect_handler.signal_ready(),
         );
         tokio::pin!(worker_start);
         let mut worker = loop {
@@ -629,6 +640,50 @@ mod tests {
         assert_eq!(sample.metadata.diagnostics.counter_read_failures, 3);
         assert_eq!(sample.metadata.failures.len(), 3);
         assert_eq!(failed_counter_value_count(&sample.metadata.failures), 3);
+    }
+
+    /// Scenario: The initial PDH pass remains pending before it eventually succeeds.
+    /// Guarantees: Pipeline readiness stays blocked until native initialization completes, so downstream nodes cannot start against an unprimed receiver.
+    #[tokio::test]
+    async fn startup_readiness_waits_for_initial_pass() {
+        let ready = Rc::new(std::cell::Cell::new(false));
+        let signal = Rc::clone(&ready);
+        let (release, pending) = tokio::sync::oneshot::channel::<()>();
+        let startup = initialize_and_signal_ready(
+            async move {
+                pending.await.expect("release initial pass");
+                Ok::<_, &'static str>(42)
+            },
+            move || signal.set(true),
+        );
+        tokio::pin!(startup);
+
+        tokio::select! {
+            biased;
+            result = &mut startup => panic!("startup completed early: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert!(!ready.get());
+
+        release.send(()).expect("release startup");
+        assert_eq!(startup.await.unwrap(), 42);
+        assert!(ready.get());
+    }
+
+    /// Scenario: Native initialization fails before the worker can enter its collection loop.
+    /// Guarantees: A failed receiver never reports readiness, allowing the pipeline to surface startup failure instead of advertising a false healthy state.
+    #[tokio::test]
+    async fn startup_failure_does_not_signal_readiness() {
+        let ready = Rc::new(std::cell::Cell::new(false));
+        let signal = Rc::clone(&ready);
+        let result = initialize_and_signal_ready(
+            async { Err::<(), _>("initial PDH pass failed") },
+            move || signal.set(true),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), "initial PDH pass failed");
+        assert!(!ready.get());
     }
 
     /// Scenario: One collected scrape contains a healthy point beside a point with an invalid timestamp.
