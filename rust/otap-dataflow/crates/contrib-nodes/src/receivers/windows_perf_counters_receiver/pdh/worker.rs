@@ -818,8 +818,13 @@ impl<A: PdhApi> QuerySlot<A> {
         };
         for point in &mut sample.points {
             point.counter_index = remap(point.counter_index)?;
-            if point.monotonic_publication_generation.is_some() {
-                point.monotonic_publication_generation = Some(self.query_generation);
+            if point.monotonic_start_pending {
+                point.monotonic_publication = Some(MonotonicPublication {
+                    counter_index: point.counter_index,
+                    path: Arc::clone(&point.path),
+                    query_generation: self.query_generation,
+                    timestamp_unix_nano: point.timestamp_unix_nano,
+                });
             }
         }
         for failure in &mut sample.metadata.failures {
@@ -858,7 +863,6 @@ impl<A: PdhApi> QuerySlot<A> {
             query.publish_monotonic_start(
                 config_index,
                 &publication.path,
-                publication.value,
                 publication.timestamp_unix_nano,
             )
         })

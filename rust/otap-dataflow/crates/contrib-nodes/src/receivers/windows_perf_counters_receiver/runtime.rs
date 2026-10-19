@@ -140,16 +140,11 @@ struct WindowsPerfCountersReceiver {
 }
 
 #[derive(Debug)]
-enum ProcessSampleError {
+enum CollectionLoopError {
+    Native(pdh::Error),
     Projection(ProjectionInvariantError),
     MissingCounter(usize),
     Send(Error),
-}
-
-#[derive(Debug)]
-enum CollectionLoopError {
-    Native(pdh::Error),
-    Sample(ProcessSampleError),
 }
 
 async fn wait_initial_delay(delay: Duration) {
@@ -318,7 +313,7 @@ impl WindowsPerfCountersReceiver {
         overrun: bool,
         failure_logs: &mut FailureLogState,
         send: F,
-    ) -> Result<Vec<MonotonicPublication>, ProcessSampleError>
+    ) -> Result<Vec<MonotonicPublication>, CollectionLoopError>
     where
         F: FnOnce(OtapPdata) -> Fut,
         Fut: Future<Output = Result<(), Error>>,
@@ -327,7 +322,7 @@ impl WindowsPerfCountersReceiver {
             Ok(projection) => projection,
             Err(err) => {
                 self.record_completed_scrape(scrape_start, false, overrun);
-                return Err(ProcessSampleError::Projection(err));
+                return Err(CollectionLoopError::Projection(err));
             }
         };
         append_projection_failures(&mut sample, projection.point_failures);
@@ -336,13 +331,13 @@ impl WindowsPerfCountersReceiver {
         self.log_sample_events(&sample);
         failure_logs
             .log_counter_failures(self, &sample)
-            .map_err(ProcessSampleError::MissingCounter)?;
+            .map_err(CollectionLoopError::MissingCounter)?;
         let Some(records) = projection.records else {
             return Ok(Vec::new());
         };
         send(OtapPdata::new(Context::default(), records.into()))
             .await
-            .map_err(ProcessSampleError::Send)?;
+            .map_err(CollectionLoopError::Send)?;
         Ok(projection.monotonic_publications)
     }
 
@@ -417,11 +412,11 @@ impl WindowsPerfCountersReceiver {
                     &mut failure_logs,
                     &mut send,
                 )
-                .await
-                .map_err(CollectionLoopError::Sample)?;
-            publish(publications)
-                .await
-                .map_err(CollectionLoopError::Native)?;
+                .await?;
+            match publish(publications).await {
+                Ok(()) | Err(pdh::Error::WorkerBusy) => {}
+                Err(error) => return Err(CollectionLoopError::Native(error)),
+            }
         }
     }
 
@@ -445,17 +440,15 @@ impl WindowsPerfCountersReceiver {
             CollectionLoopError::Native(error) => {
                 receiver_error(effect_handler, error.to_string(), "")
             }
-            CollectionLoopError::Sample(ProcessSampleError::Projection(error)) => {
+            CollectionLoopError::Projection(error) => {
                 receiver_error(effect_handler, error.to_string(), "")
             }
-            CollectionLoopError::Sample(ProcessSampleError::MissingCounter(counter_index)) => {
-                receiver_error(
-                    effect_handler,
-                    format!("sample failure references missing configured counter {counter_index}"),
-                    "",
-                )
-            }
-            CollectionLoopError::Sample(ProcessSampleError::Send(error)) => error,
+            CollectionLoopError::MissingCounter(counter_index) => receiver_error(
+                effect_handler,
+                format!("sample failure references missing configured counter {counter_index}"),
+                "",
+            ),
+            CollectionLoopError::Send(error) => error,
         })
     }
 }
@@ -622,7 +615,8 @@ mod tests {
             emit_instance_attribute: false,
             timestamp_unix_nano: timestamp,
             start_time_unix_nano: None,
-            monotonic_publication_generation: None,
+            monotonic_start_pending: false,
+            monotonic_publication: None,
             value: SampleValue::Value(value),
         }
     }
@@ -880,7 +874,7 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(ProcessSampleError::Projection(_))));
+        assert!(matches!(result, Err(CollectionLoopError::Projection(_))));
         assert!(sent.borrow().is_empty());
         let metrics = receiver.metrics.borrow();
         assert_eq!(metrics.scrape_attempts(Outcome::Success), 0);
@@ -976,6 +970,73 @@ mod tests {
         assert_eq!(metrics.health.scrape_overruns.get(), 2);
     }
 
+    /// Scenario: Delivery succeeds, but the worker command queue is busy when the monotonic start acknowledgement is published.
+    /// Guarantees: The busy acknowledgement is best-effort, so collection continues until a later fatal worker stop.
+    #[tokio::test]
+    async fn worker_busy_after_delivery_does_not_stop_collection() {
+        let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        let collect_calls = Rc::new(std::cell::Cell::new(0_usize));
+        let collect_state = Rc::clone(&collect_calls);
+        let result = receiver
+            .collect_and_send_with(
+                move || {
+                    let call = collect_state.get();
+                    collect_state.set(call + 1);
+                    async move {
+                        if call == 0 {
+                            Ok(Sample {
+                                timestamp_unix_nano: 100,
+                                points: vec![sample_point(0, 100, Number::Integer(1))],
+                                metadata: Default::default(),
+                            })
+                        } else {
+                            Err(pdh::Error::WorkerStopped)
+                        }
+                    }
+                },
+                |_| async { Ok(()) },
+                |_| async { Err(pdh::Error::WorkerBusy) },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CollectionLoopError::Native(pdh::Error::WorkerStopped))
+        ));
+        assert_eq!(collect_calls.get(), 2);
+    }
+
+    /// Scenario: Delivery succeeds, but the worker has stopped before the monotonic start acknowledgement can be published.
+    /// Guarantees: A stopped worker remains fatal because no future collection can succeed.
+    #[tokio::test]
+    async fn worker_stopped_after_delivery_stops_collection() {
+        let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        let collect_calls = Rc::new(std::cell::Cell::new(0_usize));
+        let collect_state = Rc::clone(&collect_calls);
+        let result = receiver
+            .collect_and_send_with(
+                move || {
+                    collect_state.set(collect_state.get() + 1);
+                    async {
+                        Ok(Sample {
+                            timestamp_unix_nano: 100,
+                            points: vec![sample_point(0, 100, Number::Integer(1))],
+                            metadata: Default::default(),
+                        })
+                    }
+                },
+                |_| async { Ok(()) },
+                |_| async { Err(pdh::Error::WorkerStopped) },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CollectionLoopError::Native(pdh::Error::WorkerStopped))
+        ));
+        assert_eq!(collect_calls.get(), 1);
+    }
+
     /// Scenario: A positive timeout discards one monotonic candidate before the next scrape is projected, sent, and acknowledged.
     /// Guarantees: Runtime acknowledges only the delivered point, whose unknown cumulative start equals its own timestamp rather than the discarded scrape's timestamp.
     #[tokio::test]
@@ -1011,7 +1072,13 @@ mod tests {
                         emit_instance_attribute: false,
                         timestamp_unix_nano: timestamp,
                         start_time_unix_nano: Some(start.get().unwrap_or(timestamp)),
-                        monotonic_publication_generation: Some(0),
+                        monotonic_start_pending: true,
+                        monotonic_publication: Some(MonotonicPublication {
+                            counter_index: 0,
+                            path: Arc::from(r"\Memory\Available Bytes"),
+                            query_generation: 0,
+                            timestamp_unix_nano: timestamp,
+                        }),
                         value: SampleValue::Value(Number::Integer(call as i64 + 1)),
                     }],
                     metadata: Default::default(),

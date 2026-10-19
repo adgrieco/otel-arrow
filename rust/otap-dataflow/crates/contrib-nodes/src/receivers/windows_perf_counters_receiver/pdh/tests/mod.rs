@@ -403,19 +403,7 @@ fn collected_monotonic_publications(sample: &Sample) -> Vec<MonotonicPublication
     sample
         .points
         .iter()
-        .filter_map(|point| {
-            let query_generation = point.monotonic_publication_generation?;
-            let SampleValue::Value(Number::Integer(value)) = point.value else {
-                return None;
-            };
-            Some(MonotonicPublication {
-                counter_index: point.counter_index,
-                path: Arc::clone(&point.path),
-                query_generation,
-                value,
-                timestamp_unix_nano: point.timestamp_unix_nano,
-            })
-        })
+        .filter_map(|point| point.monotonic_publication.clone())
         .collect()
 }
 

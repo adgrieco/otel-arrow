@@ -71,6 +71,15 @@ pub(super) struct InstanceIdentity {
     pub(super) index: u32,
 }
 
+/// One delivered monotonic cumulative point whose start can be committed by the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MonotonicPublication {
+    pub(super) counter_index: usize,
+    pub(super) path: Arc<str>,
+    pub(super) query_generation: u64,
+    pub(super) timestamp_unix_nano: i64,
+}
+
 /// One exact or expanded counter point in a collection.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct SamplePoint {
@@ -86,20 +95,12 @@ pub(super) struct SamplePoint {
     pub(super) timestamp_unix_nano: i64,
     /// Start of this point's cumulative sequence or delta interval.
     pub(super) start_time_unix_nano: Option<i64>,
-    /// Query generation that can consume this monotonic cumulative start after delivery.
-    pub(super) monotonic_publication_generation: Option<u64>,
+    /// Whether delivery should publish an unknown monotonic cumulative start.
+    pub(super) monotonic_start_pending: bool,
+    /// Worker-owned acknowledgement identity for a pending monotonic start.
+    pub(super) monotonic_publication: Option<MonotonicPublication>,
     /// Ready value or expected omission.
     pub(super) value: SampleValue,
-}
-
-/// One delivered monotonic cumulative point whose start can be committed by the worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct MonotonicPublication {
-    pub(super) counter_index: usize,
-    pub(super) path: Arc<str>,
-    pub(super) query_generation: u64,
-    pub(super) value: i64,
-    pub(super) timestamp_unix_nano: i64,
 }
 
 /// One counter-local failure omitted from an otherwise successful collection.

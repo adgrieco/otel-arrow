@@ -57,11 +57,9 @@ pub(super) fn pending_monotonic_start_time(
 
 pub(super) fn publish_monotonic_start(
     sequence: &mut MonotonicSequence,
-    value: i64,
     timestamp_unix_nano: i64,
 ) -> bool {
     if sequence.start_time_unix_nano.is_none()
-        && sequence.previous_value == Some(value)
         && sequence.previous_timestamp_unix_nano == Some(timestamp_unix_nano)
     {
         sequence.start_time_unix_nano = Some(timestamp_unix_nano);

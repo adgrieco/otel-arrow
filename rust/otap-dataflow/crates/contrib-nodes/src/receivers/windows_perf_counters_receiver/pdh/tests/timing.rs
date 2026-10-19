@@ -95,7 +95,7 @@ fn primed_monotonic_query_tracks_published_sequence_only() {
     }
     let first = query.collect().unwrap();
     assert_eq!(first.points[0].start_time_unix_nano, Some(110));
-    assert!(query.publish_monotonic_start(0, &Arc::from(path), 20, 110));
+    assert!(query.publish_monotonic_start(0, &Arc::from(path), 110));
 
     {
         let mut state = state.borrow_mut();
@@ -236,7 +236,7 @@ fn formatted_transient_preserves_monotonic_sequence() {
     state.borrow_mut().timestamp = 120;
     let first = query.collect().unwrap();
     assert_eq!(first.points[0].start_time_unix_nano, Some(120));
-    assert!(query.publish_monotonic_start(0, &Arc::from(path), 20, 120));
+    assert!(query.publish_monotonic_start(0, &Arc::from(path), 120));
     {
         let mut state = state.borrow_mut();
         state.timestamp = 125;

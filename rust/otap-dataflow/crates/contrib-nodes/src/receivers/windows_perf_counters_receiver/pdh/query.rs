@@ -596,16 +596,11 @@ impl<A: PdhApi> Query<A> {
         &mut self,
         config_index: usize,
         path: &Arc<str>,
-        value: i64,
         timestamp_unix_nano: i64,
     ) -> bool {
         let key = CounterKey::new(config_index, path);
         self.counters.get_mut(&key).is_some_and(|counter| {
-            publish_monotonic_start(
-                &mut counter.history.monotonic_sequence,
-                value,
-                timestamp_unix_nano,
-            )
+            publish_monotonic_start(&mut counter.history.monotonic_sequence, timestamp_unix_nano)
         })
     }
 
@@ -783,14 +778,14 @@ impl<A: PdhApi> Query<A> {
                 emit_instance_attribute: counter.emit_instance_attribute,
                 timestamp_unix_nano,
                 start_time_unix_nano: point_start_time,
-                monotonic_publication_generation: matches!(
+                monotonic_start_pending: matches!(
                     metric_kind,
                     MetricKind::Sum {
                         aggregation: Aggregation::Cumulative,
                         monotonic: true,
                     }
-                )
-                .then_some(0),
+                ),
+                monotonic_publication: None,
                 value,
             });
         }

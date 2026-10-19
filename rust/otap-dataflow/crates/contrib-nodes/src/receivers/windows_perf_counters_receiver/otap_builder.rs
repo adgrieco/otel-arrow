@@ -67,21 +67,18 @@ impl PreparedPoint<'_> {
     fn monotonic_publication(
         &self,
     ) -> Result<Option<MonotonicPublication>, ProjectionInvariantError> {
-        let Some(query_generation) = self.point.monotonic_publication_generation else {
+        if !self.point.monotonic_start_pending {
             return Ok(None);
         };
-        let Number::Integer(value) = self.value else {
-            return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
-                "monotonic publication was not backed by an integer value".to_owned(),
-            )));
-        };
-        Ok(Some(MonotonicPublication {
-            counter_index: self.point.counter_index,
-            path: Arc::clone(&self.point.path),
-            query_generation,
-            value,
-            timestamp_unix_nano: self.point.timestamp_unix_nano,
-        }))
+        self.point
+            .monotonic_publication
+            .clone()
+            .map(Some)
+            .ok_or_else(|| {
+                ProjectionInvariantError(ArrowError::InvalidArgumentError(
+                    "pending monotonic start has no worker publication".to_owned(),
+                ))
+            })
     }
 }
 
@@ -491,7 +488,8 @@ mod tests {
             emit_instance_attribute: false,
             timestamp_unix_nano,
             start_time_unix_nano: None,
-            monotonic_publication_generation: None,
+            monotonic_start_pending: false,
+            monotonic_publication: None,
             value,
         }
     }
@@ -1585,7 +1583,8 @@ mod tests {
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
-                        monotonic_publication_generation: None,
+                        monotonic_start_pending: false,
+                        monotonic_publication: None,
                         value: SampleValue::Value(Number::Integer(10)),
                     },
                     SamplePoint {
@@ -1599,7 +1598,8 @@ mod tests {
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
-                        monotonic_publication_generation: None,
+                        monotonic_start_pending: false,
+                        monotonic_publication: None,
                         value: SampleValue::Value(Number::Integer(20)),
                     },
                 ],
@@ -1665,7 +1665,8 @@ mod tests {
                         emit_instance_attribute: false,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
-                        monotonic_publication_generation: None,
+                        monotonic_start_pending: false,
+                        monotonic_publication: None,
                         value: SampleValue::Value(Number::Integer(10)),
                     },
                     SamplePoint {
@@ -1675,7 +1676,8 @@ mod tests {
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
-                        monotonic_publication_generation: None,
+                        monotonic_start_pending: false,
+                        monotonic_publication: None,
                         value: SampleValue::Value(Number::Integer(20)),
                     },
                 ],
@@ -1731,7 +1733,8 @@ mod tests {
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
-                        monotonic_publication_generation: None,
+                        monotonic_start_pending: false,
+                        monotonic_publication: None,
                         value: SampleValue::Value(Number::Integer(10)),
                     },
                     SamplePoint {
@@ -1745,7 +1748,8 @@ mod tests {
                         emit_instance_attribute: true,
                         timestamp_unix_nano: 1,
                         start_time_unix_nano: None,
-                        monotonic_publication_generation: None,
+                        monotonic_start_pending: false,
+                        monotonic_publication: None,
                         value: SampleValue::Value(Number::Integer(20)),
                     },
                 ],

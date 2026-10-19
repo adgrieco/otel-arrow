@@ -1162,6 +1162,59 @@ fn recreated_monotonic_query_defers_start_until_publication() {
     assert_eq!(open_calls.get(), 3);
 }
 
+/// Scenario: A monotonic cumulative Sum applies a nonzero decimal scale before OTAP delivery.
+/// Guarantees: Delivery publishes the native monotonic start without requiring an integer projected value, and the next scrape retains that start.
+#[test]
+fn scaled_monotonic_sum_publishes_and_retains_start() {
+    let path = r"\TCPv4\Connection Failures";
+    let mut config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
+    config.scale_power10 = -1;
+    let projection_config = config.clone();
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
+        let (state, query) = fake_query(
+            configs,
+            vec![FakeCounter {
+                path: path.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(10)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+        );
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let plan = query_plans(vec![config]).pop().unwrap();
+    let mut queries = vec![QuerySlot::open_initial(plan, 4_096, &mut open).unwrap()];
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 110;
+        state.counters[0].formatted = Some(Number::Integer(10));
+    }
+    let first = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    assert_eq!(first.points[0].start_time_unix_nano, Some(110));
+    let projection = project_sample(std::slice::from_ref(&projection_config), &first).unwrap();
+    assert_eq!(projection.monotonic_publications.len(), 1);
+    publish_monotonic_starts(&mut queries, projection.monotonic_publications);
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 120;
+        state.counters[0].formatted = Some(Number::Integer(20));
+    }
+    let second = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    assert_eq!(second.points[0].start_time_unix_nano, Some(110));
+    let projection = project_sample(std::slice::from_ref(&projection_config), &second).unwrap();
+    assert!(projection.records.is_some());
+}
+
 /// Scenario: A monotonic direct-count query is rebuilt after repeated collection failures and primed successfully.
 /// Guarantees: Rebuild priming restores native readiness without backdating the first recovered cumulative point.
 #[test]
