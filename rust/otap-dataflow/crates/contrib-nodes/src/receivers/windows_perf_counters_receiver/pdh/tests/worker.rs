@@ -166,10 +166,10 @@ fn query_plans_isolate_recreated_source_mappings() {
     assert!(plans[2].recreate_query);
 }
 
-/// Scenario: Shared, isolated, and shared mappings collect from interleaved configuration positions.
-/// Guarantees: Stable grouping preserves global point identity and each query's own timestamp, preventing metrics from being attributed to the wrong mapping or scrape time.
+/// Scenario: Shared, isolated, and shared mappings collect from interleaved positions while isolated recreation and collection fail in sequence.
+/// Guarantees: Shared values retain global indices 0 and 2, and both isolated failures report only global index 1.
 #[test]
-fn interleaved_query_plans_remap_points_and_preserve_query_timestamps() {
+fn interleaved_query_failures_keep_global_indices() {
     let mut shared_first = counter(r"\Shared(first)\Value", "shared.first");
     shared_first.source_mapping_index = 0;
     let mut isolated = counter(r"\Isolated\Value", "isolated");
@@ -180,7 +180,18 @@ fn interleaved_query_plans_remap_points_and_preserve_query_timestamps() {
 
     let states = Rc::new(RefCell::new(Vec::new()));
     let factory_states = Rc::clone(&states);
+    let open_calls = Rc::new(Cell::new(0_usize));
+    let factory_open_calls = Rc::clone(&open_calls);
     let mut open = move |configs: Vec<CounterConfig>, _max_expanded_counters: usize| {
+        let open_index = factory_open_calls.get();
+        factory_open_calls.set(open_index + 1);
+        if open_index == 2 {
+            return Err(Error::Pdh {
+                operation: "PdhOpenQueryW",
+                path: "<query>".to_owned(),
+                status: 1,
+            });
+        }
         let counters = configs
             .iter()
             .map(|config| FakeCounter {
@@ -228,7 +239,35 @@ fn interleaved_query_plans_remap_points_and_preserve_query_timestamps() {
         ]
     );
     assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 1);
-    assert_eq!(states.borrow().len(), 3);
+    assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 1);
+    assert_eq!(sample.metadata.failures.len(), 1);
+    assert_eq!(sample.metadata.failures[0].counter_index, 1);
+    assert_eq!(sample.metadata.failures[0].reason, "PdhOpenQueryW");
+    assert!(sample.metadata.failures[0].diagnostic_only);
+
+    {
+        let states = states.borrow();
+        states[0].borrow_mut().timestamp = 120;
+        states[1].borrow_mut().collect_error = true;
+    }
+    let partial = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+
+    assert_eq!(
+        partial
+            .points
+            .iter()
+            .map(|point| (point.counter_index, point.path.as_ref()))
+            .collect::<Vec<_>>(),
+        [(0, r"\Shared(first)\Value"), (2, r"\Shared(second)\Value")]
+    );
+    assert_eq!(partial.metadata.diagnostics.query_recreation_attempts, 0);
+    assert_eq!(partial.metadata.diagnostics.scrape_failures, 1);
+    assert_eq!(partial.metadata.failures.len(), 1);
+    assert_eq!(partial.metadata.failures[0].counter_index, 1);
+    assert_eq!(partial.metadata.failures[0].reason, "PdhCollectQueryData");
+    assert!(!partial.metadata.failures[0].diagnostic_only);
+    assert_eq!(open_calls.get(), 3);
+    assert_eq!(states.borrow().len(), 2);
 }
 
 /// Scenario: One exact mapping and multiple recreated wildcard mappings fill one receiver-wide native-entry limit.
