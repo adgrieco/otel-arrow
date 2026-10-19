@@ -146,6 +146,12 @@ enum ProcessSampleError {
     Send(Error),
 }
 
+#[derive(Debug)]
+enum CollectionLoopError {
+    Native(pdh::Error),
+    Sample(ProcessSampleError),
+}
+
 async fn wait_initial_delay(delay: Duration) {
     tokio::time::sleep(delay).await;
 }
@@ -360,11 +366,17 @@ impl WindowsPerfCountersReceiver {
         }
     }
 
-    async fn collect_and_send(
+    async fn collect_and_send_with<C, CFut, S, SFut>(
         &self,
-        worker: &pdh::Worker,
-        effect_handler: &local::EffectHandler<OtapPdata>,
-    ) -> Result<TerminalState, Error> {
+        mut collect: C,
+        mut send: S,
+    ) -> Result<TerminalState, CollectionLoopError>
+    where
+        C: FnMut() -> CFut,
+        CFut: Future<Output = Result<Sample, pdh::Error>>,
+        S: FnMut(OtapPdata) -> SFut,
+        SFut: Future<Output = Result<(), Error>>,
+    {
         wait_initial_delay(self.config.initial_delay).await;
         let mut interval = tokio::time::interval(self.config.collection_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -372,7 +384,7 @@ impl WindowsPerfCountersReceiver {
         loop {
             let _ = interval.tick().await;
             let scrape_start = Instant::now();
-            let sample = match with_optional_timeout(self.config.timeout, worker.collect()).await {
+            let sample = match with_optional_timeout(self.config.timeout, collect()).await {
                 Ok(Ok(sample)) => sample,
                 Ok(Err(err)) if err.is_collection_failure() => {
                     let overrun = err.is_overrun()
@@ -383,7 +395,7 @@ impl WindowsPerfCountersReceiver {
                 }
                 Ok(Err(err)) => {
                     self.metrics.borrow_mut().record_scrape(Outcome::Failure);
-                    return Err(receiver_error(effect_handler, err.to_string(), ""));
+                    return Err(CollectionLoopError::Native(err));
                 }
                 Err(_) => {
                     self.record_completed_scrape(scrape_start, false, true);
@@ -398,26 +410,44 @@ impl WindowsPerfCountersReceiver {
                 scrape_start,
                 overrun,
                 &mut failure_logs,
-                |pdata| async {
-                    effect_handler
-                        .send_message_with_source_node(pdata)
-                        .await
-                        .map_err(Error::from)
-                },
+                &mut send,
             )
             .await
-            .map_err(|error| match error {
-                ProcessSampleError::Projection(error) => {
-                    receiver_error(effect_handler, error.to_string(), "")
-                }
-                ProcessSampleError::MissingCounter(counter_index) => receiver_error(
+            .map_err(CollectionLoopError::Sample)?;
+        }
+    }
+
+    async fn collect_and_send(
+        &self,
+        worker: &pdh::Worker,
+        effect_handler: &local::EffectHandler<OtapPdata>,
+    ) -> Result<TerminalState, Error> {
+        self.collect_and_send_with(
+            || worker.collect(),
+            |pdata| async {
+                effect_handler
+                    .send_message_with_source_node(pdata)
+                    .await
+                    .map_err(Error::from)
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            CollectionLoopError::Native(error) => {
+                receiver_error(effect_handler, error.to_string(), "")
+            }
+            CollectionLoopError::Sample(ProcessSampleError::Projection(error)) => {
+                receiver_error(effect_handler, error.to_string(), "")
+            }
+            CollectionLoopError::Sample(ProcessSampleError::MissingCounter(counter_index)) => {
+                receiver_error(
                     effect_handler,
                     format!("sample failure references missing configured counter {counter_index}"),
                     "",
-                ),
-                ProcessSampleError::Send(error) => error,
-            })?;
-        }
+                )
+            }
+            CollectionLoopError::Sample(ProcessSampleError::Send(error)) => error,
+        })
     }
 }
 
@@ -529,6 +559,7 @@ mod tests {
     use crate::receivers::windows_perf_counters_receiver::model::{
         Number, SamplePoint, SampleValue,
     };
+    use arrow::array::TimestampNanosecondArray;
     use arrow::util::display::array_value_to_string;
     use otel_arrow_dfe_config::node::NodeUserConfig;
     use otel_arrow_dfe_engine::testing::receiver::TestRuntime;
@@ -848,6 +879,87 @@ mod tests {
         assert_eq!(metrics.health.failed_counter_values.get(), 0);
     }
 
+    /// Scenario: Two collections each finish after the cadence while timeout is disabled.
+    /// Guarantees: Late scrapes retain their native timestamps, count as successful overruns, and collection proceeds to the next scrape instead of stalling after the first.
+    #[tokio::test]
+    async fn no_timeout_delivers_late_scrapes_and_continues() {
+        let mut receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        receiver.config.timeout = None;
+        receiver.config.collection_interval = Duration::from_millis(10);
+        let collect_calls = Rc::new(std::cell::Cell::new(0_usize));
+        let collect_state = Rc::clone(&collect_calls);
+        let collect = move || {
+            let call = collect_state.get();
+            collect_state.set(call + 1);
+            async move {
+                if call >= 2 {
+                    return std::future::pending::<Result<Sample, pdh::Error>>().await;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let timestamp = if call == 0 { 100 } else { 200 };
+                Ok(Sample {
+                    timestamp_unix_nano: timestamp,
+                    points: vec![sample_point(0, timestamp, Number::Integer(call as i64))],
+                    metadata: Default::default(),
+                })
+            }
+        };
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let capture = Rc::clone(&sent);
+        let run = receiver.collect_and_send_with(collect, move |pdata| {
+            let capture = Rc::clone(&capture);
+            async move {
+                capture.borrow_mut().push(pdata);
+                Ok(())
+            }
+        });
+        tokio::pin!(run);
+
+        let wait_for_following_scrape = async {
+            while collect_calls.get() < 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = &mut run => panic!("collection loop stopped after a late scrape"),
+            result = timeout(Duration::from_secs(1), wait_for_following_scrape) => {
+                result.expect("following scrape did not start");
+            }
+        }
+
+        assert_eq!(collect_calls.get(), 3);
+        assert_eq!(sent.borrow().len(), 2);
+        let timestamps = sent
+            .borrow()
+            .iter()
+            .cloned()
+            .map(|pdata| {
+                let (_, payload) = pdata.into_parts();
+                let PayloadData::OtapRecords(records) = payload.into_data() else {
+                    panic!("expected native OTAP records");
+                };
+                records
+                    .get(ArrowPayloadType::NumberDataPoints)
+                    .expect("number data points")
+                    .column_by_name("time_unix_nano")
+                    .expect("point timestamps")
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .expect("nanosecond timestamp array")
+                    .value(0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(timestamps, vec![100, 200]);
+
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(metrics.scrape_attempts(Outcome::Success), 2);
+        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 0);
+        assert_eq!(metrics.health.scrapes.get(), 2);
+        assert_eq!(metrics.health.scrape_failures.get(), 0);
+        assert_eq!(metrics.health.scrape_overruns.get(), 2);
+    }
+
     /// Scenario: Collection has a nonzero initial delay before its first request.
     /// Guarantees: The delay remains pending until the configured duration has fully elapsed.
     #[tokio::test(start_paused = true)]
@@ -987,7 +1099,7 @@ mod tests {
     }
 
     /// Scenario: One collection spans several scheduled interval ticks.
-    /// Guarantees: Late completion resumes at the next cadence boundary instead of bursting queued scrapes.
+    /// Guarantees: One immediate tick follows the overrun, then cadence resumes without a burst of every missed scrape.
     #[tokio::test(start_paused = true)]
     async fn missed_collection_ticks_are_skipped() {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
