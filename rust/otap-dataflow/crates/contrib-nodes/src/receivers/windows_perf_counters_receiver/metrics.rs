@@ -157,4 +157,12 @@ impl WindowsPerfCountersReceiverMetrics {
         snapshots.extend(self.health.terminal_snapshots());
         snapshots
     }
+
+    #[cfg(test)]
+    pub(super) fn scrape_attempts(&self, outcome: Outcome) -> u64 {
+        self.scrapes
+            .get(OutcomeAttributes { outcome })
+            .attempts
+            .get()
+    }
 }

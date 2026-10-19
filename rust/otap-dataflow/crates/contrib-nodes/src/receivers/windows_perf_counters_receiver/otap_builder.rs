@@ -44,15 +44,9 @@ struct ProjectionBuilder {
 }
 
 #[derive(Debug)]
-pub(super) enum ProjectionOutcome {
-    Projected {
-        records: Option<OtapArrowRecords>,
-        point_failures: Vec<SampleFailure>,
-    },
-    BatchDropped {
-        error: ArrowError,
-        point_failures: Vec<SampleFailure>,
-    },
+pub(super) struct ProjectionOutcome {
+    pub(super) records: Option<OtapArrowRecords>,
+    pub(super) point_failures: Vec<SampleFailure>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -319,21 +313,10 @@ fn prepare_point<'a>(
     })
 }
 
-fn recoverable_batch_error(error: &ArrowError) -> bool {
-    matches!(
-        error,
-        ArrowError::MemoryError(_) | ArrowError::ComputeError(_)
-    )
-}
-
-fn project_with_finish<F>(
+fn project(
     counters: &[CounterConfig],
     sample: &Sample,
-    finish: F,
-) -> Result<ProjectionOutcome, ProjectionInvariantError>
-where
-    F: FnOnce(ProjectionBuilder) -> Result<OtapArrowRecords, ArrowError>,
-{
+) -> Result<ProjectionOutcome, ProjectionInvariantError> {
     if sample.timestamp_unix_nano <= 0 {
         return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
             format!(
@@ -367,30 +350,26 @@ where
         point_count += 1;
     }
     if builder.metric_ids.is_empty() {
-        return Ok(ProjectionOutcome::Projected {
+        return Ok(ProjectionOutcome {
             records: None,
             point_failures,
         });
     }
-    match finish(builder) {
-        Ok(records) => Ok(ProjectionOutcome::Projected {
-            records: Some(records),
-            point_failures,
-        }),
-        Err(error) if recoverable_batch_error(&error) => Ok(ProjectionOutcome::BatchDropped {
-            error,
-            point_failures,
-        }),
-        Err(error) => Err(ProjectionInvariantError(error)),
-    }
+    // Projection supplies valid UTF-8 and keeps every builder column aligned, so a finish error
+    // indicates a violated internal invariant rather than a data-dependent scrape failure.
+    let records = builder.finish().map_err(ProjectionInvariantError)?;
+    Ok(ProjectionOutcome {
+        records: Some(records),
+        point_failures,
+    })
 }
 
-/// Project one scrape while isolating expected point and batch data failures.
+/// Project one scrape while isolating expected point-data failures.
 pub(super) fn project_sample(
     counters: &[CounterConfig],
     sample: &Sample,
 ) -> Result<ProjectionOutcome, ProjectionInvariantError> {
-    project_with_finish(counters, sample, ProjectionBuilder::finish)
+    project(counters, sample)
 }
 
 #[cfg(test)]
@@ -398,15 +377,16 @@ pub(super) fn into_otap(
     counters: &[CounterConfig],
     sample: Sample,
 ) -> Result<Option<OtapArrowRecords>, ArrowError> {
-    match project_sample(counters, &sample).map_err(|error| error.0)? {
-        ProjectionOutcome::Projected {
-            records,
-            point_failures,
-        } if point_failures.is_empty() => Ok(records),
-        ProjectionOutcome::Projected { point_failures, .. } => Err(
-            ArrowError::InvalidArgumentError(point_failures[0].error.clone()),
-        ),
-        ProjectionOutcome::BatchDropped { error, .. } => Err(error),
+    let ProjectionOutcome {
+        records,
+        point_failures,
+    } = project_sample(counters, &sample).map_err(|error| error.0)?;
+    if point_failures.is_empty() {
+        Ok(records)
+    } else {
+        Err(ArrowError::InvalidArgumentError(
+            point_failures[0].error.clone(),
+        ))
     }
 }
 
@@ -1482,7 +1462,7 @@ mod tests {
             },
         )
         .unwrap();
-        let ProjectionOutcome::Projected {
+        let ProjectionOutcome {
             records: Some(records),
             point_failures,
         } = outcome
@@ -1512,76 +1492,6 @@ mod tests {
                 .value(0),
             42
         );
-    }
-
-    /// Scenario: Arrow cannot finish an otherwise valid batch because of a recoverable memory or computation failure.
-    /// Guarantees: A transient batch failure cannot terminate the source or poison the next scrape.
-    #[test]
-    fn isolates_recoverable_batch_failure_from_subsequent_projection() {
-        let counters = [counter(
-            r"\Memory\Available Bytes",
-            "windows.memory.available",
-            "By",
-        )];
-        let sample = Sample {
-            timestamp_unix_nano: 1,
-            points: vec![point(
-                0,
-                r"\Memory\Available Bytes",
-                SampleValue::Value(Number::Integer(42)),
-            )],
-            metadata: Default::default(),
-        };
-
-        for error in [
-            ArrowError::MemoryError("injected memory failure".to_owned()),
-            ArrowError::ComputeError("injected computation failure".to_owned()),
-        ] {
-            assert!(matches!(
-                project_with_finish(&counters, &sample, move |_| Err(error)).unwrap(),
-                ProjectionOutcome::BatchDropped {
-                    point_failures,
-                    ..
-                } if point_failures.is_empty()
-            ));
-        }
-
-        assert!(matches!(
-            project_sample(&counters, &sample).unwrap(),
-            ProjectionOutcome::Projected {
-                records: Some(_),
-                point_failures,
-            } if point_failures.is_empty()
-        ));
-    }
-
-    /// Scenario: Arrow reports a schema failure while finishing an otherwise valid batch.
-    /// Guarantees: Structural corruption cannot be hidden as a recoverable dropped scrape.
-    #[test]
-    fn rejects_schema_batch_failure_as_invariant() {
-        let counters = [counter(
-            r"\Memory\Available Bytes",
-            "windows.memory.available",
-            "By",
-        )];
-        let sample = Sample {
-            timestamp_unix_nano: 1,
-            points: vec![point(
-                0,
-                r"\Memory\Available Bytes",
-                SampleValue::Value(Number::Integer(42)),
-            )],
-            metadata: Default::default(),
-        };
-
-        let error = project_with_finish(&counters, &sample, |_| {
-            Err(ArrowError::SchemaError(
-                "injected schema failure".to_owned(),
-            ))
-        })
-        .unwrap_err();
-
-        assert_eq!(error.to_string(), "Schema error: injected schema failure");
     }
 
     /// Scenario: A sample references a configured-counter index that does not exist.
