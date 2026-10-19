@@ -216,14 +216,15 @@ aggregate explicitly included with `"*"` retains it. The receiver also emits
 
 Explicit PDH duplicate-instance indexes are canonicalized before path and
 duplicate checks: the first occurrence omits `#0`, and leading zeroes are
-removed from later indexes. These indexes are positional, not durable entity
-identifiers. If same-named processes churn while their count stays unchanged,
-PDH can reuse `name#n` for a different process and a two-sample calculation can
-span the old and new process. The receiver cannot detect that entity change
-from the reused instance identity alone. Where the target host provides it,
-prefer `Process V2`, whose instances include the process ID as `name:PID`;
-provider availability varies by Windows version and installed
-performance-counter set.
+removed from later indexes. A suffix is an index only when a nonempty instance
+name precedes `#`, so an instance such as `#5` keeps that literal native name.
+These indexes are positional, not durable entity identifiers. If same-named
+processes churn while their count stays unchanged, PDH can reuse `name#n` for a
+different process and a two-sample calculation can span the old and new
+process. The receiver cannot detect that entity change from the reused instance
+identity alone. Where the target host provides it, prefer `Process V2`, whose
+instances include the process ID as `name:PID`; provider availability varies by
+Windows version and installed performance-counter set.
 
 Unknown fields, explicit references to undefined metrics, duplicate instances,
 invalid intervals, unsupported scales, and duplicate outputs are configuration
@@ -233,16 +234,17 @@ definitions may be unused. Metric definition names, explicit references, and
 attribute keys and values preserve their exact configured spelling. Lookup is
 case-sensitive and does not trim, so "cpu" and " cpu" are distinct names.
 Omitted or literal empty references select implicit path naming;
-whitespace-only references are invalid. Units and descriptions are trimmed,
-blank units default to `"1"`, and descriptions are exempt from control-character
-validation. A definition is path-shaped for usage diagnostics only when its
-first configured character is `\`. Exact references resolve any matching
-definition key, including padded, malformed, alias, or overlong path-shaped
-keys; no match reports an undefined metric. A path-shaped definition that is
-not selected by an implicit configured path/template or an explicit reference
-produces one usage warning. Metric definitions and configured wildcard
-templates have no separate receiver-specific count limit. Exact paths and
-concrete wildcard expansions share `max_expanded_counters`; exact paths that
+every other reference uses exact lookup, so whitespace-only references report
+an undefined metric. Units and descriptions are trimmed, blank units default to
+`"1"`, and descriptions are exempt from control-character validation. A
+definition is path-shaped for usage diagnostics only when its first configured
+character is `\`. Exact references resolve any matching definition key,
+including padded, malformed, alias, or overlong path-shaped keys; no match
+reports an undefined metric. A path-shaped definition that is not selected by
+an implicit configured path/template or an explicit reference produces one
+usage warning. Metric definitions and configured wildcard templates have no
+separate receiver-specific count limit. Exact paths and concrete wildcard
+expansions share `max_expanded_counters`; exact paths that
 exceed it are rejected during configuration. Metric names, units, descriptions,
 and mapping attributes share immutable backing across explicit instance
 expansions; configuration clones preserve that backing.

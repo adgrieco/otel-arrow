@@ -368,19 +368,13 @@ fn validate_object<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
 
 /// Splits a PDH duplicate-instance suffix, such as `app#2`, into name and index.
 fn instance_index(value: &str) -> Option<(&str, &str)> {
-    value
-        .rsplit_once('#')
-        .filter(|(_, index)| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
+    value.rsplit_once('#').filter(|(name, index)| {
+        !name.is_empty() && !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 fn validate_instance<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
-    let value = validate_native_component(field, value)?;
-    if instance_index(value).is_some_and(|(name, _)| name.is_empty()) {
-        return Err(invalid(format!(
-            "{field} must include an instance name before its index"
-        )));
-    }
-    Ok(value)
+    validate_native_component(field, value)
 }
 
 fn validate_instance_pattern<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
@@ -430,10 +424,10 @@ fn should_warn_instance_override(
     attributes.contains_key("instance") && has_multiple_or_wildcard_instances
 }
 
-fn normalize_attributes(
+fn validate_attribute_keys(
     field: &str,
     attributes: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>, Error> {
+) -> Result<(), Error> {
     for key in attributes.keys() {
         require_name(&format!("{field} attribute key"), key)?;
         if key.starts_with(RECEIVER_ATTRIBUTE_PREFIX) {
@@ -442,7 +436,7 @@ fn normalize_attributes(
             )));
         }
     }
-    Ok(attributes.clone())
+    Ok(())
 }
 
 struct NormalizedMetric {
@@ -762,7 +756,8 @@ impl ObjectNormalizer<'_> {
                 "{counter_field}.metric references undefined metric {name:?}"
             ))
         })?;
-        let attributes = normalize_attributes(counter_field, configured_attributes)?;
+        validate_attribute_keys(counter_field, configured_attributes)?;
+        let attributes = configured_attributes.clone();
         if should_warn_instance_override(self.instances.has_multiple_or_wildcard(), &attributes) {
             otel_arrow_dfe_telemetry::otel_warn!(
                 "windows_perf_counters_receiver.config.instance_override",
@@ -792,7 +787,6 @@ fn normalize_metric_reference<'a>(
             if name.is_empty() {
                 return Ok(None);
             }
-            let (name, _) = normalize_metric_name(name)?;
             Ok(Some(name))
         }
         Some(None) => Err(invalid(format!(
@@ -932,17 +926,17 @@ fn counter_path(object: &str, instance: Option<&str>, counter: &str) -> String {
 }
 
 fn validate_counter_outputs(counters: &[CounterConfig]) -> Result<(), Error> {
+    let lowercase_paths = counters
+        .iter()
+        .map(|counter| counter.path.to_lowercase())
+        .collect::<Vec<_>>();
     let mut output_identities = HashSet::with_capacity(counters.len());
-    for counter in counters {
+    for (counter, lowercase_path) in counters.iter().zip(&lowercase_paths) {
         validate_counter(counter)?;
         let identity = (
-            counter.path.to_lowercase(),
-            counter.name.clone(),
-            counter
-                .attributes
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect::<Vec<_>>(),
+            lowercase_path.as_str(),
+            counter.name.as_ref(),
+            counter.attributes.as_ref(),
         );
         if !output_identities.insert(identity) {
             return Err(invalid(format!(

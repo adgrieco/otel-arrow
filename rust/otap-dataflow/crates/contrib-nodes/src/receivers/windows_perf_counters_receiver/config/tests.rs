@@ -460,33 +460,18 @@ fn defaults_optional_metric_metadata_and_allows_unused_definitions() {
     assert_eq!(counter.metric_kind, MetricKind::Gauge);
 }
 
-/// Scenario: A counter supplies a literal empty metric reference.
-/// Guarantees: Go's zero-value mapping behavior treats only the empty string as an implicit path-named Gauge.
-#[test]
-fn treats_empty_metric_name_as_omitted() {
-    let config = Config::from_json(&json!({
-        "perfcounters": [{
-            "object": "Memory",
-            "counters": [{"name": "Available Bytes", "metric": ""}]
-        }]
-    }))
-    .unwrap();
-
-    assert_eq!(config.counters[0].name.as_ref(), r"\Memory\Available Bytes");
-}
-
 /// Scenario: A counter supplies a whitespace-only metric reference.
-/// Guarantees: Padding cannot silently select implicit path naming.
+/// Guarantees: Every nonempty spelling uses exact lookup and reports the unmatched reference.
 #[test]
 fn rejects_whitespace_only_metric_reference() {
     assert_config_error(
         json!({
             "perfcounters": [{
                 "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": " \t "}]
+                "counters": [{"name": "Available Bytes", "metric": "  "}]
             }]
         }),
-        "metric name must not be empty",
+        "references undefined metric \"  \"",
     );
 }
 
@@ -893,8 +878,8 @@ fn accepts_otlp_metric_names_and_units() {
     assert_config_error(config(" ", "By"), "metric name must not be empty");
 }
 
-/// Scenario: Metric names, units, references, or generated path names contain control characters.
-/// Guarantees: Identity controls are rejected, while unit-only whitespace still selects the documented default.
+/// Scenario: Metric definitions, units, references, or generated path names contain control characters.
+/// Guarantees: Definition identity controls are rejected, unmatched references remain exact, and unit-only whitespace still selects the documented default.
 #[test]
 fn rejects_metric_controls_and_defaults_blank_units() {
     let config = |metrics, metric: &str| {
@@ -917,11 +902,11 @@ fn rejects_metric_controls_and_defaults_blank_units() {
     );
     assert_config_error(
         config(json!({"selected": metric()}), "selected\nname"),
-        "metric name must not contain control characters",
+        "references undefined metric",
     );
     assert_config_error(
         config(json!({"selected": metric()}), "\\Memory\\Available Bytes\t"),
-        "metric name must not contain control characters",
+        "references undefined metric",
     );
     assert_config_error(
         config(
@@ -1604,20 +1589,23 @@ fn canonicalizes_explicit_instance_indexes() {
     }))
     .unwrap();
     assert_eq!(config.counters[0].path, r"\Process(app#1)\Private Bytes");
+}
 
-    for instance in ["#0", "#1"] {
-        assert_config_error(
-            json!({
-                "metrics": {"test": metric()},
-                "perfcounters": [{
-                    "object": "Process",
-                    "instances": instance,
-                    "counters": [{"name": "Private Bytes", "metric": "test"}]
-                }]
-            }),
-            "must include an instance name before its index",
-        );
-    }
+/// Scenario: An instance name starts with `#` and otherwise resembles a PDH duplicate suffix.
+/// Guarantees: `#5` remains a literal native instance because duplicate indexes require a nonempty name before `#`.
+#[test]
+fn preserves_hash_prefixed_instance_name() {
+    let config = Config::from_json(&json!({
+        "metrics": {"test": metric()},
+        "perfcounters": [{
+            "object": "Process",
+            "instances": "#5",
+            "counters": [{"name": "Private Bytes", "metric": "test"}]
+        }]
+    }))
+    .unwrap();
+
+    assert_eq!(config.counters[0].path, r"\Process(#5)\Private Bytes");
 }
 
 /// Scenario: YAML shorthand selects an empty Gauge with a null value.
