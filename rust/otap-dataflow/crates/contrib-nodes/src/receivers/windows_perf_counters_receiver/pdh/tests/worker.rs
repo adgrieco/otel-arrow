@@ -60,6 +60,77 @@ impl PdhApi for StartupTestPdh {
     }
 }
 
+#[derive(Default)]
+struct PeakOwnership {
+    current: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+struct PeakPdh {
+    ownership: Arc<PeakOwnership>,
+    owned: usize,
+    expansions: BTreeMap<String, Vec<String>>,
+}
+
+impl Drop for PeakPdh {
+    fn drop(&mut self) {
+        let _ = self
+            .ownership
+            .current
+            .fetch_sub(self.owned, Ordering::AcqRel);
+    }
+}
+
+impl PdhApi for PeakPdh {
+    type Counter = String;
+
+    fn add(&mut self, path: &str, _localized: bool) -> Result<Self::Counter, Error> {
+        self.owned += 1;
+        let current = self.ownership.current.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.ownership.peak.fetch_max(current, Ordering::AcqRel);
+        Ok(path.to_owned())
+    }
+
+    fn remove(&mut self, _counter: &Self::Counter, _path: &str) -> Result<(), Error> {
+        self.owned -= 1;
+        let _ = self.ownership.current.fetch_sub(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn counter_type(&mut self, _counter: &Self::Counter, _path: &str) -> Result<u32, Error> {
+        Ok(0x0001_0100)
+    }
+
+    fn collect(&mut self) -> Result<bool, Error> {
+        Ok(true)
+    }
+
+    fn raw(&mut self, _counter: &Self::Counter, _path: &str) -> Result<Option<RawSample>, Error> {
+        Ok(None)
+    }
+
+    fn formatted(
+        &mut self,
+        _counter: &Self::Counter,
+        _path: &str,
+        _format: ValueFormat,
+    ) -> Result<Option<Number>, Error> {
+        Ok(Some(Number::Integer(42)))
+    }
+
+    fn timestamp(&mut self) -> Result<i64, Error> {
+        Ok(100)
+    }
+
+    fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
+        Ok(self.expansions.get(path).cloned().unwrap_or_default())
+    }
+
+    fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
+        NativePdh::parse_instance_path(path)
+    }
+}
+
 /// Scenario: Shared and independently recreated source mappings are interleaved after expansion.
 /// Guarantees: Adjacency cannot split logical query ownership, which keeps query count and sampling history stable across configuration order.
 #[test]
@@ -160,8 +231,8 @@ fn interleaved_query_plans_remap_points_and_preserve_query_timestamps() {
     assert_eq!(states.borrow().len(), 3);
 }
 
-/// Scenario: One exact mapping and multiple recreated wildcard mappings compete for one receiver-wide native-entry limit.
-/// Guarantees: Exact reservations and replacement allocations share one ownership budget so isolated queries cannot multiply retained entries.
+/// Scenario: One exact mapping and multiple recreated wildcard mappings fill one receiver-wide native-entry limit.
+/// Guarantees: Recreation retains each old query when no replacement capacity remains, so isolated queries cannot multiply or discard retained entries.
 #[test]
 fn recreated_queries_share_receiver_native_entry_limit() {
     let mut exact = counter(r"\Memory\Available Bytes", "memory.available");
@@ -251,13 +322,179 @@ fn recreated_queries_share_receiver_native_entry_limit() {
 
     let sample = collect_queries(&mut queries, Duration::from_secs(30), 5, &mut open).unwrap();
     assert_eq!(sample.metadata.diagnostics.active_expanded_counters, 4);
-    assert_eq!(observed_limits.borrow().as_slice(), [5, 4, 1, 3, 1]);
+    assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 2);
+    assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 2);
+    assert_eq!(observed_limits.borrow().as_slice(), [5, 4, 1]);
     assert_eq!(
         queries
             .iter()
             .map(QuerySlot::reserved_native_entry_count)
             .sum::<usize>(),
         5
+    );
+}
+
+/// Scenario: A wildcard initial plan can fill the receiver budget before a later isolated exact plan opens.
+/// Guarantees: Startup reserves every unopened exact mapping, so both plans open within the validated receiver-wide limit.
+#[test]
+fn initial_wildcard_reserves_later_exact_native_entry() {
+    let wildcard_path = r"\Process(*)\Private Bytes";
+    let expanded = (0..3)
+        .map(|index| format!(r"\Process(worker{index})\Private Bytes"))
+        .collect::<Vec<_>>();
+    let mut wildcard = counter(wildcard_path, "process.private");
+    wildcard.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let mut isolated = counter(r"\System\Processes", "system.processes");
+    isolated.recreate_query = true;
+    isolated.source_mapping_index = 1;
+
+    let observed_limits = Rc::new(RefCell::new(Vec::new()));
+    let factory_limits = Rc::clone(&observed_limits);
+    let mut open = move |configs: Vec<CounterConfig>, max_native_counters: usize| {
+        factory_limits.borrow_mut().push(max_native_counters);
+        let counters = configs
+            .iter()
+            .flat_map(|config| {
+                if config.instance_config.is_wildcard() {
+                    expanded.clone()
+                } else {
+                    vec![config.path.clone()]
+                }
+            })
+            .map(|path| FakeCounter {
+                path,
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            })
+            .collect();
+        let state = Rc::new(RefCell::new(FakeState {
+            counters,
+            added: Vec::new(),
+            calls: FakeNativeCalls::default(),
+            collect_has_data: true,
+            collect_error: false,
+            timestamp: 100,
+            timestamp_error: false,
+            remove_error: false,
+            removed: Vec::new(),
+            expansions: [(wildcard_path.to_owned(), expanded.clone())]
+                .into_iter()
+                .collect(),
+        }));
+        Query::open_with(
+            FakePdh(state),
+            configs,
+            Duration::from_secs(30),
+            256,
+            max_native_counters,
+        )
+    };
+
+    let queries = open_initial_queries(
+        query_plans(vec![wildcard, isolated]),
+        Duration::from_secs(30),
+        3,
+        &mut open,
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(observed_limits.borrow().as_slice(), [2, 1]);
+    assert_eq!(
+        queries
+            .iter()
+            .map(QuerySlot::active_expanded_count)
+            .collect::<Vec<_>>(),
+        [2, 0]
+    );
+    assert_eq!(
+        queries
+            .iter()
+            .map(QuerySlot::reserved_native_entry_count)
+            .sum::<usize>(),
+        3
+    );
+}
+
+/// Scenario: A recreated exact-and-wildcard plan discovers more instances while its old handles remain live beside an exact peer.
+/// Guarantees: Replacement construction overlaps the old query without exceeding receiver-wide ownership and swaps only the entries that fit.
+#[test]
+fn recreation_peak_includes_old_query_ownership() {
+    let exact_path = r"\Memory\Available Bytes";
+    let wildcard_path = r"\Process(*)\Private Bytes";
+    let expanded_paths = (0..3)
+        .map(|index| format!(r"\Process(worker{index})\Private Bytes"))
+        .collect::<Vec<_>>();
+    let peer_path = r"\System\Processes";
+    let mut exact = counter(exact_path, "memory.available");
+    exact.recreate_query = true;
+    exact.source_mapping_index = 1;
+    let mut wildcard = counter(wildcard_path, "process.private");
+    wildcard.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    wildcard.recreate_query = true;
+    wildcard.source_mapping_index = 1;
+    let peer = counter(peer_path, "system.processes");
+
+    let ownership = Arc::new(PeakOwnership::default());
+    let factory_ownership = Arc::clone(&ownership);
+    let open_calls = Rc::new(Cell::new(0));
+    let factory_open_calls = Rc::clone(&open_calls);
+    let mut open = move |configs: Vec<CounterConfig>, max_native_counters: usize| {
+        let open_index = factory_open_calls.get();
+        factory_open_calls.set(open_index + 1);
+        let expanded = if open_index == 2 {
+            expanded_paths.clone()
+        } else {
+            expanded_paths[..1].to_vec()
+        };
+        Query::open_with(
+            PeakPdh {
+                ownership: Arc::clone(&factory_ownership),
+                owned: 0,
+                expansions: [(wildcard_path.to_owned(), expanded)].into_iter().collect(),
+            },
+            configs,
+            Duration::from_secs(30),
+            256,
+            max_native_counters,
+        )
+    };
+    let mut queries = open_initial_queries(
+        query_plans(vec![exact, wildcard, peer]),
+        Duration::from_secs(30),
+        5,
+        &mut open,
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(ownership.current.load(Ordering::Acquire), 3);
+    assert_eq!(ownership.peak.load(Ordering::Acquire), 3);
+
+    let sample = collect_queries(&mut queries, Duration::from_secs(30), 5, &mut open).unwrap();
+
+    assert_eq!(sample.points.len(), 3);
+    assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 1);
+    assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 0);
+    assert_eq!(open_calls.get(), 3);
+    assert_eq!(ownership.current.load(Ordering::Acquire), 3);
+    assert_eq!(ownership.peak.load(Ordering::Acquire), 5);
+    assert_eq!(
+        queries
+            .iter()
+            .map(QuerySlot::reserved_native_entry_count)
+            .sum::<usize>(),
+        3
     );
 }
 

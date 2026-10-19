@@ -287,7 +287,7 @@ fn run_worker_thread<A, F>(
     );
 }
 
-fn open_initial_queries<A, F>(
+pub(super) fn open_initial_queries<A, F>(
     plans: Vec<QueryPlan>,
     query_retry_cap: Duration,
     max_native_counters: usize,
@@ -299,13 +299,22 @@ where
     F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
 {
     let mut queries = Vec::with_capacity(plans.len());
+    let mut unopened_exact_reservations = plans
+        .iter()
+        .map(QueryPlan::exact_counter_reservations)
+        .fold(0usize, usize::saturating_add);
     for plan in plans {
         if shutdown_requested.load(Ordering::Acquire) {
             return Ok(None);
         }
+        unopened_exact_reservations =
+            unopened_exact_reservations.saturating_sub(plan.exact_counter_reservations());
         let query_limit = remaining_native_capacity(
             max_native_counters,
-            queries.iter().map(QuerySlot::reserved_native_entry_count),
+            queries
+                .iter()
+                .map(QuerySlot::reserved_native_entry_count)
+                .chain(std::iter::once(unopened_exact_reservations)),
         );
         queries.push(QuerySlot::open_initial_with_retry_cap(
             plan,
@@ -399,6 +408,15 @@ pub(super) struct QueryPlan {
     pub(super) recreate_query: bool,
 }
 
+impl QueryPlan {
+    fn exact_counter_reservations(&self) -> usize {
+        self.configs
+            .iter()
+            .filter(|config| !config.instance_config.is_wildcard())
+            .count()
+    }
+}
+
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 enum QueryPlanKey {
     Shared,
@@ -464,11 +482,7 @@ impl<A: PdhApi> QuerySlot<A> {
         F: FnMut(Vec<CounterConfig>, usize) -> Result<Query<A>, Error>,
     {
         let now = Instant::now();
-        let exact_counter_reservations = plan
-            .configs
-            .iter()
-            .filter(|config| !config.instance_config.is_wildcard())
-            .count();
+        let exact_counter_reservations = plan.exact_counter_reservations();
         let mut query = match open(plan.configs.clone(), max_native_counters) {
             Ok(query) => query,
             Err(error) if error.is_recoverable_query_open_failure() => {
@@ -671,11 +685,16 @@ impl<A: PdhApi> QuerySlot<A> {
             return;
         }
         metadata.diagnostics.query_recreation_attempts += 1;
-        let replacement =
+        let replacement = if max_native_counters < self.reserved_native_entry_count() {
+            Err(Error::InvalidSample(
+                "replacement query capacity is below its current reservation",
+            ))
+        } else {
             open(self.plan.configs.clone(), max_native_counters).and_then(|mut query| {
                 query.prime()?;
                 Ok(query)
-            });
+            })
+        };
         match replacement {
             Ok(query) => {
                 self.query = Some(query);
@@ -887,7 +906,10 @@ fn recreate_successful_queries<A, F>(
         if !collection_succeeded[query_index] {
             continue;
         }
-        let query_limit = query_native_limit(queries, query_index, max_native_counters);
+        let query_limit = remaining_native_capacity(
+            max_native_counters,
+            queries.iter().map(QuerySlot::reserved_native_entry_count),
+        );
         queries[query_index].recreate(now, query_limit, open, &mut sample.metadata);
     }
 }
