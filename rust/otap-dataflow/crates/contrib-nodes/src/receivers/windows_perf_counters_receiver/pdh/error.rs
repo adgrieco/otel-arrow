@@ -50,6 +50,8 @@ pub(in super::super) enum Error {
     WorkerPanicked,
     #[error("PDH query recovery is deferred for another {retry_after_ms} ms")]
     QueryRecoveryPending { retry_after_ms: u128 },
+    #[error("replacement query capacity {available} is below its current reservation {reserved}")]
+    QueryRecreationCapacity { available: usize, reserved: usize },
 }
 
 impl Error {
@@ -125,6 +127,7 @@ impl Error {
             Self::WorkerStopped => "worker_stopped",
             Self::WorkerPanicked => "worker_panicked",
             Self::QueryRecoveryPending { .. } => "query_recovery_pending",
+            Self::QueryRecreationCapacity { .. } => "query_recreation_capacity",
         }
     }
 

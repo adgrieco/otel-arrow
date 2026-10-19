@@ -67,6 +67,7 @@ impl<A: PdhApi> Query<A> {
     pub(super) fn open_with(
         api: A,
         configs: Vec<CounterConfig>,
+        exact_retry_cap: Duration,
         wildcard_refresh_interval: Duration,
         max_instances_per_wildcard: usize,
         max_native_counters: usize,
@@ -74,7 +75,7 @@ impl<A: PdhApi> Query<A> {
         Self::open_with_cadences(
             api,
             configs,
-            wildcard_refresh_interval,
+            exact_retry_cap,
             wildcard_refresh_interval,
             max_instances_per_wildcard,
             max_native_counters,

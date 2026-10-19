@@ -338,6 +338,7 @@ fn recreated_queries_share_receiver_native_entry_limit() {
             FakePdh(state),
             configs,
             Duration::from_secs(30),
+            Duration::from_secs(30),
             256,
             max_expanded_counters,
         )
@@ -363,6 +364,14 @@ fn recreated_queries_share_receiver_native_entry_limit() {
     assert_eq!(sample.metadata.diagnostics.active_expanded_counters, 4);
     assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 2);
     assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 2);
+    assert_eq!(sample.metadata.failures.len(), 2);
+    assert!(
+        sample
+            .metadata
+            .failures
+            .iter()
+            .all(|failure| failure.reason == "query_recreation_capacity")
+    );
     assert_eq!(observed_limits.borrow().as_slice(), [5, 4, 1]);
     assert_eq!(
         queries
@@ -429,6 +438,7 @@ fn initial_wildcard_reserves_later_exact_native_entry() {
         Query::open_with(
             FakePdh(state),
             configs,
+            Duration::from_secs(30),
             Duration::from_secs(30),
             256,
             max_native_counters,
@@ -502,6 +512,7 @@ fn recreation_peak_includes_old_query_ownership() {
                 expansions: [(wildcard_path.to_owned(), expanded)].into_iter().collect(),
             },
             configs,
+            Duration::from_secs(30),
             Duration::from_secs(30),
             256,
             max_native_counters,
@@ -603,6 +614,7 @@ fn exact_reservation_reduces_same_query_expansion_capacity() {
         FakePdh(Rc::clone(&state)),
         vec![counter(exact_path, "memory.available"), wildcard],
         Duration::from_secs(30),
+        Duration::from_secs(30),
         256,
         2,
     )
@@ -625,6 +637,7 @@ fn query_rejects_limit_below_exact_reservation() {
             counter(r"\Memory\Available Bytes", "memory.available"),
             counter(r"\System\Processes", "system.processes"),
         ],
+        Duration::from_secs(30),
         Duration::from_secs(30),
         256,
         1,
@@ -1304,6 +1317,7 @@ async fn startup_longer_than_thirty_seconds_eventually_succeeds() {
                 },
                 configs,
                 Duration::from_secs(30),
+                Duration::from_secs(30),
                 256,
                 max_expanded_counters,
             )
@@ -1371,6 +1385,7 @@ async fn cancelling_startup_stops_between_initialization_units() {
                 },
                 configs,
                 Duration::from_secs(30),
+                Duration::from_secs(30),
                 256,
                 max_expanded_counters,
             )
@@ -1431,6 +1446,7 @@ async fn startup_retains_recoverable_empty_and_partial_slots() {
                         dropped: Arc::new(AtomicBool::new(false)),
                     },
                     configs,
+                    Duration::from_secs(30),
                     Duration::from_secs(30),
                     256,
                     max_expanded_counters,
@@ -1510,6 +1526,7 @@ async fn startup_prime_query_failure_starts_and_recovers() {
                 },
                 counters,
                 Duration::from_secs(30),
+                Duration::from_secs(30),
                 256,
                 max_expanded_counters,
             )
@@ -1564,6 +1581,7 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
                 collect_calls: 0,
             },
             configs,
+            Duration::from_secs(30),
             Duration::from_secs(30),
             256,
             max_expanded_counters,
@@ -1646,6 +1664,7 @@ fn rebuild_prime_failure_is_counted_once() {
                 collect_calls: 0,
             },
             configs,
+            Duration::from_secs(30),
             Duration::from_secs(30),
             256,
             max_expanded_counters,

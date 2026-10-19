@@ -356,12 +356,18 @@ fn fake_query(
     configs: Vec<CounterConfig>,
     counters: Vec<FakeCounter>,
 ) -> (Rc<RefCell<FakeState>>, Query<FakePdh>) {
-    fake_query_with_refresh_interval(configs, counters, Duration::from_secs(30))
+    fake_query_with_cadences(
+        configs,
+        counters,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    )
 }
 
-fn fake_query_with_refresh_interval(
+fn fake_query_with_cadences(
     configs: Vec<CounterConfig>,
     counters: Vec<FakeCounter>,
+    exact_retry_cap: Duration,
     wildcard_refresh_interval: Duration,
 ) -> (Rc<RefCell<FakeState>>, Query<FakePdh>) {
     let state = Rc::new(RefCell::new(FakeState {
@@ -379,6 +385,7 @@ fn fake_query_with_refresh_interval(
     let query = Query::open_with(
         FakePdh(Rc::clone(&state)),
         configs,
+        exact_retry_cap,
         wildcard_refresh_interval,
         256,
         4_096,

@@ -159,6 +159,7 @@ fn invalid_handle_query(
         InvalidHandlePdh(Rc::clone(&state)),
         configs,
         Duration::ZERO,
+        Duration::ZERO,
         256,
         4_096,
     )
@@ -688,6 +689,7 @@ fn high_cardinality_collection_preserves_native_call_counts() {
         FakePdh(Rc::clone(&state)),
         vec![config],
         Duration::from_secs(60),
+        Duration::from_secs(60),
         256,
         256,
     )
@@ -735,6 +737,7 @@ fn setup_diagnostic_preserves_cleanup_failure() {
         FakePdh(Rc::clone(&state)),
         vec![counter(path, "windows.unsupported")],
         Duration::from_secs(30),
+        Duration::from_secs(30),
         256,
         4_096,
     )
@@ -760,9 +763,10 @@ fn setup_diagnostic_preserves_cleanup_failure() {
 #[test]
 fn queued_retry_stops_after_unsupported_type() {
     let path = r"\Object\Unsupported";
-    let (state, mut query) = fake_query_with_refresh_interval(
+    let (state, mut query) = fake_query_with_cadences(
         vec![counter(path, "windows.unsupported")],
         Vec::new(),
+        Duration::ZERO,
         Duration::ZERO,
     );
     state.borrow_mut().counters.push(FakeCounter {
@@ -797,9 +801,10 @@ fn queued_retry_stops_after_unsupported_type() {
 #[test]
 fn queued_retry_stops_after_invalid_mapping() {
     let path = r"\Object\Operations";
-    let (state, mut query) = fake_query_with_refresh_interval(
+    let (state, mut query) = fake_query_with_cadences(
         vec![delta_sum(path, "object.operations", false)],
         Vec::new(),
+        Duration::ZERO,
         Duration::ZERO,
     );
     state.borrow_mut().counters.push(FakeCounter {
@@ -837,9 +842,10 @@ fn queued_retry_stops_after_invalid_mapping() {
 #[test]
 fn queued_retry_stops_after_wrapped_invalid_mapping() {
     let path = r"\Object\Operations";
-    let (state, mut query) = fake_query_with_refresh_interval(
+    let (state, mut query) = fake_query_with_cadences(
         vec![delta_sum(path, "object.operations", false)],
         Vec::new(),
+        Duration::ZERO,
         Duration::ZERO,
     );
     {
@@ -888,9 +894,10 @@ fn queued_retry_stops_after_wrapped_invalid_mapping() {
 #[test]
 fn queued_transient_retry_still_recovers() {
     let path = r"\Memory\Available Bytes";
-    let (state, mut query) = fake_query_with_refresh_interval(
+    let (state, mut query) = fake_query_with_cadences(
         vec![counter(path, "system.memory.available")],
         Vec::new(),
+        Duration::ZERO,
         Duration::ZERO,
     );
 
@@ -943,7 +950,7 @@ fn wildcard_refresh_retries_permanently_rejected_instance() {
     config.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
     };
-    let (state, mut query) = fake_query_with_refresh_interval(
+    let (state, mut query) = fake_query_with_cadences(
         vec![config],
         vec![FakeCounter {
             path: expanded.to_owned(),
@@ -954,6 +961,7 @@ fn wildcard_refresh_retries_permanently_rejected_instance() {
             raw_error: false,
             formatted_error: false,
         }],
+        Duration::ZERO,
         Duration::ZERO,
     );
     let _ = state

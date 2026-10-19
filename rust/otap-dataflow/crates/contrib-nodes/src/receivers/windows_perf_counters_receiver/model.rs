@@ -278,11 +278,7 @@ fn dense_metadata_indices<T>(
     let mut max_counter_index = None::<usize>;
     for item in current.iter().chain(incoming) {
         let item_key = key(item);
-        max_counter_index = Some(
-            max_counter_index.map_or(item_key.counter_index, |current_max| {
-                current_max.max(item_key.counter_index)
-            }),
-        );
+        max_counter_index = max_counter_index.max(Some(item_key.counter_index));
         if !reasons.contains(&item_key.reason) {
             reasons.push(item_key.reason);
         }

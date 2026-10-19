@@ -765,10 +765,12 @@ impl<A: PdhApi> QuerySlot<A> {
             return;
         }
         metadata.diagnostics.query_recreation_attempts += 1;
-        let replacement = if max_native_counters < self.reserved_native_entry_count() {
-            Err(Error::InvalidSample(
-                "replacement query capacity is below its current reservation",
-            ))
+        let reserved = self.reserved_native_entry_count();
+        let replacement = if max_native_counters < reserved {
+            Err(Error::QueryRecreationCapacity {
+                available: max_native_counters,
+                reserved,
+            })
         } else {
             open(self.plan.configs.clone(), max_native_counters).and_then(|mut query| {
                 query.prime()?;
