@@ -258,23 +258,6 @@ impl Worker {
         response_rx.await.map_err(|_| Error::WorkerStopped)?
     }
 
-    pub(in super::super) async fn publish_monotonic_starts(
-        &self,
-        publications: Vec<MonotonicPublication>,
-    ) -> Result<(), Error> {
-        if publications.is_empty() {
-            return Ok(());
-        }
-        let (response_tx, response_rx) = oneshot::channel();
-        self.tx
-            .try_send(Command::PublishMonotonic(publications, response_tx))
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => Error::WorkerBusy,
-                mpsc::TrySendError::Disconnected(_) => Error::WorkerStopped,
-            })?;
-        response_rx.await.map_err(|_| Error::WorkerStopped)
-    }
-
     /// Request shutdown and return `false` if the worker outlives the deadline.
     pub(in super::super) async fn shutdown(&mut self, deadline: Instant) -> Result<bool, Error> {
         self.shutdown_requested.store(true, Ordering::Release);
@@ -477,10 +460,6 @@ fn run_command_loop<A, F>(
                     break;
                 }
             }
-            Ok(Command::PublishMonotonic(publications, response)) => {
-                publish_monotonic_starts(queries, publications);
-                let _ = response.send(());
-            }
             Ok(Command::Shutdown) | Err(_) => break,
         }
     }
@@ -495,7 +474,6 @@ impl Drop for Worker {
 
 pub(super) enum Command {
     Collect(oneshot::Sender<Result<Sample, Error>>),
-    PublishMonotonic(Vec<MonotonicPublication>, oneshot::Sender<()>),
     Shutdown,
 }
 
@@ -535,7 +513,7 @@ impl QuerySettings {
         initialize_once(&mut self.initialized, || {
             super::native::initialize_worker(&self.node, self.has_wildcards, &shutdown)
         })?;
-        Query::open_replacement(
+        let mut query = Query::open_replacement(
             counters,
             self.cadence.retry_cap,
             self.cadence.wildcard_refresh,
@@ -544,7 +522,9 @@ impl QuerySettings {
             self.node.clone(),
             seed,
             shutdown,
-        )
+        )?;
+        query.freeze_membership()?;
+        Ok(query)
     }
 }
 
@@ -658,6 +638,9 @@ impl<A: PdhApi> QuerySlot<A> {
         if let Some(query) = slot.query.as_mut() {
             query.refresh_all_wildcards_managed()?;
             let prime_error = query.prime_managed().err();
+            if prime_error.as_ref().is_some_and(Error::is_invalid_query) {
+                return Err(prime_error.expect("invalid-query prime error is present"));
+            }
             if let Some(error) = &prime_error {
                 query.record_prime_failure(error);
             }
@@ -759,6 +742,11 @@ impl<A: PdhApi> QuerySlot<A> {
             Option<&QueryRecreationSeed>,
         ) -> Result<Query<A>, Error>,
     {
+        if let Some(query) = self.query.as_mut()
+            && query.membership_is_frozen()
+        {
+            return query.collect_managed();
+        }
         let was_query_retry =
             self.query.is_some() && self.query_failure_attempts > 0 && now >= self.next_query_retry;
         if was_query_retry {
@@ -962,6 +950,9 @@ impl<A: PdhApi> QuerySlot<A> {
         if !self.plan.recreate_query {
             return;
         }
+        if self.query.as_ref().is_some_and(Query::membership_is_frozen) {
+            return;
+        }
         metadata.diagnostics.query_recreation_attempts += 1;
         let reserved = self.reserved_native_entry_count();
         let replacement = if max_native_counters < reserved {
@@ -1080,6 +1071,7 @@ impl<A: PdhApi> QuerySlot<A> {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn publish_monotonic_start(&mut self, publication: &MonotonicPublication) -> bool {
         if publication.query_generation != self.query_generation {
             return false;
@@ -1101,6 +1093,7 @@ impl<A: PdhApi> QuerySlot<A> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn publish_monotonic_starts<A: PdhApi>(
     queries: &mut [QuerySlot<A>],
     publications: Vec<MonotonicPublication>,
@@ -1278,6 +1271,9 @@ fn prepare_initial_queries<A: PdhApi>(
             continue;
         };
         let prime_error = query.prime_managed().err();
+        if prime_error.as_ref().is_some_and(Error::is_invalid_query) {
+            return Err(prime_error.expect("invalid-query prime error is present"));
+        }
         if let Some(error) = &prime_error {
             query.record_prime_failure(error);
         }

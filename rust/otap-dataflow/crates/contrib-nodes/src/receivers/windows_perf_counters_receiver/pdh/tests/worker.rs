@@ -224,6 +224,86 @@ impl PdhApi for PeakPdh {
     }
 }
 
+/// Scenario: A frozen startup query has four transient collection failures before recovering.
+/// Guarantees: Every scheduled request retries the same query and handles without rebuild, backoff, or recreation.
+#[test]
+fn frozen_worker_query_never_rebuilds_after_transient_failures() {
+    let path = r"\Memory\Available Bytes";
+    let state = fake_state(vec![fake_counter(path, Number::Integer(42))]);
+    let opens = Cell::new(0);
+    let factory_state = Rc::clone(&state);
+    let mut open = |configs, limit, _seed: Option<&QueryRecreationSeed>| {
+        opens.set(opens.get() + 1);
+        let mut query = Query::open_with(
+            FakePdh::new(Rc::clone(&factory_state)),
+            configs,
+            Duration::ZERO,
+            Duration::ZERO,
+            256,
+            limit,
+        )?;
+        query.freeze_membership()?;
+        Ok(query)
+    };
+    let plans = query_plans(vec![counter(path, "memory")]);
+    let mut queries = open_initial_queries(
+        plans,
+        Duration::ZERO,
+        4096,
+        &mut open,
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+    let adds = state.borrow().calls.add;
+    state.borrow_mut().collect_error = true;
+    for _ in 0..4 {
+        assert!(collect_queries(&mut queries, Duration::ZERO, 4096, &mut open).is_err());
+    }
+    state.borrow_mut().collect_error = false;
+    let sample = collect_queries(&mut queries, Duration::ZERO, 4096, &mut open).unwrap();
+    assert_eq!(opens.get(), 1);
+    assert_eq!(state.borrow().calls.add, adds);
+    assert!(state.borrow().removed.is_empty());
+    assert_eq!(sample.points.len(), 1);
+    assert!(sample.metadata.diagnostics.any_query_collected);
+    assert_eq!(sample.metadata.diagnostics.query_rebuild_attempts, 0);
+    assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 0);
+}
+
+/// Scenario: The frozen production startup preparation receives an invalid query during priming.
+/// Guarantees: Startup returns the typed error after one prime instead of advertising readiness or scheduling recovery.
+#[test]
+fn frozen_startup_invalid_prime_is_terminal() {
+    let path = r"\Memory\Available Bytes";
+    let state = fake_state(vec![fake_counter(path, Number::Integer(42))]);
+    state.borrow_mut().collect_status =
+        Some(windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE);
+    let factory_state = Rc::clone(&state);
+    let mut open = |configs, limit, _seed: Option<&QueryRecreationSeed>| {
+        let mut query = Query::open_with(
+            FakePdh::new(Rc::clone(&factory_state)),
+            configs,
+            Duration::ZERO,
+            Duration::ZERO,
+            256,
+            limit,
+        )?;
+        query.freeze_membership()?;
+        Ok(query)
+    };
+    let result = open_initial_queries(
+        query_plans(vec![counter(path, "memory")]),
+        Duration::ZERO,
+        4096,
+        &mut open,
+        &AtomicBool::new(false),
+    );
+    assert!(matches!(result, Err(error) if error.is_invalid_query()));
+    assert_eq!(state.borrow().calls.collect, 1);
+    assert_eq!(state.borrow().calls.add, 1);
+}
+
 /// Scenario: Shared and independently recreated source mappings are interleaved after expansion.
 /// Guarantees: Adjacency cannot split logical query ownership, which keeps query count and sampling history stable across configuration order.
 #[test]
@@ -2477,9 +2557,6 @@ fn controlled_worker() -> (
                         drop(accepted);
                         let _ = response.send(Ok(empty_sample()));
                     }
-                }
-                Ok(Command::PublishMonotonic(_, response)) => {
-                    let _ = response.send(());
                 }
                 Ok(Command::Shutdown) | Err(_) => break,
             }

@@ -324,10 +324,6 @@ impl WindowsPerfCountersReceiver {
         let mut diagnostics = sample.metadata.diagnostics.clone();
         diagnostics.counter_read_failures = failed_counter_value_count(&sample.metadata.failures);
         metrics.health.apply(&diagnostics);
-        metrics
-            .health
-            .failed_counter_values
-            .add(failed_counter_value_count(&sample.metadata.failures));
     }
 
     fn record_successful_sample(&self, collection_duration: Duration, sample: &Sample) {
@@ -369,22 +365,6 @@ impl WindowsPerfCountersReceiver {
                 added = sample.metadata.diagnostics.instances_added,
                 removed = sample.metadata.diagnostics.instances_removed,
                 active = sample.metadata.diagnostics.active_expanded_counters as u64
-            );
-        }
-        if sample.metadata.diagnostics.retry_attempts > 0
-            || sample.metadata.diagnostics.retry_recoveries > 0
-            || sample.metadata.diagnostics.query_rebuild_attempts > 0
-            || sample.metadata.diagnostics.query_recreation_failures > 0
-        {
-            otel_arrow_dfe_telemetry::otel_info!(
-                "windows_perf_counters_receiver.recovery.change",
-                node = self.node.as_str(),
-                retry_attempts = sample.metadata.diagnostics.retry_attempts,
-                retry_recoveries = sample.metadata.diagnostics.retry_recoveries,
-                query_rebuild_attempts = sample.metadata.diagnostics.query_rebuild_attempts,
-                query_rebuild_recoveries = sample.metadata.diagnostics.query_rebuild_recoveries,
-                query_recreation_attempts = sample.metadata.diagnostics.query_recreation_attempts,
-                query_recreation_failures = sample.metadata.diagnostics.query_recreation_failures
             );
         }
     }
@@ -553,7 +533,15 @@ impl WindowsPerfCountersReceiver {
                     .await
                     .map_err(Error::from)
             },
-            |publications| worker.publish_monotonic_starts(publications),
+            |publications| async move {
+                if publications.is_empty() {
+                    Ok(())
+                } else {
+                    Err(pdh::Error::InvalidSample(
+                        "publication acknowledgments are not supported",
+                    ))
+                }
+            },
         )
         .await
         .map_err(|error| match error {
@@ -613,6 +601,11 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
                     }
                 },
                 result = &mut worker_start => break result.map_err(|err| {
+                    otel_arrow_dfe_telemetry::otel_error!(
+                        "windows_perf_counters_receiver.startup.fail",
+                        node = self.node.as_str(),
+                        error = %err
+                    );
                     receiver_error(
                         &effect_handler,
                         "failed to initialize the Windows PDH query",
@@ -868,7 +861,7 @@ mod tests {
         assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
         assert_eq!(metrics.health.scrapes.get(), 1);
         assert_eq!(metrics.health.scrape_failures.get(), 1);
-        assert_eq!(metrics.health.failed_counter_values.get(), 0);
+        assert_eq!(metrics.health.counter_read_failures.get(), 0);
     }
 
     /// Scenario: A concrete counter fails, is absent and omitted on later scrapes, then produces a valid value before failing again.
@@ -1068,7 +1061,6 @@ mod tests {
         assert_eq!(metrics.health.scrapes.get(), 0);
         assert_eq!(metrics.health.scrape_failures.get(), 1);
         assert_eq!(metrics.health.counter_read_failures.get(), 0);
-        assert_eq!(metrics.health.failed_counter_values.get(), 0);
     }
 
     /// Scenario: Projection and downstream delivery occur after a two-second native collection.
@@ -1749,7 +1741,7 @@ mod tests {
     }
 
     /// Scenario: The registered factory starts a live receiver with exact, aggregate, wildcard, and unavailable peer mappings.
-    /// Guarantees: The engine handoff decodes to Memory, _Total, and startup-expanded metrics while the unavailable peer is omitted.
+    /// Guarantees: Two engine batches decode exact, aggregate, wildcard and fixed-start cumulative Sum points beside an omitted unavailable peer.
     #[test]
     #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
     fn live_factory_collects_decodes_and_hands_off_metrics() {
@@ -1765,6 +1757,10 @@ mod tests {
                 "windows.memory.available": {
                     "unit": "By",
                     "gauge": {}
+                },
+                "windows.memory.available.sum": {
+                    "unit": "By",
+                    "sum": {"aggregation": "cumulative", "monotonic": false}
                 },
                 "windows.processor.time": {
                     "unit": "%",
@@ -1785,6 +1781,9 @@ mod tests {
                     "counters": [{
                         "name": "Available Bytes",
                         "metric": "windows.memory.available"
+                    }, {
+                        "name": "Available Bytes",
+                        "metric": "windows.memory.available.sum"
                     }]
                 },
                 {
@@ -1811,12 +1810,9 @@ mod tests {
                     }]
                 }
             ],
-            "collection_interval": "10s",
+            "collection_interval": "1s",
             "initial_delay": "500ms",
-            "timeout": "5s",
-            "wildcard_refresh_interval": "30s",
-            "max_instances_per_wildcard": 256,
-            "max_expanded_counters": 512
+            "timeout": "5s"
         });
         let receiver = (factory.create)(
             pipeline,
@@ -1830,7 +1826,7 @@ mod tests {
         test_runtime
             .set_receiver(receiver)
             .run_test(|ctx| async move {
-                ctx.sleep(Duration::from_millis(1_500)).await;
+                ctx.sleep(Duration::from_millis(2_500)).await;
                 ctx.send_shutdown(
                     Instant::now() + Duration::from_secs(3),
                     "live factory handoff complete",
@@ -1839,60 +1835,79 @@ mod tests {
                 .unwrap();
             })
             .run_validation(|mut ctx| async move {
-                let pdata = ctx
-                    .recv()
-                    .await
-                    .expect("receiver should hand off one batch");
-                let (_, payload) = pdata.into_parts();
-                let PayloadData::OtapRecords(records) = payload.into_data() else {
-                    panic!("factory handoff must contain decoded OTAP records");
-                };
-                let bytes: OtlpProtoBytes = OtapPayload::from_otap(records)
-                    .try_into_with_default()
-                    .expect("OTAP records should decode to OTLP");
-                let request = ExportMetricsServiceRequest::decode(bytes.as_bytes())
-                    .expect("decoded OTLP metrics request");
-                let metrics = request
-                    .resource_metrics
-                    .iter()
-                    .flat_map(|resource| &resource.scope_metrics)
-                    .flat_map(|scope| &scope.metrics)
-                    .collect::<Vec<_>>();
-                let metric = |name: &str| metrics.iter().find(|metric| metric.name == name);
+                let mut previous_sum = None;
+                for _ in 0..2 {
+                    let pdata = ctx
+                        .recv()
+                        .await
+                        .expect("receiver should hand off one batch");
+                    let (_, payload) = pdata.into_parts();
+                    let PayloadData::OtapRecords(records) = payload.into_data() else {
+                        panic!("factory handoff must contain decoded OTAP records");
+                    };
+                    let bytes: OtlpProtoBytes = OtapPayload::from_otap(records)
+                        .try_into_with_default()
+                        .expect("OTAP records should decode to OTLP");
+                    let request = ExportMetricsServiceRequest::decode(bytes.as_bytes())
+                        .expect("decoded OTLP metrics request");
+                    let metrics = request
+                        .resource_metrics
+                        .iter()
+                        .flat_map(|resource| &resource.scope_metrics)
+                        .flat_map(|scope| &scope.metrics)
+                        .collect::<Vec<_>>();
+                    let metric = |name: &str| metrics.iter().find(|metric| metric.name == name);
 
-                let memory = metric("windows.memory.available").expect("Memory metric");
-                let Some(metric::Data::Gauge(memory)) = &memory.data else {
-                    panic!("Memory metric must be a Gauge");
-                };
-                assert_eq!(memory.data_points.len(), 1);
+                    let memory = metric("windows.memory.available").expect("Memory metric");
+                    let Some(metric::Data::Gauge(memory)) = &memory.data else {
+                        panic!("Memory metric must be a Gauge");
+                    };
+                    assert_eq!(memory.data_points.len(), 1);
 
-                let processor = metric("windows.processor.time").expect("_Total metric");
-                let Some(metric::Data::Gauge(processor)) = &processor.data else {
-                    panic!("_Total metric must be a Gauge");
-                };
-                assert_eq!(processor.data_points.len(), 1);
-                let aggregate = processor.data_points[0]
-                    .attributes
-                    .iter()
-                    .find(|attribute| attribute.key == "windows.perf_counter.instance")
-                    .expect("_Total instance identity");
-                assert!(matches!(
-                    aggregate.value.as_ref().and_then(|value| value.value.as_ref()),
-                    Some(any_value::Value::StringValue(value)) if value == "_Total"
-                ));
+                    let sum_metric = metric("windows.memory.available.sum").expect("Sum metric");
+                    let Some(metric::Data::Sum(sum)) = &sum_metric.data else {
+                        panic!("cumulative Sum metric must be a Sum");
+                    };
+                    assert!(!sum.is_monotonic);
+                    assert_eq!(sum.aggregation_temporality, 2);
+                    assert_eq!(sum.data_points.len(), 1);
+                    let point = &sum.data_points[0];
+                    assert!(point.start_time_unix_nano > 0);
+                    assert!(point.start_time_unix_nano <= point.time_unix_nano);
+                    if let Some((start, time)) = previous_sum {
+                        assert_eq!(point.start_time_unix_nano, start);
+                        assert!(point.time_unix_nano > time);
+                    }
+                    previous_sum = Some((point.start_time_unix_nano, point.time_unix_nano));
 
-                let process = metric("windows.process.id").expect("expanded Process metric");
-                let Some(metric::Data::Gauge(process)) = &process.data else {
-                    panic!("expanded Process metric must be a Gauge");
-                };
-                assert!(!process.data_points.is_empty());
-                assert!(process.data_points.iter().all(|point| {
-                    point
+                    let processor = metric("windows.processor.time").expect("_Total metric");
+                    let Some(metric::Data::Gauge(processor)) = &processor.data else {
+                        panic!("_Total metric must be a Gauge");
+                    };
+                    assert_eq!(processor.data_points.len(), 1);
+                    let aggregate = processor.data_points[0]
                         .attributes
                         .iter()
-                        .any(|attribute| attribute.key == "windows.perf_counter.instance")
-                }));
-                assert!(metric("windows.memory.missing").is_none());
+                        .find(|attribute| attribute.key == "windows.perf_counter.instance")
+                        .expect("_Total instance identity");
+                    assert!(matches!(
+                        aggregate.value.as_ref().and_then(|value| value.value.as_ref()),
+                        Some(any_value::Value::StringValue(value)) if value == "_Total"
+                    ));
+
+                    let process = metric("windows.process.id").expect("expanded Process metric");
+                    let Some(metric::Data::Gauge(process)) = &process.data else {
+                        panic!("expanded Process metric must be a Gauge");
+                    };
+                    assert!(!process.data_points.is_empty());
+                    assert!(process.data_points.iter().all(|point| {
+                        point
+                            .attributes
+                            .iter()
+                            .any(|attribute| attribute.key == "windows.perf_counter.instance")
+                    }));
+                    assert!(metric("windows.memory.missing").is_none());
+                }
             });
     }
 

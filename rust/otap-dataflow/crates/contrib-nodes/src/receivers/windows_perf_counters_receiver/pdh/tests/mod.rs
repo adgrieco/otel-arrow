@@ -103,6 +103,7 @@ struct FakeState {
     calls: FakeNativeCalls,
     collect_has_data: bool,
     collect_error: bool,
+    collect_status: Option<u32>,
     timestamp: i64,
     timestamp_error: bool,
     remove_error: bool,
@@ -116,6 +117,7 @@ struct FakeState {
 
 #[derive(Default)]
 struct FakeNativeCalls {
+    add: usize,
     counter_type: usize,
     collect: usize,
     raw: usize,
@@ -176,6 +178,7 @@ impl PdhApi for FakePdh {
 
     fn add(&mut self, path: &str) -> Result<Self::Counter, Error> {
         let mut state = self.state.borrow_mut();
+        state.calls.add += 1;
         let counter = state
             .counters
             .iter()
@@ -228,11 +231,11 @@ impl PdhApi for FakePdh {
     fn collect(&mut self) -> Result<bool, Error> {
         let mut state = self.state.borrow_mut();
         state.calls.collect += 1;
-        if state.collect_error {
+        if state.collect_error || state.collect_status.is_some() {
             Err(Error::Pdh {
                 operation: PdhOperation::CollectQueryData,
                 path: "<query>".to_owned(),
-                status: 1,
+                status: state.collect_status.unwrap_or(1),
             })
         } else {
             Ok(state.collect_has_data)
@@ -481,6 +484,7 @@ fn fake_state_value(counters: Vec<FakeCounter>) -> FakeState {
         calls: FakeNativeCalls::default(),
         collect_has_data: true,
         collect_error: false,
+        collect_status: None,
         timestamp: 100,
         timestamp_error: false,
         remove_error: false,

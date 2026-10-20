@@ -140,30 +140,24 @@ fn normalizes_scrape_timeout() {
 /// Guarantees: Collection accepts any positive interval and non-positive initial delay is immediate.
 #[test]
 fn accepts_go_timing_range() {
-    let config = |collection_interval: &str, initial_delay: &str, refresh_interval: &str| {
+    let config = |collection_interval: &str, initial_delay: &str| {
         Config::from_json(&json!({
             "perfcounters": [{
                 "object": "Memory",
                 "counters": [{"name": "Available Bytes"}]
             }],
             "collection_interval": collection_interval,
-            "initial_delay": initial_delay,
-            "wildcard_refresh_interval": refresh_interval
+            "initial_delay": initial_delay
         }))
     };
 
-    let fast = config("1ms", "-5s", "2ms").unwrap();
+    let fast = config("1ms", "-5s").unwrap();
     assert_eq!(fast.collection_interval, Duration::from_millis(1));
     assert_eq!(fast.initial_delay, Duration::ZERO);
-    assert_eq!(fast.wildcard_refresh_interval(), Duration::from_millis(2));
 
-    let slow = config("48h", "72h", "96h").unwrap();
+    let slow = config("48h", "72h").unwrap();
     assert_eq!(slow.collection_interval, Duration::from_secs(48 * 60 * 60));
     assert_eq!(slow.initial_delay, Duration::from_secs(72 * 60 * 60));
-    assert_eq!(
-        slow.wildcard_refresh_interval(),
-        Duration::from_secs(96 * 60 * 60)
-    );
 
     assert_config_error(
         json!({
@@ -174,7 +168,7 @@ fn accepts_go_timing_range() {
             "collection_interval": "2s",
             "wildcard_refresh_interval": "1s"
         }),
-        "must be at least collection_interval",
+        "wildcard_refresh_interval is not supported",
     );
 }
 
@@ -194,27 +188,55 @@ fn defaults_refresh_independently_of_query_retry() {
         if let Some(refresh_interval) = refresh_interval {
             value["wildcard_refresh_interval"] = json!(refresh_interval);
         }
-        Config::from_json(&value).unwrap()
+        Config::from_json(&value)
     };
 
-    let short = config("5s", None);
+    let short = config("5s", None).unwrap();
     assert_eq!(short.wildcard_refresh_interval(), Duration::from_secs(60));
     assert_eq!(short.query_retry_cap(), Duration::from_secs(5));
 
-    let default = config("60s", None);
+    let default = config("60s", None).unwrap();
     assert_eq!(default.wildcard_refresh_interval(), Duration::from_secs(60));
     assert_eq!(default.query_retry_cap(), Duration::from_secs(60));
 
-    let long = config("2m", None);
+    let long = config("2m", None).unwrap();
     assert_eq!(long.wildcard_refresh_interval(), Duration::from_secs(120));
     assert_eq!(long.query_retry_cap(), Duration::from_secs(120));
 
-    let explicit = config("5s", Some("90s"));
-    assert_eq!(
-        explicit.wildcard_refresh_interval(),
-        Duration::from_secs(90)
+    assert!(config("5s", Some("90s")).is_err());
+}
+
+/// Scenario: Deferred options are explicitly requested, including their default values or null.
+/// Guarantees: Presence is rejected before startup, while absent defaults keep fixed bounds and indexed recreation errors.
+#[test]
+fn rejects_explicit_deferred_capabilities() {
+    let base = json!({
+        "perfcounters": [
+            {"object": "Memory", "counters": [{"name": "Available Bytes"}]},
+            {"object": "System", "counters": [{"name": "Processes"}, {"name": "Threads"}]}
+        ]
+    });
+    for (key, value) in [
+        ("wildcard_refresh_interval", json!("60s")),
+        ("wildcard_refresh_interval", json!(null)),
+        ("max_instances_per_wildcard", json!(256)),
+        ("max_instances_per_wildcard", json!(null)),
+        ("max_expanded_counters", json!(4096)),
+        ("max_expanded_counters", json!(null)),
+    ] {
+        let mut value_with_option = base.clone();
+        value_with_option[key] = value;
+        assert_config_error(value_with_option, &format!("{key} is not supported"));
+    }
+    let config = Config::from_json(&base).unwrap();
+    assert_eq!(config.max_instances_per_wildcard, 256);
+    assert_eq!(config.max_expanded_counters, 4096);
+    let mut recreation = base;
+    recreation["perfcounters"][1]["counters"][1]["recreate_query"] = json!(true);
+    assert_config_error(
+        recreation,
+        "perfcounters[1].counters[1].recreate_query: true",
     );
-    assert_eq!(explicit.query_retry_cap(), Duration::from_secs(5));
 }
 
 /// Scenario: A cumulative Sum omits its optional monotonic setting.
@@ -248,10 +270,10 @@ fn defaults_sum_to_non_monotonic() {
 }
 
 /// Scenario: A cumulative additive value is configured as a monotonic Sum.
-/// Guarantees: Configuration preserves the requested cumulative monotonic Sum kind.
+/// Guarantees: Monotonic Sum definitions remain rejected, including when unused.
 #[test]
 fn normalizes_monotonic_sum_configuration() {
-    let config = Config::from_json(&json!({
+    let value = json!({
         "metrics": {"windows.operations": monotonic_sum_metric()},
         "perfcounters": [{
             "object": "Custom Provider",
@@ -260,15 +282,19 @@ fn normalizes_monotonic_sum_configuration() {
                 "metric": "windows.operations"
             }]
         }]
-    }))
-    .unwrap();
-    assert_eq!(config.counters[0].name.as_ref(), "windows.operations");
-    assert_eq!(
-        config.counters[0].metric_kind,
-        MetricKind::Sum {
-            aggregation: Aggregation::Cumulative,
-            monotonic: true
-        }
+    });
+    assert_config_error(
+        value.clone(),
+        "metrics.windows.operations.sum supports only cumulative, non-monotonic",
+    );
+    let mut unused = value;
+    let _ = unused["perfcounters"][0]["counters"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("metric");
+    assert_config_error(
+        unused,
+        "metrics.windows.operations.sum supports only cumulative, non-monotonic",
     );
 }
 
@@ -536,7 +562,7 @@ fn accepts_null_metrics_as_empty_definitions() {
 }
 
 /// Scenario: Mappings explicitly disable or enable query recreation across expanded paths.
-/// Guarantees: The option is retained and every path from one source mapping shares its identity.
+/// Guarantees: Explicit false remains supported, while true fails with indexed context.
 #[test]
 fn retains_query_recreation_by_source_mapping() {
     let config = |recreate_query| {
@@ -560,14 +586,10 @@ fn retains_query_recreation_by_source_mapping() {
     assert_eq!(disabled.counters[0].source_mapping_index, 0);
     assert_eq!(disabled.counters[1].source_mapping_index, 0);
 
-    let enabled = Config::from_json(&config(true)).unwrap();
-    assert!(enabled.counters[0].recreate_query);
-    assert!(enabled.counters[1].recreate_query);
-    assert_eq!(enabled.counters[0].source_mapping_index, 0);
-    assert_eq!(enabled.counters[1].source_mapping_index, 0);
-    assert!(!enabled.counters[2].recreate_query);
-    assert_eq!(enabled.counters[2].source_mapping_index, 1);
-    assert_eq!(enabled.counters[3].source_mapping_index, 1);
+    assert_config_error(
+        config(true),
+        "perfcounters[0].counters[0].recreate_query: true is not supported",
+    );
 }
 
 /// Scenario: A wildcard omits the default or custom aggregation instance unless selected.
@@ -1439,27 +1461,26 @@ fn bounds_exact_paths_by_native_counter_budget() {
                 .collect::<Vec<_>>()
         })
     };
-    let config = |perfcounters, limit| {
+    let config = |perfcounters| {
         json!({
             "metrics": {"test": metric()},
-            "perfcounters": perfcounters,
-            "max_expanded_counters": limit
+            "perfcounters": perfcounters
         })
     };
     assert_eq!(
-        Config::from_json(&config(json!([object(16, 16)]), 256))
+        Config::from_json(&config(json!([object(16, 16)])))
             .unwrap()
             .counters
             .len(),
         256
     );
     assert_config_error(
-        config(json!([object(17, 16)]), 271),
-        "normalize to 272 exact counter paths, exceeding max_expanded_counters 271",
+        config(json!([object(257, 16)])),
+        "normalize to 4097 exact counter paths, exceeding max_expanded_counters 4096",
     );
     assert_config_error(
-        config(json!([object(1, 129), object(1, 128)]), 256),
-        "normalize to 257 exact counter paths, exceeding max_expanded_counters 256",
+        config(json!([object(1, 2049), object(1, 2048)])),
+        "normalize to 4097 exact counter paths, exceeding max_expanded_counters 4096",
     );
 }
 
@@ -1478,8 +1499,7 @@ fn allows_exact_paths_beyond_removed_template_cap() {
     };
     assert_eq!(
         Config::from_json(&json!({
-            "perfcounters": [object(257)],
-            "max_expanded_counters": 257
+            "perfcounters": [object(257)]
         }))
         .unwrap()
         .counters
@@ -1518,8 +1538,7 @@ fn wildcard_templates_do_not_consume_exact_counter_budget() {
     });
 
     let config = Config::from_json(&json!({
-        "perfcounters": [omitted, empty, selected, wildcard],
-        "max_expanded_counters": 256
+        "perfcounters": [omitted, empty, selected, wildcard]
     }))
     .unwrap();
     assert_eq!(config.counters.len(), 257);
@@ -1805,11 +1824,11 @@ fn rejects_missing_or_invalid_sum_aggregation() {
 }
 
 /// Scenario: Sum selects delta temporality with either monotonicity setting.
-/// Guarantees: Configuration preserves delta aggregation for native eligibility validation.
+/// Guarantees: Delta Sum definitions remain rejected, including when unused.
 #[test]
 fn normalizes_delta_sum_configuration() {
     for monotonic in [false, true] {
-        let config = Config::from_json(&json!({
+        let value = json!({
             "metrics": {"test": {
                 "description": "Value.",
                 "unit": "1",
@@ -1819,14 +1838,19 @@ fn normalizes_delta_sum_configuration() {
                 "object": "Memory",
                 "counters": [{"name": "Available Bytes", "metric": "test"}]
             }]
-        }))
-        .unwrap();
-        assert_eq!(
-            config.counters[0].metric_kind,
-            MetricKind::Sum {
-                aggregation: Aggregation::Delta,
-                monotonic,
-            }
+        });
+        assert_config_error(
+            value.clone(),
+            "metrics.test.sum supports only cumulative, non-monotonic",
+        );
+        let mut unused = value;
+        let _ = unused["perfcounters"][0]["counters"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("metric");
+        assert_config_error(
+            unused,
+            "metrics.test.sum supports only cumulative, non-monotonic",
         );
     }
 }

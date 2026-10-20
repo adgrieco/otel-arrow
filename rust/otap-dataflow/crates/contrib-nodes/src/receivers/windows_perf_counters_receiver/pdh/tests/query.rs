@@ -430,6 +430,145 @@ fn invalid_handle_cleanup_failure_requires_query_rebuild() {
     assert_eq!(state.add_attempts.len(), 2);
 }
 
+/// Scenario: Startup membership contains a healthy exact counter, one wildcard member, and an unavailable exact peer.
+/// Guarantees: Later discovery and failed-add retries are disabled; transient collection failure retains installed handles and membership.
+#[test]
+fn frozen_membership_collects_only_installed_handles() {
+    let template = r"\Process(*)\Private Bytes";
+    let path = r"\Process(worker)\Private Bytes";
+    let healthy = r"\Memory\Available Bytes";
+    let mut wildcard = counter(template, "process");
+    wildcard.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    wildcard.source_mapping_index = 1;
+    let state = fake_state(vec![
+        fake_counter(healthy, Number::Integer(42)),
+        fake_counter(path, Number::Integer(1)),
+    ]);
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(template.to_owned(), vec![path.to_owned()]);
+    let mut query = Query::open_with(
+        FakePdh::new(Rc::clone(&state)),
+        vec![
+            counter(healthy, "memory"),
+            wildcard,
+            counter(r"\Missing\Value", "missing"),
+        ],
+        Duration::ZERO,
+        Duration::ZERO,
+        256,
+        4096,
+    )
+    .unwrap();
+    query.freeze_membership().unwrap();
+    let installed = state.borrow().added.clone();
+    let adds = state.borrow().calls.add;
+    let expansions = state.borrow().calls.expand;
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(template.to_owned(), Vec::new());
+    for _ in 0..4 {
+        state.borrow_mut().collect_error = true;
+        assert!(query.collect_managed().is_err());
+    }
+    state.borrow_mut().collect_error = false;
+    let sample = query.collect_managed().unwrap();
+    assert_eq!(sample.points.len(), 2);
+    assert_eq!(state.borrow().added, installed);
+    assert_eq!(state.borrow().calls.expand, expansions);
+    assert!(state.borrow().removed.is_empty());
+    assert_eq!(sample.metadata.diagnostics.retry_attempts, 0);
+    assert_eq!(state.borrow().calls.add, adds);
+}
+
+/// Scenario: Startup discovers no usable counters, or only a healthy counter beside an empty pattern.
+/// Guarantees: An all-empty set fails explicitly, but a partial set reports the empty pattern without a fabricated point.
+#[test]
+fn frozen_membership_rejects_empty_startup_and_diagnoses_partial_empty_pattern() {
+    let mut wildcard = counter(r"\Process(no-such-*)\Private Bytes", "process");
+    wildcard.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let (_, mut empty) = fake_query(vec![wildcard.clone()], Vec::new());
+    assert!(matches!(
+        empty.freeze_membership(),
+        Err(Error::NoUsableCounters { .. })
+    ));
+    let path = r"\Memory\Available Bytes";
+    let (_, mut partial) = fake_query(
+        vec![counter(path, "memory"), wildcard],
+        vec![fake_counter(path, Number::Integer(42))],
+    );
+    partial.freeze_membership().unwrap();
+    let sample = partial.collect_managed().unwrap();
+    assert_eq!(sample.points.len(), 1);
+    assert!(
+        sample
+            .metadata
+            .failures
+            .iter()
+            .any(|failure| failure.counter_index == 1
+                && failure.reason == "empty_expansion"
+                && failure.diagnostic_only)
+    );
+}
+
+/// Scenario: Seventeen startup patterns each discover 257 available members under the fixed MVP bounds.
+/// Guarantees: Each pattern admits at most 256 and the receiver installs at most 4096 entries with explicit overflow diagnostics.
+#[test]
+fn startup_admission_enforces_fixed_pattern_and_total_bounds() {
+    let state = fake_state(Vec::new());
+    let mut configs = Vec::new();
+    for mapping in 0..17 {
+        let template = format!(r"\Process(*)\C{mapping}");
+        let paths = (0..257)
+            .map(|instance| format!(r"\Process(p{instance:03})\C{mapping}"))
+            .collect::<Vec<_>>();
+        state.borrow_mut().counters.extend(
+            paths
+                .iter()
+                .map(|path| fake_counter(path, Number::Integer(1))),
+        );
+        let _ = state
+            .borrow_mut()
+            .expansions
+            .insert(template.clone(), paths);
+        let mut config = counter(&template, &format!("metric{mapping}"));
+        config.source_mapping_index = mapping;
+        config.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
+        configs.push(config);
+    }
+    let mut query = Query::open_with(
+        FakePdh::new(Rc::clone(&state)),
+        configs,
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        256,
+        4096,
+    )
+    .unwrap();
+    query.freeze_membership().unwrap();
+    let members = query.admitted_members();
+    assert_eq!(members.len(), 4096);
+    for mapping in 0..17 {
+        assert!(
+            members
+                .iter()
+                .filter(|member| member.counter_index == mapping)
+                .count()
+                <= 256
+        );
+    }
+    assert_eq!(state.borrow().added.len(), 4096);
+    assert!(!query.pending.overflows.is_empty());
+}
+
 /// Scenario: Two metric mappings use the same exact PDH path.
 /// Guarantees: The query adds two handles and routes one point to each configured mapping index.
 #[test]

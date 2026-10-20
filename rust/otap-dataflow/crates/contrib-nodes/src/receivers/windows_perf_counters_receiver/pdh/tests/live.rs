@@ -45,8 +45,8 @@ async fn live_pdh_persistent_worker_reuses_and_closes_query() {
     assert_eq!(after.1 - before.1, 1);
 }
 
-/// Scenario: One live calculated mapping opts into query recreation between two persistent direct mappings.
-/// Guarantees: Configuration interleaving cannot split the persistent query, so only the isolated query is replaced and every opened query is closed.
+/// Scenario: An internal caller requests query recreation despite the public configuration rejection.
+/// Guarantees: The production worker freezes every installed query and never replaces it at runtime.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_recreates_and_primes_opted_in_query() {
@@ -94,7 +94,7 @@ async fn live_pdh_recreates_and_primes_opted_in_query() {
                 .collect::<Vec<_>>(),
             [0, 1, 2]
         );
-        assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 1);
+        assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 0);
         assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 0);
     }
     assert!(
@@ -104,8 +104,8 @@ async fn live_pdh_recreates_and_primes_opted_in_query() {
             .unwrap()
     );
     let after = query_counts();
-    assert_eq!(after.0 - before.0, 4);
-    assert_eq!(after.1 - before.1, 4);
+    assert_eq!(after.0 - before.0, 2);
+    assert_eq!(after.1 - before.1, 2);
 }
 
 /// Scenario: Two independently configured receiver workers collect in one process.
@@ -697,12 +697,13 @@ async fn live_pdh_collects_backslashed_paging_file_instance() {
 }
 
 /// Scenario: Every configured exact counter is unavailable when the worker starts.
-/// Guarantees: Startup succeeds with an empty active set and reports retryable failures without points.
+/// Guarantees: Startup fails explicitly and worker-owned cleanup closes the empty query.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_entirely_unavailable_counter_set_starts_empty() {
     let _serial = TEST_PDH_LOCK.lock().await;
-    let mut worker = Worker::start(
+    let before = query_counts();
+    let result = Worker::start(
         vec![counter(
             r"\Missing Object\Missing Counter",
             "windows.missing.counter",
@@ -712,18 +713,11 @@ async fn live_pdh_entirely_unavailable_counter_set_starts_empty() {
         4_096,
         "test".to_owned(),
     )
-    .await
-    .unwrap();
-    let sample = worker.collect().await.unwrap();
-    assert!(sample.points.is_empty());
-    assert_eq!(sample.metadata.failures.len(), 1);
-    assert_eq!(sample.metadata.diagnostics.counter_add_failures, 1);
-    assert!(
-        worker
-            .shutdown(Instant::now() + Duration::from_secs(2))
-            .await
-            .unwrap()
-    );
+    .await;
+    assert!(matches!(result, Err(Error::NoUsableCounters { .. })));
+    let after = query_counts();
+    assert_eq!(after.0 - before.0, 1);
+    assert_eq!(after.1 - before.1, 1);
 }
 
 fn open_live_query(configs: Vec<CounterConfig>, node: &str) -> Query {

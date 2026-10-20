@@ -42,8 +42,28 @@ pub(super) struct Config {
 impl Config {
     /// Parse, validate, and normalize the public configuration contract.
     pub(super) fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
+        for option in [
+            "wildcard_refresh_interval",
+            "max_instances_per_wildcard",
+            "max_expanded_counters",
+        ] {
+            if value.get(option).is_some() {
+                return Err(invalid(format!(
+                    "{option} is not supported: membership is fixed at startup with limits of 256 per pattern and 4096 total entries"
+                )));
+            }
+        }
         let user: UserConfig =
             serde_json::from_value(value.clone()).map_err(|err| invalid(err.to_string()))?;
+        for (object_index, object) in user.perfcounters.iter().enumerate() {
+            for (counter_index, counter) in object.counters.iter().enumerate() {
+                if counter.recreate_query {
+                    return Err(invalid(format!(
+                        "perfcounters[{object_index}].counters[{counter_index}].recreate_query: true is not supported; restart the receiver instead"
+                    )));
+                }
+            }
+        }
         validate_user_config(&user)?;
         let metrics = normalize_metrics(&user.metrics)?;
         let mut warnings = case_distinct_metric_definitions(metrics.keys().map(Arc::as_ref))
@@ -314,6 +334,11 @@ impl MetricConfig {
             )));
         }
         if let Some(sum) = &self.sum {
+            if sum.aggregation != Aggregation::Cumulative || sum.monotonic {
+                return Err(invalid(format!(
+                    "metrics.{name}.sum supports only cumulative, non-monotonic Sums"
+                )));
+            }
             Ok(MetricKind::Sum {
                 aggregation: sum.aggregation,
                 monotonic: sum.monotonic,

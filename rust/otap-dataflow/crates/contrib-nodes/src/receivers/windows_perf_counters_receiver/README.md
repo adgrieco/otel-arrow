@@ -13,7 +13,8 @@
 ## Overview
 
 Reads configured exact or instance-wildcard Windows performance-counter paths
-through PDH and emits OTel Gauges or cumulative or delta Sums. Each data point includes
+through PDH and emits OTel Gauges or cumulative, non-monotonic Sums. Each data
+point includes
 the configured metric identity and concrete `windows.perf_counter.path`
 attribute. Instance points emit Go-compatible `instance` identity plus
 extended `windows.perf_counter.*` identity attributes. Wildcard points also
@@ -21,7 +22,9 @@ include their configured path template. The resource includes
 `os.type=windows`.
 
 The receiver constructs PDH paths from configured performance objects,
-instances, and counters, and periodically refreshes wildcard instances.
+instances, and counters, and expands instance patterns once at startup.
+Instances appearing later require a receiver restart; there is no periodic
+refresh, failed-add retry, query recreation, or recovery loop.
 Configured objects and counters must be installed and enabled on the target
 host.
 
@@ -62,7 +65,6 @@ config:
           metric: windows.process.private
   initial_delay: 1s
   collection_interval: 30s
-  wildcard_refresh_interval: 2m
 ```
 
 ### Receiver options
@@ -76,21 +78,14 @@ config:
 | `initial_delay` | No | `1s` | Delay before the first collection request; non-positive means immediate |
 | `collection_interval` | No | `1m` | Any positive collection interval |
 | `timeout` | No | `collection_interval` | Scrape lateness warning threshold; `0s` uses the collection interval |
-| `wildcard_refresh_interval` | No | See below | Wildcard discovery cadence |
-| `max_instances_per_wildcard` | No | `256` | Per-path expansion limit |
-| `max_expanded_counters` | No | `4096` | Receiver-wide exact plus expanded native-counter limit |
 
 <!-- markdownlint-enable MD013 -->
 
-`wildcard_refresh_interval` defaults to the greater of `collection_interval`
-and `60s`, and an explicit value must be at least `collection_interval`. Both
-counter limits must be between
-`1` and `16384`, and the per-wildcard limit cannot exceed the receiver-wide
-limit. `max_expanded_counters` is retained for configuration compatibility but
-limits the combined exact and expanded native counters owned by the receiver.
-Exact paths reserve entries even while unavailable so later retry cannot exceed
-the limit. Wildcard templates do not consume entries until they resolve to
-concrete paths. Zero or negative `initial_delay` starts collection immediately.
+Explicit `wildcard_refresh_interval`, `max_instances_per_wildcard`, and
+`max_expanded_counters` are rejected. Startup admission uses fixed limits of
+256 members per pattern and 4096 exact plus expanded native entries.
+Wildcard templates do not consume entries until they resolve to concrete
+paths. Zero or negative `initial_delay` starts collection immediately.
 Sub-second collection intervals are accepted, matching Go, but rate and other
 two-sample counters generally need about one second or more between samples to
 produce meaningful values.
@@ -100,8 +95,9 @@ produce meaningful values.
 Each `metrics` key is an OTel metric name. `description` defaults to empty and
 `unit` defaults to `"1"`. Definitions may be unused. A definition may select
 one `gauge: {}` or `sum:` object; omitting both defaults to Gauge. A Sum
-requires `aggregation: cumulative` or `aggregation: delta`; `monotonic`
-defaults to `false`. Empty and null Sum configurations are rejected. Metrics
+requires `aggregation: cumulative`; `monotonic` defaults to `false`.
+Delta and monotonic definitions are rejected, including unused definitions.
+Empty and null Sum configurations are rejected. Metrics
 that configure both Gauge and Sum are also rejected. Gauge may use YAML
 shorthand such as `gauge:`. Metric definition names preserve their exact
 configured spelling, including whitespace and control characters, and only the
@@ -115,20 +111,16 @@ description remains exactly as configured, including whitespace and control
 characters. Non-empty units have no receiver-specific length limit.
 Multiple counter mappings may reference one metric and contribute points
 distinguished by their configured attributes. Gauges have point-in-time
-semantics and no start timestamp. Cumulative monotonic Sums are limited to
-non-negative direct raw counts. Cumulative non-monotonic Sums are available
-for every supported numeric family. Delta Sums are limited to
-`PERF_COUNTER_DELTA` and `PERF_COUNTER_LARGE_DELTA`; PDH calculates the
-difference and the receiver emits it as a double without subtracting raw
-totals.
+semantics and no start timestamp. Cumulative non-monotonic Sums are available
+for every supported numeric family.
 
 ```yaml
 windows.operations:
-  description: Operations completed since the provider sequence began.
-  unit: "{operation}"
+  description: Current additive provider value.
+  unit: "1"
   sum:
     aggregation: cumulative
-    monotonic: true
+    monotonic: false
 ```
 
 ### Performance object and counter options
@@ -165,20 +157,8 @@ its configured mapping identity. Repeating the same path, metric name, and
 static attributes is rejected because it would emit duplicate points for one
 series.
 `scale_power10` defaults to zero and accepts values from `-18` through `18`.
-`recreate_query` defaults to `false`. When `true`, the mapping owns an isolated
-PDH query. After every successful scrape, including an empty scrape, the
-receiver creates and primes a replacement before releasing the old query. If
-replacement construction or priming fails, collection continues with the old
-query and reports the bounded mapping failure. Wildcard-expanded instances and
-explicit instance paths from the same mapping share its isolated query;
-all mappings without query recreation share one persistent query even when
-isolated mappings appear between them in configuration, and unrelated mappings
-keep their own sampling histories. Each successful
-replacement starts a new cumulative sequence, so cumulative Sum points from a
-mapping with `recreate_query: true` have a new start time on every scrape. For
-monotonic Sums, the first point published from each replacement reports
-`start_time_unix_nano == time_unix_nano` after it is successfully delivered;
-priming and discarded scrapes do not expose an earlier unpublished start.
+`recreate_query` defaults to `false`, and explicit `false` is supported.
+`recreate_query: true` is rejected. All mappings share one persistent query.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
 Object, instance, aggregation, and counter components preserve their configured
@@ -283,10 +263,8 @@ reach PDH's 2048-unit native limit are omitted and diagnosed.
 <!-- markdownlint-enable MD013 -->
 
 Use a Gauge for rates, ratios, utilization, and other non-additive current
-values. A monotonic Sum asserts that the selected PDH counter is a running
-count; it is accepted only for `PERF_COUNTER_RAWCOUNT`,
-`PERF_COUNTER_LARGE_RAWCOUNT`, and their hexadecimal variants. A
-non-monotonic Sum remains available for every supported native type, including
+values. A cumulative non-monotonic Sum is available for every supported native
+type, including
 additive current values such as committed private memory. Metric names, units,
 and descriptions must preserve the emitted semantics; Windows Private Bytes
 includes committed memory that may reside in RAM or the page file and must not
@@ -311,15 +289,6 @@ returns. Scrape duration stops at native-result receipt, before projection and
 downstream delivery. After slow collection or delivery, the next scrape waits
 for a future scheduled tick rather than catching up missed ticks.
 
-A delta Sum accepts only the two native delta-count types. Its first valid
-sample establishes an interval baseline and emits no point. Each later point
-uses the immediately preceding valid sample timestamp as its start time.
-Transient statuses, collection errors, timestamp failures, and handle
-replacement clear readiness and require a fresh baseline. Equal or decreasing
-timestamps are omitted and become the next baseline. A negative formatted
-delta is emitted only when `monotonic: false`; a monotonic delta omits the
-negative interval but remains ready for the next sample.
-
 PDH performs rate, timer, fraction, and average calculations and associates
 visible fraction, average, and multi-timer numerators with their
 provider-defined base counters. Configure only the visible numerator path.
@@ -339,8 +308,9 @@ outside this receiver's OTAP metric contract.
 Unsupported exact or expanded counter types are omitted and diagnosed without
 suppressing healthy counters. They are not retried because their native type
 cannot change while the handle exists. A missing or inaccessible exact counter
-is omitted and retried, including when no configured counter is initially
-available. Diagnostics include the native type.
+is diagnosed and omitted without retrying its addition. Zero usable installed
+counters fails startup; installed counters awaiting warm-up are not empty.
+Diagnostics include the native type.
 
 ## Scaling
 
@@ -358,32 +328,28 @@ For example, `\Memory\Available Bytes` remains an exact byte count with unit
 
 ## Collection behavior
 
-The receiver opens its PDH queries on the worker and performs one startup
+The receiver opens its PDH query on the worker and performs one startup
 collection without emitting points. This prime seeds valid native and
 receiver-side sample history before `initial_delay` and the first scheduled
-scrape. It records monotonic values for later reset detection but does not
-establish their exported cumulative start. A priming collection, timestamp, or
-refresh failure is retained as bounded diagnostics while the worker starts and
-follows its normal retry and query-rebuild policy. No-data, invalid, or
+scrape. A transient priming collection failure is retained as bounded
+diagnostics; the next tick collects the same installed handles. No-data or
 counter-local failures retain their normal omission and diagnostic behavior
 without fabricating readiness.
 The initial pass has no fixed timeout. Drain or shutdown remains responsive and
 requests worker cleanup, but a native call already in progress must return
-before its query resources can be released. A transient `PdhOpenQueryW`
-failure leaves that query slot pending with bounded exponential retry; healthy
-slots can become ready after the same initial pass, and an entirely pending
-set can recover on later scrapes. Thread-start, configuration, and invariant
-failures still reject startup explicitly.
+before its query resources can be released. Failed query open, zero usable
+counters, thread-start, configuration, and invariant failures reject startup
+explicitly. An empty wildcard is diagnosed and omitted beside healthy peers;
+it never fabricates a zero-valued point.
 
-- Wildcards are expanded at startup and then at
-  `wildcard_refresh_interval`. Concrete paths are joined by configured counter
+- Wildcards are expanded only at startup. Concrete paths are joined by
+  configured counter
   and full case-insensitive path, including PDH's `#n` duplicate index.
 - One-sample counters can emit immediately. A valid startup prime normally
   makes two-sample counters eligible on the first scheduled scrape. Insufficient
   elapsed time or an invalid/missing prime still requires fresh warm-up.
-- Delta Sum intervals require `0 < start_time < time_unix_nano`; each series
-  tracks its own previous valid native sample timestamp.
-- Removed instances stop emitting after the next discovery refresh.
+- New instances require a receiver restart. Disappeared instances retain their
+  installed handles and ordinary native no-data/read-failure handling.
 - When a sample-fraction or average base does not advance, no relevant
   operation occurred; that value is omitted rather than replaced with zero. A
   decreasing base also omits the point and resets its baseline. This differs
@@ -391,29 +357,25 @@ failures still reject startup explicitly.
   average as zero.
 - `PDH_INVALID_DATA`, `PDH_NO_DATA`, and `PDH_CALC_NEGATIVE_*` statuses mean
   no observation. They emit no point, do not count as failures, and preserve
-  the counter handle and monotonic Sum sequence. Saved PDH base history is
-  cleared, affected two-sample counters restart warm-up, and delta interval
-  baselines are invalidated so later values are not compared with stale PDH
+  the counter handle and cumulative Sum start. Saved PDH base history is
+  cleared and affected two-sample counters restart warm-up so later values are
+  not compared with stale PDH
   samples. Other counter-local invalid statuses, non-finite output, or scaling
   failures omit only that point; healthy peers remain in the batch.
 - The native worker validates timestamps, Sum intervals, and finite values
   before projection. Broken sample/configuration identity and Arrow schema
   errors remain fatal receiver invariants.
-- Exact counter add failures retry with exponential backoff capped by
-  `collection_interval`; wildcard-expanded add failures are capped by
-  `wildcard_refresh_interval`. Counter read failures omit only the affected
+- Failed additions are not retried. Counter read failures omit only the affected
   point and retain the existing handle for the next scheduled collection.
-- Counter availability does not fail startup. An empty active set emits no
-  points until a configured counter becomes available.
+- A configuration with no usable installed counters fails startup.
 - Query-level `PDH_NO_DATA` and the other transient no-observation statuses
   emit no batch and do not count as failures. They clear saved PDH base history,
-  invalidate delta intervals, and restart two-sample warm-up while preserving
-  cumulative monotonic Sum sequences. Other query-level collection failures
+  and restart two-sample warm-up while preserving cumulative Sum starts.
+  Other query-level collection failures
   and post-collection timestamp failures apply the same reset before returning
-  an error. Query collection failures retry the existing query with bounded
-  exponential backoff capped by `collection_interval`, independently of
-  wildcard discovery. Three consecutive failures rebuild the affected
-  worker-owned query and its counters.
+  an error. Transient failures retry the same installed handles on the next
+  tick, without rebuild or backoff. An invalid query is terminal and requires
+  a receiver restart.
 - The receiver waits for every accepted scrape and delivers late results with
   their original point timestamps. Crossing the lateness threshold immediately
   records an overrun and emits a warning without cancelling the scrape. A
@@ -421,28 +383,13 @@ failures still reject startup explicitly.
   `collection_interval`; omitting it or setting `0s` uses the next scheduled
   collection tick. The warning re-arms only after an on-time scrape. No
   concurrent request is queued while the native call remains in flight.
-- Wildcard expansion is sorted before applying the configured limits. Excess
-  instances are omitted, reported explicitly, and reconsidered at the next
-  discovery refresh; they are never presented as a complete expansion.
-- New or removed wildcard members and terminal wildcard counter failures are
-  reconsidered only at `wildcard_refresh_interval`, so a longer discovery
-  cadence intentionally trades membership latency for lower provider cost.
+- Wildcard expansion is sorted before applying the fixed limits. Excess
+  instances are omitted and reported explicitly, never presented as a complete
+  expansion. Membership is not reconsidered until receiver restart.
 
-Each emitted point uses the collection timestamp. Non-monotonic Sum points use
-the current PDH query's opening time as their cumulative start time; a query
-rebuild or backward wall-clock adjustment starts a new cumulative sequence.
-Monotonic Sum points track sequence start independently for each exact or
-expanded handle. The first point successfully delivered after open, recreation,
-or rebuild uses its own timestamp as the unknown cumulative start; later
-delivered points retain that start. A decrease, handle recreation, newly
-discovered instance, or backward wall-clock adjustment relative to that
-series' previous observation starts a new sequence for only that point.
-Query-level clock rollback clears all monotonic Sum sequences; a discarded or
-omitted series starts fresh at its next successfully delivered observation.
-Equal timestamps do not reset a sequence. A value wrap is treated as a
-decrease; the receiver does not compensate for it. Negative monotonic Sum
-values are omitted as invalid. Gauge points do not use or validate cumulative
-start time.
+Each emitted point retains its own collection timestamp. Cumulative
+non-monotonic Sum points use the fixed query-start rule described above.
+Gauge points do not use or validate cumulative start time.
 
 ## Examples
 
@@ -463,7 +410,7 @@ example demonstrates rates, fractions, and averages.
 The focused
 [`windows-perf-counters-wildcard-console.yaml`](../../../../../configs/windows-perf-counters-wildcard-console.yaml)
 example combines an exact Memory counter with
-`\Process(*)\Private Bytes` and refreshes discovery every five seconds. It
+`\Process(*)\Private Bytes` with fixed startup discovery. It
 uses only built-in Windows performance counters and demonstrates bounded
 per-process expansion without requiring a separate test executable.
 
@@ -490,9 +437,8 @@ not by `--validate-and-exit`.
 
 - The source pipeline must allocate one core.
 - Multiple receiver nodes may use independent intervals. Each node owns one
-  worker and one or more PDH queries; mappings with `recreate_query: true` use
-  dedicated queries. Avoid unintentionally configuring duplicate collection.
-- Use narrow wildcard patterns where possible. The configured per-path and
+  worker and one PDH query. Avoid unintentionally configuring duplicate collection.
+- Use narrow wildcard patterns where possible. The fixed per-path and
   receiver-wide limits bound active handles and emitted cardinality.
 - One scrape can be in flight. Missed ticks are skipped rather than queued.
 - Downstream backpressure delays later scrapes instead of creating an
@@ -509,11 +455,14 @@ and low-cardinality reason. Other runtime events are:
 
 - `windows_perf_counters_receiver.instance_limit.exceeded`
 - `windows_perf_counters_receiver.instances.change`
-- `windows_perf_counters_receiver.recovery.change`
 - `windows_perf_counters_receiver.scrape.fail`
 - `windows_perf_counters_receiver.scrape.timeout`
 - `windows_perf_counters_receiver.shutdown.timeout`
 - `windows_perf_counters_receiver.query.close.fail`
+- `windows_perf_counters_receiver.worker.startup`
+- `windows_perf_counters_receiver.worker.language.warn`
+- `windows_perf_counters_receiver.startup.fail`
+- `windows_perf_counters_receiver.query.invalid`
 
 Repeated scrape and counter warnings are suppressed until the affected
 condition recovers. Configuration events are:
@@ -531,9 +480,11 @@ once per Unicode lowercase identity group.
 The `receiver.windowsperfcounters.scrapes` measurement metric set attributes
 collection attempts by outcome. The `receiver.windowsperfcounters` health
 metric set records configured and active counters, scrape success/failure,
-overruns and duration, worker-busy command rejections, discovery refreshes, instance
-adds/removals/overflow, failed counter values, retries/recoveries, query
-rebuilds, and warm-up omissions.
+overruns and duration, worker-busy collection rejections, and concrete lost
+observations in `counter_read_failures`. Multiple diagnostics for one lost
+observation count once; maintenance, priming, warm-up and expected no-data
+count zero. Query failures are counted separately. No `failed_counter_values`
+metric or recovery inventory is exported.
 
 ## Related documentation
 

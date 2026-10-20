@@ -1,7 +1,7 @@
 # platform: windows-only
 # Wildcard discovery example using the built-in Process performance object.
 # The exact Memory counter continues emitting when individual process counters
-# appear, disappear, or temporarily fail.
+# disappear or temporarily fail. New instances require a receiver restart.
 # From rust\otap-dataflow:
 # cargo run --features windows-perf-counters --bin df_engine -- -c configs\windows-perf-counters-wildcard-console.yaml
 
@@ -42,9 +42,6 @@ groups:
                     - name: Private Bytes
                       metric: windows.process.private
               collection_interval: 5s
-              wildcard_refresh_interval: 5s
-              max_instances_per_wildcard: 256
-              max_expanded_counters: 512
           console:
             type: exporter:console
             config:

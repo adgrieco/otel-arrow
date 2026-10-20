@@ -101,6 +101,10 @@ pub(in super::super) enum Error {
     },
     #[error("PDH worker object-list {stage} failed with status 0x{status:08X}")]
     WorkerObjectRefresh { stage: &'static str, status: u32 },
+    #[error("no usable performance counters were installed at startup for {paths:?}")]
+    NoUsableCounters { paths: Vec<String> },
+    #[error("failed to open the startup PDH query: {0}")]
+    StartupQuery(#[source] Box<Error>),
     #[error("PDH worker stopped before initialization completed")]
     WorkerInitStopped,
     #[error("a performance-counter collection request is already pending")]
@@ -203,6 +207,8 @@ impl Error {
             Self::WorkerStart(_) => "worker_start",
             Self::WorkerLanguagePin { .. } => "worker_language_pin",
             Self::WorkerObjectRefresh { .. } => "worker_object_refresh",
+            Self::NoUsableCounters { .. } => "no_usable_counters",
+            Self::StartupQuery(_) => "startup_query",
             Self::WorkerInitStopped => "worker_init_stopped",
             Self::WorkerBusy => "worker_busy",
             Self::WorkerStopped => "worker_stopped",

@@ -59,6 +59,7 @@ pub(super) fn pending_monotonic_start_time(
     }
 }
 
+#[cfg(test)]
 pub(super) fn publish_monotonic_start(
     sequence: &mut MonotonicSequence,
     timestamp_unix_nano: i64,

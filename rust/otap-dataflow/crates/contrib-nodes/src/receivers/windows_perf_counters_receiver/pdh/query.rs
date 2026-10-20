@@ -16,9 +16,11 @@ use super::expansion::{
     refresh_changes_with_group_resets,
 };
 use super::native::NativePdh;
+#[cfg(test)]
+use super::timing::publish_monotonic_start;
 use super::timing::{
     MonotonicSequence, advance_collection_time, delta_interval_start, pending_monotonic_start_time,
-    positive_timestamp, prime_monotonic_sequence, publish_monotonic_start,
+    positive_timestamp, prime_monotonic_sequence,
 };
 use super::{PdhApi, ValueFormat};
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +47,7 @@ pub(super) struct Query<A: PdhApi = NativePdh> {
     next_wildcard_admission_order: u64,
     pub(super) last_wildcard_refresh: Instant,
     wildcard_refresh_pending: bool,
+    membership_frozen: bool,
 }
 
 impl Query {
@@ -78,7 +81,8 @@ impl Query {
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self, Error> {
         Self::open_with_cadences_and_seed(
-            NativePdh::open_controlled(node, Some(shutdown))?,
+            NativePdh::open_controlled(node, Some(shutdown))
+                .map_err(|error| Error::StartupQuery(Box::new(error)))?,
             configs,
             exact_retry_cap,
             wildcard_refresh_interval,
@@ -218,6 +222,7 @@ impl<A: PdhApi> Query<A> {
             last_wildcard_refresh: seed
                 .map_or_else(Instant::now, |seed| seed.last_wildcard_refresh),
             wildcard_refresh_pending: false,
+            membership_frozen: false,
         };
         query.initialize_exact_counters(seed)?;
         let mut metadata = PendingMetadata::default();
@@ -240,6 +245,48 @@ impl<A: PdhApi> Query<A> {
         self.configs
             .iter()
             .any(|config| config.instance_config.is_wildcard())
+    }
+
+    /// Startup admission is complete: collection may only use installed handles.
+    pub(super) fn freeze_membership(&mut self) -> Result<(), Error> {
+        for (counter_index, config) in self.configs.iter().enumerate() {
+            if config.instance_config.is_wildcard()
+                && !self
+                    .counters
+                    .values()
+                    .any(|counter| counter.config_index == counter_index)
+                && !self
+                    .pending
+                    .failures
+                    .iter()
+                    .any(|failure| failure.counter_index == counter_index)
+            {
+                self.pending.failures.push(SampleFailure {
+                    counter_index,
+                    path: Arc::from(config.path.as_str()),
+                    reason: "empty_expansion",
+                    error: "startup instance pattern has no usable selected members".to_owned(),
+                    diagnostic_only: true,
+                });
+            }
+        }
+        if self.counters.is_empty() {
+            return Err(Error::NoUsableCounters {
+                paths: self
+                    .configs
+                    .iter()
+                    .map(|config| config.path.clone())
+                    .collect(),
+            });
+        }
+        self.retry_states.clear();
+        self.membership_frozen = true;
+        self.wildcard_refresh_pending = false;
+        Ok(())
+    }
+
+    pub(super) fn membership_is_frozen(&self) -> bool {
+        self.membership_frozen
     }
 
     fn initialize_seeded_wildcards(
@@ -525,9 +572,10 @@ impl<A: PdhApi> Query<A> {
     }
 
     pub(super) fn wildcard_refresh_due(&self) -> bool {
-        self.wildcard_refresh_pending
-            || (self.has_wildcard_configs()
-                && self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval)
+        !self.membership_frozen
+            && (self.wildcard_refresh_pending
+                || (self.has_wildcard_configs()
+                    && self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval))
     }
 
     #[cfg(test)]
@@ -1066,6 +1114,7 @@ impl<A: PdhApi> Query<A> {
         self.exact_counter_reservations + self.reserved_expanded_count()
     }
 
+    #[cfg(test)]
     pub(super) fn publish_monotonic_start(
         &mut self,
         config_index: usize,
@@ -1221,9 +1270,11 @@ impl<A: PdhApi> Query<A> {
         {
             return Err(self.restore_collection_error(metadata, error));
         }
-        self.retry_pending_removals(now, &mut metadata);
-        if let Err(error) = self.retry_counters(now, &mut metadata) {
-            return Err(self.restore_collection_error(metadata, error));
+        if !self.membership_frozen {
+            self.retry_pending_removals(now, &mut metadata);
+            if let Err(error) = self.retry_counters(now, &mut metadata) {
+                return Err(self.restore_collection_error(metadata, error));
+            }
         }
         if self.counters.is_empty() {
             let timestamp_unix_nano = match self.api.timestamp().and_then(positive_timestamp) {
@@ -1317,7 +1368,7 @@ impl<A: PdhApi> Query<A> {
                         .failures
                         .push(sample_failure(counter.config_index, &error));
                     metadata.diagnostics.counter_read_failures += 1;
-                    if error.is_invalid_counter_handle_read() {
+                    if !self.membership_frozen && error.is_invalid_counter_handle_read() {
                         let mut target = counter.target();
                         target.history.restart_pdh_sampling();
                         retired.push((key.clone(), target));
