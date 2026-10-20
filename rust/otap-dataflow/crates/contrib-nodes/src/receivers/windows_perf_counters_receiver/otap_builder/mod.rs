@@ -6,7 +6,7 @@ use super::config::InstanceConfig;
 use super::config::{Aggregation, CounterConfig, MetricKind};
 use super::model::{
     InstanceIdentity, MonotonicPublication, MonotonicPublicationCandidate, Number, Sample,
-    SampleMember, SamplePoint, SampleValue,
+    SamplePoint, SampleValue,
 };
 use arrow::error::ArrowError;
 use otel_arrow_dfe_pdata::encode::record::attributes::StrKeysAttributesRecordBatchBuilder;
@@ -30,17 +30,35 @@ fn instance_attribute_value(instance: &InstanceIdentity) -> String {
     }
 }
 
-fn output_attributes(counter: &CounterConfig, member: &SampleMember) -> BTreeMap<String, String> {
-    // Native path provenance identifies the source, not the exported metric series.
-    let mut attributes = counter.attributes.as_ref().clone();
-    if member.emit_instance_attribute
-        && let Some(instance) = &member.instance
-    {
-        let _ = attributes
-            .entry("instance".to_owned())
-            .or_insert_with(|| instance_attribute_value(instance));
-    }
+fn output_attributes(
+    counter: &CounterConfig,
+    instance: Option<&InstanceIdentity>,
+    emit_instance_attribute: bool,
+) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    for_each_output_attribute(counter, instance, emit_instance_attribute, |key, value| {
+        let _ = attributes.insert(key.to_owned(), value.to_owned());
+    });
     attributes
+}
+
+fn for_each_output_attribute(
+    counter: &CounterConfig,
+    instance: Option<&InstanceIdentity>,
+    emit_instance_attribute: bool,
+    mut visit: impl FnMut(&str, &str),
+) {
+    // Native path provenance identifies the source, not the exported metric series.
+    for (key, value) in counter.attributes.iter() {
+        visit(key, value);
+    }
+    if emit_instance_attribute
+        && !counter.attributes.contains_key("instance")
+        && let Some(instance) = instance
+    {
+        let value = instance_attribute_value(instance);
+        visit("instance", &value);
+    }
 }
 
 fn output_ownership(
@@ -79,7 +97,11 @@ fn output_ownership(
         let _ = groups
             .entry((
                 Arc::clone(&counter.name),
-                output_attributes(counter, member),
+                output_attributes(
+                    counter,
+                    member.instance.as_deref(),
+                    member.emit_instance_attribute,
+                ),
             ))
             .or_default()
             .insert(
@@ -303,31 +325,16 @@ fn append_attributes(
     counter: &CounterConfig,
     point: &SamplePoint,
 ) {
-    let mut append = |key: &str, value: &str| {
-        attributes.append_parent_id(&point_id);
-        attributes.append_key(key);
-        attributes.any_values_builder.append_str(value.as_bytes());
-    };
-    for (key, value) in counter.attributes.iter() {
-        append(key, value);
-    }
-    append("windows.perf_counter.path", &point.path);
-    if point.path.as_ref() != counter.path {
-        append("windows.perf_counter.path_template", &counter.path);
-    }
-    if let Some(instance) = &point.instance {
-        if point.emit_instance_attribute && !counter.attributes.contains_key("instance") {
-            append("instance", &instance_attribute_value(instance));
-        }
-        append("windows.perf_counter.instance", &instance.name);
-        if let Some(parent) = &instance.parent {
-            append("windows.perf_counter.parent_instance", parent);
-        }
-        append(
-            "windows.perf_counter.instance_index",
-            &instance.index.to_string(),
-        );
-    }
+    for_each_output_attribute(
+        counter,
+        point.instance.as_deref(),
+        point.emit_instance_attribute,
+        |key, value| {
+            attributes.append_parent_id(&point_id);
+            attributes.append_key(key);
+            attributes.any_values_builder.append_str(value.as_bytes());
+        },
+    );
 }
 
 fn prepare_point<'a>(

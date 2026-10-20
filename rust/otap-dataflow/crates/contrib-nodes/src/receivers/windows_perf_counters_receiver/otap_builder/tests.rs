@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::config::Config;
-use super::super::model::{InstanceIdentity, PendingMetadata, SampleFailure};
+use super::super::model::{InstanceIdentity, PendingMetadata, SampleFailure, SampleMember};
 use super::*;
 use arrow::array::{Array, Int64Array, UInt8Array};
 use arrow::util::display::array_value_to_string;
@@ -230,10 +230,11 @@ fn projects_configured_instance_spelling_for_path_metric() {
     assert!(display.contains(configured_name));
     assert!(display.contains("Configured process memory."));
     assert!(display.contains("By"));
-    assert!(
-        string_attributes(&records)
-            .iter()
-            .any(|(_, key, value)| key == "windows.perf_counter.path" && value == native_path)
+    assert_eq!(
+        records
+            .get(ArrowPayloadType::NumberDpAttrs)
+            .map(arrow::record_batch::RecordBatch::num_rows),
+        Some(0)
     );
 }
 
@@ -306,19 +307,9 @@ fn projects_static_attribute_spelling_verbatim() {
         panic!("expected a Gauge");
     };
     assert_eq!(gauge.data_points.len(), 2);
-    for (index, point) in gauge.data_points.iter().enumerate() {
-        let mut expected = expected.clone();
-        let _ = expected.insert(
-            "windows.perf_counter.path",
-            config.counters[index].path.as_str(),
-        );
-        let _ = expected.insert(
-            "windows.perf_counter.instance",
-            if index == 0 { "app" } else { "worker" },
-        );
-        let _ = expected.insert("windows.perf_counter.instance_index", "0");
+    for point in &gauge.data_points {
         assert_eq!(point.attributes.len(), expected.len());
-        assert_eq!(decoded_attributes(&point.attributes), expected);
+        assert_eq!(decoded_attributes(&point.attributes), expected.clone());
     }
 }
 
@@ -373,10 +364,11 @@ fn projects_case_distinct_path_name_fallback() {
         .to_string();
     assert!(display.contains(configured_path));
     assert!(!display.contains("Must not match."));
-    assert!(
-        string_attributes(&records).iter().any(|(_, key, value)| {
-            key == "windows.perf_counter.path" && value == configured_path
-        })
+    assert_eq!(
+        records
+            .get(ArrowPayloadType::NumberDpAttrs)
+            .map(arrow::record_batch::RecordBatch::num_rows),
+        Some(0)
     );
 }
 
@@ -456,13 +448,12 @@ fn projects_integer_gauges() {
     assert!(display.contains("windows.memory.committed"));
     assert!(display.contains("Description for windows.memory.available."));
     assert!(display.contains("By"));
-    let attrs = records.get(ArrowPayloadType::NumberDpAttrs).unwrap();
-    let display = arrow::util::pretty::pretty_format_batches(std::slice::from_ref(attrs))
-        .unwrap()
-        .to_string();
-    assert!(display.contains(r"\Memory\Available Bytes"));
-    assert!(display.contains(r"\Memory\Committed Bytes"));
-    assert!(display.contains("windows.perf_counter.path"));
+    assert_eq!(
+        records
+            .get(ArrowPayloadType::NumberDpAttrs)
+            .map(arrow::record_batch::RecordBatch::num_rows),
+        Some(0)
+    );
     let time = points
         .column_by_name("time_unix_nano")
         .unwrap()
@@ -1093,18 +1084,6 @@ fn projects_wildcard_instance_identity() {
     assert_eq!(metrics.num_rows(), 1);
     let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
     assert_eq!(points.num_rows(), 2);
-    let attrs = records.get(ArrowPayloadType::NumberDpAttrs).unwrap();
-    let display = arrow::util::pretty::pretty_format_batches(std::slice::from_ref(attrs))
-        .unwrap()
-        .to_string();
-    assert!(display.contains(r"\Process(svchost)\Private Bytes"));
-    assert!(display.contains(r"\Process(svchost#1)\Private Bytes"));
-    assert!(display.contains(r"\Process(svc?ost)\Private Bytes"));
-    assert!(display.contains("windows.perf_counter.instance"));
-    assert!(display.contains("windows.perf_counter.instance_index"));
-    assert!(display.contains("windows.perf_counter.parent_instance"));
-    assert!(display.contains("svchost"));
-    assert!(display.contains("service"));
     assert_eq!(
         string_attributes(&records)
             .into_iter()
@@ -1180,13 +1159,7 @@ fn projects_aggregate_instance_selection() {
             .collect::<Vec<_>>(),
         [("1".to_owned(), "instance".to_owned(), "_Total".to_owned())]
     );
-    assert_eq!(
-        attrs
-            .iter()
-            .filter(|(_, key, _)| key == "windows.perf_counter.instance")
-            .count(),
-        2
-    );
+    assert_eq!(attrs.len(), 1);
 }
 
 /// Scenario: Two native instances in one mapping share a fixed user `instance` attribute.

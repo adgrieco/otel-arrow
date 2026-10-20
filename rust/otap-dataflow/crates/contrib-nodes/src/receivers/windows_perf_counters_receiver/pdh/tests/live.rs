@@ -1186,7 +1186,7 @@ async fn live_pdh_collects_distinct_mappings_of_one_native_path() {
                     (attribute.key.as_str(), value.as_str())
                 })
                 .collect::<BTreeMap<_, _>>();
-            let mut expected = BTreeMap::from([("windows.perf_counter.path", path)]);
+            let mut expected = BTreeMap::new();
             if let Some(state) = state {
                 let _ = expected.insert("state", state);
             }

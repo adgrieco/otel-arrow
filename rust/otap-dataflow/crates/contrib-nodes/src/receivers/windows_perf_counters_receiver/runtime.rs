@@ -739,7 +739,6 @@ mod tests {
     use otel_arrow_dfe_otap::OTAP_PIPELINE_FACTORY;
     use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
-    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value;
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric;
     use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryIntoWithOptions};
     use otel_arrow_dfe_pdata_codec::OtapPayload;
@@ -1934,15 +1933,7 @@ mod tests {
                     panic!("_Total metric must be a Gauge");
                 };
                 assert_eq!(processor.data_points.len(), 1);
-                let aggregate = processor.data_points[0]
-                    .attributes
-                    .iter()
-                    .find(|attribute| attribute.key == "windows.perf_counter.instance")
-                    .expect("_Total instance identity");
-                assert!(matches!(
-                    aggregate.value.as_ref().and_then(|value| value.value.as_ref()),
-                    Some(any_value::Value::StringValue(value)) if value == "_Total"
-                ));
+                assert!(processor.data_points[0].attributes.is_empty());
 
                 let process = metric("windows.process.id").expect("expanded Process metric");
                 let Some(metric::Data::Gauge(process)) = &process.data else {
@@ -1953,7 +1944,7 @@ mod tests {
                     point
                         .attributes
                         .iter()
-                        .any(|attribute| attribute.key == "windows.perf_counter.instance")
+                        .any(|attribute| attribute.key == "instance")
                 }));
                 assert!(metric("windows.memory.missing").is_none());
             });

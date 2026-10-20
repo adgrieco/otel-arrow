@@ -13,12 +13,10 @@
 ## Overview
 
 Reads configured exact or instance-wildcard Windows performance-counter paths
-through PDH and emits OTel Gauges or cumulative or delta Sums. Each data point includes
-the configured metric identity and concrete `windows.perf_counter.path`
-attribute. Instance points emit Go-compatible `instance` identity plus
-extended `windows.perf_counter.*` identity attributes. Wildcard points also
-include their configured path template. The resource includes
-`os.type=windows`.
+through PDH and emits OTel Gauges or cumulative or delta Sums. Data points
+include configured static attributes and, for selected named instances, the
+Go-compatible `instance` identity. Native path provenance is not exported as
+metric attributes. The resource includes `os.type=windows`.
 
 The receiver constructs PDH paths from configured performance objects,
 instances, and counters, and periodically refreshes wildcard instances.
@@ -216,17 +214,15 @@ the concrete identity returned by PDH. Duplicate PDH instances use the
 canonical suffix, such as `instance=process#1`; index zero omits `#0`.
 An exact aggregate entry omits `instance`, including when other exact entries
 are configured beside it, matching Go's per-entry watcher behavior. An
-aggregate explicitly included with `"*"` retains it. The receiver also emits
-`windows.perf_counter.instance`, optional
-`windows.perf_counter.parent_instance`, and
-`windows.perf_counter.instance_index` for lossless PDH identity.
+aggregate explicitly included with `"*"` retains it. Native path, parent, and
+duplicate-index provenance is not exported as metric attributes.
 
 Explicit PDH duplicate-instance selectors preserve configured spelling in
 their native paths and lookup identities. Emitted instance labels normalize
 the positional suffix: `name`, `name#0`, and `name#00` emit `instance=name`,
-while `name#01` emits `instance=name#1`; the path attribute retains the exact
-configured spelling. Wildcard expansion uses the concrete identity returned
-by PDH. Numeric indexes are positional, not durable entity identifiers. If
+while `name#01` emits `instance=name#1`. Wildcard expansion uses the concrete
+identity returned by PDH. Numeric indexes are positional, not durable entity
+identifiers. If
 same-named processes churn while their count stays unchanged, PDH can reuse
 `name#n` for a different process and a two-sample calculation can span the old
 and new process. The receiver cannot detect that entity change from the reused
