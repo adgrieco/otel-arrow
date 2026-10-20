@@ -897,7 +897,7 @@ impl NormalizedInstances {
 
 impl InstanceSegment {
     fn from_config(field: &str, configured: String) -> Result<Self, Error> {
-        if configured.contains('*') {
+        if configured.contains(['*', '?']) {
             Ok(Self::Wildcard(
                 validate_native_component(field, &configured)?.to_owned(),
             ))

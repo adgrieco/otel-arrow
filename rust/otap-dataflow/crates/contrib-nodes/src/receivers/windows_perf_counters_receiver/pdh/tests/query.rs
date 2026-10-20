@@ -798,6 +798,40 @@ fn high_cardinality_collection_preserves_native_call_counts() {
     assert_eq!(state.calls.expand, 1);
 }
 
+/// Scenario: A pure question-mark instance pattern discovers one matching concrete process.
+/// Guarantees: The pattern uses wildcard expansion and emits the returned concrete path and parsed instance identity.
+#[test]
+fn question_mark_instance_pattern_expands_to_concrete_identity() {
+    let template = r"\Process(svc?ost)\ID Process";
+    let concrete = r"\Process(svchost)\ID Process";
+    let mut config = counter(template, "process.id");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: Some("_Total".to_owned()),
+    };
+    let state = Rc::new(RefCell::new(FakeState {
+        expansions: [(template.to_owned(), vec![concrete.to_owned()])]
+            .into_iter()
+            .collect(),
+        ..fake_state_value(vec![fake_counter(concrete, Number::Integer(42))])
+    }));
+    let mut query = Query::open_with(
+        FakePdh::new(Rc::clone(&state)),
+        vec![config],
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+        256,
+        1,
+    )
+    .unwrap();
+
+    let sample = query.collect().unwrap();
+
+    assert_eq!(state.borrow().calls.expand, 1);
+    assert_eq!(sample.points.len(), 1);
+    assert_eq!(sample.points[0].path.as_ref(), concrete);
+    assert_eq!(sample.points[0].instance.as_ref().unwrap().name, "svchost");
+}
+
 /// Scenario: Counter inspection fails and native cleanup also reports an error during query setup.
 /// Guarantees: The combined failure remains typed as rebuild-required so dropping the failed query releases the unremovable handle.
 #[test]

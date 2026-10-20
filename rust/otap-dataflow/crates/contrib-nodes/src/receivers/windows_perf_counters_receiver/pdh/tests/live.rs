@@ -274,8 +274,8 @@ async fn live_pdh_isolates_ineligible_monotonic_mapping_at_startup() {
     );
 }
 
-/// Scenario: The local host exposes one exact gauge and dynamically enumerated process gauges.
-/// Guarantees: Native wildcard expansion returns concrete identity-keyed points without changing the exact point.
+/// Scenario: The local host exposes one exact gauge plus full-`*` and pure-`?` process wildcard gauges.
+/// Guarantees: Both wildcard forms return concrete identity-keyed points without changing the exact point.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_collects_exact_and_wildcard_counters() {
@@ -284,9 +284,14 @@ async fn live_pdh_collects_exact_and_wildcard_counters() {
     wildcard.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
     };
+    let mut question = counter(r"\Process(svc?ost)\ID Process", "windows.process.id");
+    question.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: Some("_Total".to_owned()),
+    };
     let counters = vec![
         counter(r"\Memory\Available Bytes", "windows.memory.available"),
         wildcard,
+        question,
     ];
     let mut worker = Worker::start(
         counters,
@@ -299,7 +304,12 @@ async fn live_pdh_collects_exact_and_wildcard_counters() {
     .unwrap();
     let mut sample = worker.collect().await.unwrap();
     for _ in 0..3 {
-        if sample.points.iter().any(|point| point.counter_index == 1) {
+        if [1, 2].into_iter().all(|counter_index| {
+            sample
+                .points
+                .iter()
+                .any(|point| point.counter_index == counter_index)
+        }) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -331,6 +341,23 @@ async fn live_pdh_collects_exact_and_wildcard_counters() {
     assert!(wildcard.iter().all(|point| {
         point.instance.is_some()
             && point.path.as_ref() != r"\Process(*)\Private Bytes"
+            && matches!(
+                point.value,
+                SampleValue::Value(Number::Integer(value)) if value >= 0
+            )
+    }));
+    let question = sample
+        .points
+        .iter()
+        .filter(|point| point.counter_index == 2)
+        .collect::<Vec<_>>();
+    assert!(!question.is_empty());
+    assert!(question.iter().all(|point| {
+        point.path.as_ref() != r"\Process(svc?ost)\ID Process"
+            && point
+                .instance
+                .as_ref()
+                .is_some_and(|instance| instance.name.eq_ignore_ascii_case("svchost"))
             && matches!(
                 point.value,
                 SampleValue::Value(Number::Integer(value)) if value >= 0

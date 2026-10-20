@@ -1239,8 +1239,8 @@ fn collects_config_warnings_after_validation() {
     );
 }
 
-/// Scenario: Instances are empty, use a partial wildcard, or combine full wildcard with explicit names.
-/// Guarantees: Empty means no instance, partial patterns are preserved, and full wildcard follows Go selection.
+/// Scenario: Instances are empty, use `*` or `?` partial wildcards, or combine full wildcard with explicit names.
+/// Guarantees: Empty means no instance, partial patterns remain wildcard templates, and only literal `*` selects all instances.
 #[test]
 fn accepts_go_instance_selection_forms() {
     let empty = Config::from_json(&json!({
@@ -1275,6 +1275,21 @@ fn accepts_go_instance_selection_forms() {
     );
     assert_eq!(
         partial.counters[0].instance_config.excluded_aggregation(),
+        Some("_Total")
+    );
+
+    let question = Config::from_json(&json!({
+        "perfcounters": [{
+            "object": "Process",
+            "instances": ["svc?ost"],
+            "counters": [{"name": "ID Process"}]
+        }]
+    }))
+    .unwrap();
+    assert_eq!(question.counters[0].path, r"\Process(svc?ost)\ID Process");
+    assert!(question.counters[0].instance_config.is_wildcard());
+    assert_eq!(
+        question.counters[0].instance_config.excluded_aggregation(),
         Some("_Total")
     );
 
@@ -1498,7 +1513,7 @@ fn wildcard_templates_do_not_consume_exact_counter_budget() {
     });
     let wildcard = json!({
         "object": "Processor",
-        "instances": ["*"],
+        "instances": ["svc?ost"],
         "counters": [{"name": "Wildcard"}]
     });
 

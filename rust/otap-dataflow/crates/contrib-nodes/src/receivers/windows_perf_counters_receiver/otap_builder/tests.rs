@@ -984,12 +984,12 @@ fn rejects_missing_counter_index_as_invariant() {
     );
 }
 
-/// Scenario: Two expanded instances map to one configured wildcard metric.
-/// Guarantees: Concrete paths and parsed duplicate identities are emitted without positional joining.
+/// Scenario: Two returned instances map to one configured pure question-mark wildcard metric.
+/// Guarantees: Output uses concrete returned names and duplicate identities rather than the configured pattern.
 #[test]
 fn projects_wildcard_instance_identity() {
     let mut wildcard = counter(
-        r"\Process(*)\Private Bytes",
+        r"\Process(svc?ost)\Private Bytes",
         "windows.process.private",
         "By",
     );
@@ -1004,9 +1004,9 @@ fn projects_wildcard_instance_identity() {
             points: vec![
                 SamplePoint {
                     counter_index: 0,
-                    path: Arc::from(r"\Process(worker)\Private Bytes"),
+                    path: Arc::from(r"\Process(svchost)\Private Bytes"),
                     instance: Some(Arc::new(InstanceIdentity {
-                        name: "worker".to_owned(),
+                        name: "svchost".to_owned(),
                         parent: None,
                         index: 0,
                     })),
@@ -1018,9 +1018,9 @@ fn projects_wildcard_instance_identity() {
                 },
                 SamplePoint {
                     counter_index: 0,
-                    path: Arc::from(r"\Process(worker#1)\Private Bytes"),
+                    path: Arc::from(r"\Process(svchost#1)\Private Bytes"),
                     instance: Some(Arc::new(InstanceIdentity {
-                        name: "worker".to_owned(),
+                        name: "svchost".to_owned(),
                         parent: Some("service".to_owned()),
                         index: 1,
                     })),
@@ -1044,13 +1044,13 @@ fn projects_wildcard_instance_identity() {
     let display = arrow::util::pretty::pretty_format_batches(std::slice::from_ref(attrs))
         .unwrap()
         .to_string();
-    assert!(display.contains(r"\Process(worker)\Private Bytes"));
-    assert!(display.contains(r"\Process(worker#1)\Private Bytes"));
-    assert!(display.contains(r"\Process(*)\Private Bytes"));
+    assert!(display.contains(r"\Process(svchost)\Private Bytes"));
+    assert!(display.contains(r"\Process(svchost#1)\Private Bytes"));
+    assert!(display.contains(r"\Process(svc?ost)\Private Bytes"));
     assert!(display.contains("windows.perf_counter.instance"));
     assert!(display.contains("windows.perf_counter.instance_index"));
     assert!(display.contains("windows.perf_counter.parent_instance"));
-    assert!(display.contains("worker"));
+    assert!(display.contains("svchost"));
     assert!(display.contains("service"));
     assert_eq!(
         string_attributes(&records)
@@ -1058,8 +1058,12 @@ fn projects_wildcard_instance_identity() {
             .filter(|(_, key, _)| key == "instance")
             .collect::<Vec<_>>(),
         [
-            ("0".to_owned(), "instance".to_owned(), "worker".to_owned()),
-            ("1".to_owned(), "instance".to_owned(), "worker#1".to_owned())
+            ("0".to_owned(), "instance".to_owned(), "svchost".to_owned()),
+            (
+                "1".to_owned(),
+                "instance".to_owned(),
+                "svchost#1".to_owned()
+            )
         ]
     );
 }
