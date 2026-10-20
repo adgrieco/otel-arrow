@@ -1,5 +1,5 @@
 change_type: bug_fix
 component: pipeline
-note: Pin Windows performance-counter workers to English and refresh PDH object metadata before wildcard discovery.
+note: Use an English-only PDH route for Windows performance-counter wildcard discovery and collection.
 issues: [4074]
-subtext: Wildcard startup now fails explicitly when the worker cannot select en-US or refresh the PDH object list.
+subtext: Workers pin en-US and refresh object metadata before expanding English templates. Exact and expanded members are added through the English PDH API.

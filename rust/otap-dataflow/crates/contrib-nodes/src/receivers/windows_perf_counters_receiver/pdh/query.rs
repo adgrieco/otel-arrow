@@ -384,7 +384,7 @@ impl<A: PdhApi> Query<A> {
     }
 
     fn add_counter(&mut self, target: CounterTarget) -> Result<(), Error> {
-        let counter = self.api.add(&target.path, target.origin.is_wildcard())?;
+        let counter = self.api.add(&target.path)?;
         let kind = match self
             .api
             .counter_type(&counter, &target.path)

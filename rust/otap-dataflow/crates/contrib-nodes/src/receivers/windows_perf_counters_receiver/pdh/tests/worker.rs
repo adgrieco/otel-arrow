@@ -16,7 +16,7 @@ impl Drop for StartupTestPdh {
 impl PdhApi for StartupTestPdh {
     type Counter = ();
 
-    fn add(&mut self, _path: &str, _localized: bool) -> Result<Self::Counter, Error> {
+    fn add(&mut self, _path: &str) -> Result<Self::Counter, Error> {
         Ok(())
     }
 
@@ -96,7 +96,7 @@ struct RecoveringRefreshPdh {
 impl PdhApi for RecoveringRefreshPdh {
     type Counter = String;
 
-    fn add(&mut self, path: &str, _localized: bool) -> Result<Self::Counter, Error> {
+    fn add(&mut self, path: &str) -> Result<Self::Counter, Error> {
         if self.add_calls.fetch_add(1, Ordering::AcqRel) == 0 {
             return Err(Error::CounterSetup {
                 path: path.to_owned(),
@@ -176,7 +176,7 @@ impl Drop for PeakPdh {
 impl PdhApi for PeakPdh {
     type Counter = String;
 
-    fn add(&mut self, path: &str, _localized: bool) -> Result<Self::Counter, Error> {
+    fn add(&mut self, path: &str) -> Result<Self::Counter, Error> {
         self.owned += 1;
         let current = self.ownership.current.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.ownership.peak.fetch_max(current, Ordering::AcqRel);

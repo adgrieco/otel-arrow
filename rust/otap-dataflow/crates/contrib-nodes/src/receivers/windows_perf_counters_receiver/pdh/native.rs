@@ -16,9 +16,9 @@ use windows_sys::Win32::System::Performance::{
     PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_INSTANCE, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE,
     PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY, PDH_INVALID_ARGUMENT,
     PDH_INVALID_DATA, PDH_MORE_DATA, PDH_NO_DATA, PDH_RAW_COUNTER, PDH_REFRESHCOUNTERS,
-    PERF_DETAIL_WIZARD, PdhAddCounterW, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-    PdhEnumObjectsW, PdhExpandWildCardPathW, PdhGetCounterInfoW, PdhGetFormattedCounterValue,
-    PdhGetRawCounterValue, PdhOpenQueryW, PdhParseCounterPathW, PdhRemoveCounter,
+    PERF_DETAIL_WIZARD, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhEnumObjectsW,
+    PdhExpandWildCardPathW, PdhGetCounterInfoW, PdhGetFormattedCounterValue, PdhGetRawCounterValue,
+    PdhOpenQueryW, PdhParseCounterPathW, PdhRemoveCounter,
 };
 
 // These flags are not exposed by windows-sys 0.61.2.
@@ -305,24 +305,7 @@ impl NativePdh {
         NativePdh::parse_instance_identity(path)
     }
 
-    fn counter_info_buffer(
-        path: &str,
-        counter: PDH_HCOUNTER,
-    ) -> Result<(NativeBuffer<usize>, usize), Error> {
-        Self::counter_info_buffer_with(path, |size, buffer| {
-            // SAFETY: The counter is live. Sizing uses null and zero; filling
-            // uses an aligned writable slice and its byte capacity.
-            unsafe {
-                PdhGetCounterInfoW(
-                    counter,
-                    false,
-                    size,
-                    buffer.map_or(null_mut(), |buffer| buffer.as_mut_ptr().cast()),
-                )
-            }
-        })
-    }
-
+    #[cfg(test)]
     fn counter_info_buffer_with(
         path: &str,
         mut info: impl FnMut(&mut u32, Option<&mut [usize]>) -> u32,
@@ -395,40 +378,6 @@ impl NativePdh {
             ));
         };
         Ok(Some(String::from_utf16_lossy(&units[..length])))
-    }
-
-    fn localized_wildcard_path(&mut self, path: &str) -> Result<String, Error> {
-        let generation = self.counters.take_generation(path)?;
-        let wide_path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
-        let mut counter = null_mut();
-        // SAFETY: The adapter owns the live query, path is NUL-terminated,
-        // and the output handle is writable.
-        check(PdhOperation::AddEnglishWildcardCounter, path, unsafe {
-            PdhAddEnglishCounterW(self.query, wide_path.as_ptr(), 0, &mut counter)
-        })?;
-        let counter = self.counters.insert(generation, counter);
-        let result = (|| {
-            let handle = self.counters.handle(&counter, path)?;
-            let (buffer, filled_size) = Self::counter_info_buffer(path, handle)?;
-            let info = buffer.as_ptr::<PDH_COUNTER_INFO_W>();
-            // SAFETY: A successful metadata fill initialized the fixed header.
-            let full_path = unsafe { Self::wide_string((*info).szFullPath, &buffer, filled_size)? };
-            full_path.ok_or(Error::InvalidSample(
-                "PdhGetCounterInfoW returned a null full path",
-            ))
-        })();
-        let cleanup = self.counters.remove_with(&counter, path, |handle| {
-            // SAFETY: The generational token resolves to this query's live temporary handle.
-            unsafe { PdhRemoveCounter(handle) }
-        });
-        match (result, cleanup) {
-            (Ok(localized), Ok(())) => Ok(localized),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(cleanup)) => Err(Error::with_cleanup_failure(path, None, cleanup)),
-            (Err(error), Err(cleanup)) => {
-                Err(Error::with_cleanup_failure(path, Some(error), cleanup))
-            }
-        }
     }
 
     fn parse_multi_sz(buffer: &[u16]) -> Result<Vec<String>, Error> {
@@ -514,8 +463,7 @@ impl NativePdh {
     }
 
     fn expand_wildcard(&mut self, path: &str) -> Result<Vec<String>, Error> {
-        let localized = self.localized_wildcard_path(path)?;
-        let wide: Vec<u16> = localized.encode_utf16().chain(Some(0)).collect();
+        let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
         let buffer = Self::expanded_path_buffer_with(path, |size, buffer| {
             // SAFETY: The path is NUL-terminated. The optional buffer, when present,
             // is writable for the size supplied to PDH.
@@ -715,28 +663,15 @@ impl NativePdh {
 impl PdhApi for NativePdh {
     type Counter = CounterToken;
 
-    fn add(&mut self, path: &str, localized: bool) -> Result<CounterToken, Error> {
+    fn add(&mut self, path: &str) -> Result<CounterToken, Error> {
         let generation = self.counters.take_generation(path)?;
         let wide_path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
         let mut handle = null_mut();
         // SAFETY: The adapter owns the live query, path is NUL-terminated,
         // and the output handle is writable.
-        let status = unsafe {
-            if localized {
-                PdhAddCounterW(self.query, wide_path.as_ptr(), 0, &mut handle)
-            } else {
-                PdhAddEnglishCounterW(self.query, wide_path.as_ptr(), 0, &mut handle)
-            }
-        };
-        check(
-            if localized {
-                PdhOperation::AddCounter
-            } else {
-                PdhOperation::AddEnglishCounter
-            },
-            path,
-            status,
-        )?;
+        let status =
+            unsafe { PdhAddEnglishCounterW(self.query, wide_path.as_ptr(), 0, &mut handle) };
+        check(PdhOperation::AddEnglishCounter, path, status)?;
         Ok(self.counters.insert(generation, handle))
     }
 

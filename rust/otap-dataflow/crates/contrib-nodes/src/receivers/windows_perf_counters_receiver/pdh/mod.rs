@@ -40,7 +40,7 @@ pub(super) struct RawSample {
 pub(super) trait PdhApi {
     type Counter;
 
-    fn add(&mut self, path: &str, localized: bool) -> Result<Self::Counter, Error>;
+    fn add(&mut self, path: &str) -> Result<Self::Counter, Error>;
     fn remove(&mut self, counter: &Self::Counter, path: &str) -> Result<(), Error>;
     fn counter_type(&mut self, counter: &Self::Counter, path: &str) -> Result<u32, Error>;
     /// Returns whether collection has data; an expected omission returns false.
@@ -55,9 +55,9 @@ pub(super) trait PdhApi {
         format: ValueFormat,
     ) -> Result<Option<Number>, Error>;
     fn timestamp(&mut self) -> Result<i64, Error>;
-    /// Returns concrete localized paths for one configured wildcard template.
+    /// Returns concrete English paths for one configured wildcard template.
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error>;
-    /// Parses the instance identity from one concrete localized path.
+    /// Parses the instance identity from one concrete English path.
     fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error>;
 }
 

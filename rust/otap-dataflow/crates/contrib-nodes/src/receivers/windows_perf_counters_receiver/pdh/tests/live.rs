@@ -372,7 +372,7 @@ async fn live_pdh_collects_exact_and_wildcard_counters() {
 }
 
 /// Scenario: Windows expands canonical and mixed-ASCII-case spellings of the same Process wildcard.
-/// Guarantees: Native case-insensitive lookup returns exactly the same provider-spelled concrete membership.
+/// Guarantees: Native case-insensitive lookup returns the same concrete membership independent of template spelling.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_ascii_case_variants_share_native_membership() {
@@ -397,7 +397,7 @@ async fn live_pdh_ascii_case_variants_share_native_membership() {
             .points
             .iter()
             .filter(|point| point.counter_index == counter_index)
-            .map(|point| point.path.clone())
+            .map(|point| point.path.to_ascii_lowercase())
             .collect::<BTreeSet<_>>()
     });
     assert!(!paths[0].is_empty());
@@ -496,7 +496,7 @@ async fn live_pdh_unavailable_exact_counter_retries_after_startup() {
 }
 
 /// Scenario: A provider counter requires its trailing space while the trimmed spelling is unavailable.
-/// Guarantees: Parsed native spelling reaches PDH unchanged, the exact provider path emits, and the trimmed peer fails counter-locally beside a healthy control.
+/// Guarantees: Parsed native spelling reaches PDH unchanged, the exact provider path emits, and the trimmed peer fails discovery beside a healthy control.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_preserves_provider_significant_counter_space() {
@@ -594,8 +594,9 @@ async fn live_pdh_preserves_provider_significant_counter_space() {
     assert!(
         sample.metadata.failures.iter().any(|failure| {
             failure.counter_index == 1
-                && failure.reason == "PdhAddEnglishCounterW(wildcard)"
+                && failure.reason == "PdhExpandWildCardPathW(size)"
                 && failure.error == "PDH status 0xC0000BB9"
+                && failure.diagnostic_only
         }),
         "{:#?}",
         sample.metadata
@@ -744,9 +745,9 @@ async fn live_pdh_adapter_rejects_removed_tokens() {
     let _serial = TEST_PDH_LOCK.lock().await;
     let path = r"\Memory\Available Bytes";
     let mut api = NativePdh::open("removed".to_owned()).unwrap();
-    let removed = api.add(path, false).unwrap();
+    let removed = api.add(path).unwrap();
     api.remove(&removed, path).unwrap();
-    let live = api.add(path, false).unwrap();
+    let live = api.add(path).unwrap();
     for result in [
         api.remove(&removed, path),
         api.counter_type(&removed, path).map(|_| ()),

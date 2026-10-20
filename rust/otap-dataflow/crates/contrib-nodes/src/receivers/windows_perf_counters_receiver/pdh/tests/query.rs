@@ -9,7 +9,7 @@ struct InvalidHandleState {
     paths: BTreeMap<usize, String>,
     active: BTreeSet<usize>,
     max_active: usize,
-    add_attempts: Vec<(String, bool)>,
+    add_attempts: Vec<String>,
     cleanup_attempts: Vec<usize>,
     invalid_handles: BTreeSet<usize>,
     failed_adds_remaining: usize,
@@ -25,17 +25,13 @@ struct InvalidHandlePdh(Rc<RefCell<InvalidHandleState>>);
 impl PdhApi for InvalidHandlePdh {
     type Counter = usize;
 
-    fn add(&mut self, path: &str, localized: bool) -> Result<Self::Counter, Error> {
+    fn add(&mut self, path: &str) -> Result<Self::Counter, Error> {
         let mut state = self.0.borrow_mut();
-        state.add_attempts.push((path.to_owned(), localized));
+        state.add_attempts.push(path.to_owned());
         if state.failed_adds_remaining > 0 {
             state.failed_adds_remaining -= 1;
             return Err(Error::Pdh {
-                operation: if localized {
-                    PdhOperation::AddCounter
-                } else {
-                    PdhOperation::AddEnglishCounter
-                },
+                operation: PdhOperation::AddEnglishCounter,
                 path: path.to_owned(),
                 status: 1,
             });
@@ -263,10 +259,9 @@ fn invalid_handle_retries_one_counter_with_fresh_history() {
         let affected_adds = state
             .add_attempts
             .iter()
-            .filter(|(path, _)| path == expanded)
+            .filter(|path| path.as_str() == expanded)
             .collect::<Vec<_>>();
         assert_eq!(affected_adds.len(), 4);
-        assert!(affected_adds.iter().all(|(_, localized)| *localized));
     }
 
     {
@@ -324,7 +319,6 @@ fn formatted_invalid_handle_retries_exact_counter() {
     assert_eq!(state.active.len(), 1);
     assert_eq!(state.max_active, 1);
     assert_eq!(state.add_attempts.len(), 2);
-    assert!(state.add_attempts.iter().all(|(_, localized)| !localized));
 }
 
 /// Scenario: A published cumulative monotonic counter is re-added after its native handle becomes invalid.
@@ -458,10 +452,7 @@ fn same_path_mappings_use_independent_query_entries() {
         }],
     );
 
-    assert_eq!(
-        state.borrow().added,
-        [(path.to_owned(), false), (path.to_owned(), false)]
-    );
+    assert_eq!(state.borrow().added, [path.to_owned(), path.to_owned()]);
     let sample = query.collect().unwrap();
     assert_eq!(
         sample
@@ -1201,7 +1192,7 @@ fn expansion_limit_prioritizes_admitted_wildcard_member() {
     assert_eq!(retained.metadata.overflows.len(), 1);
     let state = state.borrow();
     assert_eq!(state.added.len(), 1);
-    assert_eq!(state.added[0].0, admitted);
+    assert_eq!(state.added[0], admitted);
     assert!(state.removed.is_empty());
 }
 
@@ -1362,7 +1353,7 @@ fn rediscovered_pending_removal_restores_existing_handle() {
     assert_eq!(query.reserved_native_entry_count(), 1);
     let state = state.borrow();
     assert_eq!(state.added.len(), 1);
-    assert_eq!(state.added[0].0, expanded);
+    assert_eq!(state.added[0], expanded);
     assert_eq!(state.removed, [0, 0]);
 }
 

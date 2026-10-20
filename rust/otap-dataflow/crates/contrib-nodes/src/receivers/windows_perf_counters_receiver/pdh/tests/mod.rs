@@ -99,7 +99,7 @@ fn fake_counter(path: &str, formatted: Number) -> FakeCounter {
 
 struct FakeState {
     counters: Vec<FakeCounter>,
-    added: Vec<(String, bool)>,
+    added: Vec<String>,
     calls: FakeNativeCalls,
     collect_has_data: bool,
     collect_error: bool,
@@ -159,22 +159,18 @@ impl FakePdh {
 impl PdhApi for FakePdh {
     type Counter = FakeCounterToken;
 
-    fn add(&mut self, path: &str, localized: bool) -> Result<Self::Counter, Error> {
+    fn add(&mut self, path: &str) -> Result<Self::Counter, Error> {
         let mut state = self.state.borrow_mut();
         let counter = state
             .counters
             .iter()
             .position(|counter| counter.path == path)
             .ok_or_else(|| Error::Pdh {
-                operation: if localized {
-                    PdhOperation::AddCounter
-                } else {
-                    PdhOperation::AddEnglishCounter
-                },
+                operation: PdhOperation::AddEnglishCounter,
                 path: path.to_owned(),
                 status: 1,
             })?;
-        state.added.push((path.to_owned(), localized));
+        state.added.push(path.to_owned());
         if counter >= self.generations.len() {
             self.generations.resize(counter + 1, 0);
         }
@@ -309,7 +305,7 @@ struct RecoveringPrimePdh {
 impl PdhApi for RecoveringPrimePdh {
     type Counter = ();
 
-    fn add(&mut self, _path: &str, _localized: bool) -> Result<Self::Counter, Error> {
+    fn add(&mut self, _path: &str) -> Result<Self::Counter, Error> {
         Ok(())
     }
 
@@ -373,7 +369,7 @@ struct RebuildPrimePdh {
 impl PdhApi for RebuildPrimePdh {
     type Counter = ();
 
-    fn add(&mut self, _path: &str, _localized: bool) -> Result<Self::Counter, Error> {
+    fn add(&mut self, _path: &str) -> Result<Self::Counter, Error> {
         Ok(())
     }
 
@@ -527,10 +523,10 @@ fn collected_monotonic_publications(sample: &Sample) -> Vec<MonotonicPublication
         .collect()
 }
 
-/// Scenario: A fake PDH add uses the localized API mode for a concrete expanded path.
-/// Guarantees: Tests can distinguish localized adds from English configured-path adds.
+/// Scenario: A fake PDH add receives one concrete English wildcard expansion result.
+/// Guarantees: Expanded members use the same English-add adapter route as exact configured paths.
 #[test]
-fn fake_pdh_records_localized_add_mode() {
+fn fake_pdh_records_english_expanded_add() {
     let path = r"\Process(worker)\Private Bytes";
     let state = fake_state(vec![FakeCounter {
         path: path.to_owned(),
@@ -543,9 +539,9 @@ fn fake_pdh_records_localized_add_mode() {
     }]);
     let mut api = FakePdh::new(Rc::clone(&state));
 
-    let _ = api.add(path, true).unwrap();
+    let _ = api.add(path).unwrap();
 
-    assert_eq!(state.borrow().added, [(path.to_owned(), true)]);
+    assert_eq!(state.borrow().added, [path.to_owned()]);
 }
 
 /// Scenario: A fake PDH token is used after removal and after a replacement add.
@@ -563,9 +559,9 @@ fn fake_pdh_rejects_removed_tokens() {
         formatted_error: false,
     }]);
     let mut api = FakePdh::new(state);
-    let removed = api.add(path, false).unwrap();
+    let removed = api.add(path).unwrap();
     api.remove(&removed, path).unwrap();
-    let replacement = api.add(path, false).unwrap();
+    let replacement = api.add(path).unwrap();
 
     assert!(matches!(
         api.counter_type(&removed, path),

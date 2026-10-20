@@ -8,9 +8,7 @@ use windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) enum PdhOperation {
-    AddCounter,
     AddEnglishCounter,
-    AddEnglishWildcardCounter,
     CollectQueryData,
     #[cfg(test)]
     CounterDataStatus,
@@ -31,9 +29,7 @@ pub(in super::super) enum PdhOperation {
 impl PdhOperation {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
-            Self::AddCounter => "PdhAddCounterW",
             Self::AddEnglishCounter => "PdhAddEnglishCounterW",
-            Self::AddEnglishWildcardCounter => "PdhAddEnglishCounterW(wildcard)",
             Self::CollectQueryData => "PdhCollectQueryData",
             #[cfg(test)]
             Self::CounterDataStatus => "counter CStatus",
