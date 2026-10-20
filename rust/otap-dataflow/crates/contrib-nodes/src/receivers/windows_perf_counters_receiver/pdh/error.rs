@@ -92,9 +92,13 @@ pub(in super::super) enum Error {
     #[error("failed to start PDH worker thread: {0}")]
     WorkerStart(String),
     #[error(
-        "PDH worker failed to pin UI language to 0x{requested:04X}; SetThreadUILanguage returned 0x{returned:04X}"
+        "PDH worker failed to pin UI language to 0x{requested:04X}; SetThreadUILanguage returned 0x{returned:04X}, GetThreadUILanguage verified 0x{verified:04X}"
     )]
-    WorkerLanguagePin { requested: u16, returned: u16 },
+    WorkerLanguagePin {
+        requested: u16,
+        returned: u16,
+        verified: u16,
+    },
     #[error("PDH worker object-list {stage} failed with status 0x{status:08X}")]
     WorkerObjectRefresh { stage: &'static str, status: u32 },
     #[error("PDH worker stopped before initialization completed")]

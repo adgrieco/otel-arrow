@@ -9,7 +9,7 @@ use std::mem::{size_of, size_of_val};
 use std::ptr::{null, null_mut};
 use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::Globalization::SetThreadUILanguage;
+use windows_sys::Win32::Globalization::{GetThreadUILanguage, SetThreadUILanguage};
 use windows_sys::Win32::System::Performance::{
     PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
     PDH_COUNTER_INFO_W, PDH_COUNTER_PATH_ELEMENTS_W, PDH_CSTATUS_INVALID_DATA,
@@ -32,7 +32,10 @@ pub(super) fn initialize_worker(node: &str, refresh_objects: bool) -> Result<(),
         refresh_objects,
         || {
             // SAFETY: This changes only the calling worker thread's UI language.
-            unsafe { SetThreadUILanguage(ENGLISH_UI_LANGUAGE) }
+            unsafe {
+                let returned = SetThreadUILanguage(ENGLISH_UI_LANGUAGE);
+                (returned, GetThreadUILanguage())
+            }
         },
         |refresh, size, buffer| {
             // SAFETY: Null selects the local live source and machine. The optional
@@ -54,17 +57,30 @@ pub(super) fn initialize_worker(node: &str, refresh_objects: bool) -> Result<(),
 fn initialize_worker_with(
     node: &str,
     refresh_objects: bool,
-    pin_language: impl FnOnce() -> u16,
+    pin_language: impl FnOnce() -> (u16, u16),
     mut enumerate_objects: impl FnMut(bool, &mut u32, Option<&mut [u16]>) -> u32,
 ) -> Result<(), Error> {
-    let language_result = pin_language();
+    let (language_result, verified_language) = pin_language();
     let mut refresh_status = None;
     let mut enumeration_status = None;
-    let result = if language_result != ENGLISH_UI_LANGUAGE {
-        Err(Error::WorkerLanguagePin {
+    let pin_error = (language_result != ENGLISH_UI_LANGUAGE
+        || verified_language != ENGLISH_UI_LANGUAGE)
+        .then_some(Error::WorkerLanguagePin {
             requested: ENGLISH_UI_LANGUAGE,
             returned: language_result,
-        })
+            verified: verified_language,
+        });
+    let result = if let Some(error) = pin_error {
+        if refresh_objects {
+            Err(error)
+        } else {
+            otel_arrow_dfe_telemetry::otel_warn!(
+                "windows_perf_counters_receiver.worker.language.warn",
+                node = node,
+                error = %error
+            );
+            Ok(())
+        }
     } else if refresh_objects {
         let mut size = 0;
         let status = enumerate_objects(true, &mut size, None);
@@ -105,6 +121,7 @@ fn initialize_worker_with(
         node = node,
         requested_language_id = ENGLISH_UI_LANGUAGE as u64,
         language_result = language_result as u64,
+        verified_language_id = verified_language as u64,
         wildcards_configured = refresh_objects,
         object_refresh_status = ?refresh_status,
         object_enumeration_status = ?enumeration_status
@@ -778,7 +795,7 @@ mod tests {
         initialize_worker_with(
             "exact",
             false,
-            || ENGLISH_UI_LANGUAGE,
+            || (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE),
             |_, _, _| panic!("exact-only worker must not enumerate objects"),
         )
         .unwrap();
@@ -795,7 +812,7 @@ mod tests {
             true,
             || {
                 pinned.set(true);
-                ENGLISH_UI_LANGUAGE
+                (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE)
             },
             |refresh, size, buffer| {
                 assert!(pinned.get());
@@ -816,11 +833,11 @@ mod tests {
     /// Guarantees: Worker startup returns a typed language-pin error before any PDH object refresh.
     #[test]
     fn worker_rejects_failed_language_pin() {
-        for returned in [0, 0x0407] {
+        for (returned, verified) in [(0, 0x0409), (0x0407, 0x0409), (0x0409, 0x0407)] {
             let error = initialize_worker_with(
                 "language-failure",
                 true,
-                || returned,
+                || (returned, verified),
                 |_, _, _| panic!("failed pin must stop before object enumeration"),
             )
             .unwrap_err();
@@ -829,8 +846,24 @@ mod tests {
                 Error::WorkerLanguagePin {
                     requested: ENGLISH_UI_LANGUAGE,
                     returned: actual,
-                } if actual == returned
+                    verified: actual_verified,
+                } if actual == returned && actual_verified == verified
             ));
+        }
+    }
+
+    /// Scenario: An exact-only worker cannot set or verify English UI language.
+    /// Guarantees: Startup continues without object refresh because English adds do not require the pin.
+    #[test]
+    fn exact_worker_continues_after_failed_or_ineffective_pin() {
+        for result in [(0, 0x0407), (0x0409, 0x0407)] {
+            initialize_worker_with(
+                "exact-pin-warning",
+                false,
+                || result,
+                |_, _, _| panic!("exact-only worker must not refresh objects"),
+            )
+            .unwrap();
         }
     }
 
@@ -838,9 +871,13 @@ mod tests {
     /// Guarantees: Both native stages fail startup with the typed object-refresh error.
     #[test]
     fn worker_rejects_failed_object_refresh() {
-        let sizing =
-            initialize_worker_with("refresh-failure", true, || ENGLISH_UI_LANGUAGE, |_, _, _| 5)
-                .unwrap_err();
+        let sizing = initialize_worker_with(
+            "refresh-failure",
+            true,
+            || (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE),
+            |_, _, _| 5,
+        )
+        .unwrap_err();
         assert!(matches!(
             sizing,
             Error::WorkerObjectRefresh {
@@ -852,7 +889,7 @@ mod tests {
         let fill = initialize_worker_with(
             "fill-failure",
             true,
-            || ENGLISH_UI_LANGUAGE,
+            || (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE),
             |_, size, buffer| {
                 if buffer.is_none() {
                     *size = 8;

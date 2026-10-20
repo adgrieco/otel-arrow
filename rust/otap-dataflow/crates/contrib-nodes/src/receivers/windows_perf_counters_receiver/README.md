@@ -191,13 +191,16 @@ because providers may use them as part of valid native identity. An invalid or
 unavailable constructed path is diagnosed for that counter without rejecting
 unrelated mappings.
 
-Configure performance object and counter names in English. Exact paths are
-added through PDH's language-neutral English API. Before wildcard expansion,
-the receiver asks PDH to translate the English template to its localized full
-path, expands that localized template, and adds the resulting concrete paths
-through the localized API. Localized exact object, instance, or counter names
-are not accepted as configuration aliases, and exact-path collection does not
-fall back to the localized API.
+Configure performance object and counter names in English. Every worker pins
+and verifies native UI language `0x0409` before its first PDH call. With any
+wildcard configured, a failed or ineffective pin or failed startup object-list
+refresh fails the whole receiver. Exact-only configurations skip refresh and
+warn once if the pin fails, continuing with English adds. Startup refresh
+changes PDH name lookups process-wide, not just for this worker.
+
+English templates expand directly, and exact and expanded paths are added
+with `PdhAddEnglishCounterW`. Counter-info paths do not determine identity.
+There is no localized translation or fallback.
 
 Omit `instances`, or use an empty list, for objects without instances. Specify
 one name or a list for exact instances. Partial patterns such as `"worker*"` are
