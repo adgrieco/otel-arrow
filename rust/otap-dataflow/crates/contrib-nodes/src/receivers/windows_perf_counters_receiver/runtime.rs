@@ -126,6 +126,22 @@ impl FailureLogState {
         receiver: &WindowsPerfCountersReceiver,
         sample: &Sample,
     ) -> Result<(), usize> {
+        let current_failures = sample
+            .metadata
+            .failures
+            .iter()
+            .map(|failure| (failure.counter_index, failure.path.as_ref(), failure.reason))
+            .collect::<BTreeSet<_>>();
+        let current_members = sample
+            .members
+            .iter()
+            .map(|member| (member.counter_index, member.path.as_ref()))
+            .collect::<BTreeSet<_>>();
+        self.active_counter_failures
+            .retain(|(counter_index, path, reason)| {
+                current_failures.contains(&(*counter_index, path.as_ref(), *reason))
+                    || current_members.contains(&(*counter_index, path.as_ref()))
+            });
         for point in &sample.points {
             if !matches!(point.value, SampleValue::Value(_)) {
                 continue;
@@ -653,8 +669,8 @@ mod tests {
         Aggregation, CounterConfig, InstanceConfig, MetricKind,
     };
     use crate::receivers::windows_perf_counters_receiver::model::{
-        MonotonicPublicationCandidate, Number, PendingMetadata, SampleDiagnostics, SamplePoint,
-        SampleValue,
+        MonotonicPublicationCandidate, Number, PendingMetadata, SampleDiagnostics, SampleMember,
+        SamplePoint, SampleValue,
     };
     use crate::receivers::windows_perf_counters_receiver::otap_builder::OutputSource;
     use arrow::array::TimestampNanosecondArray;
@@ -839,12 +855,18 @@ mod tests {
         assert_eq!(metrics.health.failed_counter_values.get(), 1);
     }
 
-    /// Scenario: A concrete counter fails, is absent and omitted on later scrapes, then produces a valid value before failing again.
-    /// Guarantees: Warning suppression persists until real value recovery and re-arms only after that recovery.
+    /// Scenario: A concrete counter fails, remains admitted without a value, leaves membership, then fails again before recovering.
+    /// Guarantees: Warning suppression survives omission while admitted, is pruned on removal, and clears on valid recovery.
     #[test]
-    fn counter_failure_suppression_requires_valid_recovery() {
+    fn counter_failure_suppression_tracks_source_membership_and_recovery() {
         let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
         let path = Arc::<str>::from(r"\Memory\Available Bytes");
+        let member = SampleMember {
+            counter_index: 0,
+            path: Arc::clone(&path),
+            instance: None,
+            emit_instance_attribute: false,
+        };
         let failure = SampleFailure {
             counter_index: 0,
             path: Arc::clone(&path),
@@ -858,14 +880,16 @@ mod tests {
         state.log_counter_failures(&receiver, &failed).unwrap();
         assert_eq!(state.active_counter_failures.len(), 1);
 
+        let mut admitted_without_point = Sample::empty(20);
+        admitted_without_point.members.push(member.clone());
         state
-            .log_counter_failures(&receiver, &Sample::empty(20))
+            .log_counter_failures(&receiver, &admitted_without_point)
             .unwrap();
         assert_eq!(state.active_counter_failures.len(), 1);
 
         let omitted = Sample {
             timestamp_unix_nano: 30,
-            members: Vec::new(),
+            members: vec![member.clone()],
             points: vec![SamplePoint {
                 counter_index: 0,
                 path: Arc::clone(&path),
@@ -881,17 +905,22 @@ mod tests {
         state.log_counter_failures(&receiver, &omitted).unwrap();
         assert_eq!(state.active_counter_failures.len(), 1);
 
-        let recovered = Sample {
-            timestamp_unix_nano: 40,
-            members: Vec::new(),
-            points: vec![sample_point(0, 40, Number::Integer(42))],
-            metadata: collected_metadata(),
-        };
-        state.log_counter_failures(&receiver, &recovered).unwrap();
+        state
+            .log_counter_failures(&receiver, &Sample::empty(40))
+            .unwrap();
         assert!(state.active_counter_failures.is_empty());
 
         state.log_counter_failures(&receiver, &failed).unwrap();
         assert_eq!(state.active_counter_failures.len(), 1);
+
+        let recovered = Sample {
+            timestamp_unix_nano: 50,
+            members: vec![member],
+            points: vec![sample_point(0, 50, Number::Integer(42))],
+            metadata: collected_metadata(),
+        };
+        state.log_counter_failures(&receiver, &recovered).unwrap();
+        assert!(state.active_counter_failures.is_empty());
     }
 
     /// Scenario: One output collision persists across invalid and recovered samples, clears with membership, then recurs.
