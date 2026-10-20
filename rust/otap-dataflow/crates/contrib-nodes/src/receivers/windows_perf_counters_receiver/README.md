@@ -337,7 +337,8 @@ counter-local failures retain their normal omission and diagnostic behavior
 without fabricating readiness.
 The initial pass has no fixed timeout. Drain or shutdown remains responsive and
 requests worker cleanup, but a native call already in progress must return
-before its query resources can be released. Failed query open, zero usable
+before its query resources can be released. Setup checks for shutdown between
+native calls, including aggregate filtering. Failed query open, zero usable
 counters, thread-start, configuration, and invariant failures reject startup
 explicitly. An empty wildcard is diagnosed and omitted beside healthy peers;
 it never fabricates a zero-valued point.

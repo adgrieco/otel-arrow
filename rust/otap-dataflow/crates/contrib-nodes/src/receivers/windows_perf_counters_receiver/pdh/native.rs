@@ -345,6 +345,7 @@ impl NativePdh {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn parse_instance_path(path: &str) -> Result<InstanceIdentity, Error> {
         NativePdh::parse_instance_identity(path)
     }
@@ -533,6 +534,7 @@ impl NativePdh {
         }
     }
 
+    #[cfg(test)]
     fn parse_instance_identity(path: &str) -> Result<InstanceIdentity, Error> {
         Self::parse_instance_controlled(path, None)
     }

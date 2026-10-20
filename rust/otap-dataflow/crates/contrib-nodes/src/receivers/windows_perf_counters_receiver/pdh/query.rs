@@ -807,7 +807,11 @@ impl<A: PdhApi> Query<A> {
                 self.configs[config_index]
                     .instance_config
                     .excluded_aggregation(),
-            );
+                |path| {
+                    self.api.check_running()?;
+                    self.api.parse_instance(path)
+                },
+            )?;
             let oversized = paths
                 .iter()
                 .filter(|path| path.encode_utf16().count() >= PDH_MAX_COUNTER_PATH as usize)

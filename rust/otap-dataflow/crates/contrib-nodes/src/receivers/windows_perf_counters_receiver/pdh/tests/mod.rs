@@ -111,6 +111,7 @@ struct FakeState {
     expand_errors: BTreeSet<String>,
     stop_after_expand: Option<Arc<AtomicBool>>,
     stop_after_add: Option<Arc<AtomicBool>>,
+    stop_after_parse: Option<Arc<AtomicBool>>,
     removed: Vec<usize>,
     expansions: BTreeMap<String, Vec<String>>,
 }
@@ -124,6 +125,7 @@ struct FakeNativeCalls {
     formatted: usize,
     timestamp: usize,
     expand: usize,
+    parse: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -168,6 +170,7 @@ impl PdhApi for FakePdh {
             .stop_after_expand
             .iter()
             .chain(state.stop_after_add.iter())
+            .chain(state.stop_after_parse.iter())
             .any(|stop| stop.load(Ordering::Acquire))
         {
             Err(Error::WorkerInitStopped)
@@ -315,6 +318,11 @@ impl PdhApi for FakePdh {
     }
 
     fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
+        let mut state = self.state.borrow_mut();
+        state.calls.parse += 1;
+        if let Some(stop) = &state.stop_after_parse {
+            stop.store(true, Ordering::Release);
+        }
         NativePdh::parse_instance_path(path)
     }
 }
@@ -492,6 +500,7 @@ fn fake_state_value(counters: Vec<FakeCounter>) -> FakeState {
         expand_errors: BTreeSet::new(),
         stop_after_expand: None,
         stop_after_add: None,
+        stop_after_parse: None,
         removed: Vec::new(),
         expansions: BTreeMap::new(),
     }

@@ -3,10 +3,12 @@
 
 use super::super::model::InstanceIdentity;
 use super::error::Error;
+#[cfg(test)]
 use super::native::NativePdh;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Parses a counter path through handle-independent native PDH path processing.
+#[cfg(test)]
 pub(super) fn parse_instance(path: &str) -> Result<InstanceIdentity, Error> {
     NativePdh::parse_instance_path(path)
 }
@@ -98,30 +100,47 @@ pub(super) fn expansion_allocation(
     }
 }
 
+#[cfg(test)]
 pub(super) fn is_aggregation_instance(path: &str, aggregation_name: &str) -> bool {
-    parse_instance(path).is_ok_and(|instance| {
-        let name = if instance.index == 0 {
-            instance.name
-        } else {
-            format!("{}#{}", instance.name, instance.index)
-        };
-        instance.parent.map_or(name == aggregation_name, |parent| {
-            format!("{parent}/{name}") == aggregation_name
-        })
+    parse_instance(path).is_ok_and(|instance| matches_aggregation(instance, aggregation_name))
+}
+
+fn matches_aggregation(instance: InstanceIdentity, aggregation_name: &str) -> bool {
+    let name = if instance.index == 0 {
+        instance.name
+    } else {
+        format!("{}#{}", instance.name, instance.index)
+    };
+    instance.parent.map_or(name == aggregation_name, |parent| {
+        format!("{parent}/{name}") == aggregation_name
     })
 }
 
 pub(super) fn cleanup_aggregation_instances(
     paths: &mut Vec<String>,
     aggregation_name: Option<&str>,
-) -> bool {
-    if let Some(aggregation_name) = aggregation_name {
-        if paths.len() == 1 && is_aggregation_instance(&paths[0], aggregation_name) {
-            return true;
+    mut parse: impl FnMut(&str) -> Result<InstanceIdentity, Error>,
+) -> Result<bool, Error> {
+    let Some(aggregation_name) = aggregation_name else {
+        return Ok(false);
+    };
+    let single = paths.len() == 1;
+    let mut retained = Vec::with_capacity(paths.len());
+    let mut aggregation_only = false;
+    for path in paths.drain(..) {
+        let aggregate = match parse(&path) {
+            Ok(instance) => matches_aggregation(instance, aggregation_name),
+            Err(error @ (Error::WorkerStopped | Error::WorkerInitStopped)) => return Err(error),
+            // Invalid paths remain available for ordinary admission diagnostics.
+            Err(_) => false,
+        };
+        if !aggregate || single {
+            retained.push(path);
+            aggregation_only = aggregate;
         }
-        paths.retain(|path| !is_aggregation_instance(path, aggregation_name));
     }
-    false
+    *paths = retained;
+    Ok(single && aggregation_only)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

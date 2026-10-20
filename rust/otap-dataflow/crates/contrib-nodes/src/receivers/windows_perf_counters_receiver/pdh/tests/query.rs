@@ -517,6 +517,42 @@ fn frozen_membership_rejects_empty_startup_and_diagnoses_partial_empty_pattern()
     );
 }
 
+/// Scenario: Shutdown arrives during the first native aggregate-filter parse in startup expansion.
+/// Guarantees: Setup stops before another parse, counter add or prime instead of walking the remaining expansion.
+#[test]
+fn startup_aggregate_filter_stops_between_native_parses() {
+    let template = r"\Process(*)\Private Bytes";
+    let paths =
+        ["worker", "_Total", "service"].map(|name| format!(r"\Process({name})\Private Bytes"));
+    let state = fake_state(
+        paths
+            .iter()
+            .map(|path| fake_counter(path, Number::Integer(1)))
+            .collect(),
+    );
+    state.borrow_mut().stop_after_parse = Some(Arc::new(AtomicBool::new(false)));
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(template.to_owned(), paths.to_vec());
+    let mut config = counter(template, "process.private");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: Some("_Total".to_owned()),
+    };
+    let result = Query::open_with_cadences(
+        FakePdh::new(Rc::clone(&state)),
+        vec![config],
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        256,
+        4096,
+    );
+    assert!(matches!(result, Err(Error::WorkerInitStopped)));
+    assert_eq!(state.borrow().calls.parse, 1);
+    assert_eq!(state.borrow().calls.add, 0);
+    assert_eq!(state.borrow().calls.collect, 0);
+}
+
 /// Scenario: Seventeen startup patterns each discover 257 available members under the fixed MVP bounds.
 /// Guarantees: Each pattern admits at most 256 and the receiver installs at most 4096 entries with explicit overflow diagnostics.
 #[test]
@@ -2149,7 +2185,7 @@ fn filters_aggregation_before_expansion_limits() {
         r"\Process(_Total)\Private Bytes".to_owned(),
         r"\Process(worker)\Private Bytes".to_owned(),
     ];
-    assert!(!cleanup_aggregation_instances(&mut paths, Some("_Total")));
+    assert!(!cleanup_aggregation_instances(&mut paths, Some("_Total"), parse_instance).unwrap());
     let allocation = limit_expanded_paths(&mut paths, 1, 1);
     assert_eq!(
         allocation,
