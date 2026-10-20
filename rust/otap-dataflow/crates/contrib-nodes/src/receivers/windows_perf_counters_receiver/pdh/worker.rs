@@ -10,8 +10,11 @@ use super::super::model::{
 };
 use super::PdhApi;
 use super::error::Error;
-use super::query::{Query, QueryRecreationSeed, retry_delay};
-use std::collections::HashMap;
+use super::query::{
+    Query, QueryRecreationSeed, WildcardRefreshAdditions, WildcardRefreshPlan,
+    WildcardRefreshSelection, retry_delay,
+};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -998,7 +1001,7 @@ impl<A: PdhApi> QuerySlot<A> {
         Ok(sample)
     }
 
-    fn admitted_members(&self) -> Result<Vec<SampleMember>, Error> {
+    pub(super) fn admitted_members(&self) -> Result<Vec<SampleMember>, Error> {
         let mut members = self.query.as_ref().map_or_else(
             || self.last_admitted_members.clone(),
             Query::admitted_members,
@@ -1250,7 +1253,14 @@ fn prepare_initial_queries<A: PdhApi>(
     Ok(true)
 }
 
-fn refresh_wildcards_in_config_order<A: PdhApi>(
+struct PlannedWildcardRefresh {
+    query_index: usize,
+    plan: WildcardRefreshPlan,
+    eligible: Vec<usize>,
+    selected: BTreeSet<super::expansion::CounterKey>,
+}
+
+pub(super) fn refresh_wildcards_in_config_order<A: PdhApi>(
     queries: &mut [QuerySlot<A>],
     max_native_counters: usize,
     shutdown_requested: Option<&AtomicBool>,
@@ -1287,23 +1297,172 @@ fn refresh_wildcards_in_config_order<A: PdhApi>(
     let mut errors = std::iter::repeat_with(|| None)
         .take(queries.len())
         .collect::<Vec<_>>();
+    let admitted_by_query = queries
+        .iter()
+        .map(|slot| {
+            slot.query
+                .as_ref()
+                .map_or_else(BTreeSet::new, Query::admitted_wildcard_keys)
+        })
+        .collect::<Vec<_>>();
+    let blocked = queries
+        .iter()
+        .filter_map(|slot| slot.query.as_ref())
+        .flat_map(Query::blocked_wildcard_removal_keys)
+        .collect::<BTreeSet<_>>();
+    let mut retained = admitted_by_query
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    retained.extend(blocked.iter().cloned());
+    let exact_reservations = queries
+        .iter()
+        .filter_map(|slot| slot.query.as_ref())
+        .map(Query::exact_counter_reservations)
+        .fold(0usize, |total, count| total.saturating_add(count));
+    let wildcard_capacity = max_native_counters.saturating_sub(exact_reservations);
+    let mut native_keys = blocked;
+    for (query_index, admitted) in admitted_by_query.iter().enumerate() {
+        if !due[query_index] {
+            native_keys.extend(admitted.iter().cloned());
+        }
+    }
+    let mut selected_keys = BTreeSet::new();
+    let mut planned = Vec::with_capacity(tasks.len());
     for (_, query_index, config_index) in tasks {
         if shutdown_requested.is_some_and(|stop| stop.load(Ordering::Acquire)) {
             return (errors, true);
         }
-        if errors[query_index].is_some() {
-            continue;
-        }
-        let query_limit = query_native_limit(queries, query_index, max_native_counters);
         let query = queries[query_index]
             .query
             .as_mut()
             .expect("wildcard refresh task requires an active query");
-        let result = query
-            .set_max_native_counters(query_limit)
-            .and_then(|()| query.refresh_wildcard_config_managed(config_index));
-        if let Err(error) = result {
+        let plan = query.plan_wildcard_refresh_managed(config_index);
+        let mut eligible = (0..plan.paths.len()).collect::<Vec<_>>();
+        eligible.sort_by_key(|candidate_index| {
+            !retained.contains(&plan.paths[*candidate_index].key)
+                && !plan.paths[*candidate_index].satisfied_by_exact
+        });
+        eligible.truncate(query.max_instances_per_wildcard());
+        planned.push(PlannedWildcardRefresh {
+            query_index,
+            plan,
+            eligible,
+            selected: BTreeSet::new(),
+        });
+    }
+
+    let mut selection_order = Vec::new();
+    for task in &mut planned {
+        for &candidate_index in &task.eligible {
+            let candidate = &task.plan.paths[candidate_index];
+            if candidate.satisfied_by_exact {
+                let _ = task.selected.insert(candidate.key.clone());
+                let _ = selected_keys.insert(candidate.key.clone());
+            }
+        }
+    }
+    for task in &mut planned {
+        for &candidate_index in &task.eligible {
+            let candidate = &task.plan.paths[candidate_index];
+            if task.selected.contains(&candidate.key) || !retained.contains(&candidate.key) {
+                continue;
+            }
+            if selected_keys.contains(&candidate.key) || native_keys.len() < wildcard_capacity {
+                let _ = task.selected.insert(candidate.key.clone());
+                if selected_keys.insert(candidate.key.clone()) {
+                    let _ = native_keys.insert(candidate.key.clone());
+                    selection_order.push((task.query_index, candidate.key.clone()));
+                }
+            }
+        }
+    }
+    for task in &mut planned {
+        for &candidate_index in &task.eligible {
+            let candidate = &task.plan.paths[candidate_index];
+            if task.selected.contains(&candidate.key) {
+                continue;
+            }
+            if selected_keys.contains(&candidate.key) || native_keys.len() < wildcard_capacity {
+                let _ = task.selected.insert(candidate.key.clone());
+                if selected_keys.insert(candidate.key.clone()) {
+                    let _ = native_keys.insert(candidate.key.clone());
+                    selection_order.push((task.query_index, candidate.key.clone()));
+                }
+            }
+        }
+    }
+
+    let mut selections = std::iter::repeat_with(Vec::new)
+        .take(queries.len())
+        .collect::<Vec<Vec<WildcardRefreshSelection>>>();
+    for task in planned {
+        let per_wildcard_retained = task.eligible.len();
+        let selected = task.selected.len();
+        let allocation = super::expansion::ExpansionAllocation {
+            retained: selected,
+            per_wildcard_omitted: task.plan.discovered - per_wildcard_retained,
+            total_omitted: per_wildcard_retained - selected,
+        };
+        selections[task.query_index].push(WildcardRefreshSelection {
+            plan: task.plan,
+            selected: task.selected,
+            allocation,
+        });
+    }
+    let mut additions = selections
+        .into_iter()
+        .enumerate()
+        .map(|(query_index, selections)| {
+            if selections.is_empty() {
+                None
+            } else {
+                queries[query_index]
+                    .query
+                    .as_mut()
+                    .map(|query| query.prepare_managed_wildcard_refresh(selections))
+            }
+        })
+        .collect::<Vec<Option<WildcardRefreshAdditions>>>();
+    let mut completed = BTreeSet::new();
+    for (query_index, key) in selection_order {
+        if errors[query_index].is_some() || !completed.insert(key.clone()) {
+            continue;
+        }
+        let Some(additions) = additions[query_index].as_mut() else {
+            continue;
+        };
+        if !additions.added.contains(&key) {
+            continue;
+        }
+        let query = queries[query_index]
+            .query
+            .as_mut()
+            .expect("wildcard additions require an active query");
+        if let Err(error) = query.complete_managed_wildcard_addition(&key, additions) {
             errors[query_index] = Some(error);
+        }
+    }
+    for (query_index, additions) in additions.iter_mut().enumerate() {
+        if errors[query_index].is_some() {
+            continue;
+        }
+        let Some(additions) = additions else {
+            continue;
+        };
+        for key in additions.added.clone() {
+            if !completed.insert(key.clone()) {
+                continue;
+            }
+            let query = queries[query_index]
+                .query
+                .as_mut()
+                .expect("wildcard additions require an active query");
+            if let Err(error) = query.complete_managed_wildcard_addition(&key, additions) {
+                errors[query_index] = Some(error);
+                break;
+            }
         }
     }
     for (query_index, is_due) in due.into_iter().enumerate() {

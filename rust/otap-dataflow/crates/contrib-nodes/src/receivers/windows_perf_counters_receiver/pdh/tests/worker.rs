@@ -358,6 +358,137 @@ fn wildcard_admission_across_queries_follows_config_order() {
     assert_eq!(sample.metadata.diagnostics.instances_omitted_over_limit, 1);
 }
 
+fn global_admission_fixture(
+    first_paths: Vec<String>,
+    second_paths: Vec<String>,
+    max_native_counters: usize,
+) -> (Vec<Rc<RefCell<FakeState>>>, Vec<QuerySlot<FakePdh>>) {
+    let first_template = r"\Process(first*)\Private Bytes";
+    let second_template = r"\Process(second*)\Private Bytes";
+    let mut first = counter(first_template, "process.first");
+    first.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    first.source_mapping_index = 0;
+    let mut second = counter(second_template, "process.second");
+    second.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    second.recreate_query = true;
+    second.source_mapping_index = 1;
+
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
+        let (template, paths) = if configs[0].source_mapping_index == 0 {
+            (first_template, first_paths.clone())
+        } else {
+            (second_template, second_paths.clone())
+        };
+        let known_path = if configs[0].source_mapping_index == 0 {
+            r"\Process(first0)\Private Bytes"
+        } else {
+            r"\Process(second0)\Private Bytes"
+        };
+        let counters = vec![fake_counter(known_path, Number::Integer(42))];
+        let state = Rc::new(RefCell::new(FakeState {
+            expansions: BTreeMap::from([(template.to_owned(), paths)]),
+            ..fake_state_value(counters)
+        }));
+        let query = Query::open_managed_with_seed(
+            FakePdh::new(Rc::clone(&state)),
+            configs,
+            Duration::ZERO,
+            Duration::ZERO,
+            256,
+            max_native_counters,
+            seed,
+        )
+        .unwrap();
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let queries = open_initial_queries(
+        query_plans(vec![first, second]),
+        Duration::ZERO,
+        max_native_counters,
+        &mut open,
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+    drop(open);
+    let states = Rc::try_unwrap(states).ok().unwrap().into_inner();
+    (states, queries)
+}
+
+/// Scenario: Capacity shrinks after the first mapping was admitted before a later isolated mapping.
+/// Guarantees: Global admission order retains the earlier native member instead of query traversal protecting the later one.
+#[test]
+fn capacity_shrink_preserves_earliest_global_admission() {
+    let first = r"\Process(first0)\Private Bytes";
+    let second = r"\Process(second0)\Private Bytes";
+    let (states, mut queries) = global_admission_fixture(vec![first.to_owned()], Vec::new(), 1);
+    let _ = states[1].borrow_mut().expansions.insert(
+        r"\Process(second*)\Private Bytes".to_owned(),
+        vec![second.to_owned()],
+    );
+
+    let (errors, stopped) = refresh_wildcards_in_config_order(&mut queries, 2, None);
+    assert!(!stopped);
+    assert!(errors.iter().all(Option::is_none));
+    assert_eq!(
+        queries
+            .iter()
+            .map(QuerySlot::active_expanded_count)
+            .collect::<Vec<_>>(),
+        [1, 1]
+    );
+
+    let (errors, stopped) = refresh_wildcards_in_config_order(&mut queries, 1, None);
+    assert!(!stopped);
+    assert!(errors.iter().all(Option::is_none));
+    assert_eq!(
+        queries
+            .iter()
+            .flat_map(|query| query.admitted_members().unwrap())
+            .map(|member| member.path)
+            .collect::<Vec<_>>(),
+        [Arc::<str>::from(first)]
+    );
+}
+
+/// Scenario: A later mapping's retained member disappears while an earlier mapping discovers a newcomer under a full one-entry budget.
+/// Guarantees: The same refresh releases the disappeared member and admits the earlier mapping instead of wasting capacity until the next refresh.
+#[test]
+fn disappeared_retained_member_releases_capacity_to_earlier_mapping() {
+    let first = r"\Process(first0)\Private Bytes";
+    let second = r"\Process(second0)\Private Bytes";
+    let (states, mut queries) = global_admission_fixture(Vec::new(), vec![second.to_owned()], 1);
+    let _ = states[0].borrow_mut().expansions.insert(
+        r"\Process(first*)\Private Bytes".to_owned(),
+        vec![first.to_owned()],
+    );
+    let _ = states[1]
+        .borrow_mut()
+        .expansions
+        .insert(r"\Process(second*)\Private Bytes".to_owned(), Vec::new());
+
+    let (errors, stopped) = refresh_wildcards_in_config_order(&mut queries, 1, None);
+    assert!(!stopped);
+    assert!(errors.iter().all(Option::is_none));
+    assert_eq!(
+        queries
+            .iter()
+            .flat_map(|query| query.admitted_members().unwrap())
+            .map(|member| member.path)
+            .collect::<Vec<_>>(),
+        [Arc::<str>::from(first)]
+    );
+}
+
 /// Scenario: Shared, isolated, and shared mappings collect from interleaved positions while isolated recreation and collection fail in sequence.
 /// Guarantees: Shared values retain global indices 0 and 2, and both isolated failures report only global index 1.
 #[test]

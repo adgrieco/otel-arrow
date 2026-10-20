@@ -536,6 +536,7 @@ impl<A: PdhApi> Query<A> {
         result
     }
 
+    #[cfg(test)]
     pub(super) fn refresh_wildcard_config_managed(
         &mut self,
         config_index: usize,
@@ -553,6 +554,200 @@ impl<A: PdhApi> Query<A> {
         let result = self.refresh_wildcard_config(config_index, &mut metadata);
         self.pending.merge(metadata);
         result
+    }
+
+    pub(super) fn plan_wildcard_refresh_managed(
+        &mut self,
+        config_index: usize,
+    ) -> WildcardRefreshPlan {
+        let mut metadata = PendingMetadata::default();
+        let paths: Vec<WildcardCandidate> = match self.api.expand(&self.configs[config_index].path)
+        {
+            Ok(paths) => {
+                let mut paths = paths
+                    .into_iter()
+                    .map(normalize_expanded_path)
+                    .collect::<Vec<_>>();
+                let aggregation_only = cleanup_aggregation_instances(
+                    &mut paths,
+                    self.configs[config_index]
+                        .instance_config
+                        .excluded_aggregation(),
+                );
+                let oversized = paths
+                    .iter()
+                    .filter(|path| path.encode_utf16().count() >= PDH_MAX_COUNTER_PATH as usize)
+                    .count();
+                if oversized > 0 {
+                    metadata.diagnostics.counter_add_failures +=
+                        u64::try_from(oversized).unwrap_or(u64::MAX);
+                    metadata.failures.push(SampleFailure {
+                        counter_index: config_index,
+                        path: Arc::from(self.configs[config_index].path.as_str()),
+                        reason: "expanded_path_too_long",
+                        error: format!(
+                            "{oversized} expanded paths reached the PDH {PDH_MAX_COUNTER_PATH}-unit limit"
+                        ),
+                        diagnostic_only: false,
+                    });
+                    paths
+                        .retain(|path| path.encode_utf16().count() < PDH_MAX_COUNTER_PATH as usize);
+                }
+                keyed_expanded_paths(self.configs[config_index].source_mapping_index, paths)
+                    .into_iter()
+                    .map(|(key, path)| {
+                        let satisfied_by_exact = self
+                            .counters
+                            .get(&key)
+                            .is_some_and(|counter| !counter.origin.is_wildcard())
+                            || self
+                                .retry_states
+                                .get(&key)
+                                .is_some_and(|state| !state.target.origin.is_wildcard());
+                        let desired = self.api.parse_instance(&path).map(|instance| {
+                            let emit_instance_attribute =
+                                self.configs[config_index].instance_config.emit_attribute()
+                                    && !aggregation_only;
+                            DesiredCounter::new(
+                                config_index,
+                                path.clone(),
+                                Arc::new(instance),
+                                emit_instance_attribute,
+                            )
+                        });
+                        WildcardCandidate {
+                            key,
+                            desired,
+                            satisfied_by_exact,
+                        }
+                    })
+                    .collect()
+            }
+            Err(error) => {
+                metadata.diagnostics.discovery_failures += 1;
+                let mut failure = sample_failure(config_index, &error);
+                failure.diagnostic_only = true;
+                metadata.failures.push(failure);
+                self.current_wildcard_desired(config_index)
+                    .into_iter()
+                    .map(|(key, desired)| WildcardCandidate {
+                        key,
+                        desired: Ok(desired),
+                        satisfied_by_exact: false,
+                    })
+                    .collect()
+            }
+        };
+        WildcardRefreshPlan {
+            config_index,
+            discovered: paths.len(),
+            paths,
+            metadata,
+        }
+    }
+
+    pub(super) fn prepare_managed_wildcard_refresh(
+        &mut self,
+        selections: Vec<WildcardRefreshSelection>,
+    ) -> WildcardRefreshAdditions {
+        let planned_configs = selections
+            .iter()
+            .map(|selection| selection.plan.config_index)
+            .collect::<BTreeSet<_>>();
+        let mut desired = self.current_wildcards_excluding(&planned_configs);
+        let mut metadata = PendingMetadata::default();
+        for selection in selections {
+            metadata.merge(selection.plan.metadata);
+            metadata.record_expansion_overflows(
+                selection.plan.config_index,
+                selection.plan.discovered,
+                selection.allocation,
+            );
+            let selected_keys = selection
+                .plan
+                .paths
+                .iter()
+                .filter(|candidate| selection.selected.contains(&candidate.key))
+                .map(|candidate| candidate.key.clone())
+                .collect::<BTreeSet<_>>();
+            self.restore_rediscovered_pending_removals(&selected_keys);
+            for candidate in selection.plan.paths {
+                if !selection.selected.contains(&candidate.key) {
+                    continue;
+                }
+                match candidate.desired {
+                    Ok(counter) => {
+                        let _ = desired.insert(candidate.key, counter);
+                    }
+                    Err(error) => {
+                        metadata.diagnostics.counter_add_failures += 1;
+                        metadata
+                            .failures
+                            .push(sample_failure(selection.plan.config_index, &error));
+                    }
+                }
+            }
+        }
+        let changes = self.plan_wildcard_reconciliation(&desired);
+        self.discard_unwanted_wildcard_retries(&changes.wanted, &mut metadata);
+        self.remove_wildcard_counters(&changes.removed, &changes.wanted, &mut metadata);
+        self.pending.merge(metadata);
+        WildcardRefreshAdditions {
+            desired,
+            added: changes.added,
+            live: changes.live,
+        }
+    }
+
+    pub(super) fn complete_managed_wildcard_addition(
+        &mut self,
+        key: &CounterKey,
+        additions: &mut WildcardRefreshAdditions,
+    ) -> Result<(), Error> {
+        let mut metadata = PendingMetadata::default();
+        let result = self.add_wildcard_counters(
+            std::slice::from_ref(key),
+            &additions.live,
+            &mut additions.desired,
+            &mut metadata,
+        );
+        self.pending.merge(metadata);
+        result
+    }
+
+    pub(super) fn admitted_wildcard_keys(&self) -> BTreeSet<CounterKey> {
+        self.counters
+            .iter()
+            .filter_map(|(key, counter)| counter.origin.is_wildcard().then_some(key.clone()))
+            .chain(self.retry_states.iter().filter_map(|(key, state)| {
+                state.target.origin.is_wildcard().then_some(key.clone())
+            }))
+            .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
+                removal
+                    .retry_target
+                    .as_ref()
+                    .is_some_and(|target| target.origin.is_wildcard())
+                    .then_some(key.clone())
+            }))
+            .collect()
+    }
+
+    pub(super) fn blocked_wildcard_removal_keys(&self) -> BTreeSet<CounterKey> {
+        self.pending_removals
+            .iter()
+            .filter_map(|(key, removal)| {
+                (removal.counter.origin.is_wildcard() && removal.retry_target.is_none())
+                    .then_some(key.clone())
+            })
+            .collect()
+    }
+
+    pub(super) fn exact_counter_reservations(&self) -> usize {
+        self.exact_counter_reservations
+    }
+
+    pub(super) fn max_instances_per_wildcard(&self) -> usize {
+        self.max_instances_per_wildcard
     }
 
     pub(super) fn finish_managed_wildcard_refresh(&mut self) {
@@ -648,6 +843,74 @@ impl<A: PdhApi> Query<A> {
                         })
                     })
                     .flatten()
+            }))
+            .collect()
+    }
+
+    fn current_wildcard_desired(&self, config_index: usize) -> DesiredCounters {
+        self.current_wildcards_excluding(&BTreeSet::new())
+            .into_iter()
+            .filter(|(_, desired)| desired.config_index == config_index)
+            .collect()
+    }
+
+    fn current_wildcards_excluding(&self, excluded_configs: &BTreeSet<usize>) -> DesiredCounters {
+        self.counters
+            .iter()
+            .filter_map(|(key, counter)| {
+                (counter.origin.is_wildcard() && !excluded_configs.contains(&counter.config_index))
+                    .then(|| {
+                        counter.instance.clone().map(|instance| {
+                            (
+                                key.clone(),
+                                DesiredCounter::new(
+                                    counter.config_index,
+                                    counter.path.clone(),
+                                    instance,
+                                    counter.emit_instance_attribute,
+                                ),
+                            )
+                        })
+                    })
+                    .flatten()
+            })
+            .chain(self.retry_states.iter().filter_map(|(key, state)| {
+                (state.target.origin.is_wildcard()
+                    && !excluded_configs.contains(&state.target.config_index))
+                .then(|| {
+                    state.target.instance.clone().map(|instance| {
+                        (
+                            key.clone(),
+                            DesiredCounter::new(
+                                state.target.config_index,
+                                state.target.path.clone(),
+                                instance,
+                                state.target.emit_instance_attribute,
+                            ),
+                        )
+                    })
+                })
+                .flatten()
+            }))
+            .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
+                removal.retry_target.as_ref().and_then(|target| {
+                    (target.origin.is_wildcard()
+                        && !excluded_configs.contains(&target.config_index))
+                    .then(|| {
+                        target.instance.clone().map(|instance| {
+                            (
+                                key.clone(),
+                                DesiredCounter::new(
+                                    target.config_index,
+                                    target.path.clone(),
+                                    instance,
+                                    target.emit_instance_attribute,
+                                ),
+                            )
+                        })
+                    })
+                    .flatten()
+                })
             }))
             .collect()
     }
@@ -1458,6 +1721,31 @@ struct WildcardReconciliation {
 struct WildcardDiscovery {
     config_index: usize,
     paths: Result<Vec<String>, Error>,
+}
+
+pub(super) struct WildcardCandidate {
+    pub(super) key: CounterKey,
+    desired: Result<DesiredCounter, Error>,
+    pub(super) satisfied_by_exact: bool,
+}
+
+pub(super) struct WildcardRefreshPlan {
+    pub(super) config_index: usize,
+    pub(super) discovered: usize,
+    pub(super) paths: Vec<WildcardCandidate>,
+    metadata: PendingMetadata,
+}
+
+pub(super) struct WildcardRefreshSelection {
+    pub(super) plan: WildcardRefreshPlan,
+    pub(super) selected: BTreeSet<CounterKey>,
+    pub(super) allocation: ExpansionAllocation,
+}
+
+pub(super) struct WildcardRefreshAdditions {
+    desired: DesiredCounters,
+    pub(super) added: Vec<CounterKey>,
+    live: BTreeSet<CounterKey>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
