@@ -106,8 +106,6 @@ pub(super) enum CounterKind {
     Direct,
     /// A PDH-formatted calculation requiring only the current sample.
     FormattedSingleSample,
-    /// A PDH-formatted fraction requiring only the current sample.
-    RawFraction,
     /// A PDH formula requiring successive samples (including private-clock timers).
     CalculatedTwoSample,
     /// A PDH-provided raw difference eligible for delta Sum temporality.
@@ -144,7 +142,9 @@ pub(super) fn classify_native_type(
         | PERF_COUNTER_LARGE_RAWCOUNT
         | PERF_COUNTER_RAWCOUNT_HEX
         | PERF_COUNTER_LARGE_RAWCOUNT_HEX => Ok(CounterKind::Direct),
-        PERF_ELAPSED_TIME => Ok(CounterKind::FormattedSingleSample),
+        PERF_ELAPSED_TIME | PERF_RAW_FRACTION | PERF_LARGE_RAW_FRACTION => {
+            Ok(CounterKind::FormattedSingleSample)
+        }
         PERF_COUNTER_COUNTER
         | PERF_COUNTER_BULK_COUNT
         | PERF_COUNTER_QUEUELEN_TYPE
@@ -168,7 +168,6 @@ pub(super) fn classify_native_type(
         PERF_SAMPLE_FRACTION | PERF_AVERAGE_TIMER | PERF_AVERAGE_BULK => {
             Ok(CounterKind::CalculatedTwoSampleWithBase)
         }
-        PERF_RAW_FRACTION | PERF_LARGE_RAW_FRACTION => Ok(CounterKind::RawFraction),
         _ => Err(UnsupportedNativeType {
             path: path.to_owned(),
             native_type,
@@ -255,14 +254,21 @@ mod tests {
         }
     }
 
-    /// Scenario: SDK metadata describes elapsed time and normal or inverse multi-timers.
-    /// Guarantees: Elapsed time formats from one sample while every multi-timer requires two samples and a native base.
+    /// Scenario: SDK metadata describes elapsed time, raw fractions, and normal or inverse multi-timers.
+    /// Guarantees: Elapsed time and raw fractions format from one sample while every multi-timer requires two samples and a native base.
     #[test]
     fn classifies_elapsed_and_multi_timers() {
         assert_eq!(
             classify_native_type("elapsed", 0x3024_0500).unwrap(),
             CounterKind::FormattedSingleSample
         );
+        for native_type in [0x2002_0400, 0x2002_0500] {
+            assert_eq!(
+                classify_native_type("raw fraction", native_type).unwrap(),
+                CounterKind::FormattedSingleSample,
+                "native type 0x{native_type:08X}"
+            );
+        }
         for native_type in [
             0x2241_0500, // PERF_COUNTER_MULTI_TIMER
             0x2341_0500, // PERF_COUNTER_MULTI_TIMER_INV
@@ -293,17 +299,10 @@ mod tests {
         }
     }
 
-    /// Scenario: SDK metadata describes raw fractions, sample fractions and timer/bulk averages.
-    /// Guarantees: Current-sample fractions remain distinct from formulas needing advancing bases.
+    /// Scenario: SDK metadata describes sample fractions and timer/bulk averages.
+    /// Guarantees: Every supported advancing-base formula uses the two-sample base kind.
     #[test]
     fn classifies_fractions_and_averages() {
-        for native_type in [0x2002_0400, 0x2002_0500] {
-            assert_eq!(
-                classify_native_type("raw fraction", native_type).unwrap(),
-                CounterKind::RawFraction,
-                "native type 0x{native_type:08X}"
-            );
-        }
         for native_type in [0x20C2_0400, 0x3002_0400, 0x4002_0500] {
             assert_eq!(
                 classify_native_type("delta/base", native_type).unwrap(),

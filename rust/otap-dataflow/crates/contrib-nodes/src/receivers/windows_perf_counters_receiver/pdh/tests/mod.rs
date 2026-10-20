@@ -3,8 +3,9 @@
 
 use super::super::config::{Aggregation, CounterConfig, InstanceConfig, MetricKind};
 use super::super::model::{
-    ExpansionOverflow, InstanceIdentity, MonotonicPublication, Number, PendingMetadata, Sample,
-    SampleDiagnostics, SampleFailure, SampleValue, merge_diagnostics, scale_integer,
+    ExpansionOverflow, InstanceIdentity, MonotonicPublication, MonotonicPublicationCandidate,
+    Number, PendingMetadata, Sample, SampleDiagnostics, SampleFailure, SampleValue,
+    merge_diagnostics, scale_integer,
 };
 use super::super::{
     TEST_PDH_LOCK,
@@ -86,13 +87,14 @@ struct FakeCounter {
 
 struct FakeState {
     counters: Vec<FakeCounter>,
-    added: Vec<String>,
+    added: Vec<(String, bool)>,
     calls: FakeNativeCalls,
     collect_has_data: bool,
     collect_error: bool,
     timestamp: i64,
     timestamp_error: bool,
     remove_error: bool,
+    expand_error: bool,
     removed: Vec<usize>,
     expansions: BTreeMap<String, Vec<String>>,
 }
@@ -107,52 +109,100 @@ struct FakeNativeCalls {
     expand: usize,
 }
 
-struct FakePdh(Rc<RefCell<FakeState>>);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FakeCounterToken {
+    index: usize,
+    generation: u64,
+}
+
+struct FakePdh {
+    state: Rc<RefCell<FakeState>>,
+    generations: Vec<u64>,
+    active: BTreeSet<FakeCounterToken>,
+}
+
+impl FakePdh {
+    fn new(state: Rc<RefCell<FakeState>>) -> Self {
+        let counter_count = state.borrow().counters.len();
+        Self {
+            state,
+            generations: vec![0; counter_count],
+            active: BTreeSet::new(),
+        }
+    }
+
+    fn counter_index(&self, counter: &FakeCounterToken, path: &str) -> Result<usize, Error> {
+        if self.active.contains(counter) {
+            Ok(counter.index)
+        } else {
+            Err(Error::InvalidCounterToken {
+                path: path.to_owned(),
+            })
+        }
+    }
+}
 
 impl PdhApi for FakePdh {
-    type Counter = usize;
+    type Counter = FakeCounterToken;
 
-    fn add(&mut self, path: &str, _localized: bool) -> Result<Self::Counter, Error> {
-        let mut state = self.0.borrow_mut();
+    fn add(&mut self, path: &str, localized: bool) -> Result<Self::Counter, Error> {
+        let mut state = self.state.borrow_mut();
         let counter = state
             .counters
             .iter()
             .position(|counter| counter.path == path)
             .ok_or_else(|| Error::Pdh {
-                operation: "PdhAddEnglishCounterW",
+                operation: if localized {
+                    PdhOperation::AddCounter
+                } else {
+                    PdhOperation::AddEnglishCounter
+                },
                 path: path.to_owned(),
                 status: 1,
             })?;
-        state.added.push(path.to_owned());
-        Ok(counter)
+        state.added.push((path.to_owned(), localized));
+        if counter >= self.generations.len() {
+            self.generations.resize(counter + 1, 0);
+        }
+        self.generations[counter] = self.generations[counter].wrapping_add(1);
+        let generation = self.generations[counter];
+        let token = FakeCounterToken {
+            index: counter,
+            generation,
+        };
+        let _ = self.active.insert(token);
+        Ok(token)
     }
 
-    fn remove(&mut self, counter: &Self::Counter, _path: &str) -> Result<(), Error> {
-        let mut state = self.0.borrow_mut();
-        state.removed.push(*counter);
+    fn remove(&mut self, counter: &Self::Counter, path: &str) -> Result<(), Error> {
+        let index = self.counter_index(counter, path)?;
+        let mut state = self.state.borrow_mut();
+        state.removed.push(index);
         if state.remove_error {
             Err(Error::Pdh {
-                operation: "PdhRemoveCounter",
-                path: state.counters[*counter].path.clone(),
+                operation: PdhOperation::RemoveCounter,
+                path: state.counters[index].path.clone(),
                 status: 1,
             })
         } else {
+            let _ = self.active.remove(counter);
             Ok(())
         }
     }
 
-    fn counter_type(&mut self, counter: &Self::Counter, _path: &str) -> Result<u32, Error> {
-        let mut state = self.0.borrow_mut();
+    fn counter_type(&mut self, counter: &Self::Counter, path: &str) -> Result<u32, Error> {
+        let index = self.counter_index(counter, path)?;
+        let mut state = self.state.borrow_mut();
         state.calls.counter_type += 1;
-        Ok(state.counters[*counter].native_type)
+        Ok(state.counters[index].native_type)
     }
 
     fn collect(&mut self) -> Result<bool, Error> {
-        let mut state = self.0.borrow_mut();
+        let mut state = self.state.borrow_mut();
         state.calls.collect += 1;
         if state.collect_error {
             Err(Error::Pdh {
-                operation: "PdhCollectQueryData",
+                operation: PdhOperation::CollectQueryData,
                 path: "<query>".to_owned(),
                 status: 1,
             })
@@ -162,12 +212,13 @@ impl PdhApi for FakePdh {
     }
 
     fn raw(&mut self, counter: &Self::Counter, path: &str) -> Result<Option<RawSample>, Error> {
-        let mut state = self.0.borrow_mut();
+        let index = self.counter_index(counter, path)?;
+        let mut state = self.state.borrow_mut();
         state.calls.raw += 1;
-        let counter = &state.counters[*counter];
+        let counter = &state.counters[index];
         if counter.raw_error {
             Err(Error::Pdh {
-                operation: "PdhGetRawCounterValue",
+                operation: PdhOperation::GetRawCounterValue,
                 path: path.to_owned(),
                 status: 1,
             })
@@ -185,12 +236,13 @@ impl PdhApi for FakePdh {
         path: &str,
         format: ValueFormat,
     ) -> Result<Option<Number>, Error> {
-        let mut state = self.0.borrow_mut();
+        let index = self.counter_index(counter, path)?;
+        let mut state = self.state.borrow_mut();
         state.calls.formatted += 1;
-        let counter = &state.counters[*counter];
+        let counter = &state.counters[index];
         if counter.formatted_error {
             return Err(Error::CounterData {
-                operation: "counter CStatus",
+                operation: PdhOperation::CounterDataStatus,
                 path: path.to_owned(),
                 status: 1,
             });
@@ -206,7 +258,7 @@ impl PdhApi for FakePdh {
     }
 
     fn timestamp(&mut self) -> Result<i64, Error> {
-        let mut state = self.0.borrow_mut();
+        let mut state = self.state.borrow_mut();
         state.calls.timestamp += 1;
         if state.timestamp_error {
             Err(Error::InvalidSample("test timestamp failure"))
@@ -216,8 +268,15 @@ impl PdhApi for FakePdh {
     }
 
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
-        let mut state = self.0.borrow_mut();
+        let mut state = self.state.borrow_mut();
         state.calls.expand += 1;
+        if state.expand_error {
+            return Err(Error::Pdh {
+                operation: PdhOperation::ExpandWildcardPath,
+                path: path.to_owned(),
+                status: 1,
+            });
+        }
         Ok(state.expansions.get(path).cloned().unwrap_or_default())
     }
 
@@ -248,7 +307,7 @@ impl PdhApi for RecoveringPrimePdh {
     fn collect(&mut self) -> Result<bool, Error> {
         if self.collect_calls.fetch_add(1, Ordering::Relaxed) == 0 {
             Err(Error::Pdh {
-                operation: "PdhCollectQueryData",
+                operation: PdhOperation::CollectQueryData,
                 path: "<query>".to_owned(),
                 status: 1,
             })
@@ -312,7 +371,7 @@ impl PdhApi for RebuildPrimePdh {
     fn collect(&mut self) -> Result<bool, Error> {
         if self.fail_collect.load(Ordering::Relaxed) {
             return Err(Error::Pdh {
-                operation: "PdhCollectQueryData",
+                operation: PdhOperation::CollectQueryData,
                 path: "<query>".to_owned(),
                 status: 1,
             });
@@ -370,7 +429,22 @@ fn fake_query_with_cadences(
     exact_retry_cap: Duration,
     wildcard_refresh_interval: Duration,
 ) -> (Rc<RefCell<FakeState>>, Query<FakePdh>) {
-    let state = Rc::new(RefCell::new(FakeState {
+    let state = fake_state(counters);
+    let query = Query::open_with_seed(
+        FakePdh::new(Rc::clone(&state)),
+        configs,
+        exact_retry_cap,
+        wildcard_refresh_interval,
+        256,
+        4_096,
+        None,
+    )
+    .unwrap();
+    (state, query)
+}
+
+fn fake_state(counters: Vec<FakeCounter>) -> Rc<RefCell<FakeState>> {
+    Rc::new(RefCell::new(FakeState {
         counters,
         added: Vec::new(),
         calls: FakeNativeCalls::default(),
@@ -379,16 +453,29 @@ fn fake_query_with_cadences(
         timestamp: 100,
         timestamp_error: false,
         remove_error: false,
+        expand_error: false,
         removed: Vec::new(),
         expansions: BTreeMap::new(),
-    }));
-    let query = Query::open_with(
-        FakePdh(Rc::clone(&state)),
+    }))
+}
+
+fn fake_query_with_seed(
+    configs: Vec<CounterConfig>,
+    counters: Vec<FakeCounter>,
+    exact_retry_cap: Duration,
+    wildcard_refresh_interval: Duration,
+    max_native_counters: usize,
+    seed: Option<&QueryRecreationSeed>,
+) -> (Rc<RefCell<FakeState>>, Query<FakePdh>) {
+    let state = fake_state(counters);
+    let query = Query::open_managed_with_seed(
+        FakePdh::new(Rc::clone(&state)),
         configs,
         exact_retry_cap,
         wildcard_refresh_interval,
         256,
-        4_096,
+        max_native_counters,
+        seed,
     )
     .unwrap();
     (state, query)
@@ -410,8 +497,58 @@ fn collected_monotonic_publications(sample: &Sample) -> Vec<MonotonicPublication
     sample
         .points
         .iter()
-        .filter_map(|point| point.monotonic_publication.clone())
+        .filter_map(|point| match &point.monotonic_publication {
+            Some(MonotonicPublicationCandidate::Ready(publication)) => Some(publication.clone()),
+            Some(MonotonicPublicationCandidate::Pending) | None => None,
+        })
         .collect()
+}
+
+/// Scenario: A fake PDH add uses the localized API mode for a concrete expanded path.
+/// Guarantees: Tests can distinguish localized adds from English configured-path adds.
+#[test]
+fn fake_pdh_records_localized_add_mode() {
+    let path = r"\Process(worker)\Private Bytes";
+    let state = fake_state(vec![FakeCounter {
+        path: path.to_owned(),
+        native_type: 0x0001_0100,
+        raw: None,
+        multi_count: 1,
+        formatted: Some(Number::Integer(1)),
+        raw_error: false,
+        formatted_error: false,
+    }]);
+    let mut api = FakePdh::new(Rc::clone(&state));
+
+    let _ = api.add(path, true).unwrap();
+
+    assert_eq!(state.borrow().added, [(path.to_owned(), true)]);
+}
+
+/// Scenario: A fake PDH token is used after removal and after a replacement add.
+/// Guarantees: Removed generations stay invalid while the replacement token remains usable.
+#[test]
+fn fake_pdh_rejects_removed_tokens() {
+    let path = r"\Memory\Available Bytes";
+    let state = fake_state(vec![FakeCounter {
+        path: path.to_owned(),
+        native_type: 0x0001_0100,
+        raw: None,
+        multi_count: 1,
+        formatted: Some(Number::Integer(1)),
+        raw_error: false,
+        formatted_error: false,
+    }]);
+    let mut api = FakePdh::new(state);
+    let removed = api.add(path, false).unwrap();
+    api.remove(&removed, path).unwrap();
+    let replacement = api.add(path, false).unwrap();
+
+    assert!(matches!(
+        api.counter_type(&removed, path),
+        Err(Error::InvalidCounterToken { .. })
+    ));
+    assert_eq!(api.counter_type(&replacement, path).unwrap(), 0x0001_0100);
 }
 
 mod live;

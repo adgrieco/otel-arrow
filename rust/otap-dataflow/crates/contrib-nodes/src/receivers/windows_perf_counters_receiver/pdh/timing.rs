@@ -27,6 +27,7 @@ pub(super) fn cumulative_start_time(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct MonotonicSequence {
     pub(super) start_time_unix_nano: Option<i64>,
+    pub(super) pending_start_time_unix_nano: Option<i64>,
     pub(super) previous_value: Option<i64>,
     pub(super) previous_timestamp_unix_nano: Option<i64>,
 }
@@ -49,10 +50,13 @@ pub(super) fn pending_monotonic_start_time(
     value: i64,
     timestamp_unix_nano: i64,
 ) -> Result<i64, Error> {
-    Ok(
-        update_monotonic_sequence(path, sequence, value, timestamp_unix_nano, false)?
-            .unwrap_or(timestamp_unix_nano),
-    )
+    let start = update_monotonic_sequence(path, sequence, value, timestamp_unix_nano, false)?;
+    if let Some(start) = start {
+        Ok(start)
+    } else {
+        sequence.pending_start_time_unix_nano = Some(timestamp_unix_nano);
+        Ok(timestamp_unix_nano)
+    }
 }
 
 pub(super) fn publish_monotonic_start(
@@ -60,9 +64,10 @@ pub(super) fn publish_monotonic_start(
     timestamp_unix_nano: i64,
 ) -> bool {
     if sequence.start_time_unix_nano.is_none()
-        && sequence.previous_timestamp_unix_nano == Some(timestamp_unix_nano)
+        && sequence.pending_start_time_unix_nano == Some(timestamp_unix_nano)
     {
         sequence.start_time_unix_nano = Some(timestamp_unix_nano);
+        sequence.pending_start_time_unix_nano = None;
         true
     } else {
         false
@@ -100,9 +105,11 @@ fn update_monotonic_sequence(
             .is_some_and(|previous| timestamp_unix_nano < previous);
     if reset {
         sequence.start_time_unix_nano = None;
+        sequence.pending_start_time_unix_nano = None;
     }
     if publish && sequence.start_time_unix_nano.is_none() {
         sequence.start_time_unix_nano = Some(timestamp_unix_nano);
+        sequence.pending_start_time_unix_nano = None;
     }
     sequence.previous_value = Some(value);
     sequence.previous_timestamp_unix_nano = Some(timestamp_unix_nano);

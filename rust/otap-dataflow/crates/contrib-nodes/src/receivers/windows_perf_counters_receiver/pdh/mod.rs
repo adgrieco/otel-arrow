@@ -14,7 +14,7 @@ mod query;
 mod timing;
 mod worker;
 
-pub(super) use error::Error;
+pub(super) use error::{Error, PdhOperation};
 pub(super) use worker::{QueryCadence, Worker};
 
 #[cfg(test)]

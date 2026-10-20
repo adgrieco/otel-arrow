@@ -27,7 +27,7 @@ pub(super) struct Config {
     pub(super) collection_interval: Duration,
     /// Delay before the first collection request; defaults to one second.
     pub(super) initial_delay: Duration,
-    /// Optional discard deadline for one scrape; `None` waits for completion.
+    /// Optional warning threshold for one scrape; collection still waits for completion.
     pub(super) timeout: Option<Duration>,
     /// Time between wildcard discovery refreshes. Defaults to the greater of
     /// `collection_interval` and 60s. Must be at least `collection_interval`.
@@ -77,6 +77,13 @@ impl Config {
     #[must_use]
     pub(super) fn query_retry_cap(&self) -> Duration {
         self.collection_interval
+    }
+
+    /// Effective lateness threshold. An omitted or zero timeout uses the next
+    /// scheduled collection tick.
+    #[must_use]
+    pub(super) fn scrape_timeout_threshold(&self) -> Duration {
+        self.timeout.unwrap_or(self.collection_interval)
     }
 }
 
@@ -168,7 +175,7 @@ pub(super) enum Aggregation {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_metrics")]
     metrics: BTreeMap<String, MetricConfig>,
     perfcounters: Vec<ObjectConfig>,
     #[serde(default = "default_interval", with = "humantime_serde")]
@@ -188,6 +195,13 @@ struct UserConfig {
     max_instances_per_wildcard: usize,
     #[serde(default = "default_max_expanded_counters")]
     max_expanded_counters: usize,
+}
+
+fn deserialize_metrics<'de, D>(deserializer: D) -> Result<BTreeMap<String, MetricConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<BTreeMap<String, MetricConfig>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -355,22 +369,6 @@ fn validate_native_component<'a>(field: &str, value: &'a str) -> Result<&'a str,
     Ok(value)
 }
 
-fn validate_object<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
-    validate_native_component(field, value)
-}
-
-fn validate_instance<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
-    validate_native_component(field, value)
-}
-
-fn validate_instance_pattern<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
-    validate_native_component(field, value)
-}
-
-fn validate_counter_name<'a>(field: &str, value: &'a str) -> Result<&'a str, Error> {
-    validate_native_component(field, value)
-}
-
 fn is_path_metric_name(name: &str) -> bool {
     name.starts_with('\\')
 }
@@ -447,7 +445,6 @@ enum InstanceSegment {
 
 struct ExpandedPath {
     native: String,
-    configured: String,
     instance_config: InstanceConfig,
 }
 
@@ -512,7 +509,7 @@ fn normalize_metrics(
             "windows_perf_counters_receiver.config.metric_definition.case_collision",
             message = "metric definitions differ only by case; exact lookup keeps them distinct, \
                        but this may be a configuration typo",
-            names = format!("{group:?}")
+            names = ?group
         );
     }
     Ok(metrics)
@@ -590,7 +587,7 @@ fn normalize_object(
     source_mapping_index: &mut usize,
 ) -> Result<(), Error> {
     let object_field = format!("perfcounters[{object_index}]");
-    let object_name = validate_object(&format!("{object_field}.object"), &object.object)?;
+    let object_name = validate_native_component(&format!("{object_field}.object"), &object.object)?;
     if object.counters.is_empty() {
         return Err(invalid(format!(
             "{object_field}.counters must contain at least one entry"
@@ -627,7 +624,8 @@ fn normalize_aggregation_name(
     let configured = configured
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| DEFAULT_AGGREGATION_NAME.to_owned());
-    validate_instance(&format!("{object_field}.aggregation_name"), &configured).map(str::to_owned)
+    validate_native_component(&format!("{object_field}.aggregation_name"), &configured)
+        .map(str::to_owned)
 }
 
 impl ObjectNormalizer<'_> {
@@ -644,7 +642,8 @@ impl ObjectNormalizer<'_> {
             "perfcounters[{}].counters[{counter_index}]",
             self.object_index
         );
-        let counter_name = validate_counter_name(&format!("{counter_field}.name"), &mapping.name)?;
+        let counter_name =
+            validate_native_component(&format!("{counter_field}.name"), &mapping.name)?;
         let metric_name = normalize_metric_reference(&counter_field, &mapping.metric)?;
         let explicit_metric = self.normalize_explicit_metric(
             counter_index,
@@ -656,7 +655,7 @@ impl ObjectNormalizer<'_> {
             .instances
             .expand(self.object_name, counter_name, self.aggregation_name)
         {
-            let metric = self.resolve_metric(&expanded.configured, explicit_metric.as_ref());
+            let metric = self.resolve_metric(&expanded.native, explicit_metric.as_ref());
             if !expanded.instance_config.is_wildcard() {
                 *exact_counter_count = exact_counter_count.saturating_add(1);
                 if *exact_counter_count > max_native_counters {
@@ -811,14 +810,12 @@ impl NormalizedInstances {
         match self {
             Self::None => vec![ExpandedPath {
                 native: counter_path(object, None, counter),
-                configured: counter_path(object, None, counter),
                 instance_config: InstanceConfig::None,
             }],
             Self::All {
                 include_aggregation,
             } => vec![ExpandedPath {
                 native: counter_path(object, Some("*"), counter),
-                configured: counter_path(object, Some("*"), counter),
                 instance_config: InstanceConfig::Wildcard {
                     excluded_aggregation: (!include_aggregation)
                         .then(|| aggregation_name.to_owned()),
@@ -828,7 +825,6 @@ impl NormalizedInstances {
                 .iter()
                 .map(|segment| ExpandedPath {
                     native: counter_path(object, Some(segment.value()), counter),
-                    configured: counter_path(object, Some(segment.value()), counter),
                     instance_config: if segment.is_wildcard() {
                         InstanceConfig::Wildcard {
                             excluded_aggregation: Some(aggregation_name.to_owned()),
@@ -848,10 +844,10 @@ impl InstanceSegment {
     fn from_config(field: &str, configured: String) -> Result<Self, Error> {
         if configured.contains('*') {
             Ok(Self::Wildcard(
-                validate_instance_pattern(field, &configured)?.to_owned(),
+                validate_native_component(field, &configured)?.to_owned(),
             ))
         } else {
-            let configured = validate_instance(field, &configured)?.to_owned();
+            let configured = validate_native_component(field, &configured)?.to_owned();
             Ok(Self::Exact(configured))
         }
     }

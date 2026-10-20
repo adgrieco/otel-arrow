@@ -104,7 +104,7 @@ fn normalizes_structured_configuration() {
 }
 
 /// Scenario: Timeout is omitted, positive, zero, or negative.
-/// Guarantees: Late data is retained by default, explicit positive deadlines opt into discard, and invalid negatives fail.
+/// Guarantees: Omitted and zero values use the collection interval, a positive timeout takes precedence, and invalid negatives fail.
 #[test]
 fn normalizes_scrape_timeout() {
     let base = json!({
@@ -117,17 +117,19 @@ fn normalizes_scrape_timeout() {
 
     let omitted = Config::from_json(&base).unwrap();
     assert_eq!(omitted.timeout, None);
+    assert_eq!(omitted.scrape_timeout_threshold(), Duration::from_secs(45));
 
     let mut positive = base.clone();
     positive["timeout"] = json!("10s");
-    assert_eq!(
-        Config::from_json(&positive).unwrap().timeout,
-        Some(Duration::from_secs(10))
-    );
+    let positive = Config::from_json(&positive).unwrap();
+    assert_eq!(positive.timeout, Some(Duration::from_secs(10)));
+    assert_eq!(positive.scrape_timeout_threshold(), Duration::from_secs(10));
 
     let mut disabled = base.clone();
     disabled["timeout"] = json!("0s");
-    assert_eq!(Config::from_json(&disabled).unwrap().timeout, None);
+    let zero = Config::from_json(&disabled).unwrap();
+    assert_eq!(zero.timeout, None);
+    assert_eq!(zero.scrape_timeout_threshold(), Duration::from_secs(45));
 
     let mut negative = base;
     negative["timeout"] = json!("-1s");
@@ -475,10 +477,10 @@ fn rejects_whitespace_only_metric_reference() {
     );
 }
 
-/// Scenario: Null metric references appear at each object/counter position or replace the definitions map.
-/// Guarantees: Every null reference reports its exact location and a null definitions map is rejected.
+/// Scenario: Null metric references appear at each object/counter position.
+/// Guarantees: Every null reference reports its exact location.
 #[test]
-fn rejects_null_metric_forms_at_each_location() {
+fn rejects_null_metric_references_at_each_location() {
     for (object_index, counter_index) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
         let mut value = json!({
             "perfcounters": [
@@ -508,17 +510,29 @@ fn rejects_null_metric_forms_at_each_location() {
             ),
         );
     }
+}
 
-    assert_config_error(
-        json!({
-            "metrics": null,
+/// Scenario: Metric definitions are omitted, explicitly null, or an empty map.
+/// Guarantees: Every form decodes as no definitions and leaves unreferenced counters on default Gauge metadata.
+#[test]
+fn accepts_null_metrics_as_empty_definitions() {
+    for metrics in [None, Some(json!(null)), Some(json!({}))] {
+        let mut value = json!({
             "perfcounters": [{
                 "object": "Memory",
                 "counters": [{"name": "Available Bytes"}]
             }]
-        }),
-        "expected a map",
-    );
+        });
+        if let Some(metrics) = metrics {
+            value["metrics"] = metrics;
+        }
+
+        let config = Config::from_json(&value).unwrap();
+        assert_eq!(config.counters.len(), 1);
+        assert_eq!(config.counters[0].path, r"\Memory\Available Bytes");
+        assert_eq!(config.counters[0].metric_kind, MetricKind::Gauge);
+        assert_eq!(config.counters[0].unit.as_ref(), "1");
+    }
 }
 
 /// Scenario: Mappings explicitly disable or enable query recreation across expanded paths.
@@ -1090,6 +1104,33 @@ fn preserves_space_distinct_metric_and_attribute_keys() {
         }),
         "attribute key must not be empty",
     );
+}
+
+/// Scenario: A configured data-point attribute uses the receiver-owned namespace.
+/// Guarantees: Validation rejects the reserved prefix and variants that remain exact prefix matches.
+#[test]
+fn rejects_reserved_attribute_prefix() {
+    for key in [
+        "windows.perf_counter.",
+        "windows.perf_counter.custom",
+        "windows.perf_counter.path ",
+        "windows.perf_counter.\0",
+    ] {
+        assert_config_error(
+            json!({
+                "metrics": {"available": {"gauge": {}}},
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{
+                        "name": "Available Bytes",
+                        "metric": "available",
+                        "attributes": {(key): "value"}
+                    }]
+                }]
+            }),
+            &format!("perfcounters[0].counters[0] attribute {key:?} conflicts"),
+        );
+    }
 }
 
 /// Scenario: Metric names differ only by ASCII case.

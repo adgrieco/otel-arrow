@@ -334,70 +334,64 @@ fn collection_failures_restart_calculated_readiness() {
     );
 }
 
-/// Scenario: An elapsed-time counter has one valid collected sample.
-/// Guarantees: One-sample native formulas are not delayed by readiness intended only for successive-sample counters.
+/// Scenario: Elapsed-time, raw-fraction, and large raw-fraction counters each have one valid collected sample.
+/// Guarantees: Every formatted single-sample formula emits immediately, accepts a zero native base through PDH formatting, and performs no raw read.
 #[test]
 fn elapsed_time_emits_from_first_sample() {
-    let path = r"\System\System Up Time";
-    let (_, mut query) = fake_query(
-        vec![counter(path, "system.uptime")],
-        vec![FakeCounter {
-            path: path.to_owned(),
-            native_type: 0x3024_0500,
-            raw: None,
-            multi_count: 1,
-            formatted: Some(Number::Double(42.5)),
-            raw_error: false,
-            formatted_error: false,
-        }],
-    );
-
-    assert_eq!(
-        query.collect().unwrap().points[0].value,
-        SampleValue::Value(Number::Double(42.5))
-    );
-}
-
-/// Scenario: A raw fraction emits, receives native omission and non-finite results, then emits again.
-/// Guarantees: PDH alone governs denominator status, while receiver validation isolates bad output without inventing warm-up.
-#[test]
-fn raw_fraction_delegates_sampling_and_status_to_pdh() {
-    let path = r"\Memory\% Committed Bytes In Use";
+    let elapsed_path = r"\System\System Up Time";
+    let fraction_path = r"\Memory\% Committed Bytes In Use";
+    let large_fraction_path = r"\Memory\Large Fraction";
     let (state, mut query) = fake_query(
-        vec![counter(path, "system.memory.committed")],
-        vec![FakeCounter {
-            path: path.to_owned(),
-            native_type: 0x2002_0400,
-            raw: Some(0),
-            multi_count: 0,
-            formatted: Some(Number::Double(0.0)),
-            raw_error: true,
-            formatted_error: false,
-        }],
+        vec![
+            counter(elapsed_path, "system.uptime"),
+            counter(fraction_path, "system.memory.committed"),
+            counter(large_fraction_path, "system.memory.large_fraction"),
+        ],
+        vec![
+            FakeCounter {
+                path: elapsed_path.to_owned(),
+                native_type: 0x3024_0500,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Double(42.5)),
+                raw_error: false,
+                formatted_error: false,
+            },
+            FakeCounter {
+                path: fraction_path.to_owned(),
+                native_type: 0x2002_0400,
+                raw: Some(0),
+                multi_count: 0,
+                formatted: Some(Number::Double(50.0)),
+                raw_error: true,
+                formatted_error: false,
+            },
+            FakeCounter {
+                path: large_fraction_path.to_owned(),
+                native_type: 0x2002_0500,
+                raw: Some(0),
+                multi_count: 0,
+                formatted: Some(Number::Double(25.0)),
+                raw_error: true,
+                formatted_error: false,
+            },
+        ],
     );
 
-    assert_eq!(
-        query.collect().unwrap().points[0].value,
-        SampleValue::Value(Number::Double(0.0))
-    );
-
-    state.borrow_mut().counters[0].formatted = None;
-    assert_eq!(
-        query.collect().unwrap().points[0].value,
-        SampleValue::NoObservation
-    );
-
-    state.borrow_mut().counters[0].formatted = Some(Number::Double(f64::NAN));
     let sample = query.collect().unwrap();
-    assert!(sample.points.is_empty());
-    assert_eq!(sample.metadata.failures.len(), 1);
-    assert!(sample.metadata.failures[0].error.contains("finite"));
-
-    state.borrow_mut().counters[0].formatted = Some(Number::Double(50.0));
     assert_eq!(
-        query.collect().unwrap().points[0].value,
-        SampleValue::Value(Number::Double(50.0))
+        sample
+            .points
+            .iter()
+            .map(|point| point.value)
+            .collect::<Vec<_>>(),
+        [
+            SampleValue::Value(Number::Double(42.5)),
+            SampleValue::Value(Number::Double(50.0)),
+            SampleValue::Value(Number::Double(25.0))
+        ]
     );
+    assert_eq!(state.borrow().calls.raw, 0);
 }
 
 /// Scenario: Each multi-timer SDK family warms, receives a zero native MultiCount, then recovers.
@@ -556,7 +550,7 @@ fn isolates_invalid_monotonic_sum_mapping() {
         ExactAddFailureDisposition::Diagnostic
     );
     let retryable = Error::Pdh {
-        operation: "PdhAddEnglishCounterW",
+        operation: PdhOperation::AddEnglishCounter,
         path: "missing".to_owned(),
         status: 1,
     };
@@ -888,6 +882,7 @@ fn detects_value_drop_before_scaling() {
         start_time_unix_nano: Some(100),
         previous_value: Some(previous_value),
         previous_timestamp_unix_nano: Some(100),
+        ..Default::default()
     };
     assert_eq!(
         monotonic_start_time("counter", &mut sequence, current_value, 110).unwrap(),

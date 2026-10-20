@@ -5,7 +5,7 @@
 
 use super::config::Config;
 use super::metrics::WindowsPerfCountersReceiverMetrics;
-use super::model::{MonotonicPublication, Sample, SampleFailure};
+use super::model::{MonotonicPublication, Sample, SampleFailure, SampleValue};
 use super::otap_builder::{ProjectionInvariantError, project_sample};
 use super::pdh;
 use async_trait::async_trait;
@@ -23,8 +23,12 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::{MissedTickBehavior, timeout};
+use tokio::time::MissedTickBehavior;
+
+#[cfg(test)]
+use tokio::time::timeout;
 
 /// Factory identity for the Windows performance-counter receiver.
 pub const WINDOWSPERFCOUNTERS_RECEIVER_URN: &str = "urn:otel:receiver:windowsperfcounters";
@@ -42,19 +46,6 @@ fn failed_counter_value_count(failures: &[SampleFailure]) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
-fn append_projection_failures(sample: &mut Sample, failures: Vec<SampleFailure>) {
-    sample.metadata.diagnostics.counter_read_failures = sample
-        .metadata
-        .diagnostics
-        .counter_read_failures
-        .saturating_add(u64::try_from(failures.len()).unwrap_or(u64::MAX));
-    sample.metadata.failures.extend(failures);
-}
-
-fn scrape_overran(collection_interval: Duration, elapsed: Duration) -> bool {
-    elapsed > collection_interval
-}
-
 fn receiver_error(
     effect_handler: &local::EffectHandler<OtapPdata>,
     error: impl Into<String>,
@@ -70,34 +61,38 @@ fn receiver_error(
 
 #[derive(Default)]
 struct FailureLogState {
-    scrape_failed: bool,
-    active_counter_failures: BTreeSet<(usize, &'static str)>,
+    scrape_failure_active: bool,
+    scrape_timeout_active: bool,
+    active_counter_failures: BTreeSet<(usize, Arc<str>, &'static str)>,
 }
 
 impl FailureLogState {
-    fn record_success(&mut self) {
-        self.scrape_failed = false;
+    fn record_success(&mut self, on_time: bool) {
+        self.scrape_failure_active = false;
+        if on_time {
+            self.scrape_timeout_active = false;
+        }
     }
 
     fn log_scrape_failure(&mut self, node: &str, error: &pdh::Error) {
-        if !self.scrape_failed {
+        if !self.scrape_failure_active {
             otel_arrow_dfe_telemetry::otel_warn!(
                 "windows_perf_counters_receiver.scrape.fail",
                 node = node,
                 error = %error
             );
-            self.scrape_failed = true;
+            self.scrape_failure_active = true;
         }
     }
 
     fn log_scrape_timeout(&mut self, node: &str, timeout: Duration) {
-        if !self.scrape_failed {
+        if !self.scrape_timeout_active {
             otel_arrow_dfe_telemetry::otel_warn!(
                 "windows_perf_counters_receiver.scrape.timeout",
                 node = node,
                 timeout_seconds = timeout.as_secs_f64()
             );
-            self.scrape_failed = true;
+            self.scrape_timeout_active = true;
         }
     }
 
@@ -106,12 +101,29 @@ impl FailureLogState {
         receiver: &WindowsPerfCountersReceiver,
         sample: &Sample,
     ) -> Result<(), usize> {
-        let mut current = BTreeSet::new();
+        for point in &sample.points {
+            if !matches!(point.value, SampleValue::Value(_)) {
+                continue;
+            }
+            let Some(counter) = receiver.config.counters.get(point.counter_index) else {
+                return Err(point.counter_index);
+            };
+            self.active_counter_failures
+                .retain(|(counter_index, path, _)| {
+                    *counter_index != point.counter_index
+                        || (path.as_ref() != point.path.as_ref()
+                            && path.as_ref() != counter.path.as_str())
+                });
+        }
         for failure in &sample.metadata.failures {
             let Some(counter) = receiver.config.counters.get(failure.counter_index) else {
                 return Err(failure.counter_index);
             };
-            let key = (failure.counter_index, failure.reason);
+            let key = (
+                failure.counter_index,
+                Arc::clone(&failure.path),
+                failure.reason,
+            );
             if !self.active_counter_failures.contains(&key) {
                 otel_arrow_dfe_telemetry::otel_warn!(
                     "windows_perf_counters_receiver.counter.fail",
@@ -121,9 +133,8 @@ impl FailureLogState {
                     error = failure.error.as_str()
                 );
             }
-            let _ = current.insert(key);
+            let _ = self.active_counter_failures.insert(key);
         }
-        self.active_counter_failures = current;
         Ok(())
     }
 }
@@ -159,19 +170,6 @@ where
     let initialized = startup.await?;
     signal_ready();
     Ok(initialized)
-}
-
-async fn with_optional_timeout<F>(
-    duration: Option<Duration>,
-    future: F,
-) -> Result<F::Output, tokio::time::error::Elapsed>
-where
-    F: Future,
-{
-    match duration {
-        Some(duration) => timeout(duration, future).await,
-        None => Ok(future.await),
-    }
 }
 
 fn worker_shutdown_deadline(now: Instant, pipeline_deadline: Instant) -> Instant {
@@ -228,7 +226,7 @@ pub static WINDOWSPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFa
 };
 
 impl WindowsPerfCountersReceiver {
-    fn record_completed_scrape(&self, scrape_start: Instant, succeeded: bool, overrun: bool) {
+    fn record_completed_scrape(&self, scrape_start: Instant, succeeded: bool) {
         let mut metrics = self.metrics.borrow_mut();
         metrics.record_scrape(if succeeded {
             Outcome::Success
@@ -239,9 +237,6 @@ impl WindowsPerfCountersReceiver {
             metrics.health.scrapes.add(1);
         } else {
             metrics.health.scrape_failures.add(1);
-        }
-        if overrun {
-            metrics.health.scrape_overruns.inc();
         }
         metrics
             .health
@@ -258,8 +253,8 @@ impl WindowsPerfCountersReceiver {
             .add(failed_counter_value_count(&sample.metadata.failures));
     }
 
-    fn record_successful_sample(&self, scrape_start: Instant, sample: &Sample, overrun: bool) {
-        self.record_completed_scrape(scrape_start, true, overrun);
+    fn record_successful_sample(&self, scrape_start: Instant, sample: &Sample) {
+        self.record_completed_scrape(scrape_start, true);
         self.record_sample_diagnostics(sample);
     }
 
@@ -308,7 +303,7 @@ impl WindowsPerfCountersReceiver {
 
     async fn process_collected_sample<F, Fut>(
         &self,
-        mut sample: Sample,
+        sample: Sample,
         scrape_start: Instant,
         overrun: bool,
         failure_logs: &mut FailureLogState,
@@ -321,13 +316,12 @@ impl WindowsPerfCountersReceiver {
         let projection = match project_sample(&self.config.counters, &sample) {
             Ok(projection) => projection,
             Err(err) => {
-                self.record_completed_scrape(scrape_start, false, overrun);
+                self.record_completed_scrape(scrape_start, false);
                 return Err(CollectionLoopError::Projection(err));
             }
         };
-        append_projection_failures(&mut sample, projection.point_failures);
-        self.record_successful_sample(scrape_start, &sample, overrun);
-        failure_logs.record_success();
+        self.record_successful_sample(scrape_start, &sample);
+        failure_logs.record_success(!overrun);
         self.log_sample_events(&sample);
         failure_logs
             .log_counter_failures(self, &sample)
@@ -383,27 +377,35 @@ impl WindowsPerfCountersReceiver {
         loop {
             let _ = interval.tick().await;
             let scrape_start = Instant::now();
-            let sample = match with_optional_timeout(self.config.timeout, collect()).await {
-                Ok(Ok(sample)) => sample,
-                Ok(Err(err)) if err.is_collection_failure() => {
-                    let overrun = err.is_overrun()
-                        || scrape_overran(self.config.collection_interval, scrape_start.elapsed());
-                    self.record_completed_scrape(scrape_start, false, overrun);
+            let collection = collect();
+            tokio::pin!(collection);
+            let threshold = self.config.scrape_timeout_threshold();
+            let (result, overrun) = tokio::select! {
+                biased;
+                result = &mut collection => {
+                    (result, false)
+                }
+                _ = tokio::time::sleep_until(
+                    tokio::time::Instant::from_std(scrape_start + threshold)
+                ) => {
+                    self.metrics.borrow_mut().health.scrape_overruns.inc();
+                    failure_logs.log_scrape_timeout(&self.node, threshold);
+                    (collection.await, true)
+                }
+            };
+            let sample = match result {
+                Ok(sample) => sample,
+                Err(pdh::Error::WorkerBusy) => continue,
+                Err(err) if err.is_collection_failure() => {
+                    self.record_completed_scrape(scrape_start, false);
                     failure_logs.log_scrape_failure(&self.node, &err);
                     continue;
                 }
-                Ok(Err(err)) => {
+                Err(err) => {
                     self.metrics.borrow_mut().record_scrape(Outcome::Failure);
                     return Err(CollectionLoopError::Native(err));
                 }
-                Err(_) => {
-                    self.record_completed_scrape(scrape_start, false, true);
-                    failure_logs
-                        .log_scrape_timeout(&self.node, self.config.timeout.unwrap_or_default());
-                    continue;
-                }
             };
-            let overrun = scrape_overran(self.config.collection_interval, scrape_start.elapsed());
             let publications = self
                 .process_collected_sample(
                     sample,
@@ -561,10 +563,9 @@ mod tests {
         Aggregation, CounterConfig, InstanceConfig, MetricKind,
     };
     use crate::receivers::windows_perf_counters_receiver::model::{
-        Number, SamplePoint, SampleValue,
+        MonotonicPublicationCandidate, Number, SamplePoint, SampleValue,
     };
     use arrow::array::TimestampNanosecondArray;
-    use arrow::util::display::array_value_to_string;
     use otel_arrow_dfe_config::node::NodeUserConfig;
     use otel_arrow_dfe_engine::testing::receiver::TestRuntime;
     use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_ctx};
@@ -615,7 +616,6 @@ mod tests {
             emit_instance_attribute: false,
             timestamp_unix_nano: timestamp,
             start_time_unix_nano: None,
-            monotonic_start_pending: false,
             monotonic_publication: None,
             value: SampleValue::Value(value),
         }
@@ -628,12 +628,14 @@ mod tests {
         let failures = vec![
             SampleFailure {
                 counter_index: 0,
+                path: Arc::from(r"\Memory\Available Bytes"),
                 reason: "counter CStatus",
                 error: "PDH_INVALID_DATA".to_owned(),
                 diagnostic_only: false,
             },
             SampleFailure {
                 counter_index: 1,
+                path: Arc::from(r"\Memory\Committed Bytes"),
                 reason: "PdhCollectQueryData",
                 error: "PDH status 0x00000001".to_owned(),
                 diagnostic_only: true,
@@ -643,40 +645,92 @@ mod tests {
         assert_eq!(failed_counter_value_count(&failures), 1);
     }
 
-    /// Scenario: Projection omits two invalid points after native collection already reported one read failure.
-    /// Guarantees: Health telemetry stays truthful when native and projection failures share one scrape.
+    /// Scenario: A concrete counter fails, is absent and omitted on later scrapes, then produces a valid value before failing again.
+    /// Guarantees: Warning suppression persists until real value recovery and re-arms only after that recovery.
     #[test]
-    fn projection_failures_extend_sample_accounting() {
-        let mut sample = Sample::empty(1);
-        sample.metadata.diagnostics.counter_read_failures = 1;
-        sample.metadata.failures.push(SampleFailure {
+    fn counter_failure_suppression_requires_valid_recovery() {
+        let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        let path = Arc::<str>::from(r"\Memory\Available Bytes");
+        let failure = SampleFailure {
             counter_index: 0,
+            path: Arc::clone(&path),
             reason: "counter CStatus",
             error: "PDH_INVALID_DATA".to_owned(),
             diagnostic_only: false,
-        });
+        };
+        let mut state = FailureLogState::default();
+        let mut failed = Sample::empty(10);
+        failed.metadata.failures.push(failure.clone());
+        state.log_counter_failures(&receiver, &failed).unwrap();
+        assert_eq!(state.active_counter_failures.len(), 1);
 
-        append_projection_failures(
-            &mut sample,
-            vec![
-                SampleFailure {
-                    counter_index: 1,
-                    reason: "projection.point",
-                    error: "invalid timestamp".to_owned(),
-                    diagnostic_only: false,
-                },
-                SampleFailure {
-                    counter_index: 2,
-                    reason: "projection.point",
-                    error: "invalid start time".to_owned(),
-                    diagnostic_only: false,
-                },
-            ],
+        state
+            .log_counter_failures(&receiver, &Sample::empty(20))
+            .unwrap();
+        assert_eq!(state.active_counter_failures.len(), 1);
+
+        let omitted = Sample {
+            timestamp_unix_nano: 30,
+            points: vec![SamplePoint {
+                counter_index: 0,
+                path: Arc::clone(&path),
+                instance: None,
+                emit_instance_attribute: false,
+                timestamp_unix_nano: 30,
+                start_time_unix_nano: None,
+                monotonic_publication: None,
+                value: SampleValue::NoObservation,
+            }],
+            metadata: Default::default(),
+        };
+        state.log_counter_failures(&receiver, &omitted).unwrap();
+        assert_eq!(state.active_counter_failures.len(), 1);
+
+        let recovered = Sample {
+            timestamp_unix_nano: 40,
+            points: vec![sample_point(0, 40, Number::Integer(42))],
+            metadata: Default::default(),
+        };
+        state.log_counter_failures(&receiver, &recovered).unwrap();
+        assert!(state.active_counter_failures.is_empty());
+
+        state.log_counter_failures(&receiver, &failed).unwrap();
+        assert_eq!(state.active_counter_failures.len(), 1);
+    }
+
+    /// Scenario: A timeout warning is followed by a distinct native collection failure before any successful scrape.
+    /// Guarantees: Timeout suppression cannot hide the first real failure warning in the same unsuccessful episode.
+    #[test]
+    fn timeout_and_failure_warning_states_are_independent() {
+        let mut state = FailureLogState::default();
+        state.log_scrape_timeout("test", Duration::from_secs(1));
+        assert!(state.scrape_timeout_active);
+        assert!(!state.scrape_failure_active);
+
+        state.log_scrape_failure(
+            "test",
+            &pdh::Error::Pdh {
+                operation: pdh::PdhOperation::CollectQueryData,
+                path: "<query>".to_owned(),
+                status: 1,
+            },
         );
+        assert!(state.scrape_timeout_active);
+        assert!(state.scrape_failure_active);
+    }
 
-        assert_eq!(sample.metadata.diagnostics.counter_read_failures, 3);
-        assert_eq!(sample.metadata.failures.len(), 3);
-        assert_eq!(failed_counter_value_count(&sample.metadata.failures), 3);
+    /// Scenario: A timeout warning is followed first by a late success and then by an on-time success.
+    /// Guarantees: Late success keeps warning suppression armed, while the first on-time success re-arms the warning.
+    #[test]
+    fn timeout_warning_rearms_only_after_on_time_success() {
+        let mut state = FailureLogState::default();
+        state.log_scrape_timeout("test", Duration::from_secs(1));
+
+        state.record_success(false);
+        assert!(state.scrape_timeout_active);
+
+        state.record_success(true);
+        assert!(!state.scrape_timeout_active);
     }
 
     /// Scenario: The initial PDH pass remains pending before it eventually succeeds.
@@ -723,133 +777,6 @@ mod tests {
         assert!(!ready.get());
     }
 
-    /// Scenario: One collected scrape contains a healthy point beside a point with an invalid timestamp.
-    /// Guarantees: Runtime delivery keeps the healthy value and only its attributes, preventing one bad provider value from corrupting the Arrow batch or health accounting.
-    #[tokio::test]
-    async fn runtime_delivers_healthy_peer_without_orphan_attributes() {
-        let receiver = test_receiver(vec![test_counter(BTreeMap::from([(
-            "role".to_owned(),
-            "primary".to_owned(),
-        )]))]);
-        let sent = Rc::new(RefCell::new(Vec::new()));
-        let capture = Rc::clone(&sent);
-        let _ = receiver
-            .process_collected_sample(
-                Sample {
-                    timestamp_unix_nano: 10,
-                    points: vec![
-                        sample_point(0, 10, Number::Integer(42)),
-                        sample_point(0, 0, Number::Integer(99)),
-                    ],
-                    metadata: Default::default(),
-                },
-                Instant::now(),
-                false,
-                &mut FailureLogState::default(),
-                move |pdata| async move {
-                    capture.borrow_mut().push(pdata);
-                    Ok(())
-                },
-            )
-            .await
-            .expect("healthy peer should be delivered");
-
-        let pdata = sent.borrow_mut().pop().expect("one batch should be sent");
-        let (_, payload) = pdata.into_parts();
-        let PayloadData::OtapRecords(records) = payload.into_data() else {
-            panic!("expected native OTAP records");
-        };
-        let points = records
-            .get(ArrowPayloadType::NumberDataPoints)
-            .expect("number data points");
-        assert_eq!(points.num_rows(), 1);
-        assert_eq!(
-            array_value_to_string(points.column_by_name("int_value").unwrap().as_ref(), 0).unwrap(),
-            "42"
-        );
-        let attributes = records
-            .get(ArrowPayloadType::NumberDpAttrs)
-            .expect("number point attributes");
-        let parent_ids = attributes.column_by_name("parent_id").unwrap();
-        let keys = attributes.column_by_name("key").unwrap();
-        let values = attributes.column_by_name("str").unwrap();
-        let decoded = (0..attributes.num_rows())
-            .map(|index| {
-                (
-                    array_value_to_string(parent_ids.as_ref(), index).unwrap(),
-                    array_value_to_string(keys.as_ref(), index).unwrap(),
-                    array_value_to_string(values.as_ref(), index).unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            decoded,
-            vec![
-                ("0".to_owned(), "role".to_owned(), "primary".to_owned()),
-                (
-                    "0".to_owned(),
-                    "windows.perf_counter.path".to_owned(),
-                    r"\Memory\Available Bytes".to_owned()
-                )
-            ]
-        );
-
-        let metrics = receiver.metrics.borrow();
-        assert_eq!(metrics.scrape_attempts(Outcome::Success), 1);
-        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 0);
-        assert_eq!(metrics.health.scrapes.get(), 1);
-        assert_eq!(metrics.health.scrape_failures.get(), 0);
-        assert_eq!(metrics.health.counter_read_failures.get(), 1);
-        assert_eq!(metrics.health.failed_counter_values.get(), 1);
-    }
-
-    /// Scenario: A scrape has only an expected invalid point and the following scrape is valid.
-    /// Guarantees: Expected point rejection cannot create a hidden batch-failure state that suppresses the next delivery or distorts cumulative health.
-    #[tokio::test]
-    async fn runtime_continues_after_expected_point_rejection() {
-        let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
-        let sent = Rc::new(RefCell::new(Vec::new()));
-        let mut failure_logs = FailureLogState::default();
-
-        for (timestamp, value) in [(0, 99), (20, 42)] {
-            let capture = Rc::clone(&sent);
-            let _ = receiver
-                .process_collected_sample(
-                    Sample {
-                        timestamp_unix_nano: if timestamp == 0 { 10 } else { timestamp },
-                        points: vec![sample_point(0, timestamp, Number::Integer(value))],
-                        metadata: Default::default(),
-                    },
-                    Instant::now(),
-                    false,
-                    &mut failure_logs,
-                    move |pdata| async move {
-                        capture.borrow_mut().push(pdata);
-                        Ok(())
-                    },
-                )
-                .await
-                .expect("expected point rejection should not terminate collection");
-
-            let metrics = receiver.metrics.borrow();
-            if timestamp == 0 {
-                assert!(sent.borrow().is_empty());
-                assert_eq!(metrics.health.scrapes.get(), 1);
-                assert_eq!(metrics.health.counter_read_failures.get(), 1);
-                assert_eq!(metrics.health.failed_counter_values.get(), 1);
-            }
-        }
-
-        assert_eq!(sent.borrow().len(), 1);
-        let metrics = receiver.metrics.borrow();
-        assert_eq!(metrics.scrape_attempts(Outcome::Success), 2);
-        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 0);
-        assert_eq!(metrics.health.scrapes.get(), 2);
-        assert_eq!(metrics.health.scrape_failures.get(), 0);
-        assert_eq!(metrics.health.counter_read_failures.get(), 1);
-        assert_eq!(metrics.health.failed_counter_values.get(), 1);
-    }
-
     /// Scenario: A collected sample references a counter index outside the validated configuration.
     /// Guarantees: Runtime processing returns a fatal invariant and records a failed scrape instead of silently dropping structurally corrupt telemetry.
     #[tokio::test]
@@ -885,7 +812,7 @@ mod tests {
         assert_eq!(metrics.health.failed_counter_values.get(), 0);
     }
 
-    /// Scenario: Two collections each finish after the cadence while timeout is disabled.
+    /// Scenario: Two collections each finish after the cadence while timeout is unset.
     /// Guarantees: Late scrapes retain their native timestamps, count as successful overruns, and collection proceeds to the next scrape instead of stalling after the first.
     #[tokio::test]
     async fn no_timeout_delivers_late_scrapes_and_continues() {
@@ -1006,6 +933,65 @@ mod tests {
         assert_eq!(collect_calls.get(), 2);
     }
 
+    /// Scenario: A native collection request is rejected because the capacity-one worker queue is busy.
+    /// Guarantees: Worker backpressure counts as neither an overrun nor a failed scrape.
+    #[tokio::test]
+    async fn worker_busy_collection_is_not_an_overrun() {
+        let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        let collect_calls = Rc::new(std::cell::Cell::new(0_usize));
+        let collect_state = Rc::clone(&collect_calls);
+        let result = receiver
+            .collect_and_send_with(
+                move || {
+                    let call = collect_state.get();
+                    collect_state.set(call + 1);
+                    async move {
+                        if call == 0 {
+                            Err(pdh::Error::WorkerBusy)
+                        } else {
+                            Err(pdh::Error::WorkerStopped)
+                        }
+                    }
+                },
+                |_| async { Ok(()) },
+                |_| async { Ok(()) },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CollectionLoopError::Native(pdh::Error::WorkerStopped))
+        ));
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
+        assert_eq!(metrics.health.scrape_failures.get(), 0);
+        assert_eq!(metrics.health.scrape_overruns.get(), 0);
+    }
+
+    /// Scenario: Native collection reports an impossible internal sample invariant.
+    /// Guarantees: Invariant corruption terminates the receiver instead of being retried as an ordinary scrape failure.
+    #[tokio::test]
+    async fn invalid_sample_collection_is_fatal() {
+        let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        let result = receiver
+            .collect_and_send_with(
+                || async { Err(pdh::Error::InvalidSample("injected invariant")) },
+                |_| async { Ok(()) },
+                |_| async { Ok(()) },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CollectionLoopError::Native(pdh::Error::InvalidSample(
+                "injected invariant"
+            )))
+        ));
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
+        assert_eq!(metrics.health.scrape_failures.get(), 0);
+    }
+
     /// Scenario: Delivery succeeds, but the worker has stopped before the monotonic start acknowledgement can be published.
     /// Guarantees: A stopped worker remains fatal because no future collection can succeed.
     #[tokio::test]
@@ -1037,10 +1023,10 @@ mod tests {
         assert_eq!(collect_calls.get(), 1);
     }
 
-    /// Scenario: A positive timeout discards one monotonic candidate before the next scrape is projected, sent, and acknowledged.
-    /// Guarantees: Runtime acknowledges only the delivered point, whose unknown cumulative start equals its own timestamp rather than the discarded scrape's timestamp.
+    /// Scenario: A monotonic collection finishes after its configured timeout threshold.
+    /// Guarantees: The late scrape is delivered and acknowledged with its native timestamp, counts as a successful overrun, and does not start a concurrent scrape.
     #[tokio::test]
-    async fn timeout_does_not_publish_discarded_monotonic_start() {
+    async fn timeout_retains_and_publishes_late_monotonic_start() {
         let mut counter = test_counter(BTreeMap::new());
         counter.metric_kind = MetricKind::Sum {
             aggregation: Aggregation::Cumulative,
@@ -1059,10 +1045,10 @@ mod tests {
             collect_state.set(call + 1);
             let start = Rc::clone(&collect_published_start);
             async move {
-                if call >= 2 {
+                if call >= 1 {
                     return std::future::pending::<Result<Sample, pdh::Error>>().await;
                 }
-                let timestamp = if call == 0 { 100 } else { 200 };
+                let timestamp = 100;
                 let sample = Sample {
                     timestamp_unix_nano: timestamp,
                     points: vec![SamplePoint {
@@ -1072,13 +1058,14 @@ mod tests {
                         emit_instance_attribute: false,
                         timestamp_unix_nano: timestamp,
                         start_time_unix_nano: Some(start.get().unwrap_or(timestamp)),
-                        monotonic_start_pending: true,
-                        monotonic_publication: Some(MonotonicPublication {
-                            counter_index: 0,
-                            path: Arc::from(r"\Memory\Available Bytes"),
-                            query_generation: 0,
-                            timestamp_unix_nano: timestamp,
-                        }),
+                        monotonic_publication: Some(MonotonicPublicationCandidate::Ready(
+                            MonotonicPublication {
+                                counter_index: 0,
+                                path: Arc::from(r"\Memory\Available Bytes"),
+                                query_generation: 0,
+                                timestamp_unix_nano: timestamp,
+                            },
+                        )),
                         value: SampleValue::Value(Number::Integer(call as i64 + 1)),
                     }],
                     metadata: Default::default(),
@@ -1113,13 +1100,13 @@ mod tests {
         tokio::pin!(run);
 
         let wait_for_following_scrape = async {
-            while collect_calls.get() < 3 {
+            while collect_calls.get() < 2 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         };
         tokio::select! {
             biased;
-            _ = &mut run => panic!("collection loop stopped after timeout recovery"),
+            _ = &mut run => panic!("collection loop stopped after late delivery"),
             result = timeout(Duration::from_secs(1), wait_for_following_scrape) => {
                 result.expect("following scrape did not start");
             }
@@ -1143,15 +1130,174 @@ mod tests {
                     .downcast_ref::<TimestampNanosecondArray>()
                     .expect("nanosecond timestamp array")
                     .value(0),
-                200
+                100
             );
         }
-        assert_eq!(published_start.get(), Some(200));
+        assert_eq!(published_start.get(), Some(100));
         let metrics = receiver.metrics.borrow();
         assert_eq!(metrics.scrape_attempts(Outcome::Success), 1);
-        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
+        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 0);
         assert_eq!(metrics.health.scrapes.get(), 1);
-        assert_eq!(metrics.health.scrape_failures.get(), 1);
+        assert_eq!(metrics.health.scrape_failures.get(), 0);
+        assert_eq!(metrics.health.scrape_overruns.get(), 1);
+    }
+
+    /// Scenario: A scrape remains blocked after its configured timeout threshold and completes later.
+    /// Guarantees: Overrun telemetry increments at threshold crossing before completion or delivery, then remains single-counted.
+    #[tokio::test]
+    async fn timeout_records_overrun_before_late_scrape_completes() {
+        let mut receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        receiver.config.timeout = Some(Duration::from_millis(10));
+        receiver.config.collection_interval = Duration::from_secs(1);
+        let release = Rc::new(std::cell::Cell::new(false));
+        let collect_release = Rc::clone(&release);
+        let collect_calls = Rc::new(std::cell::Cell::new(0_usize));
+        let collect_state = Rc::clone(&collect_calls);
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let capture = Rc::clone(&sent);
+        let run = receiver.collect_and_send_with(
+            move || {
+                let call = collect_state.get();
+                collect_state.set(call + 1);
+                let release = Rc::clone(&collect_release);
+                async move {
+                    if call > 0 {
+                        return std::future::pending::<Result<Sample, pdh::Error>>().await;
+                    }
+                    while !release.get() {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Ok(Sample {
+                        timestamp_unix_nano: 100,
+                        points: vec![sample_point(0, 100, Number::Integer(1))],
+                        metadata: Default::default(),
+                    })
+                }
+            },
+            move |pdata| {
+                let capture = Rc::clone(&capture);
+                async move {
+                    capture.borrow_mut().push(pdata);
+                    Ok(())
+                }
+            },
+            |_| async { Ok(()) },
+        );
+        tokio::pin!(run);
+
+        let wait_for_overrun = async {
+            while receiver.metrics.borrow().health.scrape_overruns.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = &mut run => panic!("collection loop stopped before late scrape release"),
+            result = timeout(Duration::from_secs(1), wait_for_overrun) => {
+                result.expect("overrun was not recorded at the threshold");
+            }
+        }
+        assert!(sent.borrow().is_empty());
+        assert_eq!(receiver.metrics.borrow().health.scrapes.get(), 0);
+
+        release.set(true);
+        let wait_for_delivery = async {
+            while sent.borrow().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = &mut run => panic!("collection loop stopped after late scrape release"),
+            result = timeout(Duration::from_secs(1), wait_for_delivery) => {
+                result.expect("late scrape was not delivered");
+            }
+        }
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(metrics.health.scrapes.get(), 1);
+        assert_eq!(metrics.health.scrape_overruns.get(), 1);
+    }
+
+    /// Scenario: A positive timeout is longer than the collection interval and the scrape completes between them.
+    /// Guarantees: The explicit timeout takes precedence, so the successful scrape is on time and does not count as an overrun.
+    #[tokio::test]
+    async fn positive_timeout_takes_precedence_over_collection_interval() {
+        let mut receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        receiver.config.timeout = Some(Duration::from_millis(200));
+        receiver.config.collection_interval = Duration::from_millis(5);
+        let calls = Rc::new(std::cell::Cell::new(0_usize));
+        let collect_calls = Rc::clone(&calls);
+        let result = receiver
+            .collect_and_send_with(
+                move || {
+                    let call = collect_calls.get();
+                    collect_calls.set(call + 1);
+                    async move {
+                        if call == 0 {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Ok(Sample {
+                                timestamp_unix_nano: 100,
+                                points: vec![sample_point(0, 100, Number::Integer(1))],
+                                metadata: Default::default(),
+                            })
+                        } else {
+                            Err(pdh::Error::WorkerStopped)
+                        }
+                    }
+                },
+                |_| async { Ok(()) },
+                |_| async { Ok(()) },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CollectionLoopError::Native(pdh::Error::WorkerStopped))
+        ));
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(metrics.health.scrapes.get(), 1);
+        assert_eq!(metrics.health.scrape_overruns.get(), 0);
+    }
+
+    /// Scenario: Native collection completes at the same instant as the configured timeout threshold.
+    /// Guarantees: Completion at the boundary is on time and does not increment overrun telemetry.
+    #[tokio::test(start_paused = true)]
+    async fn completion_at_timeout_threshold_is_on_time() {
+        let mut receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        receiver.config.timeout = Some(Duration::from_millis(10));
+        receiver.config.collection_interval = Duration::from_millis(10);
+        let calls = Rc::new(std::cell::Cell::new(0_usize));
+        let collect_calls = Rc::clone(&calls);
+        let result = receiver
+            .collect_and_send_with(
+                move || {
+                    let call = collect_calls.get();
+                    collect_calls.set(call + 1);
+                    async move {
+                        if call == 0 {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            Ok(Sample {
+                                timestamp_unix_nano: 100,
+                                points: vec![sample_point(0, 100, Number::Integer(1))],
+                                metadata: Default::default(),
+                            })
+                        } else {
+                            Err(pdh::Error::WorkerStopped)
+                        }
+                    }
+                },
+                |_| async { Ok(()) },
+                |_| async { Ok(()) },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CollectionLoopError::Native(pdh::Error::WorkerStopped))
+        ));
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(metrics.health.scrapes.get(), 1);
+        assert_eq!(metrics.health.scrape_overruns.get(), 0);
     }
 
     /// Scenario: Collection has a nonzero initial delay before its first request.
@@ -1261,35 +1407,6 @@ mod tests {
     fn completes_drain_and_shutdown_through_engine_harness() {
         run_live_lifecycle(true);
         run_live_lifecycle(false);
-    }
-
-    /// Scenario: Scrape discard is explicitly enabled or left disabled.
-    /// Guarantees: Default late data is retained while a positive deadline can intentionally discard it.
-    #[tokio::test(start_paused = true)]
-    async fn optional_timeout_controls_scrape_deadline() {
-        let timed = with_optional_timeout(
-            Some(Duration::from_secs(1)),
-            tokio::time::sleep(Duration::from_secs(2)),
-        )
-        .await;
-        assert!(timed.is_err());
-
-        let untimed = with_optional_timeout(None, async { 42 }).await;
-        assert_eq!(untimed.unwrap(), 42);
-    }
-
-    /// Scenario: Collection finishes before, exactly at, or after its scheduled cadence.
-    /// Guarantees: Only genuinely late completion increments overrun telemetry without turning success into failure.
-    #[test]
-    fn classifies_collection_cadence_overrun() {
-        let interval = Duration::from_secs(1);
-
-        assert!(!scrape_overran(
-            interval,
-            interval - Duration::from_nanos(1)
-        ));
-        assert!(!scrape_overran(interval, interval));
-        assert!(scrape_overran(interval, interval + Duration::from_nanos(1)));
     }
 
     /// Scenario: One collection spans several scheduled interval ticks.

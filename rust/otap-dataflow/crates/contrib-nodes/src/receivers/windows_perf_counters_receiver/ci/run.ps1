@@ -10,6 +10,14 @@ try {
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
+    cargo test --locked `
+        -p otel-arrow-dfe-contrib-nodes `
+        windows_perf_counters_receiver::runtime::tests::completes_drain_and_shutdown_through_engine_harness `
+        --features windows-perf-counters `
+        -- --ignored --test-threads=1
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
 } finally {
     Pop-Location
 }

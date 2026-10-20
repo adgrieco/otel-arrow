@@ -77,7 +77,16 @@ pub(super) fn expansion_allocation(
 }
 
 pub(super) fn is_aggregation_instance(path: &str, aggregation_name: &str) -> bool {
-    parse_instance(path).is_ok_and(|instance| instance.name == aggregation_name)
+    parse_instance(path).is_ok_and(|instance| {
+        let name = if instance.index == 0 {
+            instance.name
+        } else {
+            format!("{}#{}", instance.name, instance.index)
+        };
+        instance.parent.map_or(name == aggregation_name, |parent| {
+            format!("{parent}/{name}") == aggregation_name
+        })
+    })
 }
 
 pub(super) fn cleanup_aggregation_instances(

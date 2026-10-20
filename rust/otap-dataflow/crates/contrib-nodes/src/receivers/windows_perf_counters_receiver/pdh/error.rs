@@ -3,20 +3,74 @@
 
 use super::super::model::{SampleFailure, ScaleError};
 use super::counter_type::UnsupportedNativeType;
+use std::sync::Arc;
 use windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) enum PdhOperation {
+    AddCounter,
+    AddEnglishCounter,
+    AddEnglishWildcardCounter,
+    CollectQueryData,
+    #[cfg(test)]
+    CounterDataStatus,
+    ExpandWildcardPath,
+    ExpandWildcardPathSize,
+    FormattedCounterDataStatus,
+    GetCounterInfo,
+    GetCounterInfoSize,
+    GetFormattedCounterValue,
+    GetRawCounterValue,
+    OpenQuery,
+    ParseCounterPath,
+    ParseCounterPathSize,
+    RawCounterDataStatus,
+    RemoveCounter,
+}
+
+impl PdhOperation {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AddCounter => "PdhAddCounterW",
+            Self::AddEnglishCounter => "PdhAddEnglishCounterW",
+            Self::AddEnglishWildcardCounter => "PdhAddEnglishCounterW(wildcard)",
+            Self::CollectQueryData => "PdhCollectQueryData",
+            #[cfg(test)]
+            Self::CounterDataStatus => "counter CStatus",
+            Self::ExpandWildcardPath => "PdhExpandWildCardPathW",
+            Self::ExpandWildcardPathSize => "PdhExpandWildCardPathW(size)",
+            Self::FormattedCounterDataStatus => "formatted counter CStatus",
+            Self::GetCounterInfo => "PdhGetCounterInfoW",
+            Self::GetCounterInfoSize => "PdhGetCounterInfoW(size)",
+            Self::GetFormattedCounterValue => "PdhGetFormattedCounterValue",
+            Self::GetRawCounterValue => "PdhGetRawCounterValue",
+            Self::OpenQuery => "PdhOpenQueryW",
+            Self::ParseCounterPath => "PdhParseCounterPathW",
+            Self::ParseCounterPathSize => "PdhParseCounterPathW(size)",
+            Self::RawCounterDataStatus => "raw counter CStatus",
+            Self::RemoveCounter => "PdhRemoveCounter",
+        }
+    }
+}
+
+impl std::fmt::Display for PdhOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(in super::super) enum Error {
     #[error("{operation} for {path} failed with PDH status 0x{status:08X}")]
     Pdh {
-        operation: &'static str,
+        operation: PdhOperation,
         path: String,
         status: u32,
     },
     /// A counter's CStatus failure, separate from a PDH API return code.
     #[error("{operation} for {path} failed with counter data status 0x{status:08X}")]
     CounterData {
-        operation: &'static str,
+        operation: PdhOperation,
         path: String,
         status: u32,
     },
@@ -29,6 +83,7 @@ pub(in super::super) enum Error {
         path: String,
         message: String,
         permanent: bool,
+        cleanup_failed: bool,
     },
     #[error("invalid performance-counter token for {path}")]
     InvalidCounterToken { path: String },
@@ -60,23 +115,21 @@ impl Error {
             self,
             Self::Pdh { .. }
                 | Self::CounterData { .. }
-                | Self::InvalidSample(_)
+                | Self::UnsupportedType(_)
+                | Self::InvalidMetricMapping { .. }
+                | Self::CounterSetup { .. }
+                | Self::InvalidCounterToken { .. }
                 | Self::Calculation { .. }
                 | Self::Scale { .. }
-                | Self::WorkerBusy
                 | Self::QueryRecoveryPending { .. }
         )
-    }
-
-    pub(in super::super) fn is_overrun(&self) -> bool {
-        matches!(self, Self::WorkerBusy)
     }
 
     pub(super) fn is_query_collection_failure(&self) -> bool {
         matches!(
             self,
             Self::Pdh {
-                operation: "PdhCollectQueryData" | "PdhCollectQueryData(prime)",
+                operation: PdhOperation::CollectQueryData,
                 ..
             }
         )
@@ -85,8 +138,16 @@ impl Error {
     pub(super) fn requires_immediate_query_rebuild(&self) -> bool {
         matches!(
             self,
-            Self::Pdh { operation, .. }
-                if matches!(*operation, "PdhRemoveCounter" | "PdhRemoveCounter(retry)")
+            Self::Pdh {
+                operation: PdhOperation::RemoveCounter,
+                ..
+            }
+        ) || matches!(
+            self,
+            Self::CounterSetup {
+                cleanup_failed: true,
+                ..
+            }
         )
     }
 
@@ -94,17 +155,18 @@ impl Error {
         matches!(
             self,
             Self::Pdh {
-                operation: "PdhOpenQueryW",
+                operation: PdhOperation::OpenQuery,
                 ..
             }
-        )
+        ) || self.requires_immediate_query_rebuild()
     }
 
     pub(super) fn is_invalid_counter_handle_read(&self) -> bool {
         matches!(
             self,
             Self::Pdh {
-                operation: "PdhGetRawCounterValue" | "PdhGetFormattedCounterValue",
+                operation:
+                    PdhOperation::GetRawCounterValue | PdhOperation::GetFormattedCounterValue,
                 status,
                 ..
             } if *status == PDH_INVALID_HANDLE
@@ -113,7 +175,7 @@ impl Error {
 
     pub(super) fn reason(&self) -> &'static str {
         match self {
-            Self::Pdh { operation, .. } | Self::CounterData { operation, .. } => operation,
+            Self::Pdh { operation, .. } | Self::CounterData { operation, .. } => operation.as_str(),
             Self::UnsupportedType(_) => "unsupported_type",
             Self::InvalidMetricMapping { .. } => "invalid_metric_mapping",
             Self::CounterSetup { .. } => "counter_setup",
@@ -150,6 +212,19 @@ impl Error {
         }
     }
 
+    fn path(&self) -> Option<&str> {
+        match self {
+            Self::Pdh { path, .. }
+            | Self::CounterData { path, .. }
+            | Self::InvalidMetricMapping { path, .. }
+            | Self::CounterSetup { path, .. }
+            | Self::InvalidCounterToken { path }
+            | Self::Calculation { path, .. }
+            | Self::Scale { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
     pub(super) fn is_permanent_counter_error(&self) -> bool {
         matches!(
             self,
@@ -161,11 +236,29 @@ impl Error {
                 }
         )
     }
+
+    pub(super) fn with_cleanup_failure(path: &str, primary: Option<Self>, cleanup: Self) -> Self {
+        let permanent = primary
+            .as_ref()
+            .is_some_and(Self::is_permanent_counter_error);
+        let cleanup = cleanup.to_string();
+        let message = primary.map_or_else(
+            || cleanup.clone(),
+            |primary| format!("{primary}; {cleanup}"),
+        );
+        Self::CounterSetup {
+            path: path.to_owned(),
+            message,
+            permanent,
+            cleanup_failed: true,
+        }
+    }
 }
 
 pub(super) fn sample_failure(counter_index: usize, error: &Error) -> SampleFailure {
     SampleFailure {
         counter_index,
+        path: Arc::from(error.path().unwrap_or("<worker>")),
         reason: error.reason(),
         error: error.bounded_detail(),
         diagnostic_only: false,

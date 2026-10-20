@@ -4,6 +4,7 @@
 //! Portable values shared by configuration, PDH collection, and OTAP projection.
 
 use super::config::{MAX_SCALE_POWER10, MIN_SCALE_POWER10};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // F6-sized measurements put the metadata-index crossover above 128x128 comparisons.
@@ -80,6 +81,15 @@ pub(super) struct MonotonicPublication {
     pub(super) timestamp_unix_nano: i64,
 }
 
+/// Publication state for an unknown monotonic cumulative start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MonotonicPublicationCandidate {
+    /// The query identified a point whose start is not published yet.
+    Pending,
+    /// The worker attached the query identity needed to publish the start.
+    Ready(MonotonicPublication),
+}
+
 /// One exact or expanded counter point in a collection.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct SamplePoint {
@@ -95,10 +105,8 @@ pub(super) struct SamplePoint {
     pub(super) timestamp_unix_nano: i64,
     /// Start of this point's cumulative sequence or delta interval.
     pub(super) start_time_unix_nano: Option<i64>,
-    /// Whether delivery should publish an unknown monotonic cumulative start.
-    pub(super) monotonic_start_pending: bool,
-    /// Worker-owned acknowledgement identity for a pending monotonic start.
-    pub(super) monotonic_publication: Option<MonotonicPublication>,
+    /// Worker-owned acknowledgement state for an unknown monotonic cumulative start.
+    pub(super) monotonic_publication: Option<MonotonicPublicationCandidate>,
     /// Ready value or expected omission.
     pub(super) value: SampleValue,
 }
@@ -108,6 +116,8 @@ pub(super) struct SamplePoint {
 pub(super) struct SampleFailure {
     /// Index of the configured exact or wildcard path.
     pub(super) counter_index: usize,
+    /// Concrete native path, or the configured template for query-wide failures.
+    pub(super) path: Arc<str>,
     /// Low-cardinality failure category.
     pub(super) reason: &'static str,
     /// Native status or calculation detail without expanded instance identity.
@@ -178,9 +188,7 @@ pub(super) struct PendingMetadata {
 impl PendingMetadata {
     pub(super) fn merge(&mut self, delta: Self) {
         merge_diagnostics(&mut self.diagnostics, delta.diagnostics);
-        merge_latest_by_key(&mut self.failures, delta.failures, |failure| {
-            MetadataKey::new(failure.counter_index, failure.reason)
-        });
+        merge_latest_failures(&mut self.failures, delta.failures);
         merge_latest_by_key(&mut self.overflows, delta.overflows, |overflow| {
             MetadataKey::new(overflow.counter_index, overflow.reason)
         });
@@ -188,12 +196,82 @@ impl PendingMetadata {
 
     pub(super) fn merge_older(&mut self, older: Self) {
         merge_diagnostics(&mut self.diagnostics, older.diagnostics);
-        merge_older_by_key(&mut self.failures, older.failures, |failure| {
-            MetadataKey::new(failure.counter_index, failure.reason)
-        });
+        merge_older_failures(&mut self.failures, older.failures);
         merge_older_by_key(&mut self.overflows, older.overflows, |overflow| {
             MetadataKey::new(overflow.counter_index, overflow.reason)
         });
+    }
+}
+
+fn merge_latest_failures(current: &mut Vec<SampleFailure>, latest: Vec<SampleFailure>) {
+    if current.len().saturating_mul(latest.len()) <= METADATA_INDEX_WORK_THRESHOLD {
+        for item in latest {
+            if let Some(existing) = current.iter_mut().find(|existing| {
+                existing.counter_index == item.counter_index
+                    && existing.reason == item.reason
+                    && existing.path == item.path
+            }) {
+                *existing = item;
+            } else {
+                current.push(item);
+            }
+        }
+        return;
+    }
+    let mut indices = current
+        .iter()
+        .enumerate()
+        .map(|(index, failure)| {
+            (
+                (
+                    failure.counter_index,
+                    failure.reason,
+                    Arc::clone(&failure.path),
+                ),
+                index,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for item in latest {
+        let key = (item.counter_index, item.reason, Arc::clone(&item.path));
+        if let Some(index) = indices.get(&key).copied() {
+            current[index] = item;
+        } else {
+            let index = current.len();
+            current.push(item);
+            let _ = indices.insert(key, index);
+        }
+    }
+}
+
+fn merge_older_failures(current: &mut Vec<SampleFailure>, older: Vec<SampleFailure>) {
+    if current.len().saturating_mul(older.len()) <= METADATA_INDEX_WORK_THRESHOLD {
+        for item in older {
+            if !current.iter().any(|existing| {
+                existing.counter_index == item.counter_index
+                    && existing.reason == item.reason
+                    && existing.path == item.path
+            }) {
+                current.push(item);
+            }
+        }
+        return;
+    }
+    let mut keys = current
+        .iter()
+        .map(|failure| {
+            (
+                failure.counter_index,
+                failure.reason,
+                Arc::clone(&failure.path),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    for item in older {
+        let key = (item.counter_index, item.reason, Arc::clone(&item.path));
+        if keys.insert(key) {
+            current.push(item);
+        }
     }
 }
 
@@ -414,6 +492,7 @@ mod tests {
     ) -> SampleFailure {
         SampleFailure {
             counter_index,
+            path: Arc::from(format!("counter-{counter_index}")),
             reason,
             error: detail.to_owned(),
             diagnostic_only: false,
@@ -422,6 +501,16 @@ mod tests {
 
     fn failure(counter_index: usize, detail: &str) -> SampleFailure {
         failure_with_reason(counter_index, "n12", detail)
+    }
+
+    fn failure_with_path(counter_index: usize, path: &str, detail: &str) -> SampleFailure {
+        SampleFailure {
+            counter_index,
+            path: Arc::from(path),
+            reason: "counter CStatus",
+            error: detail.to_owned(),
+            diagnostic_only: false,
+        }
     }
 
     fn metadata(size: usize, detail: &str) -> PendingMetadata {
@@ -470,6 +559,27 @@ mod tests {
         });
         assert_eq!(older_target.failures.len(), 1);
         assert_eq!(older_target.failures[0].error, "first");
+    }
+
+    /// Scenario: Two concrete wildcard members report the same failure class under one mapping.
+    /// Guarantees: Metadata merging retains both failed values independently of query merge order.
+    #[test]
+    fn metadata_merge_keys_failures_by_concrete_path() {
+        let first = failure_with_path(0, r"\Process(first)\Value", "first");
+        let second = failure_with_path(0, r"\Process(second)\Value", "second");
+        for failures in [
+            vec![first.clone(), second.clone()],
+            vec![second.clone(), first.clone()],
+        ] {
+            let mut metadata = PendingMetadata::default();
+            metadata.merge(PendingMetadata {
+                failures,
+                ..Default::default()
+            });
+            assert_eq!(metadata.failures.len(), 2);
+            assert!(metadata.failures.contains(&first));
+            assert!(metadata.failures.contains(&second));
+        }
     }
 
     /// Scenario: High-cardinality pending metadata overlaps current evidence and repeats a previously unseen older key.

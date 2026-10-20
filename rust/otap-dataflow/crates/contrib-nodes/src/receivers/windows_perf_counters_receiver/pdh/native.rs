@@ -4,7 +4,7 @@
 //! Owns native handles, aligned metadata storage, and PDH status/value decoding.
 #![allow(unsafe_code)]
 
-use super::{Error, InstanceIdentity, Number, PdhApi, RawSample, ValueFormat};
+use super::{Error, InstanceIdentity, Number, PdhApi, PdhOperation, RawSample, ValueFormat};
 use std::mem::{size_of, size_of_val};
 use std::ptr::{null, null_mut};
 use std::slice;
@@ -12,19 +12,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::System::Performance::{
     PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
     PDH_COUNTER_INFO_W, PDH_COUNTER_PATH_ELEMENTS_W, PDH_CSTATUS_INVALID_DATA,
-    PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE,
-    PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY, PDH_INVALID_ARGUMENT, PDH_INVALID_DATA, PDH_MORE_DATA,
-    PDH_NO_DATA, PDH_RAW_COUNTER, PDH_REFRESHCOUNTERS, PdhAddCounterW, PdhAddEnglishCounterW,
-    PdhCloseQuery, PdhCollectQueryData, PdhExpandWildCardPathW, PdhGetCounterInfoW,
-    PdhGetFormattedCounterValue, PdhGetRawCounterValue, PdhOpenQueryW, PdhParseCounterPathW,
-    PdhRemoveCounter,
+    PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_INSTANCE, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE,
+    PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY, PDH_INVALID_ARGUMENT,
+    PDH_INVALID_DATA, PDH_MORE_DATA, PDH_NO_DATA, PDH_RAW_COUNTER, PDH_REFRESHCOUNTERS,
+    PdhAddCounterW, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
+    PdhExpandWildCardPathW, PdhGetCounterInfoW, PdhGetFormattedCounterValue, PdhGetRawCounterValue,
+    PdhOpenQueryW, PdhParseCounterPathW, PdhRemoveCounter,
 };
 
 // These flags are not exposed by windows-sys 0.61.2.
 const PDH_FMT_NOSCALE: u32 = 0x0000_1000;
 const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
 
-pub(super) fn check(operation: &'static str, path: &str, status: u32) -> Result<(), Error> {
+pub(super) fn check(operation: PdhOperation, path: &str, status: u32) -> Result<(), Error> {
     if status == 0 {
         Ok(())
     } else {
@@ -36,7 +36,7 @@ pub(super) fn check(operation: &'static str, path: &str, status: u32) -> Result<
     }
 }
 
-fn check_data(operation: &'static str, path: &str, status: u32) -> Result<(), Error> {
+fn check_data(operation: PdhOperation, path: &str, status: u32) -> Result<(), Error> {
     if matches!(status, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
         Ok(())
     } else {
@@ -48,11 +48,46 @@ fn check_data(operation: &'static str, path: &str, status: u32) -> Result<(), Er
     }
 }
 
+struct NativeBuffer<T> {
+    storage: Vec<T>,
+}
+
+impl<T: Clone + Default> NativeBuffer<T> {
+    fn with_byte_capacity(size: u32, capacity_error: &'static str) -> Result<Self, Error> {
+        let elements = (size as usize).div_ceil(size_of::<T>());
+        let storage = vec![T::default(); elements];
+        let buffer = Self { storage };
+        let _ = buffer.byte_capacity_u32(capacity_error)?;
+        Ok(buffer)
+    }
+
+    fn byte_capacity(&self) -> usize {
+        size_of_val(self.storage.as_slice())
+    }
+
+    fn byte_capacity_u32(&self, error: &'static str) -> Result<u32, Error> {
+        u32::try_from(self.byte_capacity()).map_err(|_| Error::InvalidSample(error))
+    }
+
+    fn as_ptr<U>(&self) -> *const U {
+        self.storage.as_ptr().cast::<U>()
+    }
+
+    fn as_mut_ptr<U>(&mut self) -> *mut U {
+        self.storage.as_mut_ptr().cast::<U>()
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.storage
+    }
+}
+
 fn is_no_observation_status(status: u32) -> bool {
     matches!(
         status,
         PDH_INVALID_DATA
             | PDH_NO_DATA
+            | PDH_CSTATUS_NO_INSTANCE
             | PDH_CALC_NEGATIVE_DENOMINATOR
             | PDH_CALC_NEGATIVE_TIMEBASE
             | PDH_CALC_NEGATIVE_VALUE
@@ -63,6 +98,7 @@ fn is_no_observation_data_status(status: u32) -> bool {
     matches!(
         status,
         PDH_CSTATUS_INVALID_DATA
+            | PDH_CSTATUS_NO_INSTANCE
             | PDH_NO_DATA
             | PDH_CALC_NEGATIVE_DENOMINATOR
             | PDH_CALC_NEGATIVE_TIMEBASE
@@ -105,6 +141,7 @@ impl CounterHandles {
                     path: path.to_owned(),
                     message: "counter token generation exhausted".to_owned(),
                     permanent: true,
+                    cleanup_failed: false,
                 })?;
         Ok(generation)
     }
@@ -143,7 +180,7 @@ impl CounterHandles {
         remove: impl FnOnce(PDH_HCOUNTER) -> u32,
     ) -> Result<(), Error> {
         let handle = self.handle(counter, path)?;
-        check("PdhRemoveCounter", path, remove(handle))?;
+        check(PdhOperation::RemoveCounter, path, remove(handle))?;
         let slot = &mut self.slots[counter.index];
         debug_assert_eq!(slot.generation, counter.generation);
         debug_assert!(slot.handle.is_some());
@@ -163,7 +200,7 @@ impl NativePdh {
     pub(super) fn open(node: String) -> Result<Self, Error> {
         let mut query = null_mut();
         // SAFETY: Null selects live local data; the output handle is writable.
-        check("PdhOpenQueryW", "<query>", unsafe {
+        check(PdhOperation::OpenQuery, "<query>", unsafe {
             PdhOpenQueryW(null(), 0, &mut query)
         })?;
         #[cfg(test)]
@@ -179,13 +216,16 @@ impl NativePdh {
         NativePdh::parse_instance_identity(path)
     }
 
-    fn counter_info_buffer(path: &str, counter: PDH_HCOUNTER) -> Result<Vec<usize>, Error> {
+    fn counter_info_buffer(
+        path: &str,
+        counter: PDH_HCOUNTER,
+    ) -> Result<NativeBuffer<usize>, Error> {
         let mut size = 0;
         // SAFETY: The counter is live. Null and zero request the required size.
         let status = unsafe { PdhGetCounterInfoW(counter, false, &mut size, null_mut()) };
         if status != PDH_MORE_DATA {
             return Err(Error::Pdh {
-                operation: "PdhGetCounterInfoW(size)",
+                operation: PdhOperation::GetCounterInfoSize,
                 path: path.to_owned(),
                 status,
             });
@@ -195,28 +235,17 @@ impl NativePdh {
                 "PdhGetCounterInfoW returned an undersized buffer",
             ));
         }
-        let word = size_of::<usize>();
-        let words = (size as usize).div_ceil(word);
-        let mut buffer = vec![0_usize; words];
-        let capacity = buffer
-            .len()
-            .checked_mul(word)
-            .and_then(|bytes| u32::try_from(bytes).ok())
-            .ok_or(Error::InvalidSample(
-                "PdhGetCounterInfoW buffer capacity exceeds u32",
-            ))?;
-        size = capacity;
+        let mut buffer = NativeBuffer::with_byte_capacity(
+            size,
+            "PdhGetCounterInfoW buffer capacity exceeds u32",
+        )?;
+        size = buffer.byte_capacity_u32("PdhGetCounterInfoW buffer capacity exceeds u32")?;
         // SAFETY: The aligned usize buffer is writable for size bytes.
-        check("PdhGetCounterInfoW", path, unsafe {
-            PdhGetCounterInfoW(
-                counter,
-                false,
-                &mut size,
-                buffer.as_mut_ptr().cast::<PDH_COUNTER_INFO_W>(),
-            )
+        check(PdhOperation::GetCounterInfo, path, unsafe {
+            PdhGetCounterInfoW(counter, false, &mut size, buffer.as_mut_ptr())
         })?;
         if (size as usize) < size_of::<PDH_COUNTER_INFO_W>()
-            || (size as usize) > buffer.len() * word
+            || (size as usize) > buffer.byte_capacity()
         {
             return Err(Error::InvalidSample(
                 "PdhGetCounterInfoW returned an invalid filled size",
@@ -225,12 +254,15 @@ impl NativePdh {
         Ok(buffer)
     }
 
-    fn wide_string(pointer: *const u16, buffer: &[usize]) -> Result<Option<String>, Error> {
+    fn wide_string(
+        pointer: *const u16,
+        buffer: &NativeBuffer<usize>,
+    ) -> Result<Option<String>, Error> {
         if pointer.is_null() {
             return Ok(None);
         }
-        let start = buffer.as_ptr() as usize;
-        let bytes = size_of_val(buffer);
+        let start = buffer.as_ptr::<usize>() as usize;
+        let bytes = buffer.byte_capacity();
         let end = start
             .checked_add(bytes)
             .ok_or(Error::InvalidSample("counter info buffer overflowed"))?;
@@ -253,32 +285,37 @@ impl NativePdh {
     }
 
     fn localized_wildcard_path(&mut self, path: &str) -> Result<String, Error> {
+        let generation = self.counters.take_generation(path)?;
         let wide_path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
         let mut counter = null_mut();
         // SAFETY: The adapter owns the live query, path is NUL-terminated,
         // and the output handle is writable.
-        check("PdhAddEnglishCounterW(wildcard)", path, unsafe {
+        check(PdhOperation::AddEnglishWildcardCounter, path, unsafe {
             PdhAddEnglishCounterW(self.query, wide_path.as_ptr(), 0, &mut counter)
         })?;
+        let counter = self.counters.insert(generation, counter);
         let result = (|| {
-            let buffer = Self::counter_info_buffer(path, counter)?;
-            let info = buffer.as_ptr().cast::<PDH_COUNTER_INFO_W>();
+            let handle = self.counters.handle(&counter, path)?;
+            let buffer = Self::counter_info_buffer(path, handle)?;
+            let info = buffer.as_ptr::<PDH_COUNTER_INFO_W>();
             // SAFETY: A successful metadata fill initialized the fixed header.
             let full_path = unsafe { Self::wide_string((*info).szFullPath, &buffer)? };
             full_path.ok_or(Error::InvalidSample(
                 "PdhGetCounterInfoW returned a null full path",
             ))
         })();
-        // SAFETY: The temporary handle belongs to this query and is no longer used.
-        let remove_status = unsafe { PdhRemoveCounter(counter) };
-        if remove_status != 0 && result.is_ok() {
-            return Err(Error::Pdh {
-                operation: "PdhRemoveCounter(wildcard)",
-                path: path.to_owned(),
-                status: remove_status,
-            });
+        let cleanup = self.counters.remove_with(&counter, path, |handle| {
+            // SAFETY: The generational token resolves to this query's live temporary handle.
+            unsafe { PdhRemoveCounter(handle) }
+        });
+        match (result, cleanup) {
+            (Ok(localized), Ok(())) => Ok(localized),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(cleanup)) => Err(Error::with_cleanup_failure(path, None, cleanup)),
+            (Err(error), Err(cleanup)) => {
+                Err(Error::with_cleanup_failure(path, Some(error), cleanup))
+            }
         }
-        result
     }
 
     fn parse_multi_sz(buffer: &[u16]) -> Result<Vec<String>, Error> {
@@ -302,44 +339,38 @@ impl NativePdh {
         ))
     }
 
-    fn expand_wildcard(&mut self, path: &str) -> Result<Vec<String>, Error> {
-        let localized = self.localized_wildcard_path(path)?;
-        let wide: Vec<u16> = localized.encode_utf16().chain(Some(0)).collect();
+    fn expanded_path_buffer_with(
+        path: &str,
+        mut expand: impl FnMut(&mut u32, Option<&mut [u16]>) -> u32,
+    ) -> Result<Vec<u16>, Error> {
+        let mut size = 0;
+        let size_status = expand(&mut size, None);
+        if matches!(size_status, 0 | PDH_CSTATUS_NO_INSTANCE) && size == 0 {
+            return Ok(Vec::new());
+        }
+        if size_status != PDH_MORE_DATA {
+            return Err(Error::Pdh {
+                operation: PdhOperation::ExpandWildcardPathSize,
+                path: path.to_owned(),
+                status: size_status,
+            });
+        }
+        let measured = usize::try_from(size)
+            .map_err(|_| Error::InvalidSample("wildcard path list size exceeds usize"))?;
+        let headroom = measured / 4;
+        let mut capacity = measured
+            .checked_add(headroom.max(64))
+            .ok_or(Error::InvalidSample("wildcard path list size overflowed"))?;
         let mut last_status = PDH_MORE_DATA;
-        for _ in 0..3 {
-            let mut size = 0;
-            // SAFETY: Null and zero request the required output size.
-            let size_status = unsafe {
-                PdhExpandWildCardPathW(
-                    null(),
-                    wide.as_ptr(),
-                    null_mut(),
-                    &mut size,
-                    PDH_REFRESHCOUNTERS,
-                )
-            };
-            if size_status == 0 && size == 0 {
-                return Ok(Vec::new());
-            }
-            if size_status != PDH_MORE_DATA {
-                return Err(Error::Pdh {
-                    operation: "PdhExpandWildCardPathW(size)",
-                    path: path.to_owned(),
-                    status: size_status,
-                });
-            }
-            let mut buffer = vec![0_u16; size as usize];
-            // SAFETY: The buffer is writable for size UTF-16 units.
-            let status = unsafe {
-                PdhExpandWildCardPathW(
-                    null(),
-                    wide.as_ptr(),
-                    buffer.as_mut_ptr(),
-                    &mut size,
-                    PDH_REFRESHCOUNTERS,
-                )
-            };
-            if status == 0 {
+        for _ in 0..8 {
+            let mut buffer = vec![0_u16; capacity];
+            size = u32::try_from(buffer.len())
+                .map_err(|_| Error::InvalidSample("wildcard path list size exceeds u32"))?;
+            let status = expand(&mut size, Some(&mut buffer));
+            if matches!(status, 0 | PDH_CSTATUS_NO_INSTANCE) {
+                if status == PDH_CSTATUS_NO_INSTANCE || size == 0 {
+                    return Ok(Vec::new());
+                }
                 let used = usize::try_from(size)
                     .map_err(|_| Error::InvalidSample("wildcard path list size exceeds usize"))?;
                 if used > buffer.len() {
@@ -347,18 +378,49 @@ impl NativePdh {
                         "PdhExpandWildCardPathW reported an oversized path list",
                     ));
                 }
-                return Self::parse_multi_sz(&buffer[..used]);
+                buffer.truncate(used);
+                return Ok(buffer);
             }
             last_status = status;
             if !matches!(status, PDH_MORE_DATA | PDH_INVALID_ARGUMENT) {
                 break;
             }
+            let reported = usize::try_from(size)
+                .map_err(|_| Error::InvalidSample("wildcard path list size exceeds usize"))?;
+            let geometric = capacity
+                .checked_add(capacity / 2)
+                .and_then(|value| value.checked_add(64))
+                .ok_or(Error::InvalidSample("wildcard path list size overflowed"))?;
+            capacity = reported.max(geometric);
         }
         Err(Error::Pdh {
-            operation: "PdhExpandWildCardPathW",
+            operation: PdhOperation::ExpandWildcardPath,
             path: path.to_owned(),
             status: last_status,
         })
+    }
+
+    fn expand_wildcard(&mut self, path: &str) -> Result<Vec<String>, Error> {
+        let localized = self.localized_wildcard_path(path)?;
+        let wide: Vec<u16> = localized.encode_utf16().chain(Some(0)).collect();
+        let buffer = Self::expanded_path_buffer_with(path, |size, buffer| {
+            // SAFETY: The path is NUL-terminated. The optional buffer, when present,
+            // is writable for the size supplied to PDH.
+            unsafe {
+                PdhExpandWildCardPathW(
+                    null(),
+                    wide.as_ptr(),
+                    buffer.map_or(null_mut(), |buffer| buffer.as_mut_ptr()),
+                    size,
+                    PDH_REFRESHCOUNTERS,
+                )
+            }
+        })?;
+        if buffer.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Self::parse_multi_sz(&buffer)
+        }
     }
 
     fn parse_instance_identity(path: &str) -> Result<InstanceIdentity, Error> {
@@ -368,7 +430,7 @@ impl NativePdh {
         let status = unsafe { PdhParseCounterPathW(wide_path.as_ptr(), null_mut(), &mut size, 0) };
         if status != PDH_MORE_DATA {
             return Err(Error::Pdh {
-                operation: "PdhParseCounterPathW(size)",
+                operation: PdhOperation::ParseCounterPathSize,
                 path: path.to_owned(),
                 status,
             });
@@ -378,18 +440,15 @@ impl NativePdh {
                 "PdhParseCounterPathW returned an undersized buffer",
             ));
         }
-        let words = (size as usize).div_ceil(size_of::<usize>());
-        let mut buffer = vec![0_usize; words];
-        let capacity = buffer
-            .len()
-            .checked_mul(size_of::<usize>())
-            .and_then(|bytes| u32::try_from(bytes).ok())
-            .ok_or(Error::InvalidSample(
-                "PdhParseCounterPathW buffer capacity exceeds u32",
-            ))?;
-        let elements = buffer.as_mut_ptr().cast::<PDH_COUNTER_PATH_ELEMENTS_W>();
+        let mut buffer = NativeBuffer::with_byte_capacity(
+            size,
+            "PdhParseCounterPathW buffer capacity exceeds u32",
+        )?;
+        let capacity =
+            buffer.byte_capacity_u32("PdhParseCounterPathW buffer capacity exceeds u32")?;
+        let elements = buffer.as_mut_ptr::<PDH_COUNTER_PATH_ELEMENTS_W>();
         // SAFETY: The aligned buffer is writable for the requested bytes.
-        check("PdhParseCounterPathW", path, unsafe {
+        check(PdhOperation::ParseCounterPath, path, unsafe {
             PdhParseCounterPathW(wide_path.as_ptr(), elements, &mut size, 0)
         })?;
         if (size as usize) < size_of::<PDH_COUNTER_PATH_ELEMENTS_W>() || size > capacity {
@@ -418,7 +477,7 @@ impl NativePdh {
         if is_no_observation_status(status) {
             return Ok(false);
         }
-        check("PdhCollectQueryData", "<query>", status)?;
+        check(PdhOperation::CollectQueryData, "<query>", status)?;
         Ok(true)
     }
 
@@ -431,11 +490,11 @@ impl NativePdh {
         if is_no_observation_status(status) {
             return Ok(None);
         }
-        check("PdhGetRawCounterValue", path, status)?;
+        check(PdhOperation::GetRawCounterValue, path, status)?;
         if is_no_observation_data_status(raw.CStatus) {
             return Ok(None);
         }
-        check_data("raw counter CStatus", path, raw.CStatus)?;
+        check_data(PdhOperation::RawCounterDataStatus, path, raw.CStatus)?;
         Ok(Some(RawSample {
             second_value: raw.SecondValue,
             multi_count: raw.MultiCount,
@@ -450,7 +509,7 @@ impl NativePdh {
         let status = info(&mut size, None)?;
         if status != PDH_MORE_DATA {
             return Err(Error::Pdh {
-                operation: "PdhGetCounterInfoW(size)",
+                operation: PdhOperation::GetCounterInfoSize,
                 path: path.to_owned(),
                 status,
             });
@@ -462,24 +521,25 @@ impl NativePdh {
         }
         // Typed storage guarantees the header's alignment and initializes the
         // trailing buffer; PDH fills both the header and variable-sized data.
-        let mut buffer = vec![
-            PDH_COUNTER_INFO_W::default();
-            (size as usize).div_ceil(size_of::<PDH_COUNTER_INFO_W>())
-        ];
+        let mut buffer = NativeBuffer::<PDH_COUNTER_INFO_W>::with_byte_capacity(
+            size,
+            "PdhGetCounterInfoW buffer capacity exceeds u32",
+        )?;
         check(
-            "PdhGetCounterInfoW",
+            PdhOperation::GetCounterInfo,
             path,
-            info(&mut size, Some(&mut buffer))?,
+            info(&mut size, Some(buffer.as_mut_slice()))?,
         )?;
         if (size as usize) < size_of::<PDH_COUNTER_INFO_W>()
-            || (size as usize) > size_of_val(buffer.as_slice())
+            || (size as usize) > buffer.byte_capacity()
         {
             return Err(Error::InvalidSample(
                 "PdhGetCounterInfoW returned an invalid filled size",
             ));
         }
         // Only a successful fill reaches classification; zero is a valid type.
-        Ok(buffer[0].dwType)
+        // Only a successful fill reaches classification; zero is a valid type.
+        Ok(buffer.as_mut_slice()[0].dwType)
     }
 
     pub(super) fn formatted_with(
@@ -497,13 +557,17 @@ impl NativePdh {
             if is_no_observation_status(status) {
                 return Ok(None);
             }
-            check("PdhGetFormattedCounterValue", path, status)?;
+            check(PdhOperation::GetFormattedCounterValue, path, status)?;
         }
         // PDH_INVALID_DATA can carry a more specific failure in CStatus.
         if is_no_observation_data_status(value.CStatus) {
             return Ok(None);
         }
-        check_data("formatted counter CStatus", path, value.CStatus)?;
+        check_data(
+            PdhOperation::FormattedCounterDataStatus,
+            path,
+            value.CStatus,
+        )?;
         if status == PDH_INVALID_DATA {
             return Ok(None);
         }
@@ -535,9 +599,9 @@ impl PdhApi for NativePdh {
         };
         check(
             if localized {
-                "PdhAddCounterW"
+                PdhOperation::AddCounter
             } else {
-                "PdhAddEnglishCounterW"
+                PdhOperation::AddEnglishCounter
             },
             path,
             status,
@@ -709,7 +773,7 @@ mod tests {
         assert!(matches!(
             error,
             Error::Pdh {
-                operation: "PdhRemoveCounter",
+                operation: PdhOperation::RemoveCounter,
                 status: PDH_INVALID_ARGUMENT,
                 ..
             }
@@ -927,6 +991,7 @@ mod tests {
         for status in [
             PDH_INVALID_DATA,
             PDH_NO_DATA,
+            PDH_CSTATUS_NO_INSTANCE,
             PDH_CALC_NEGATIVE_VALUE,
             PDH_CALC_NEGATIVE_DENOMINATOR,
             PDH_CALC_NEGATIVE_TIMEBASE,
@@ -944,6 +1009,7 @@ mod tests {
         for status in [
             PDH_INVALID_DATA,
             PDH_NO_DATA,
+            PDH_CSTATUS_NO_INSTANCE,
             PDH_CALC_NEGATIVE_VALUE,
             PDH_CALC_NEGATIVE_DENOMINATOR,
             PDH_CALC_NEGATIVE_TIMEBASE,
@@ -953,6 +1019,7 @@ mod tests {
         for status in [
             PDH_CSTATUS_INVALID_DATA,
             PDH_NO_DATA,
+            PDH_CSTATUS_NO_INSTANCE,
             PDH_CALC_NEGATIVE_VALUE,
             PDH_CALC_NEGATIVE_DENOMINATOR,
             PDH_CALC_NEGATIVE_TIMEBASE,
@@ -989,6 +1056,7 @@ mod tests {
         for status in [
             PDH_CSTATUS_INVALID_DATA,
             PDH_NO_DATA,
+            PDH_CSTATUS_NO_INSTANCE,
             PDH_CALC_NEGATIVE_VALUE,
             PDH_CALC_NEGATIVE_DENOMINATOR,
             PDH_CALC_NEGATIVE_TIMEBASE,
@@ -1010,7 +1078,7 @@ mod tests {
         assert!(matches!(
             error,
             Error::CounterData {
-                operation: "formatted counter CStatus",
+                operation: PdhOperation::FormattedCounterDataStatus,
                 status: PDH_INVALID_ARGUMENT,
                 ..
             }
@@ -1047,5 +1115,52 @@ mod tests {
             ]
         );
         assert!(NativePdh::parse_multi_sz(&[b'a' as u16]).is_err());
+    }
+
+    /// Scenario: Wildcard membership grows after PDH's size measurement and exceeds the initial headroom.
+    /// Guarantees: Expansion grows geometrically from the reported fill size and returns the later complete multi-string.
+    #[test]
+    fn wildcard_expansion_retries_growing_membership() {
+        let mut calls = 0;
+        let buffer = NativePdh::expanded_path_buffer_with("fixture", |size, buffer| {
+            calls += 1;
+            match buffer {
+                None => {
+                    *size = 4;
+                    PDH_MORE_DATA
+                }
+                Some(_) if calls == 2 => {
+                    *size = 128;
+                    PDH_MORE_DATA
+                }
+                Some(buffer) => {
+                    buffer[..3].copy_from_slice(&[b'a' as u16, 0, 0]);
+                    *size = 3;
+                    0
+                }
+            }
+        })
+        .unwrap();
+
+        assert_eq!(calls, 3);
+        assert_eq!(buffer, [b'a' as u16, 0, 0]);
+    }
+
+    /// Scenario: PDH reports that a valid wildcard currently has no matching instances.
+    /// Guarantees: Both documented no-instance status and successful zero-size responses become an empty membership set.
+    #[test]
+    fn wildcard_expansion_accepts_zero_matches() {
+        for status in [0, PDH_CSTATUS_NO_INSTANCE] {
+            let mut calls = 0;
+            let buffer = NativePdh::expanded_path_buffer_with("fixture", |size, buffer| {
+                calls += 1;
+                assert!(buffer.is_none());
+                *size = 0;
+                status
+            })
+            .unwrap();
+            assert!(buffer.is_empty());
+            assert_eq!(calls, 1);
+        }
     }
 }

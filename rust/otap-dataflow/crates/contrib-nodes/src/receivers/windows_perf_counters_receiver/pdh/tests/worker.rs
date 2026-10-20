@@ -60,10 +60,74 @@ impl PdhApi for StartupTestPdh {
     }
 }
 
+struct RecoveringRefreshPdh {
+    add_calls: Arc<std::sync::atomic::AtomicUsize>,
+    timestamp: i64,
+}
+
+impl PdhApi for RecoveringRefreshPdh {
+    type Counter = String;
+
+    fn add(&mut self, path: &str, _localized: bool) -> Result<Self::Counter, Error> {
+        if self.add_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            return Err(Error::CounterSetup {
+                path: path.to_owned(),
+                message: "injected cleanup failure".to_owned(),
+                permanent: false,
+                cleanup_failed: true,
+            });
+        }
+        Ok(path.to_owned())
+    }
+
+    fn remove(&mut self, _counter: &Self::Counter, _path: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn counter_type(&mut self, _counter: &Self::Counter, _path: &str) -> Result<u32, Error> {
+        Ok(0x0001_0100)
+    }
+
+    fn collect(&mut self) -> Result<bool, Error> {
+        self.timestamp += 10;
+        Ok(true)
+    }
+
+    fn raw(&mut self, _counter: &Self::Counter, _path: &str) -> Result<Option<RawSample>, Error> {
+        Ok(None)
+    }
+
+    fn formatted(
+        &mut self,
+        _counter: &Self::Counter,
+        _path: &str,
+        _format: ValueFormat,
+    ) -> Result<Option<Number>, Error> {
+        Ok(Some(Number::Integer(42)))
+    }
+
+    fn timestamp(&mut self) -> Result<i64, Error> {
+        Ok(self.timestamp)
+    }
+
+    fn expand(&mut self, _path: &str) -> Result<Vec<String>, Error> {
+        Ok(vec![r"\Process(worker)\Private Bytes".to_owned()])
+    }
+
+    fn parse_instance(&mut self, _path: &str) -> Result<InstanceIdentity, Error> {
+        Ok(InstanceIdentity {
+            name: "worker".to_owned(),
+            parent: None,
+            index: 0,
+        })
+    }
+}
+
 #[derive(Default)]
 struct PeakOwnership {
     current: std::sync::atomic::AtomicUsize,
     peak: std::sync::atomic::AtomicUsize,
+    expansions: std::sync::atomic::AtomicUsize,
 }
 
 struct PeakPdh {
@@ -123,6 +187,7 @@ impl PdhApi for PeakPdh {
     }
 
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
+        let _ = self.ownership.expansions.fetch_add(1, Ordering::AcqRel);
         Ok(self.expansions.get(path).cloned().unwrap_or_default())
     }
 
@@ -166,6 +231,118 @@ fn query_plans_isolate_recreated_source_mappings() {
     assert!(plans[2].recreate_query);
 }
 
+/// Scenario: Shared wildcard mappings surround an isolated wildcard mapping while only one expanded entry fits.
+/// Guarantees: Receiver-wide admission follows global configuration order, not grouped query-plan traversal order.
+#[test]
+fn wildcard_admission_across_queries_follows_config_order() {
+    let first_path = r"\Process(first*)\Private Bytes";
+    let isolated_path = r"\Process(isolated*)\Private Bytes";
+    let later_path = r"\Process(later*)\Private Bytes";
+    let isolated_concrete = r"\Process(isolated0)\Private Bytes";
+    let later_concrete = r"\Process(later0)\Private Bytes";
+
+    let mut first = counter(first_path, "process.first");
+    first.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    first.source_mapping_index = 0;
+    let mut isolated = counter(isolated_path, "process.isolated");
+    isolated.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    isolated.recreate_query = true;
+    isolated.source_mapping_index = 1;
+    let mut later = counter(later_path, "process.later");
+    later.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    later.source_mapping_index = 2;
+
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
+        let mut expansions = BTreeMap::new();
+        let mut counters = Vec::new();
+        for config in &configs {
+            let paths = match config.source_mapping_index {
+                0 => Vec::new(),
+                1 => vec![isolated_concrete.to_owned()],
+                2 => vec![later_concrete.to_owned()],
+                _ => unreachable!("test config index"),
+            };
+            let _ = expansions.insert(config.path.clone(), paths.clone());
+            counters.extend(paths.into_iter().map(|path| FakeCounter {
+                path,
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            }));
+        }
+        let state = Rc::new(RefCell::new(FakeState {
+            counters,
+            added: Vec::new(),
+            calls: FakeNativeCalls::default(),
+            collect_has_data: true,
+            collect_error: false,
+            timestamp: 100,
+            timestamp_error: false,
+            remove_error: false,
+            expand_error: false,
+            removed: Vec::new(),
+            expansions,
+        }));
+        let query = Query::open_managed_with_seed(
+            FakePdh::new(Rc::clone(&state)),
+            configs,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            256,
+            max_native_counters,
+            seed,
+        )
+        .unwrap();
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+
+    let mut queries = open_initial_queries(
+        query_plans(vec![first, isolated, later]),
+        Duration::from_secs(30),
+        1,
+        &mut open,
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+    for state in states.borrow().iter() {
+        state.borrow_mut().timestamp = 110;
+    }
+
+    let sample = collect_queries(&mut queries, Duration::from_secs(30), 1, &mut open).unwrap();
+
+    assert_eq!(
+        sample
+            .points
+            .iter()
+            .map(|point| point.counter_index)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+    assert_eq!(
+        queries
+            .iter()
+            .map(QuerySlot::active_expanded_count)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(sample.metadata.diagnostics.instances_omitted_over_limit, 1);
+}
+
 /// Scenario: Shared, isolated, and shared mappings collect from interleaved positions while isolated recreation and collection fail in sequence.
 /// Guarantees: Shared values retain global indices 0 and 2, and both isolated failures report only global index 1.
 #[test]
@@ -182,12 +359,14 @@ fn interleaved_query_failures_keep_global_indices() {
     let factory_states = Rc::clone(&states);
     let open_calls = Rc::new(Cell::new(0_usize));
     let factory_open_calls = Rc::clone(&open_calls);
-    let mut open = move |configs: Vec<CounterConfig>, _max_expanded_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_expanded_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
         let open_index = factory_open_calls.get();
         factory_open_calls.set(open_index + 1);
         if open_index == 2 {
             return Err(Error::Pdh {
-                operation: "PdhOpenQueryW",
+                operation: PdhOperation::OpenQuery,
                 path: "<query>".to_owned(),
                 status: 1,
             });
@@ -204,7 +383,14 @@ fn interleaved_query_failures_keep_global_indices() {
                 formatted_error: false,
             })
             .collect();
-        let (state, query) = fake_query(configs, counters);
+        let (state, query) = fake_query_with_seed(
+            configs,
+            counters,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            max_expanded_counters,
+            seed,
+        );
         factory_states.borrow_mut().push(state);
         Ok(query)
     };
@@ -266,8 +452,114 @@ fn interleaved_query_failures_keep_global_indices() {
     assert_eq!(partial.metadata.failures[0].counter_index, 1);
     assert_eq!(partial.metadata.failures[0].reason, "PdhCollectQueryData");
     assert!(!partial.metadata.failures[0].diagnostic_only);
+
+    states.borrow()[0].borrow_mut().timestamp = 130;
+    let deferred =
+        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    assert_eq!(deferred.points.len(), 2);
+    assert_eq!(deferred.metadata.diagnostics.scrape_failures, 0);
+    assert_eq!(deferred.metadata.failures.len(), 1);
+    assert_eq!(deferred.metadata.failures[0].counter_index, 1);
+    assert_eq!(
+        deferred.metadata.failures[0].reason,
+        "query_recovery_pending"
+    );
+    assert!(deferred.metadata.failures[0].diagnostic_only);
     assert_eq!(open_calls.get(), 3);
     assert_eq!(states.borrow().len(), 2);
+}
+
+/// Scenario: One isolated query is unavailable at startup and later rebuilds into a permanent mapping error beside a healthy query.
+/// Guarantees: The query-local fatal mapping error is diagnosed without discarding the healthy peer's collected value.
+#[test]
+fn isolated_query_mapping_error_preserves_healthy_peer_output() {
+    let healthy_path = r"\Memory\Available Bytes";
+    let failing_path = r"\Unavailable\Value";
+    let healthy = counter(healthy_path, "memory.available");
+    let mut failing = counter(failing_path, "unavailable.value");
+    failing.recreate_query = true;
+    failing.source_mapping_index = 1;
+
+    let failing_open_calls = Rc::new(Cell::new(0_usize));
+    let factory_failing_open_calls = Rc::clone(&failing_open_calls);
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
+        if configs[0].path == failing_path {
+            let call = factory_failing_open_calls.get();
+            factory_failing_open_calls.set(call + 1);
+            return if call == 0 {
+                Err(Error::Pdh {
+                    operation: PdhOperation::OpenQuery,
+                    path: "<query>".to_owned(),
+                    status: 1,
+                })
+            } else {
+                Err(Error::CounterSetup {
+                    path: failing_path.to_owned(),
+                    message: "injected permanent mapping error".to_owned(),
+                    permanent: true,
+                    cleanup_failed: false,
+                })
+            };
+        }
+        let (_, query) = fake_query_with_seed(
+            configs,
+            vec![FakeCounter {
+                path: healthy_path.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+            Duration::ZERO,
+            Duration::from_secs(30),
+            max_native_counters,
+            seed,
+        );
+        Ok(query)
+    };
+    let mut queries = open_initial_queries(
+        query_plans(vec![healthy, failing]),
+        Duration::ZERO,
+        2,
+        &mut open,
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+
+    let sample = collect_queries(&mut queries, Duration::from_secs(30), 2, &mut open).unwrap();
+
+    assert_eq!(sample.points.len(), 1);
+    assert_eq!(sample.points[0].counter_index, 0);
+    assert_eq!(sample.metadata.diagnostics.scrape_failures, 1);
+    assert_eq!(sample.metadata.failures.len(), 1);
+    assert_eq!(sample.metadata.failures[0].counter_index, 1);
+    assert_eq!(sample.metadata.failures[0].reason, "counter_setup");
+    assert_eq!(failing_open_calls.get(), 2);
+
+    let deferred = collect_queries(&mut queries, Duration::from_secs(30), 2, &mut open).unwrap();
+    assert_eq!(deferred.points.len(), 1);
+    assert_eq!(deferred.metadata.diagnostics.scrape_failures, 0);
+    assert_eq!(deferred.metadata.failures.len(), 2);
+    assert!(
+        deferred
+            .metadata
+            .failures
+            .iter()
+            .all(|failure| failure.diagnostic_only)
+    );
+    assert!(
+        deferred
+            .metadata
+            .failures
+            .iter()
+            .any(|failure| failure.reason == "query_recovery_pending")
+    );
+    assert_eq!(failing_open_calls.get(), 2);
 }
 
 /// Scenario: One exact mapping and multiple recreated wildcard mappings fill one receiver-wide native-entry limit.
@@ -291,7 +583,9 @@ fn recreated_queries_share_receiver_native_entry_limit() {
 
     let observed_limits = Rc::new(RefCell::new(Vec::new()));
     let factory_limits = Rc::clone(&observed_limits);
-    let mut open = move |configs: Vec<CounterConfig>, max_expanded_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_expanded_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
         factory_limits.borrow_mut().push(max_expanded_counters);
         let template = configs[0].path.clone();
         let paths = if configs[0].instance_config.is_wildcard() {
@@ -326,6 +620,7 @@ fn recreated_queries_share_receiver_native_entry_limit() {
             timestamp: 100,
             timestamp_error: false,
             remove_error: false,
+            expand_error: false,
             removed: Vec::new(),
             expansions: configs[0]
                 .instance_config
@@ -334,13 +629,14 @@ fn recreated_queries_share_receiver_native_entry_limit() {
                 .into_iter()
                 .collect(),
         }));
-        Query::open_with(
-            FakePdh(state),
+        Query::open_with_seed(
+            FakePdh::new(state),
             configs,
             Duration::from_secs(30),
             Duration::from_secs(30),
             256,
             max_expanded_counters,
+            seed,
         )
     };
 
@@ -400,7 +696,9 @@ fn initial_wildcard_reserves_later_exact_native_entry() {
 
     let observed_limits = Rc::new(RefCell::new(Vec::new()));
     let factory_limits = Rc::clone(&observed_limits);
-    let mut open = move |configs: Vec<CounterConfig>, max_native_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
         factory_limits.borrow_mut().push(max_native_counters);
         let counters = configs
             .iter()
@@ -430,18 +728,20 @@ fn initial_wildcard_reserves_later_exact_native_entry() {
             timestamp: 100,
             timestamp_error: false,
             remove_error: false,
+            expand_error: false,
             removed: Vec::new(),
             expansions: [(wildcard_path.to_owned(), expanded.clone())]
                 .into_iter()
                 .collect(),
         }));
-        Query::open_with(
-            FakePdh(state),
+        Query::open_with_seed(
+            FakePdh::new(state),
             configs,
             Duration::from_secs(30),
             Duration::from_secs(30),
             256,
             max_native_counters,
+            seed,
         )
     };
 
@@ -472,8 +772,8 @@ fn initial_wildcard_reserves_later_exact_native_entry() {
     );
 }
 
-/// Scenario: A recreated exact-and-wildcard plan discovers more instances while its old handles remain live beside an exact peer.
-/// Guarantees: Replacement construction overlaps the old query without exceeding receiver-wide ownership and swaps only the entries that fit.
+/// Scenario: An exact-and-wildcard plan is recreated before its wildcard refresh deadline while old handles remain live beside an exact peer.
+/// Guarantees: Replacement reuses admitted membership without another expansion and overlaps ownership without exceeding the receiver-wide limit.
 #[test]
 fn recreation_peak_includes_old_query_ownership() {
     let exact_path = r"\Memory\Available Bytes";
@@ -497,7 +797,9 @@ fn recreation_peak_includes_old_query_ownership() {
     let factory_ownership = Arc::clone(&ownership);
     let open_calls = Rc::new(Cell::new(0));
     let factory_open_calls = Rc::clone(&open_calls);
-    let mut open = move |configs: Vec<CounterConfig>, max_native_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
         let open_index = factory_open_calls.get();
         factory_open_calls.set(open_index + 1);
         let expanded = if open_index == 2 {
@@ -505,7 +807,7 @@ fn recreation_peak_includes_old_query_ownership() {
         } else {
             expanded_paths[..1].to_vec()
         };
-        Query::open_with(
+        Query::open_with_seed(
             PeakPdh {
                 ownership: Arc::clone(&factory_ownership),
                 owned: 0,
@@ -516,6 +818,7 @@ fn recreation_peak_includes_old_query_ownership() {
             Duration::from_secs(30),
             256,
             max_native_counters,
+            seed,
         )
     };
     let mut queries = open_initial_queries(
@@ -530,6 +833,7 @@ fn recreation_peak_includes_old_query_ownership() {
 
     assert_eq!(ownership.current.load(Ordering::Acquire), 3);
     assert_eq!(ownership.peak.load(Ordering::Acquire), 3);
+    assert_eq!(ownership.expansions.load(Ordering::Acquire), 1);
 
     let sample = collect_queries(&mut queries, Duration::from_secs(30), 5, &mut open).unwrap();
 
@@ -539,6 +843,7 @@ fn recreation_peak_includes_old_query_ownership() {
     assert_eq!(open_calls.get(), 3);
     assert_eq!(ownership.current.load(Ordering::Acquire), 3);
     assert_eq!(ownership.peak.load(Ordering::Acquire), 5);
+    assert_eq!(ownership.expansions.load(Ordering::Acquire), 1);
     assert_eq!(
         queries
             .iter()
@@ -557,9 +862,9 @@ fn unavailable_query_reserves_exact_native_entry() {
         global_indices: vec![0],
         recreate_query: false,
     };
-    let mut open = |_: Vec<CounterConfig>, _: usize| {
+    let mut open = |_: Vec<CounterConfig>, _: usize, _: Option<&QueryRecreationSeed>| {
         Err::<Query<FakePdh>, _>(Error::Pdh {
-            operation: "PdhOpenQueryW",
+            operation: PdhOperation::OpenQuery,
             path: "<query>".to_owned(),
             status: 1,
         })
@@ -571,6 +876,227 @@ fn unavailable_query_reserves_exact_native_entry() {
         remaining_native_capacity(2, std::iter::once(slot.reserved_native_entry_count())),
         1
     );
+}
+
+/// Scenario: A wildcard query reaches the rebuild threshold while its admitted member has not disappeared.
+/// Guarantees: The down slot reserves the seeded wildcard member so healthy peers cannot consume its recovery capacity.
+#[test]
+fn down_query_reserves_seeded_wildcard_membership() {
+    let path = r"\Process(*)\Private Bytes";
+    let concrete = r"\Process(worker)\Private Bytes";
+    let mut config = counter(path, "process.private");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
+        let state = Rc::new(RefCell::new(FakeState {
+            counters: vec![FakeCounter {
+                path: concrete.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+            added: Vec::new(),
+            calls: FakeNativeCalls::default(),
+            collect_has_data: true,
+            collect_error: false,
+            timestamp: 100,
+            timestamp_error: false,
+            remove_error: false,
+            expand_error: false,
+            removed: Vec::new(),
+            expansions: [(path.to_owned(), vec![concrete.to_owned()])]
+                .into_iter()
+                .collect(),
+        }));
+        let query = Query::open_with_seed(
+            FakePdh::new(Rc::clone(&state)),
+            configs,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            256,
+            max_native_counters,
+            seed,
+        )
+        .unwrap();
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let plan = query_plans(vec![config]).pop().unwrap();
+    let mut slot = QuerySlot::open_initial(plan, 1, &mut open).unwrap();
+    assert_eq!(slot.reserved_native_entry_count(), 1);
+    states.borrow()[0].borrow_mut().collect_error = true;
+
+    for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
+        let result = slot.collect(Instant::now(), Duration::ZERO, 1, &mut open);
+        assert!(result.is_err_and(|error| error.is_query_collection_failure()));
+    }
+
+    assert!(slot.query.is_none());
+    assert_eq!(slot.reserved_native_entry_count(), 1);
+    assert_eq!(
+        remaining_native_capacity(1, std::iter::once(slot.reserved_native_entry_count())),
+        0
+    );
+}
+
+/// Scenario: A down wildcard query's rebuild attempt fails with an error that normally schedules an immediate rebuild.
+/// Guarantees: Re-scheduling an already down query preserves its seed, native reservation, attempt count, and bounded backoff.
+#[test]
+fn failed_rebuild_preserves_down_query_state() {
+    let path = r"\Process(*)\Private Bytes";
+    let concrete = r"\Process(worker)\Private Bytes";
+    let mut config = counter(path, "process.private");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let state = Rc::new(RefCell::new(FakeState {
+        counters: vec![FakeCounter {
+            path: concrete.to_owned(),
+            native_type: 0x0001_0100,
+            raw: None,
+            multi_count: 1,
+            formatted: Some(Number::Integer(42)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+        added: Vec::new(),
+        calls: FakeNativeCalls::default(),
+        collect_has_data: true,
+        collect_error: false,
+        timestamp: 100,
+        timestamp_error: false,
+        remove_error: false,
+        expand_error: false,
+        removed: Vec::new(),
+        expansions: [(path.to_owned(), vec![concrete.to_owned()])]
+            .into_iter()
+            .collect(),
+    }));
+    let initial_state = Rc::clone(&state);
+    let mut open_initial = move |configs: Vec<CounterConfig>,
+                                 max_native_counters: usize,
+                                 seed: Option<&QueryRecreationSeed>| {
+        Query::open_with_seed(
+            FakePdh::new(Rc::clone(&initial_state)),
+            configs,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            256,
+            max_native_counters,
+            seed,
+        )
+    };
+    let plan = query_plans(vec![config]).pop().unwrap();
+    let mut slot = QuerySlot::open_initial(plan, 1, &mut open_initial).unwrap();
+    state.borrow_mut().collect_error = true;
+    let now = Instant::now();
+    for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
+        let result = slot.collect(now, Duration::ZERO, 1, &mut open_initial);
+        assert!(result.is_err_and(|error| error.is_query_collection_failure()));
+    }
+    assert!(slot.query.is_none());
+    assert_eq!(slot.reserved_native_entry_count(), 1);
+
+    let observed_seeds = RefCell::new(Vec::new());
+    let mut fail_rebuild = |_: Vec<CounterConfig>, _: usize, seed: Option<&QueryRecreationSeed>| {
+        observed_seeds.borrow_mut().push(seed.is_some());
+        Err::<Query<FakePdh>, _>(Error::Pdh {
+            operation: PdhOperation::RemoveCounter,
+            path: concrete.to_owned(),
+            status: 1,
+        })
+    };
+    let rebuild_at = now + Duration::from_secs(1);
+    for attempt_at in [rebuild_at, rebuild_at + Duration::from_secs(1)] {
+        let error = slot
+            .collect(attempt_at, Duration::from_secs(30), 1, &mut fail_rebuild)
+            .unwrap_err();
+        assert!(error.requires_immediate_query_rebuild());
+    }
+    let pending = slot
+        .collect(
+            rebuild_at + Duration::from_secs(2),
+            Duration::from_secs(30),
+            1,
+            &mut fail_rebuild,
+        )
+        .unwrap_err();
+
+    assert!(matches!(pending, Error::QueryRecoveryPending { .. }));
+    assert_eq!(observed_seeds.borrow().as_slice(), [true, true]);
+    assert!(slot.query.is_none());
+    assert_eq!(slot.reserved_native_entry_count(), 1);
+}
+
+/// Scenario: A wildcard refresh fails recoverably for the configured consecutive-failure threshold.
+/// Guarantees: Repeated refresh failures schedule a seeded query rebuild using the same bounded recovery policy as collection failures.
+#[test]
+fn repeated_refresh_failures_schedule_query_rebuild() {
+    let exact_path = r"\Memory\Available Bytes";
+    let path = r"\Process(*)\Private Bytes";
+    let mut config = counter(path, "process.private");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let open_calls = Rc::new(Cell::new(0_usize));
+    let factory_open_calls = Rc::clone(&open_calls);
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
+        factory_open_calls.set(factory_open_calls.get() + 1);
+        let (state, query) = fake_query_with_seed(
+            configs,
+            vec![FakeCounter {
+                path: exact_path.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+            Duration::ZERO,
+            Duration::ZERO,
+            max_native_counters,
+            seed,
+        );
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let plan = query_plans(vec![counter(exact_path, "memory.available"), config])
+        .pop()
+        .unwrap();
+    let slot = QuerySlot::open_initial(plan, 1, &mut open).unwrap();
+    states.borrow()[0].borrow_mut().expand_error = true;
+    let mut queries = vec![slot];
+    for attempt in 1..=QUERY_REBUILD_AFTER_FAILURES {
+        let sample = collect_queries(&mut queries, Duration::ZERO, 1, &mut open).unwrap();
+        if attempt < QUERY_REBUILD_AFTER_FAILURES {
+            assert_eq!(sample.points.len(), 1);
+            assert_eq!(sample.points[0].counter_index, 0);
+            assert_eq!(sample.metadata.diagnostics.discovery_failures, 1);
+            assert_eq!(sample.metadata.failures.len(), 1);
+            assert_eq!(sample.metadata.failures[0].reason, "PdhExpandWildCardPathW");
+            assert!(sample.metadata.failures[0].diagnostic_only);
+        } else {
+            assert_eq!(sample.metadata.diagnostics.query_rebuild_attempts, 1);
+            assert_eq!(sample.metadata.diagnostics.query_rebuild_recoveries, 1);
+        }
+    }
+
+    assert!(queries[0].query.is_some());
+    assert_eq!(queries[0].reserved_native_entry_count(), 1);
+    assert_eq!(open_calls.get(), 2);
 }
 
 /// Scenario: One query combines an exact mapping with a wildcard that discovers three paths under a two-entry limit.
@@ -602,6 +1128,7 @@ fn exact_reservation_reduces_same_query_expansion_capacity() {
         timestamp: 100,
         timestamp_error: false,
         remove_error: false,
+        expand_error: false,
         removed: Vec::new(),
         expansions: [(wildcard_path.to_owned(), expanded)].into_iter().collect(),
     }));
@@ -611,7 +1138,7 @@ fn exact_reservation_reduces_same_query_expansion_capacity() {
     };
 
     let query = Query::open_with(
-        FakePdh(Rc::clone(&state)),
+        FakePdh::new(Rc::clone(&state)),
         vec![counter(exact_path, "memory.available"), wildcard],
         Duration::from_secs(30),
         Duration::from_secs(30),
@@ -651,7 +1178,7 @@ fn query_rejects_limit_below_exact_reservation() {
     ));
 }
 
-/// Scenario: A monotonic collection is discarded before delivery, as with a positive runtime timeout, and a later scrape succeeds.
+/// Scenario: A monotonic collection is discarded before delivery, and a later scrape succeeds.
 /// Guarantees: The discarded point does not consume the unknown start, so the next delivered candidate starts at its own timestamp and only its acknowledgement establishes the sequence.
 #[test]
 fn discarded_monotonic_collection_does_not_consume_start() {
@@ -659,7 +1186,9 @@ fn discarded_monotonic_collection_does_not_consume_start() {
     let config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
     let states = Rc::new(RefCell::new(Vec::new()));
     let factory_states = Rc::clone(&states);
-    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         _max_native_counters: usize,
+                         _seed: Option<&QueryRecreationSeed>| {
         let (state, query) = fake_query(
             configs,
             vec![FakeCounter {
@@ -712,135 +1241,6 @@ fn discarded_monotonic_collection_does_not_consume_start() {
     assert_eq!(retained.points[0].start_time_unix_nano, Some(120));
 }
 
-/// Scenario: Projection rejects the only monotonic point, leaving no Arrow records to send for that scrape.
-/// Guarantees: An all-point projection drop acknowledges nothing, so the next valid point starts a fresh exported sequence at its own timestamp.
-#[test]
-fn all_point_projection_drop_does_not_consume_monotonic_start() {
-    let path = r"\TCPv4\Connection Failures";
-    let config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
-    let projection_config = config.clone();
-    let states = Rc::new(RefCell::new(Vec::new()));
-    let factory_states = Rc::clone(&states);
-    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
-        let (state, query) = fake_query(
-            configs,
-            vec![FakeCounter {
-                path: path.to_owned(),
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(10)),
-                raw_error: false,
-                formatted_error: false,
-            }],
-        );
-        factory_states.borrow_mut().push(state);
-        Ok(query)
-    };
-    let mut queries = query_plans(vec![config])
-        .into_iter()
-        .map(|plan| QuerySlot::open_initial(plan, 4_096, &mut open).unwrap())
-        .collect::<Vec<_>>();
-
-    {
-        let states = states.borrow();
-        let mut state = states[0].borrow_mut();
-        state.timestamp = 110;
-        state.counters[0].formatted = Some(Number::Integer(20));
-    }
-    let mut dropped =
-        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
-    dropped.points[0].start_time_unix_nano = Some(0);
-    let projection = project_sample(std::slice::from_ref(&projection_config), &dropped).unwrap();
-    assert!(projection.records.is_none());
-    assert_eq!(projection.point_failures.len(), 1);
-    assert!(projection.monotonic_publications.is_empty());
-    publish_monotonic_starts(&mut queries, projection.monotonic_publications);
-
-    {
-        let states = states.borrow();
-        let mut state = states[0].borrow_mut();
-        state.timestamp = 120;
-        state.counters[0].formatted = Some(Number::Integer(30));
-    }
-    let delivered =
-        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
-    assert_eq!(delivered.points[0].start_time_unix_nano, Some(120));
-}
-
-/// Scenario: Projection accepts one monotonic point and rejects its peer before a successful batch send.
-/// Guarantees: Delivery acknowledges only the projected point; its sequence retains the earlier start while the rejected peer starts fresh on its next valid output.
-#[test]
-fn per_point_projection_drop_commits_only_delivered_monotonic_start() {
-    let first_path = r"\TCPv4\Connection Failures";
-    let second_path = r"\TCPv4\Connections Reset";
-    let configs = vec![
-        monotonic_sum(first_path, "windows.tcp.connection_failures", "{failure}"),
-        monotonic_sum(second_path, "windows.tcp.connections_reset", "{reset}"),
-    ];
-    let projection_configs = configs.clone();
-    let states = Rc::new(RefCell::new(Vec::new()));
-    let factory_states = Rc::clone(&states);
-    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
-        let (state, query) = fake_query(
-            configs,
-            [first_path, second_path]
-                .into_iter()
-                .map(|path| FakeCounter {
-                    path: path.to_owned(),
-                    native_type: 0x0001_0100,
-                    raw: None,
-                    multi_count: 1,
-                    formatted: Some(Number::Integer(10)),
-                    raw_error: false,
-                    formatted_error: false,
-                })
-                .collect(),
-        );
-        factory_states.borrow_mut().push(state);
-        Ok(query)
-    };
-    let mut queries = query_plans(configs)
-        .into_iter()
-        .map(|plan| QuerySlot::open_initial(plan, 4_096, &mut open).unwrap())
-        .collect::<Vec<_>>();
-
-    {
-        let states = states.borrow();
-        let mut state = states[0].borrow_mut();
-        state.timestamp = 110;
-        for counter in &mut state.counters {
-            counter.formatted = Some(Number::Integer(20));
-        }
-    }
-    let mut mixed =
-        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
-    mixed.points[1].start_time_unix_nano = Some(0);
-    let projection = project_sample(&projection_configs, &mixed).unwrap();
-    assert!(projection.records.is_some());
-    assert_eq!(projection.point_failures.len(), 1);
-    assert_eq!(projection.monotonic_publications.len(), 1);
-    assert_eq!(projection.monotonic_publications[0].counter_index, 0);
-    publish_monotonic_starts(&mut queries, projection.monotonic_publications);
-
-    {
-        let states = states.borrow();
-        let mut state = states[0].borrow_mut();
-        state.timestamp = 120;
-        for counter in &mut state.counters {
-            counter.formatted = Some(Number::Integer(30));
-        }
-    }
-    let next = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
-    assert_eq!(
-        next.points
-            .iter()
-            .map(|point| point.start_time_unix_nano)
-            .collect::<Vec<_>>(),
-        [Some(110), Some(120)]
-    );
-}
-
 /// Scenario: A delta mapping and a recreated peer collect through separate queries with different clocks.
 /// Guarantees: Each delta interval starts exactly at that series' previous point timestamp without overlap from the later peer timestamp.
 #[test]
@@ -855,7 +1255,9 @@ fn cross_query_delta_intervals_use_their_own_timestamps() {
 
     let states = Rc::new(RefCell::new(Vec::new()));
     let factory_states = Rc::clone(&states);
-    let mut open = move |configs: Vec<CounterConfig>, _max_expanded_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         _max_expanded_counters: usize,
+                         _seed: Option<&QueryRecreationSeed>| {
         let config = &configs[0];
         let native_counter = if config.path == delta_path {
             FakeCounter {
@@ -936,7 +1338,9 @@ fn isolated_query_failure_preserves_healthy_peer_output() {
     let factory_states = Rc::clone(&states);
     let open_calls = Rc::new(Cell::new(0_usize));
     let factory_open_calls = Rc::clone(&open_calls);
-    let mut open = move |configs: Vec<CounterConfig>, _max_expanded_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         _max_expanded_counters: usize,
+                         _seed: Option<&QueryRecreationSeed>| {
         factory_open_calls.set(factory_open_calls.get() + 1);
         let config = &configs[0];
         let native_counter = if config.path == shared_path {
@@ -1004,12 +1408,14 @@ fn recreated_query_primes_before_swap_and_preserves_old_query_on_failure() {
     let factory_states = Rc::clone(&states);
     let open_calls = Rc::new(Cell::new(0_usize));
     let factory_open_calls = Rc::clone(&open_calls);
-    let mut open = move |configs: Vec<CounterConfig>, _max_expanded_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         _max_expanded_counters: usize,
+                         _seed: Option<&QueryRecreationSeed>| {
         let open_index = factory_open_calls.get();
         factory_open_calls.set(open_index + 1);
         if open_index == 2 {
             return Err(Error::Pdh {
-                operation: "PdhOpenQueryW",
+                operation: PdhOperation::OpenQuery,
                 path: "<query>".to_owned(),
                 status: 1,
             });
@@ -1088,7 +1494,7 @@ fn recreated_query_primes_before_swap_and_preserves_old_query_on_failure() {
             }
             1 => {
                 assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 1);
-                assert_eq!(sample.metadata.diagnostics.scrape_failures, 1);
+                assert_eq!(sample.metadata.diagnostics.scrape_failures, 0);
                 assert_eq!(sample.metadata.failures.len(), 1);
                 assert_eq!(sample.metadata.failures[0].reason, "PdhCollectQueryData");
                 assert!(sample.metadata.failures[0].diagnostic_only);
@@ -1104,10 +1510,10 @@ fn recreated_query_primes_before_swap_and_preserves_old_query_on_failure() {
     assert_eq!(open_calls.get(), 6);
 }
 
-/// Scenario: A recreated monotonic direct-count query is primed before each of two scrapes and receives the prior query's delivery acknowledgement.
-/// Guarantees: Generation checks ignore the stale acknowledgement, so every replacement's first exported point uses start equal to time, including in decoded OTAP.
+/// Scenario: A recreated monotonic direct-count query is primed after collection but before that collection's delivery acknowledgement.
+/// Guarantees: The unchanged replacement retains the pending publication identity, accepts the acknowledgement, and keeps the published start.
 #[test]
-fn recreated_monotonic_query_defers_start_until_publication() {
+fn recreated_monotonic_query_preserves_start_and_publication() {
     let path = r"\TCPv4\Connection Failures";
     let mut config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
     config.recreate_query = true;
@@ -1116,11 +1522,13 @@ fn recreated_monotonic_query_defers_start_until_publication() {
     let factory_states = Rc::clone(&states);
     let open_calls = Rc::new(Cell::new(0_usize));
     let factory_open_calls = Rc::clone(&open_calls);
-    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
         let open_index = factory_open_calls.get();
         factory_open_calls.set(open_index + 1);
         let offset = i64::try_from(open_index).unwrap() * 10;
-        let (state, query) = fake_query(
+        let (state, query) = fake_query_with_seed(
             configs,
             vec![FakeCounter {
                 path: path.to_owned(),
@@ -1131,6 +1539,10 @@ fn recreated_monotonic_query_defers_start_until_publication() {
                 raw_error: false,
                 formatted_error: false,
             }],
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            max_native_counters,
+            seed,
         );
         state.borrow_mut().timestamp = 100 + offset;
         factory_states.borrow_mut().push(state);
@@ -1144,12 +1556,14 @@ fn recreated_monotonic_query_defers_start_until_publication() {
             let states = states.borrow();
             let mut state = states[scrape_index].borrow_mut();
             state.timestamp = timestamp;
-            state.counters[0].formatted = Some(Number::Integer(timestamp / 10 + 10));
+            state.counters[0].formatted = Some(Number::Integer(
+                i64::try_from(scrape_index + 2).unwrap() * 10,
+            ));
         }
         let sample =
             collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
         assert_eq!(sample.points[0].timestamp_unix_nano, timestamp);
-        assert_eq!(sample.points[0].start_time_unix_nano, Some(timestamp));
+        assert_eq!(sample.points[0].start_time_unix_nano, Some(110));
 
         if scrape_index == 0 {
             let projection =
@@ -1169,7 +1583,19 @@ fn recreated_monotonic_query_defers_start_until_publication() {
                 .downcast_ref::<arrow::array::TimestampNanosecondArray>()
                 .unwrap();
             assert_eq!(starts.value(0), times.value(0));
-            publish_monotonic_starts(&mut queries, projection.monotonic_publications);
+            assert_eq!(projection.monotonic_publications.len(), 1);
+            let publication = &projection.monotonic_publications[0];
+            assert_eq!(
+                queries[0]
+                    .query
+                    .as_ref()
+                    .unwrap()
+                    .monotonic_sequence(0, &publication.path)
+                    .unwrap()
+                    .pending_start_time_unix_nano,
+                Some(110)
+            );
+            assert!(queries[0].publish_monotonic_start(publication));
         }
     }
     assert_eq!(open_calls.get(), 3);
@@ -1185,7 +1611,9 @@ fn scaled_monotonic_sum_publishes_and_retains_start() {
     let projection_config = config.clone();
     let states = Rc::new(RefCell::new(Vec::new()));
     let factory_states = Rc::clone(&states);
-    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         _max_native_counters: usize,
+                         _seed: Option<&QueryRecreationSeed>| {
         let (state, query) = fake_query(
             configs,
             vec![FakeCounter {
@@ -1228,20 +1656,22 @@ fn scaled_monotonic_sum_publishes_and_retains_start() {
     assert!(projection.records.is_some());
 }
 
-/// Scenario: A monotonic direct-count query is rebuilt after repeated collection failures and primed successfully.
-/// Guarantees: Rebuild priming restores native readiness without backdating the first recovered cumulative point.
+/// Scenario: A published monotonic direct-count sequence is rebuilt after repeated collection failures and primed successfully.
+/// Guarantees: Rebuild priming preserves the unchanged series' published start/value/time instead of beginning a fresh sequence.
 #[test]
-fn rebuilt_monotonic_query_defers_start_until_publication() {
+fn rebuilt_monotonic_query_preserves_published_start() {
     let path = r"\TCPv4\Connection Failures";
     let states = Rc::new(RefCell::new(Vec::new()));
     let factory_states = Rc::clone(&states);
     let open_calls = Rc::new(Cell::new(0_usize));
     let factory_open_calls = Rc::clone(&open_calls);
-    let mut open = move |configs: Vec<CounterConfig>, _max_native_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
         let open_index = factory_open_calls.get();
         factory_open_calls.set(open_index + 1);
         let offset = i64::try_from(open_index).unwrap() * 10;
-        let (state, query) = fake_query(
+        let (state, query) = fake_query_with_seed(
             configs,
             vec![FakeCounter {
                 path: path.to_owned(),
@@ -1252,30 +1682,40 @@ fn rebuilt_monotonic_query_defers_start_until_publication() {
                 raw_error: false,
                 formatted_error: false,
             }],
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            max_native_counters,
+            seed,
         );
         state.borrow_mut().timestamp = 100 + offset;
         factory_states.borrow_mut().push(state);
         Ok(query)
     };
-    let plan = query_plans(vec![monotonic_sum(
-        path,
-        "windows.tcp.connection_failures",
-        "{failure}",
-    )])
-    .pop()
-    .unwrap();
-    let mut query = QuerySlot::open_initial(plan, 4_096, &mut open).unwrap();
+    let config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
+    let plan = query_plans(vec![config.clone()]).pop().unwrap();
+    let mut queries = vec![QuerySlot::open_initial(plan, 4_096, &mut open).unwrap()];
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 110;
+        state.counters[0].formatted = Some(Number::Integer(20));
+    }
+    let first = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
+    assert_eq!(first.points[0].start_time_unix_nano, Some(110));
+    let projection = project_sample(std::slice::from_ref(&config), &first).unwrap();
+    publish_monotonic_starts(&mut queries, projection.monotonic_publications);
+
     states.borrow()[0].borrow_mut().collect_error = true;
     let now = Instant::now();
     for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
         assert!(
-            query
+            queries[0]
                 .collect(now, Duration::ZERO, 4_096, &mut open)
                 .is_err()
         );
     }
 
-    let rebuilt = query
+    let rebuilt = queries[0]
         .collect(now, Duration::ZERO, 4_096, &mut open)
         .unwrap();
     assert!(rebuilt.points.is_empty());
@@ -1285,11 +1725,11 @@ fn rebuilt_monotonic_query_defers_start_until_publication() {
         state.timestamp = 120;
         state.counters[0].formatted = Some(Number::Integer(30));
     }
-    let recovered = query
+    let recovered = queries[0]
         .collect(now, Duration::ZERO, 4_096, &mut open)
         .unwrap();
     assert_eq!(recovered.points[0].timestamp_unix_nano, 120);
-    assert_eq!(recovered.points[0].start_time_unix_nano, Some(120));
+    assert_eq!(recovered.points[0].start_time_unix_nano, Some(110));
     assert_eq!(open_calls.get(), 2);
 }
 
@@ -1308,7 +1748,7 @@ async fn startup_longer_than_thirty_seconds_eventually_succeeds() {
         )],
         Duration::from_secs(30),
         4_096,
-        move |configs, max_expanded_counters| {
+        move |configs, max_expanded_counters, _seed| {
             let _ = entered_tx.send(());
             let _ = release_rx.recv();
             Query::open_with(
@@ -1353,6 +1793,71 @@ async fn startup_longer_than_thirty_seconds_eventually_succeeds() {
     .expect("slow startup worker did not release its query");
 }
 
+/// Scenario: The initial wildcard refresh hits a recoverable native cleanup failure before succeeding after the configured retry cap.
+/// Guarantees: Startup remains ready, the backoff scrape reports diagnostics without failing, and recovery waits for the bounded retry.
+#[tokio::test(flavor = "current_thread")]
+async fn startup_wildcard_refresh_failure_retries_after_cap() {
+    let template = r"\Process(*)\Private Bytes";
+    let mut config = counter(template, "process.private");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let add_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factory_add_calls = Arc::clone(&add_calls);
+    let retry_cap = Duration::from_secs(1);
+    let mut worker = Worker::start_with(
+        vec![config],
+        retry_cap,
+        4_096,
+        move |configs, max_native_counters, seed| {
+            Query::open_managed_with_seed(
+                RecoveringRefreshPdh {
+                    add_calls: Arc::clone(&factory_add_calls),
+                    timestamp: 100,
+                },
+                configs,
+                retry_cap,
+                Duration::ZERO,
+                256,
+                max_native_counters,
+                seed,
+            )
+        },
+    )
+    .await
+    .unwrap();
+
+    let deferred = worker.collect().await.unwrap();
+    assert!(deferred.points.is_empty());
+    assert_eq!(deferred.metadata.diagnostics.scrape_failures, 0);
+    assert_eq!(deferred.metadata.failures.len(), 2);
+    assert!(
+        deferred
+            .metadata
+            .failures
+            .iter()
+            .any(|failure| failure.reason == "query_recovery_pending" && failure.diagnostic_only)
+    );
+    assert_eq!(add_calls.load(Ordering::Acquire), 1);
+
+    tokio::time::sleep(retry_cap + Duration::from_millis(50)).await;
+    let rebuilt = worker.collect().await.unwrap();
+    let recovered = worker.collect().await.unwrap();
+
+    assert!(rebuilt.points.is_empty());
+    assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_attempts, 1);
+    assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
+    assert!(rebuilt.metadata.failures.is_empty());
+    assert_eq!(add_calls.load(Ordering::Acquire), 2);
+    assert_eq!(recovered.points.len(), 1);
+    assert!(
+        worker
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap()
+    );
+}
+
 /// Scenario: Control abandons startup while the first of multiple native initialization units is blocked.
 /// Guarantees: Cancellation requests cleanup and prevents later units from opening, avoiding overlapping orphan work.
 #[tokio::test(flavor = "current_thread")]
@@ -1373,7 +1878,7 @@ async fn cancelling_startup_stops_between_initialization_units() {
         ],
         Duration::from_secs(30),
         4_096,
-        move |configs, max_expanded_counters| {
+        move |configs, max_expanded_counters, _seed| {
             let call = factory_open_calls.fetch_add(1, Ordering::AcqRel);
             if call == 0 {
                 let _ = entered_tx.send(());
@@ -1431,12 +1936,12 @@ async fn startup_retains_recoverable_empty_and_partial_slots() {
             counters,
             Duration::ZERO,
             4_096,
-            move |configs, max_expanded_counters| {
+            move |configs, max_expanded_counters, _seed| {
                 if configs[0].path == failed_path
                     && !factory_failed_once.swap(true, Ordering::AcqRel)
                 {
                     return Err(Error::Pdh {
-                        operation: "PdhOpenQueryW",
+                        operation: PdhOperation::OpenQuery,
                         path: "<query>".to_owned(),
                         status: 1,
                     });
@@ -1494,7 +1999,7 @@ async fn startup_rejects_nonrecoverable_query_errors() {
         )],
         Duration::from_secs(30),
         4_096,
-        |_, _| Err(Error::InvalidSample("injected startup invariant")),
+        |_, _, _| Err(Error::InvalidSample("injected startup invariant")),
     )
     .await;
     let Err(error) = result else {
@@ -1519,7 +2024,7 @@ async fn startup_prime_query_failure_starts_and_recovers() {
         counters,
         Duration::from_secs(30),
         4_096,
-        move |counters, max_expanded_counters| {
+        move |counters, max_expanded_counters, _seed| {
             Query::open_with(
                 RecoveringPrimePdh {
                     collect_calls: Arc::clone(&factory_calls),
@@ -1542,7 +2047,7 @@ async fn startup_prime_query_failure_starts_and_recovers() {
     assert_eq!(warming.metadata.failures[0].reason, "PdhCollectQueryData");
     assert!(warming.metadata.failures[0].diagnostic_only);
     assert_eq!(warming.metadata.diagnostics.counter_read_failures, 0);
-    assert_eq!(warming.metadata.diagnostics.scrape_failures, 1);
+    assert_eq!(warming.metadata.diagnostics.scrape_failures, 0);
     assert_eq!(warming.metadata.diagnostics.retry_attempts, 1);
     assert_eq!(warming.metadata.diagnostics.retry_recoveries, 1);
 
@@ -1559,8 +2064,8 @@ async fn startup_prime_query_failure_starts_and_recovers() {
     );
 }
 
-/// Scenario: A calculated query reaches the failure threshold and is rebuilt during a scrape.
-/// Guarantees: The rebuild scrape is empty after priming, and the following scrape emits over the full post-prime interval.
+/// Scenario: A calculated query configured for planned recreation reaches the failure threshold and is rebuilt during a scrape.
+/// Guarantees: The rebuild scrape skips same-scrape recreation, remains empty after priming, and the following scrape emits over the full post-prime interval.
 #[test]
 fn rebuilt_query_defers_values_until_the_next_scrape() {
     let path = r"\Processor(_Total)\% Processor Time";
@@ -1568,7 +2073,9 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
     let factory_first_query_failure = Arc::clone(&first_query_failure);
     let open_calls = Rc::new(Cell::new(0_usize));
     let factory_open_calls = Rc::clone(&open_calls);
-    let mut open = move |configs: Vec<CounterConfig>, max_expanded_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_expanded_counters: usize,
+                         _seed: Option<&QueryRecreationSeed>| {
         let open_index = factory_open_calls.get();
         factory_open_calls.set(open_index + 1);
         Query::open_with(
@@ -1587,9 +2094,9 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
             max_expanded_counters,
         )
     };
-    let plan = query_plans(vec![counter(path, "system.cpu.time")])
-        .pop()
-        .unwrap();
+    let mut config = counter(path, "system.cpu.time");
+    config.recreate_query = true;
+    let plan = query_plans(vec![config]).pop().unwrap();
     let mut query = QuerySlot::open_initial(plan, 4_096, &mut open).unwrap();
     first_query_failure.store(true, Ordering::Relaxed);
     let now = Instant::now();
@@ -1597,24 +2104,29 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
         assert!(matches!(
             query.collect(now, Duration::ZERO, 4_096, &mut open),
             Err(Error::Pdh {
-                operation: "PdhCollectQueryData",
+                operation: PdhOperation::CollectQueryData,
                 ..
             })
         ));
     }
 
-    let rebuilt = query
-        .collect(now, Duration::ZERO, 4_096, &mut open)
-        .unwrap();
+    let rebuilt = collect_queries(
+        std::slice::from_mut(&mut query),
+        Duration::ZERO,
+        4_096,
+        &mut open,
+    )
+    .unwrap();
 
     assert!(rebuilt.points.is_empty());
     assert_eq!(rebuilt.timestamp_unix_nano, 110);
     assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_attempts, 1);
     assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
+    assert_eq!(rebuilt.metadata.diagnostics.query_recreation_attempts, 0);
     assert_eq!(rebuilt.metadata.diagnostics.warmup_omissions, 2);
 
     let recovered = query
-        .collect(now, Duration::ZERO, 4_096, &mut open)
+        .collect(Instant::now(), Duration::ZERO, 4_096, &mut open)
         .unwrap();
     assert!(matches!(
         recovered.points[0].value,
@@ -1629,9 +2141,9 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
 }
 
 /// Scenario: Rebuild priming fails while another query succeeds in the same scrape.
-/// Guarantees: The partial scrape counts one query failure and the rebuilt query carries no duplicate pending prime failure.
+/// Guarantees: The recovery failure remains diagnostic without counting a scrape failure or duplicating pending prime metadata.
 #[test]
-fn rebuild_prime_failure_is_counted_once() {
+fn rebuild_prime_failure_is_diagnostic_only() {
     let healthy_path = r"\Processor(_Total)\% Processor Time";
     let rebuilding_path = r"\Processor(0)\% Processor Time";
     let first_rebuilding_failure = Arc::new(AtomicBool::new(false));
@@ -1640,7 +2152,9 @@ fn rebuild_prime_failure_is_counted_once() {
     let factory_rebuild_prime_failure = Arc::clone(&rebuild_prime_failure);
     let open_counts = Rc::new(RefCell::new(BTreeMap::<String, usize>::new()));
     let factory_open_counts = Rc::clone(&open_counts);
-    let mut open = move |configs: Vec<CounterConfig>, max_expanded_counters: usize| {
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_expanded_counters: usize,
+                         _seed: Option<&QueryRecreationSeed>| {
         let path = configs[0].path.clone();
         let open_index = {
             let mut counts = factory_open_counts.borrow_mut();
@@ -1698,11 +2212,11 @@ fn rebuild_prime_failure_is_counted_once() {
 
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.points[0].counter_index, 0);
-    assert_eq!(sample.metadata.diagnostics.scrape_failures, 1);
+    assert_eq!(sample.metadata.diagnostics.scrape_failures, 0);
     assert_eq!(sample.metadata.failures.len(), 1);
     assert_eq!(sample.metadata.failures[0].counter_index, 1);
     assert_eq!(sample.metadata.failures[0].reason, "PdhCollectQueryData");
-    assert!(!sample.metadata.failures[0].diagnostic_only);
+    assert!(sample.metadata.failures[0].diagnostic_only);
     let rebuilt = queries[1].query.as_ref().unwrap();
     assert_eq!(rebuilt.pending.diagnostics.scrape_failures, 0);
     assert!(rebuilt.pending.failures.is_empty());
@@ -1868,6 +2382,7 @@ fn sample_metadata_merge_preserves_pending_evidence() {
         },
         failures: vec![SampleFailure {
             counter_index: 0,
+            path: Arc::from(r"\Initial\Value"),
             reason: "initial",
             error: "initial failure".to_owned(),
             diagnostic_only: false,
@@ -1888,6 +2403,7 @@ fn sample_metadata_merge_preserves_pending_evidence() {
         },
         failures: vec![SampleFailure {
             counter_index: 1,
+            path: Arc::from(r"\Recovery\Value"),
             reason: "recovery",
             error: "recovery failure".to_owned(),
             diagnostic_only: false,
@@ -1914,6 +2430,7 @@ fn sample_metadata_merge_preserves_pending_evidence() {
         diagnostics: SampleDiagnostics::default(),
         failures: vec![SampleFailure {
             counter_index: 0,
+            path: Arc::from(r"\Initial\Value"),
             reason: "initial",
             error: "latest failure".to_owned(),
             diagnostic_only: false,
@@ -1944,6 +2461,7 @@ fn slot_metadata_merge_keeps_newer_failure() {
         },
         failures: vec![SampleFailure {
             counter_index: 0,
+            path: Arc::from(r"\Counter\Value"),
             reason: "counter read",
             error: "pending failure".to_owned(),
             diagnostic_only: false,
@@ -1962,6 +2480,7 @@ fn slot_metadata_merge_keeps_newer_failure() {
         metadata: PendingMetadata {
             failures: vec![SampleFailure {
                 counter_index: 0,
+                path: Arc::from(r"\Counter\Value"),
                 reason: "counter read",
                 error: "current failure".to_owned(),
                 diagnostic_only: false,
@@ -2027,7 +2546,7 @@ async fn query_recovery_cap_is_independent_of_membership_refresh() {
         vec![counter(path, "system.memory.available")],
         cadence,
         4_096,
-        move |configs, max_native_counters, cadence| {
+        move |configs, max_native_counters, cadence, _seed| {
             let _ = factory_open_calls.fetch_add(1, Ordering::AcqRel);
             factory_refreshes
                 .lock()
@@ -2053,7 +2572,7 @@ async fn query_recovery_cap_is_independent_of_membership_refresh() {
     assert!(matches!(
         worker.collect().await,
         Err(Error::Pdh {
-            operation: "PdhCollectQueryData",
+            operation: PdhOperation::CollectQueryData,
             ..
         })
     ));
@@ -2061,7 +2580,7 @@ async fn query_recovery_cap_is_independent_of_membership_refresh() {
     assert!(matches!(
         worker.collect().await,
         Err(Error::Pdh {
-            operation: "PdhCollectQueryData",
+            operation: PdhOperation::CollectQueryData,
             ..
         })
     ));
@@ -2069,7 +2588,7 @@ async fn query_recovery_cap_is_independent_of_membership_refresh() {
     assert!(matches!(
         worker.collect().await,
         Err(Error::Pdh {
-            operation: "PdhCollectQueryData",
+            operation: PdhOperation::CollectQueryData,
             ..
         })
     ));

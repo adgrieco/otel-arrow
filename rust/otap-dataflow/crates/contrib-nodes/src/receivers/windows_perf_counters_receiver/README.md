@@ -75,7 +75,7 @@ config:
 | `perfcounters` | Yes | None | Performance objects and counter mappings |
 | `initial_delay` | No | `1s` | Delay before the first collection request; non-positive means immediate |
 | `collection_interval` | No | `1m` | Any positive collection interval |
-| `timeout` | No | Disabled | Optional scrape discard deadline; `0s` also disables it |
+| `timeout` | No | `collection_interval` | Scrape lateness warning threshold; `0s` uses the collection interval |
 | `wildcard_refresh_interval` | No | See below | Wildcard discovery cadence |
 | `max_instances_per_wildcard` | No | `256` | Per-path expansion limit |
 | `max_expanded_counters` | No | `4096` | Receiver-wide exact plus expanded native-counter limit |
@@ -210,8 +210,10 @@ nonempty value remain configured identity. Filtering occurs before expansion
 limits, and explicit wildcard inclusion does not create a duplicate aggregate
 query.
 
-Points for named instances emit `instance=<name>`. Duplicate PDH instances use
-the canonical suffix, such as `instance=process#1`; index zero omits `#0`.
+Points for named instances emit `instance=<name>`. Exact selectors derive that
+identity from the configured native path, while wildcard-expanded selectors use
+the concrete identity returned by PDH. Duplicate PDH instances use the
+canonical suffix, such as `instance=process#1`; index zero omits `#0`.
 An exact aggregate entry omits `instance`, including when other exact entries
 are configured beside it, matching Go's per-entry watcher behavior. An
 aggregate explicitly included with `"*"` retains it. The receiver also emits
@@ -221,8 +223,8 @@ aggregate explicitly included with `"*"` retains it. The receiver also emits
 
 Explicit PDH duplicate-instance selectors preserve their configured spelling:
 `name`, `name#0`, `name#00`, and `name#01` remain distinct native paths and
-lookup identities. Returned PDH identity still determines emitted instance
-labels, so a provider may report a canonical name for one of these selectors.
+lookup identities and emitted exact-path instance attributes. Wildcard
+expansion still uses the concrete identity returned by PDH.
 An instance such as `#5` also keeps that literal native name. Numeric indexes
 are positional, not durable entity identifiers. If same-named processes churn
 while their count stays unchanged, PDH can reuse `name#n` for a different
@@ -372,12 +374,9 @@ failures still reject startup explicitly.
   baselines are invalidated so later values are not compared with stale PDH
   samples. Other counter-local invalid statuses, non-finite output, or scaling
   failures omit only that point; healthy peers remain in the batch.
-- Projection validates every ready point before mutating the Arrow batch.
-  Invalid point timestamps, Sum start times, or non-finite values omit only
-  that point and do not establish its monotonic cumulative start. Healthy peers
-  delivered in the same batch establish their own starts independently. Broken
-  sample/configuration identity and Arrow schema errors remain fatal receiver
-  invariants.
+- The native worker validates timestamps, Sum intervals, and finite values
+  before projection. Broken sample/configuration identity and Arrow schema
+  errors remain fatal receiver invariants.
 - Exact counter add failures retry with exponential backoff capped by
   `collection_interval`; wildcard-expanded add failures are capped by
   `wildcard_refresh_interval`. Counter read failures omit only the affected
@@ -385,22 +384,21 @@ failures still reject startup explicitly.
 - Counter availability does not fail startup. An empty active set emits no
   points until a configured counter becomes available.
 - Query-level `PDH_NO_DATA` and the other transient no-observation statuses
-  emit an empty batch without counting as failures, clear saved PDH base
-  history, invalidate delta intervals, and restart two-sample warm-up while
-  preserving cumulative monotonic Sum sequences. Other query-level collection
-  failures and post-collection timestamp failures apply the same reset before
-  returning an error. Query collection failures retry the existing query with
-  bounded exponential backoff capped by `collection_interval`, independently
-  of wildcard discovery. Three consecutive failures rebuild the worker-owned
-  query and all counters.
-- By default, the receiver waits for an accepted scrape and delivers a late
-  result with its original point timestamps. A scrape completing after
-  `collection_interval` records an overrun but remains successful. Setting a
-  positive `timeout` opts into discarding a late result; `0s` also leaves the
-  deadline disabled. A discarded result does not establish any monotonic
-  cumulative start. The native call continues to own the capacity-one worker,
-  so later ticks fail fast while it is busy and no additional request is
-  queued.
+  emit no batch and do not count as failures. They clear saved PDH base history,
+  invalidate delta intervals, and restart two-sample warm-up while preserving
+  cumulative monotonic Sum sequences. Other query-level collection failures
+  and post-collection timestamp failures apply the same reset before returning
+  an error. Query collection failures retry the existing query with bounded
+  exponential backoff capped by `collection_interval`, independently of
+  wildcard discovery. Three consecutive failures rebuild the affected
+  worker-owned query and its counters.
+- The receiver waits for every accepted scrape and delivers late results with
+  their original point timestamps. Crossing the lateness threshold immediately
+  records an overrun and emits a warning without cancelling the scrape. A
+  positive `timeout` is the threshold even when it is shorter or longer than
+  `collection_interval`; omitting it or setting `0s` uses the next scheduled
+  collection tick. The warning re-arms only after an on-time scrape. No
+  concurrent request is queued while the native call remains in flight.
 - Wildcard expansion is sorted before applying the configured limits. Excess
   instances are omitted, reported explicitly, and reconsidered at the next
   discovery refresh; they are never presented as a complete expansion.
@@ -470,7 +468,8 @@ not by `--validate-and-exit`.
 
 - The source pipeline must allocate one core.
 - Multiple receiver nodes may use independent intervals. Each node owns one
-  worker and PDH query; avoid unintentionally configuring duplicate collection.
+  worker and one or more PDH queries; mappings with `recreate_query: true` use
+  dedicated queries. Avoid unintentionally configuring duplicate collection.
 - Use narrow wildcard patterns where possible. The configured per-path and
   receiver-wide limits bound active handles and emitted cardinality.
 - One scrape can be in flight. Missed ticks are skipped rather than queued.
@@ -488,15 +487,14 @@ and low-cardinality reason. Other runtime events are:
 
 - `windows_perf_counters_receiver.instance_limit.exceeded`
 - `windows_perf_counters_receiver.instances.change`
-- `windows_perf_counters_receiver.projection.batch.drop`
 - `windows_perf_counters_receiver.recovery.change`
 - `windows_perf_counters_receiver.scrape.fail`
 - `windows_perf_counters_receiver.scrape.timeout`
 - `windows_perf_counters_receiver.shutdown.timeout`
 - `windows_perf_counters_receiver.query.close.fail`
 
-Repeated scrape, projection-batch, and counter warnings are suppressed until
-the affected condition recovers. Configuration events are:
+Repeated scrape and counter warnings are suppressed until the affected
+condition recovers. Configuration events are:
 
 - `windows_perf_counters_receiver.config.instance_override`
 - `windows_perf_counters_receiver.config.metric_definition.unused_path`
