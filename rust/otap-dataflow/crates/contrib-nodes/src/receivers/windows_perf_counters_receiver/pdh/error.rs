@@ -95,6 +95,12 @@ pub(in super::super) enum Error {
     Scale { path: String, source: ScaleError },
     #[error("failed to start PDH worker thread: {0}")]
     WorkerStart(String),
+    #[error(
+        "PDH worker failed to pin UI language to 0x{requested:04X}; SetThreadUILanguage returned 0x{returned:04X}"
+    )]
+    WorkerLanguagePin { requested: u16, returned: u16 },
+    #[error("PDH worker object-list {stage} failed with status 0x{status:08X}")]
+    WorkerObjectRefresh { stage: &'static str, status: u32 },
     #[error("PDH worker stopped before initialization completed")]
     WorkerInitStopped,
     #[error("a performance-counter collection request is already pending")]
@@ -184,6 +190,8 @@ impl Error {
             Self::Calculation { .. } => "calculation",
             Self::Scale { .. } => "scale",
             Self::WorkerStart(_) => "worker_start",
+            Self::WorkerLanguagePin { .. } => "worker_language_pin",
+            Self::WorkerObjectRefresh { .. } => "worker_object_refresh",
             Self::WorkerInitStopped => "worker_init_stopped",
             Self::WorkerBusy => "worker_busy",
             Self::WorkerStopped => "worker_stopped",

@@ -89,10 +89,15 @@ impl Worker {
         max_native_counters: usize,
         node: String,
     ) -> Result<Self, Error> {
-        let settings = QuerySettings {
+        let has_wildcards = counters
+            .iter()
+            .any(|counter| counter.instance_config.is_wildcard());
+        let mut settings = QuerySettings {
             cadence,
             max_instances_per_wildcard,
             node,
+            has_wildcards,
+            initialized: false,
         };
         Self::start_with(
             counters,
@@ -478,15 +483,20 @@ pub(super) struct QuerySettings {
     cadence: QueryCadence,
     max_instances_per_wildcard: usize,
     node: String,
+    has_wildcards: bool,
+    initialized: bool,
 }
 
 impl QuerySettings {
     fn open(
-        &self,
+        &mut self,
         counters: Vec<CounterConfig>,
         max_native_counters: usize,
         seed: Option<&QueryRecreationSeed>,
     ) -> Result<Query, Error> {
+        initialize_once(&mut self.initialized, || {
+            super::native::initialize_worker(&self.node, self.has_wildcards)
+        })?;
         Query::open_replacement(
             counters,
             self.cadence.retry_cap,
@@ -497,6 +507,18 @@ impl QuerySettings {
             seed,
         )
     }
+}
+
+pub(super) fn initialize_once(
+    initialized: &mut bool,
+    initialize: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    if *initialized {
+        return Ok(());
+    }
+    initialize()?;
+    *initialized = true;
+    Ok(())
 }
 
 pub(super) struct QueryPlan {

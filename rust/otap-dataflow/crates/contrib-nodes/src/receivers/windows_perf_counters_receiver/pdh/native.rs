@@ -9,20 +9,108 @@ use std::mem::{size_of, size_of_val};
 use std::ptr::{null, null_mut};
 use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
+use windows_sys::Win32::Globalization::SetThreadUILanguage;
 use windows_sys::Win32::System::Performance::{
     PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
     PDH_COUNTER_INFO_W, PDH_COUNTER_PATH_ELEMENTS_W, PDH_CSTATUS_INVALID_DATA,
     PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_INSTANCE, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE,
     PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY, PDH_INVALID_ARGUMENT,
     PDH_INVALID_DATA, PDH_MORE_DATA, PDH_NO_DATA, PDH_RAW_COUNTER, PDH_REFRESHCOUNTERS,
-    PdhAddCounterW, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-    PdhExpandWildCardPathW, PdhGetCounterInfoW, PdhGetFormattedCounterValue, PdhGetRawCounterValue,
-    PdhOpenQueryW, PdhParseCounterPathW, PdhRemoveCounter,
+    PERF_DETAIL_WIZARD, PdhAddCounterW, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
+    PdhEnumObjectsW, PdhExpandWildCardPathW, PdhGetCounterInfoW, PdhGetFormattedCounterValue,
+    PdhGetRawCounterValue, PdhOpenQueryW, PdhParseCounterPathW, PdhRemoveCounter,
 };
 
 // These flags are not exposed by windows-sys 0.61.2.
 const PDH_FMT_NOSCALE: u32 = 0x0000_1000;
 const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
+const ENGLISH_UI_LANGUAGE: u16 = 0x0409;
+
+pub(super) fn initialize_worker(node: &str, refresh_objects: bool) -> Result<(), Error> {
+    initialize_worker_with(
+        node,
+        refresh_objects,
+        || {
+            // SAFETY: This changes only the calling worker thread's UI language.
+            unsafe { SetThreadUILanguage(ENGLISH_UI_LANGUAGE) }
+        },
+        |refresh, size, buffer| {
+            // SAFETY: Null selects the local live source and machine. The optional
+            // output slice is writable for the supplied UTF-16 element count.
+            unsafe {
+                PdhEnumObjectsW(
+                    null(),
+                    null(),
+                    buffer.map_or(null_mut(), |buffer| buffer.as_mut_ptr()),
+                    size,
+                    PERF_DETAIL_WIZARD,
+                    refresh.into(),
+                )
+            }
+        },
+    )
+}
+
+fn initialize_worker_with(
+    node: &str,
+    refresh_objects: bool,
+    pin_language: impl FnOnce() -> u16,
+    mut enumerate_objects: impl FnMut(bool, &mut u32, Option<&mut [u16]>) -> u32,
+) -> Result<(), Error> {
+    let language_result = pin_language();
+    let mut refresh_status = None;
+    let mut enumeration_status = None;
+    let result = if language_result != ENGLISH_UI_LANGUAGE {
+        Err(Error::WorkerLanguagePin {
+            requested: ENGLISH_UI_LANGUAGE,
+            returned: language_result,
+        })
+    } else if refresh_objects {
+        let mut size = 0;
+        let status = enumerate_objects(true, &mut size, None);
+        refresh_status = Some(status);
+        if status != PDH_MORE_DATA || size == 0 {
+            Err(Error::WorkerObjectRefresh {
+                stage: "refresh sizing",
+                status,
+            })
+        } else {
+            let mut buffer = vec![
+                0_u16;
+                usize::try_from(size).map_err(|_| Error::WorkerObjectRefresh {
+                    stage: "refresh size conversion",
+                    status,
+                })?
+            ];
+            size = u32::try_from(buffer.len()).map_err(|_| Error::WorkerObjectRefresh {
+                stage: "enumeration buffer size",
+                status,
+            })?;
+            let status = enumerate_objects(false, &mut size, Some(&mut buffer));
+            enumeration_status = Some(status);
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(Error::WorkerObjectRefresh {
+                    stage: "enumeration fill",
+                    status,
+                })
+            }
+        }
+    } else {
+        Ok(())
+    };
+    otel_arrow_dfe_telemetry::otel_info!(
+        "windows_perf_counters_receiver.worker.startup",
+        node = node,
+        requested_language_id = ENGLISH_UI_LANGUAGE as u64,
+        language_result = language_result as u64,
+        wildcards_configured = refresh_objects,
+        object_refresh_status = ?refresh_status,
+        object_enumeration_status = ?enumeration_status
+    );
+    result
+}
 
 pub(super) fn check(operation: PdhOperation, path: &str, status: u32) -> Result<(), Error> {
     if status == 0 {
@@ -745,7 +833,109 @@ impl Drop for NativePdh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
     use windows_sys::Win32::System::Performance::PdhFormatFromRawValue;
+
+    /// Scenario: An exact-only worker pins English UI language without refreshing the process-wide PDH object list.
+    /// Guarantees: Exact counters avoid the wildcard-only refresh side effect while still enforcing the language pin.
+    #[test]
+    fn exact_worker_pins_language_without_object_refresh() {
+        initialize_worker_with(
+            "exact",
+            false,
+            || ENGLISH_UI_LANGUAGE,
+            |_, _, _| panic!("exact-only worker must not enumerate objects"),
+        )
+        .unwrap();
+    }
+
+    /// Scenario: A wildcard worker starts on an uninitialized thread and refreshes the object list.
+    /// Guarantees: Pinning precedes one refreshing size call and one non-refreshing fill call.
+    #[test]
+    fn wildcard_worker_pins_then_refreshes_object_list() {
+        let pinned = Cell::new(false);
+        let calls = RefCell::new(Vec::new());
+        initialize_worker_with(
+            "wildcard",
+            true,
+            || {
+                pinned.set(true);
+                ENGLISH_UI_LANGUAGE
+            },
+            |refresh, size, buffer| {
+                assert!(pinned.get());
+                calls.borrow_mut().push((refresh, buffer.is_some()));
+                if buffer.is_none() {
+                    *size = 8;
+                    PDH_MORE_DATA
+                } else {
+                    0
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.into_inner(), [(true, false), (false, true)]);
+    }
+
+    /// Scenario: SetThreadUILanguage fails or returns a language other than en-US.
+    /// Guarantees: Worker startup returns a typed language-pin error before any PDH object refresh.
+    #[test]
+    fn worker_rejects_failed_language_pin() {
+        for returned in [0, 0x0407] {
+            let error = initialize_worker_with(
+                "language-failure",
+                true,
+                || returned,
+                |_, _, _| panic!("failed pin must stop before object enumeration"),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::WorkerLanguagePin {
+                    requested: ENGLISH_UI_LANGUAGE,
+                    returned: actual,
+                } if actual == returned
+            ));
+        }
+    }
+
+    /// Scenario: The pinned wildcard worker cannot refresh or fill the PDH object list.
+    /// Guarantees: Both native stages fail startup with the typed object-refresh error.
+    #[test]
+    fn worker_rejects_failed_object_refresh() {
+        let sizing =
+            initialize_worker_with("refresh-failure", true, || ENGLISH_UI_LANGUAGE, |_, _, _| 5)
+                .unwrap_err();
+        assert!(matches!(
+            sizing,
+            Error::WorkerObjectRefresh {
+                stage: "refresh sizing",
+                status: 5,
+            }
+        ));
+
+        let fill = initialize_worker_with(
+            "fill-failure",
+            true,
+            || ENGLISH_UI_LANGUAGE,
+            |_, size, buffer| {
+                if buffer.is_none() {
+                    *size = 8;
+                    PDH_MORE_DATA
+                } else {
+                    6
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            fill,
+            Error::WorkerObjectRefresh {
+                stage: "enumeration fill",
+                status: 6,
+            }
+        ));
+    }
 
     fn insert_fixture_counter(counters: &mut CounterHandles, path: &str) -> CounterToken {
         let generation = counters.take_generation(path).unwrap();

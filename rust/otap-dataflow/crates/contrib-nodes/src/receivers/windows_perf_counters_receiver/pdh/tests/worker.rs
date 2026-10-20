@@ -60,6 +60,34 @@ impl PdhApi for StartupTestPdh {
     }
 }
 
+/// Scenario: A worker query factory is invoked repeatedly for initial and replacement queries.
+/// Guarantees: Successful native worker initialization runs once, while a failed attempt remains retryable.
+#[test]
+fn worker_initialization_is_armed_only_after_success() {
+    let mut initialized = false;
+    let attempts = Cell::new(0);
+    assert!(
+        initialize_once(&mut initialized, || {
+            attempts.set(attempts.get() + 1);
+            Err(Error::InvalidSample("startup failed"))
+        })
+        .is_err()
+    );
+    assert!(!initialized);
+    initialize_once(&mut initialized, || {
+        attempts.set(attempts.get() + 1);
+        Ok(())
+    })
+    .unwrap();
+    initialize_once(&mut initialized, || {
+        attempts.set(attempts.get() + 1);
+        Ok(())
+    })
+    .unwrap();
+    assert!(initialized);
+    assert_eq!(attempts.get(), 2);
+}
+
 struct RecoveringRefreshPdh {
     add_calls: Arc<std::sync::atomic::AtomicUsize>,
     timestamp: i64,

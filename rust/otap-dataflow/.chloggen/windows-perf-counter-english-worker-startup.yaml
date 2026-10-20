@@ -1,0 +1,5 @@
+change_type: bug_fix
+component: pipeline
+note: Pin Windows performance-counter workers to English and refresh PDH object metadata before wildcard discovery.
+issues: [4074]
+subtext: Wildcard startup now fails explicitly when the worker cannot select en-US or refresh the PDH object list.
