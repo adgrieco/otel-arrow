@@ -299,6 +299,12 @@ timestamps and non-monotonic value decreases alone do not reset it. Projection
 requires `0 < start <= time`; missing or invalid starts are invariant errors.
 This start is an observation boundary, not provider creation time.
 
+Native setup observes shutdown between operations and before priming. A blocked
+PDH call is not cancelled; the worker closes its owned query after that call
+returns. Scrape duration stops at native-result receipt, before projection and
+downstream delivery. After slow collection or delivery, the next scrape waits
+for a future scheduled tick rather than catching up missed ticks.
+
 A delta Sum accepts only the two native delta-count types. Its first valid
 sample establishes an interval baseline and emits no point. Each later point
 uses the immediately preceding valid sample timestamp as its start time.

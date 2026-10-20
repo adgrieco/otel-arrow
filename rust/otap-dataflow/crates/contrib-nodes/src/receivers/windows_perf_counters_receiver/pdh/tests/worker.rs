@@ -2023,6 +2023,32 @@ fn cancelling_startup_stops_between_expansion_and_priming() {
     assert_eq!(state.borrow().calls.collect, 0);
 }
 
+/// Scenario: Stop arrives while the first exact counter is being added during initial query setup.
+/// Guarantees: Setup performs no metadata read, second add, or priming collection after that call returns.
+#[test]
+fn cancelling_startup_stops_between_exact_native_operations() {
+    let first = r"\Memory\Available Bytes";
+    let second = r"\System\Processes";
+    let state = fake_state(vec![
+        fake_counter(first, Number::Integer(42)),
+        fake_counter(second, Number::Integer(2)),
+    ]);
+    state.borrow_mut().stop_after_add = Some(Arc::new(AtomicBool::new(false)));
+    let result = Query::open_with(
+        FakePdh::new(Rc::clone(&state)),
+        vec![counter(first, "memory"), counter(second, "processes")],
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+        256,
+        4_096,
+    );
+    assert!(matches!(result, Err(Error::WorkerInitStopped)));
+    let state = state.borrow();
+    assert_eq!(state.added, [first]);
+    assert_eq!(state.calls.counter_type, 0);
+    assert_eq!(state.calls.collect, 0);
+}
+
 /// Scenario: Initial query opens fail transiently for every slot or beside one healthy isolated slot.
 /// Guarantees: Empty and partial initial state become ready, preserve bounded evidence, and recover without restarting the receiver.
 #[tokio::test(flavor = "current_thread")]

@@ -23,6 +23,7 @@ use super::timing::{
 use super::{PdhApi, ValueFormat};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::System::Performance::PDH_MAX_COUNTER_PATH;
 
@@ -74,9 +75,10 @@ impl Query {
         max_native_counters: usize,
         node: String,
         seed: Option<&QueryRecreationSeed>,
+        shutdown: Arc<AtomicBool>,
     ) -> Result<Self, Error> {
         Self::open_with_cadences_and_seed(
-            NativePdh::open(node)?,
+            NativePdh::open_controlled(node, Some(shutdown))?,
             configs,
             exact_retry_cap,
             wildcard_refresh_interval,
@@ -342,6 +344,7 @@ impl<A: PdhApi> Query<A> {
         seed: Option<&QueryRecreationSeed>,
     ) -> Result<(), Error> {
         for config_index in 0..self.configs.len() {
+            self.api.check_running()?;
             if self.configs[config_index].instance_config.is_wildcard() {
                 continue;
             }
@@ -392,7 +395,9 @@ impl<A: PdhApi> Query<A> {
     }
 
     fn add_counter(&mut self, target: CounterTarget) -> Result<(), Error> {
+        self.api.check_running()?;
         let counter = self.api.add(&target.path)?;
+        self.api.check_running()?;
         let kind = match self
             .api
             .counter_type(&counter, &target.path)
@@ -566,6 +571,7 @@ impl<A: PdhApi> Query<A> {
         config_index: usize,
         metadata: &mut PendingMetadata,
     ) -> Result<(), Error> {
+        self.api.check_running()?;
         let mut desired = self.desired_wildcards_excluding(config_index);
         let expanded_total = self.reserved_wildcards_excluding(config_index);
         let paths = match self.api.expand(&self.configs[config_index].path) {
@@ -589,7 +595,7 @@ impl<A: PdhApi> Query<A> {
             &mut desired,
             expanded_total,
             metadata,
-        );
+        )?;
         self.reconcile_wildcards(desired, metadata)
     }
 
@@ -737,8 +743,9 @@ impl<A: PdhApi> Query<A> {
         desired: &mut DesiredCounters,
         mut expanded_total: usize,
         metadata: &mut PendingMetadata,
-    ) {
+    ) -> Result<(), Error> {
         for discovery in discoveries {
+            self.api.check_running()?;
             let Ok(paths) = discovery.paths else {
                 continue;
             };
@@ -808,6 +815,7 @@ impl<A: PdhApi> Query<A> {
             metadata.record_expansion_overflows(config_index, discovered, allocation);
             expanded_total += paths.len();
             for (key, path) in paths {
+                self.api.check_running()?;
                 match self.api.parse_instance(&path) {
                     Ok(instance) => {
                         let emit_instance_attribute =
@@ -830,6 +838,7 @@ impl<A: PdhApi> Query<A> {
                 }
             }
         }
+        Ok(())
     }
 
     fn restore_rediscovered_pending_removals(&mut self, discovered: &BTreeSet<CounterKey>) {
@@ -1203,6 +1212,7 @@ impl<A: PdhApi> Query<A> {
         emit_monotonic_candidate: bool,
         refresh_wildcards: bool,
     ) -> Result<Sample, Error> {
+        self.api.check_running()?;
         let mut metadata = std::mem::take(&mut self.pending);
         let now = Instant::now();
         if refresh_wildcards

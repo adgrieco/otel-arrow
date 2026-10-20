@@ -8,6 +8,8 @@ use super::{Error, InstanceIdentity, Number, PdhApi, PdhOperation, RawSample, Va
 use std::mem::{size_of, size_of_val};
 use std::ptr::{null, null_mut};
 use std::slice;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Globalization::{GetThreadUILanguage, SetThreadUILanguage};
 use windows_sys::Win32::System::Performance::{
@@ -26,8 +28,13 @@ const PDH_FMT_NOSCALE: u32 = 0x0000_1000;
 const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
 const ENGLISH_UI_LANGUAGE: u16 = 0x0409;
 
-pub(super) fn initialize_worker(node: &str, refresh_objects: bool) -> Result<(), Error> {
-    initialize_worker_with(
+pub(super) fn initialize_worker(
+    node: &str,
+    refresh_objects: bool,
+    shutdown: &AtomicBool,
+) -> Result<(), Error> {
+    check_running(Some(shutdown))?;
+    let result = initialize_worker_with(
         node,
         refresh_objects,
         || {
@@ -38,6 +45,9 @@ pub(super) fn initialize_worker(node: &str, refresh_objects: bool) -> Result<(),
             }
         },
         |refresh, size, buffer| {
+            if check_running(Some(shutdown)).is_err() {
+                return PDH_INVALID_ARGUMENT;
+            }
             // SAFETY: Null selects the local live source and machine. The optional
             // output slice is writable for the supplied UTF-16 element count.
             unsafe {
@@ -51,7 +61,9 @@ pub(super) fn initialize_worker(node: &str, refresh_objects: bool) -> Result<(),
                 )
             }
         },
-    )
+    );
+    check_running(Some(shutdown))?;
+    result
 }
 
 fn initialize_worker_with(
@@ -161,6 +173,10 @@ struct NativeBuffer<T> {
 impl<T: Clone + Default> NativeBuffer<T> {
     fn with_byte_capacity(size: u32, capacity_error: &'static str) -> Result<Self, Error> {
         let elements = (size as usize).div_ceil(size_of::<T>());
+        let bytes = elements
+            .checked_mul(size_of::<T>())
+            .ok_or(Error::InvalidSample(capacity_error))?;
+        let _ = u32::try_from(bytes).map_err(|_| Error::InvalidSample(capacity_error))?;
         let storage = vec![T::default(); elements];
         let buffer = Self { storage };
         let _ = buffer.byte_capacity_u32(capacity_error)?;
@@ -300,21 +316,32 @@ pub(in super::super) struct NativePdh {
     query: PDH_HQUERY,
     counters: CounterHandles,
     node: String,
+    shutdown: Option<Arc<AtomicBool>>,
 }
 
 impl NativePdh {
+    #[cfg(test)]
     pub(super) fn open(node: String) -> Result<Self, Error> {
+        Self::open_controlled(node, None)
+    }
+
+    pub(super) fn open_controlled(
+        node: String,
+        shutdown: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, Error> {
+        check_running(shutdown.as_deref())?;
         let mut query = null_mut();
         // SAFETY: Null selects live local data; the output handle is writable.
         check(PdhOperation::OpenQuery, "<query>", unsafe {
             PdhOpenQueryW(null(), 0, &mut query)
         })?;
         #[cfg(test)]
-        let _ = super::QUERY_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = super::QUERY_OPENS.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             query,
             counters: CounterHandles::new(),
             node,
+            shutdown,
         })
     }
 
@@ -442,9 +469,9 @@ impl NativePdh {
             .ok_or(Error::InvalidSample("wildcard path list size overflowed"))?;
         let mut last_status = PDH_MORE_DATA;
         for _ in 0..8 {
-            let mut buffer = vec![0_u16; capacity];
-            size = u32::try_from(buffer.len())
+            size = u32::try_from(capacity)
                 .map_err(|_| Error::InvalidSample("wildcard path list size exceeds u32"))?;
+            let mut buffer = vec![0_u16; capacity];
             let status = expand(&mut size, Some(&mut buffer));
             if matches!(status, 0 | PDH_CSTATUS_NO_INSTANCE) {
                 if status == PDH_CSTATUS_NO_INSTANCE || size == 0 {
@@ -482,6 +509,9 @@ impl NativePdh {
     fn expand_wildcard(&mut self, path: &str) -> Result<Vec<String>, Error> {
         let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
         let buffer = Self::expanded_path_buffer_with(path, |size, buffer| {
+            if check_running(self.shutdown.as_deref()).is_err() {
+                return PDH_INVALID_ARGUMENT;
+            }
             // SAFETY: The path is NUL-terminated. The optional buffer, when present,
             // is writable for the size supplied to PDH.
             unsafe {
@@ -493,7 +523,9 @@ impl NativePdh {
                     PDH_REFRESHCOUNTERS,
                 )
             }
-        })?;
+        });
+        self.check_running()?;
+        let buffer = buffer?;
         if buffer.is_empty() {
             Ok(Vec::new())
         } else {
@@ -502,8 +534,18 @@ impl NativePdh {
     }
 
     fn parse_instance_identity(path: &str) -> Result<InstanceIdentity, Error> {
+        Self::parse_instance_controlled(path, None)
+    }
+
+    fn parse_instance_controlled(
+        path: &str,
+        shutdown: Option<&AtomicBool>,
+    ) -> Result<InstanceIdentity, Error> {
         let wide_path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
-        Self::parse_instance_identity_with(path, |size, buffer| {
+        let result = Self::parse_instance_identity_with(path, |size, buffer| {
+            if check_running(shutdown).is_err() {
+                return PDH_INVALID_ARGUMENT;
+            }
             // SAFETY: The path is NUL-terminated. Sizing uses null and zero;
             // filling uses an aligned writable slice.
             unsafe {
@@ -514,7 +556,9 @@ impl NativePdh {
                     0,
                 )
             }
-        })
+        });
+        check_running(shutdown)?;
+        result
     }
 
     fn parse_instance_identity_with(
@@ -680,7 +724,12 @@ impl NativePdh {
 impl PdhApi for NativePdh {
     type Counter = CounterToken;
 
+    fn check_running(&self) -> Result<(), Error> {
+        check_running(self.shutdown.as_deref())
+    }
+
     fn add(&mut self, path: &str) -> Result<CounterToken, Error> {
+        self.check_running()?;
         let generation = self.counters.take_generation(path)?;
         let wide_path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
         let mut handle = null_mut();
@@ -703,6 +752,7 @@ impl PdhApi for NativePdh {
     fn counter_type(&mut self, counter: &CounterToken, path: &str) -> Result<u32, Error> {
         let handle = self.counter_handle(counter, path)?;
         Self::counter_type_with(path, |size, buffer| {
+            self.check_running()?;
             let info = if let Some(buffer) = buffer {
                 *size = u32::try_from(size_of_val(buffer)).map_err(|_| {
                     Error::InvalidSample("PdhGetCounterInfoW buffer capacity exceeds u32")
@@ -720,11 +770,13 @@ impl PdhApi for NativePdh {
     }
 
     fn collect(&mut self) -> Result<bool, Error> {
+        self.check_running()?;
         // SAFETY: The adapter owns the live query and is borrowed exclusively.
         Self::collect_status(unsafe { PdhCollectQueryData(self.query) })
     }
 
     fn raw(&mut self, counter: &CounterToken, path: &str) -> Result<Option<RawSample>, Error> {
+        self.check_running()?;
         let handle = self.counter_handle(counter, path)?;
         Self::raw_with(path, |raw| {
             // SAFETY: Lookup returned an owned, live counter and the adapter
@@ -739,6 +791,7 @@ impl PdhApi for NativePdh {
         path: &str,
         format: ValueFormat,
     ) -> Result<Option<Number>, Error> {
+        self.check_running()?;
         let handle = self.counter_handle(counter, path)?;
         Self::formatted_with(path, format, |flags, value| {
             // SAFETY: Lookup returned an owned, live counter and the adapter
@@ -761,7 +814,15 @@ impl PdhApi for NativePdh {
     }
 
     fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
-        Self::parse_instance_identity(path)
+        Self::parse_instance_controlled(path, self.shutdown.as_deref())
+    }
+}
+
+fn check_running(shutdown: Option<&AtomicBool>) -> Result<(), Error> {
+    if shutdown.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+        Err(Error::WorkerInitStopped)
+    } else {
+        Ok(())
     }
 }
 
@@ -771,7 +832,7 @@ impl Drop for NativePdh {
         // its only close path; no counter can be read through this adapter afterward.
         let status = unsafe { PdhCloseQuery(self.query) };
         #[cfg(test)]
-        let _ = super::QUERY_CLOSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = super::QUERY_CLOSES.fetch_add(1, Ordering::Relaxed);
         if status != 0 {
             otel_arrow_dfe_telemetry::otel_warn!(
                 "windows_perf_counters_receiver.query.close.fail",
@@ -1139,6 +1200,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Scenario: Native sizing overflows rounded capacity or wildcard headroom, or returns an unaligned string.
+    /// Guarantees: Overflow fails before allocation and string decoding checks UTF-16 alignment.
+    #[test]
+    fn native_size_overflow_and_pointer_alignment_are_checked() {
+        assert!(matches!(
+            NativeBuffer::<usize>::with_byte_capacity(u32::MAX, "overflow"),
+            Err(Error::InvalidSample("overflow"))
+        ));
+        let error = NativePdh::expanded_path_buffer_with("fixture", |size, buffer| {
+            assert!(
+                buffer.is_none(),
+                "overflow must fail before fill allocation"
+            );
+            *size = u32::MAX;
+            PDH_MORE_DATA
+        })
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidSample(_)));
+        let buffer = NativeBuffer::<usize>::with_byte_capacity(32, "fixture").unwrap();
+        let pointer = buffer.as_ptr::<u8>().wrapping_add(1).cast::<u16>();
+        assert!(matches!(
+            NativePdh::wide_string(pointer, &buffer, 32),
+            Err(Error::InvalidSample(_))
+        ));
     }
 
     /// Scenario: Native metadata strings point outside filled bytes, start in allocation slack, or omit a terminator.

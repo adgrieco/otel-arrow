@@ -109,6 +109,7 @@ struct FakeState {
     expand_error: bool,
     expand_errors: BTreeSet<String>,
     stop_after_expand: Option<Arc<AtomicBool>>,
+    stop_after_add: Option<Arc<AtomicBool>>,
     removed: Vec<usize>,
     expansions: BTreeMap<String, Vec<String>>,
 }
@@ -159,6 +160,20 @@ impl FakePdh {
 impl PdhApi for FakePdh {
     type Counter = FakeCounterToken;
 
+    fn check_running(&self) -> Result<(), Error> {
+        let state = self.state.borrow();
+        if state
+            .stop_after_expand
+            .iter()
+            .chain(state.stop_after_add.iter())
+            .any(|stop| stop.load(Ordering::Acquire))
+        {
+            Err(Error::WorkerInitStopped)
+        } else {
+            Ok(())
+        }
+    }
+
     fn add(&mut self, path: &str) -> Result<Self::Counter, Error> {
         let mut state = self.state.borrow_mut();
         let counter = state
@@ -171,6 +186,9 @@ impl PdhApi for FakePdh {
                 status: 1,
             })?;
         state.added.push(path.to_owned());
+        if let Some(stop) = &state.stop_after_add {
+            stop.store(true, Ordering::Release);
+        }
         if counter >= self.generations.len() {
             self.generations.resize(counter + 1, 0);
         }
@@ -469,6 +487,7 @@ fn fake_state_value(counters: Vec<FakeCounter>) -> FakeState {
         expand_error: false,
         expand_errors: BTreeSet::new(),
         stop_after_expand: None,
+        stop_after_add: None,
         removed: Vec::new(),
         expansions: BTreeMap::new(),
     }

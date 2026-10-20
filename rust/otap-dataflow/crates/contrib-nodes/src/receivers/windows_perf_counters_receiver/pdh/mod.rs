@@ -40,6 +40,11 @@ pub(super) struct RawSample {
 pub(super) trait PdhApi {
     type Counter;
 
+    /// Observe stop between native operations without attempting native cancellation.
+    fn check_running(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
     fn add(&mut self, path: &str) -> Result<Self::Counter, Error>;
     fn remove(&mut self, counter: &Self::Counter, path: &str) -> Result<(), Error>;
     fn counter_type(&mut self, counter: &Self::Counter, path: &str) -> Result<u32, Error>;

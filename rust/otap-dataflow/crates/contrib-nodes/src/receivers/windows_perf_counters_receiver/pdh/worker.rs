@@ -99,11 +99,13 @@ impl Worker {
             has_wildcards,
             initialized: false,
         };
-        Self::start_with(
+        Self::start_controlled(
             counters,
             cadence.retry_cap,
             max_native_counters,
-            move |counters, query_limit, seed| settings.open(counters, query_limit, seed),
+            move |counters, query_limit, seed, shutdown| {
+                settings.open(counters, query_limit, seed, shutdown)
+            },
         )
         .await
     }
@@ -135,6 +137,7 @@ impl Worker {
         .await
     }
 
+    #[cfg(test)]
     pub(super) async fn start_with<A, F>(
         counters: Vec<CounterConfig>,
         query_retry_cap: Duration,
@@ -151,6 +154,32 @@ impl Worker {
             + Send
             + 'static,
     {
+        Self::start_controlled(
+            counters,
+            query_retry_cap,
+            max_native_counters,
+            move |configs, limit, seed, _shutdown| open(configs, limit, seed),
+        )
+        .await
+    }
+
+    async fn start_controlled<A, F>(
+        counters: Vec<CounterConfig>,
+        query_retry_cap: Duration,
+        max_native_counters: usize,
+        mut open: F,
+    ) -> Result<Self, Error>
+    where
+        A: PdhApi + 'static,
+        F: FnMut(
+                Vec<CounterConfig>,
+                usize,
+                Option<&QueryRecreationSeed>,
+                Arc<AtomicBool>,
+            ) -> Result<Query<A>, Error>
+            + Send
+            + 'static,
+    {
         let plans = query_plans(counters);
         let (tx, rx) = mpsc::sync_channel(1);
         let (init_tx, init_rx) = oneshot::channel();
@@ -162,6 +191,10 @@ impl Worker {
         let join = std::thread::Builder::new()
             .name("windows-perf-counters-pdh".to_owned())
             .spawn(move || {
+                let factory_shutdown = Arc::clone(&worker_shutdown);
+                let mut open = |configs, limit, seed: Option<&QueryRecreationSeed>| {
+                    open(configs, limit, seed, Arc::clone(&factory_shutdown))
+                };
                 run_worker_thread(
                     plans,
                     query_retry_cap,
@@ -493,9 +526,10 @@ impl QuerySettings {
         counters: Vec<CounterConfig>,
         max_native_counters: usize,
         seed: Option<&QueryRecreationSeed>,
+        shutdown: Arc<AtomicBool>,
     ) -> Result<Query, Error> {
         initialize_once(&mut self.initialized, || {
-            super::native::initialize_worker(&self.node, self.has_wildcards)
+            super::native::initialize_worker(&self.node, self.has_wildcards, &shutdown)
         })?;
         Query::open_replacement(
             counters,
@@ -505,6 +539,7 @@ impl QuerySettings {
             max_native_counters,
             self.node.clone(),
             seed,
+            shutdown,
         )
     }
 }

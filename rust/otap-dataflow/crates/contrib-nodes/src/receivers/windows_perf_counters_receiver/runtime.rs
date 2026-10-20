@@ -65,7 +65,22 @@ fn failed_counter_value_count(failures: &[SampleFailure]) -> u64 {
         failures
             .iter()
             .filter(|failure| !failure.diagnostic_only)
-            .count(),
+            .filter(|failure| {
+                matches!(
+                    failure.reason,
+                    "PdhGetRawCounterValue"
+                        | "PdhGetFormattedCounterValue"
+                        | "raw counter CStatus"
+                        | "formatted counter CStatus"
+                        | "counter CStatus"
+                        | "calculation"
+                        | "scale"
+                        | "projection"
+                )
+            })
+            .map(|failure| (failure.counter_index, &failure.path))
+            .collect::<BTreeSet<_>>()
+            .len(),
     )
     .unwrap_or(u64::MAX)
 }
@@ -306,7 +321,9 @@ impl WindowsPerfCountersReceiver {
 
     fn record_sample_diagnostics(&self, sample: &Sample) {
         let mut metrics = self.metrics.borrow_mut();
-        metrics.health.apply(&sample.metadata.diagnostics);
+        let mut diagnostics = sample.metadata.diagnostics.clone();
+        diagnostics.counter_read_failures = failed_counter_value_count(&sample.metadata.failures);
+        metrics.health.apply(&diagnostics);
         metrics
             .health
             .failed_counter_values
@@ -450,9 +467,20 @@ impl WindowsPerfCountersReceiver {
         let mut interval = tokio::time::interval(self.config.collection_interval);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut failure_logs = FailureLogState::default();
+        let mut previous_tick = None;
         loop {
+            if let Some(scheduled_tick) = previous_tick
+                && let Some(next_tick) = next_future_collection_tick(
+                    scheduled_tick,
+                    tokio::time::Instant::now(),
+                    self.config.collection_interval,
+                )
+            {
+                interval.reset_at(next_tick);
+            }
             let scheduled_tick = interval.tick().await;
-            let scrape_start = Instant::now();
+            previous_tick = Some(scheduled_tick);
+            let scrape_start = tokio::time::Instant::now();
             let collection = collect();
             tokio::pin!(collection);
             let threshold = self.config.scrape_timeout_threshold();
@@ -461,21 +489,12 @@ impl WindowsPerfCountersReceiver {
                 result = &mut collection => {
                     (result, false)
                 }
-                _ = tokio::time::sleep_until(
-                    tokio::time::Instant::from_std(scrape_start + threshold)
-                ) => {
+                _ = tokio::time::sleep_until(scrape_start + threshold) => {
                     self.metrics.borrow_mut().health.scrape_overruns.inc();
                     failure_logs.log_scrape_timeout(&self.node, threshold);
                     (collection.await, true)
                 }
             };
-            if let Some(next_tick) = next_future_collection_tick(
-                scheduled_tick,
-                tokio::time::Instant::now(),
-                self.config.collection_interval,
-            ) {
-                interval.reset_at(next_tick);
-            }
             let collection_duration = scrape_start.elapsed();
             let sample = match result {
                 Ok(sample) => sample,
@@ -753,6 +772,10 @@ mod tests {
             },
         ];
 
+        let mut failures = failures;
+        let mut duplicate = failures[0].clone();
+        duplicate.reason = "calculation";
+        failures.push(duplicate);
         assert_eq!(failed_counter_value_count(&failures), 1);
     }
 
@@ -836,7 +859,7 @@ mod tests {
         assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
         assert_eq!(metrics.health.scrapes.get(), 1);
         assert_eq!(metrics.health.scrape_failures.get(), 1);
-        assert_eq!(metrics.health.failed_counter_values.get(), 1);
+        assert_eq!(metrics.health.failed_counter_values.get(), 0);
     }
 
     /// Scenario: A concrete counter fails, is absent and omitted on later scrapes, then produces a valid value before failing again.
@@ -1040,30 +1063,44 @@ mod tests {
     }
 
     /// Scenario: Projection and downstream delivery occur after a two-second native collection.
-    /// Guarantees: Scrape duration records only the supplied native collection interval.
+    /// Guarantees: The real collection loop records only collection and waits for a future tick after delayed delivery.
     #[tokio::test(start_paused = true)]
     async fn scrape_duration_excludes_projection_and_delivery() {
         let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
-        let publications = receiver
-            .process_collected_sample(
-                Sample {
-                    timestamp_unix_nano: 10,
-                    members: Vec::new(),
-                    points: vec![sample_point(0, 10, Number::Integer(42))],
-                    metadata: collected_metadata(),
+        let mut receiver = receiver;
+        receiver.config.timeout = Some(Duration::from_secs(30));
+        let origin = tokio::time::Instant::now();
+        let calls = std::cell::Cell::new(0);
+        let result = receiver
+            .collect_and_send_with(
+                || {
+                    let call = calls.get();
+                    calls.set(call + 1);
+                    async move {
+                        if call > 0 {
+                            assert_eq!(origin.elapsed(), Duration::from_secs(13));
+                            return Err(pdh::Error::WorkerStopped);
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        Ok(Sample {
+                            timestamp_unix_nano: 10,
+                            members: Vec::new(),
+                            points: vec![sample_point(0, 10, Number::Integer(42))],
+                            metadata: collected_metadata(),
+                        })
+                    }
                 },
-                Duration::from_secs(2),
-                false,
-                &mut FailureLogState::default(),
                 |_| async {
                     tokio::time::sleep(Duration::from_secs(10)).await;
                     Ok(())
                 },
+                |_| async { Ok(()) },
             )
-            .await
-            .unwrap();
-
-        assert!(publications.is_empty());
+            .await;
+        assert!(matches!(
+            result,
+            Err(CollectionLoopError::Native(pdh::Error::WorkerStopped))
+        ));
         let distribution = receiver.metrics.borrow().health.scrape_duration.get();
         assert_eq!(distribution.summary(), (1, 2.0, 2.0, 2.0));
     }
