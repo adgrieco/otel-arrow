@@ -60,6 +60,62 @@ impl PdhApi for StartupTestPdh {
     }
 }
 
+struct CancellingStartupPdh {
+    shutdown_requested: Arc<AtomicBool>,
+    expansions: Arc<std::sync::atomic::AtomicUsize>,
+    collections: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PdhApi for CancellingStartupPdh {
+    type Counter = String;
+
+    fn add(&mut self, path: &str, _localized: bool) -> Result<Self::Counter, Error> {
+        Ok(path.to_owned())
+    }
+
+    fn remove(&mut self, _counter: &Self::Counter, _path: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn counter_type(&mut self, _counter: &Self::Counter, _path: &str) -> Result<u32, Error> {
+        Ok(0x0001_0100)
+    }
+
+    fn collect(&mut self) -> Result<bool, Error> {
+        let _ = self.collections.fetch_add(1, Ordering::AcqRel);
+        Ok(true)
+    }
+
+    fn raw(&mut self, _counter: &Self::Counter, _path: &str) -> Result<Option<RawSample>, Error> {
+        Ok(None)
+    }
+
+    fn formatted(
+        &mut self,
+        _counter: &Self::Counter,
+        _path: &str,
+        _format: ValueFormat,
+    ) -> Result<Option<Number>, Error> {
+        Ok(Some(Number::Integer(42)))
+    }
+
+    fn timestamp(&mut self) -> Result<i64, Error> {
+        Ok(1)
+    }
+
+    fn expand(&mut self, _path: &str) -> Result<Vec<String>, Error> {
+        let _ = self.expansions.fetch_add(1, Ordering::AcqRel);
+        self.shutdown_requested.store(true, Ordering::Release);
+        Ok(Vec::new())
+    }
+
+    fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
+        Err(Error::InvalidCounterToken {
+            path: path.to_owned(),
+        })
+    }
+}
+
 struct RecoveringRefreshPdh {
     add_calls: Arc<std::sync::atomic::AtomicUsize>,
     timestamp: i64,
@@ -293,6 +349,7 @@ fn wildcard_admission_across_queries_follows_config_order() {
             timestamp_error: false,
             remove_error: false,
             expand_error: false,
+            expand_errors: BTreeSet::new(),
             removed: Vec::new(),
             expansions,
         }));
@@ -469,6 +526,73 @@ fn interleaved_query_failures_keep_global_indices() {
     assert_eq!(states.borrow().len(), 2);
 }
 
+/// Scenario: The only scheduled query fails collection and the following scrape occurs during its recovery backoff.
+/// Guarantees: The worker marks the synthetic recovery-only sample as having no native query collection and no new scrape failure.
+#[test]
+fn recovery_only_sample_reports_no_query_collected() {
+    let path = r"\Unavailable\Value";
+    let state = fake_state(vec![FakeCounter {
+        path: path.to_owned(),
+        native_type: 0x0001_0100,
+        raw: None,
+        multi_count: 1,
+        formatted: Some(Number::Integer(42)),
+        raw_error: false,
+        formatted_error: false,
+    }]);
+    let factory_state = Rc::clone(&state);
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
+        Query::open_with_seed(
+            FakePdh::new(Rc::clone(&factory_state)),
+            configs,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            256,
+            max_native_counters,
+            seed,
+        )
+    };
+    let plan = query_plans(vec![counter(path, "windows.unavailable")])
+        .pop()
+        .unwrap();
+    let mut query = QuerySlot::open_initial(plan, 4_096, &mut open).unwrap();
+    state.borrow_mut().collect_error = true;
+
+    let failure = collect_queries(
+        std::slice::from_mut(&mut query),
+        Duration::from_secs(30),
+        4_096,
+        &mut open,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        failure,
+        Error::Pdh {
+            operation: PdhOperation::CollectQueryData,
+            ..
+        }
+    ));
+
+    let recovery_only = collect_queries(
+        std::slice::from_mut(&mut query),
+        Duration::from_secs(30),
+        4_096,
+        &mut open,
+    )
+    .unwrap();
+    assert!(recovery_only.points.is_empty());
+    assert!(!recovery_only.metadata.diagnostics.any_query_collected);
+    assert_eq!(recovery_only.metadata.diagnostics.scrape_failures, 0);
+    assert_eq!(recovery_only.metadata.failures.len(), 1);
+    assert_eq!(
+        recovery_only.metadata.failures[0].reason,
+        "query_recovery_pending"
+    );
+    assert!(recovery_only.metadata.failures[0].diagnostic_only);
+}
+
 /// Scenario: One isolated query is unavailable at startup and later rebuilds into a permanent mapping error beside a healthy query.
 /// Guarantees: The query-local fatal mapping error is diagnosed without discarding the healthy peer's collected value.
 #[test]
@@ -621,6 +745,7 @@ fn recreated_queries_share_receiver_native_entry_limit() {
             timestamp_error: false,
             remove_error: false,
             expand_error: false,
+            expand_errors: BTreeSet::new(),
             removed: Vec::new(),
             expansions: configs[0]
                 .instance_config
@@ -729,6 +854,7 @@ fn initial_wildcard_reserves_later_exact_native_entry() {
             timestamp_error: false,
             remove_error: false,
             expand_error: false,
+            expand_errors: BTreeSet::new(),
             removed: Vec::new(),
             expansions: [(wildcard_path.to_owned(), expanded.clone())]
                 .into_iter()
@@ -911,6 +1037,7 @@ fn down_query_reserves_seeded_wildcard_membership() {
             timestamp_error: false,
             remove_error: false,
             expand_error: false,
+            expand_errors: BTreeSet::new(),
             removed: Vec::new(),
             expansions: [(path.to_owned(), vec![concrete.to_owned()])]
                 .into_iter()
@@ -975,6 +1102,7 @@ fn failed_rebuild_preserves_down_query_state() {
         timestamp_error: false,
         remove_error: false,
         expand_error: false,
+        expand_errors: BTreeSet::new(),
         removed: Vec::new(),
         expansions: [(path.to_owned(), vec![concrete.to_owned()])]
             .into_iter()
@@ -1199,6 +1327,7 @@ fn exact_reservation_reduces_same_query_expansion_capacity() {
         timestamp_error: false,
         remove_error: false,
         expand_error: false,
+        expand_errors: BTreeSet::new(),
         removed: Vec::new(),
         expansions: [(wildcard_path.to_owned(), expanded)].into_iter().collect(),
     }));
@@ -1987,6 +2116,57 @@ async fn cancelling_startup_stops_between_initialization_units() {
     assert_eq!(open_calls.load(Ordering::Acquire), 1);
 }
 
+/// Scenario: One initial query has multiple wildcard mappings and cancellation arrives during the first expansion.
+/// Guarantees: Startup does not expand the next mapping or prime the partially prepared query.
+#[test]
+fn cancelling_startup_stops_between_expansion_and_priming() {
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let expansions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let collections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut counters = vec![
+        counter(r"\Process(*)\Private Bytes", "process.private"),
+        counter(r"\Thread(*)\% Processor Time", "thread.cpu.time"),
+    ];
+    for config in &mut counters {
+        config.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
+    }
+    let factory_shutdown = Arc::clone(&shutdown_requested);
+    let factory_expansions = Arc::clone(&expansions);
+    let factory_collections = Arc::clone(&collections);
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
+        Query::open_managed_with_seed(
+            CancellingStartupPdh {
+                shutdown_requested: Arc::clone(&factory_shutdown),
+                expansions: Arc::clone(&factory_expansions),
+                collections: Arc::clone(&factory_collections),
+            },
+            configs,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            256,
+            max_native_counters,
+            seed,
+        )
+    };
+
+    let queries = open_initial_queries(
+        query_plans(counters),
+        Duration::from_secs(30),
+        4_096,
+        &mut open,
+        &shutdown_requested,
+    )
+    .unwrap();
+
+    assert!(queries.is_none());
+    assert_eq!(expansions.load(Ordering::Acquire), 1);
+    assert_eq!(collections.load(Ordering::Acquire), 0);
+}
+
 /// Scenario: Initial query opens fail transiently for every slot or beside one healthy isolated slot.
 /// Guarantees: Empty and partial initial state become ready, preserve bounded evidence, and recover without restarting the receiver.
 #[tokio::test(flavor = "current_thread")]
@@ -2044,6 +2224,7 @@ async fn startup_retains_recoverable_empty_and_partial_slots() {
         assert_eq!(first.metadata.failures[0].counter_index, 0);
         assert_eq!(first.metadata.failures[0].reason, "PdhOpenQueryW");
         assert!(first.metadata.failures[0].diagnostic_only);
+        assert_eq!(first.metadata.diagnostics.scrape_failures, 0);
         assert_eq!(first.metadata.diagnostics.query_rebuild_attempts, 1);
         assert_eq!(first.metadata.diagnostics.query_rebuild_recoveries, 1);
 

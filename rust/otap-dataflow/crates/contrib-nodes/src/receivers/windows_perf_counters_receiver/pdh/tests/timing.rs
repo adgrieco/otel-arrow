@@ -334,6 +334,47 @@ fn collection_failures_restart_calculated_readiness() {
     );
 }
 
+/// Scenario: A calculated counter's native base decreases and then advances from the smaller value.
+/// Guarantees: The decrease is omitted while becoming the new baseline, so the next increase emits without another warm-up.
+#[test]
+fn calculated_base_decrease_preserves_new_baseline() {
+    let path = r"\PhysicalDisk(_Total)\Avg. Disk sec/Transfer";
+    let (state, mut query) = fake_query(
+        vec![counter(path, "windows.disk.average_latency")],
+        vec![FakeCounter {
+            path: path.to_owned(),
+            native_type: 0x4002_0500,
+            raw: Some(10),
+            multi_count: 1,
+            formatted: Some(Number::Double(4.0)),
+            raw_error: false,
+            formatted_error: false,
+        }],
+    );
+
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Warming
+    );
+    state.borrow_mut().counters[0].raw = Some(12);
+    assert!(matches!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Value(Number::Double(4.0))
+    ));
+
+    state.borrow_mut().counters[0].raw = Some(5);
+    assert_eq!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::NoObservation
+    );
+
+    state.borrow_mut().counters[0].raw = Some(6);
+    assert!(matches!(
+        query.collect().unwrap().points[0].value,
+        SampleValue::Value(Number::Double(4.0))
+    ));
+}
+
 /// Scenario: Elapsed-time, raw-fraction, and large raw-fraction counters each have one valid collected sample.
 /// Guarantees: Every formatted single-sample formula emits immediately, accepts a zero native base through PDH formatting, and performs no raw read.
 #[test]

@@ -784,6 +784,7 @@ fn high_cardinality_collection_preserves_native_call_counts() {
         timestamp_error: false,
         remove_error: false,
         expand_error: false,
+        expand_errors: BTreeSet::new(),
         removed: Vec::new(),
         expansions: [(template.to_owned(), paths)].into_iter().collect(),
     }));
@@ -837,6 +838,7 @@ fn setup_cleanup_failure_requires_query_rebuild() {
         timestamp_error: false,
         remove_error: true,
         expand_error: false,
+        expand_errors: BTreeSet::new(),
         removed: Vec::new(),
         expansions: BTreeMap::new(),
     }));
@@ -1631,27 +1633,106 @@ fn expansion_limits_are_deterministic_and_report_omissions() {
 /// Guarantees: Failed-discovery retention reserves global capacity before successful discoveries regardless of configuration order.
 #[test]
 fn failed_discovery_retention_reserves_global_capacity_first() {
-    let total_limit = 4;
-    let failed = expansion_allocation(3, 10, total_limit);
-    let success = expansion_allocation(3, 10, total_limit - failed.retained);
+    let first_template = r"\Process(*)\Private Bytes";
+    let second_template = r"\Thread(*)\Context Switches/sec";
+    let first_paths = [
+        r"\Process(alpha)\Private Bytes",
+        r"\Process(bravo)\Private Bytes",
+        r"\Process(charlie)\Private Bytes",
+    ];
+    let second_paths = [
+        r"\Thread(alpha)\Context Switches/sec",
+        r"\Thread(bravo)\Context Switches/sec",
+        r"\Thread(charlie)\Context Switches/sec",
+    ];
+    let wildcard = |path: &str, name: &str| {
+        let mut config = counter(path, name);
+        config.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
+        config
+    };
+    let counters = first_paths
+        .iter()
+        .chain(second_paths.iter())
+        .enumerate()
+        .map(|(index, path)| FakeCounter {
+            path: (*path).to_owned(),
+            native_type: 0x0001_0100,
+            raw: None,
+            multi_count: 1,
+            formatted: Some(Number::Integer(i64::try_from(index + 1).unwrap())),
+            raw_error: false,
+            formatted_error: false,
+        })
+        .collect();
+    let (state, mut query) = fake_query_with_seed(
+        vec![
+            wildcard(first_template, "process.private"),
+            wildcard(second_template, "thread.context_switches"),
+        ],
+        counters,
+        Duration::ZERO,
+        Duration::from_secs(30),
+        4,
+        None,
+    );
 
+    let _ = state.borrow_mut().expansions.insert(
+        second_template.to_owned(),
+        second_paths.iter().map(|path| (*path).to_owned()).collect(),
+    );
+    query.refresh_wildcard_config_managed(1).unwrap();
+    assert_eq!(query.active_expanded_count(), 3);
+
+    {
+        let mut state = state.borrow_mut();
+        let _ = state.expand_errors.insert(second_template.to_owned());
+        let _ = state.expansions.insert(
+            first_template.to_owned(),
+            first_paths.iter().map(|path| (*path).to_owned()).collect(),
+        );
+    }
+    query.refresh_wildcard_config_managed(1).unwrap();
+    query.refresh_wildcard_config_managed(0).unwrap();
+    query.finish_managed_wildcard_refresh();
+
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points.len(), 4);
     assert_eq!(
-        failed,
-        ExpansionAllocation {
-            retained: 3,
-            per_wildcard_omitted: 0,
-            total_omitted: 0,
-        }
+        sample
+            .points
+            .iter()
+            .filter(|point| point.counter_index == 0)
+            .count(),
+        1
     );
     assert_eq!(
-        success,
-        ExpansionAllocation {
+        sample
+            .points
+            .iter()
+            .filter(|point| point.counter_index == 1)
+            .count(),
+        3
+    );
+    assert!(
+        sample
+            .points
+            .iter()
+            .all(|point| matches!(point.value, SampleValue::Value(Number::Integer(_))))
+    );
+    assert_eq!(sample.metadata.diagnostics.active_expanded_counters, 4);
+    assert_eq!(sample.metadata.diagnostics.discovery_failures, 1);
+    assert_eq!(
+        sample.metadata.overflows,
+        [ExpansionOverflow {
+            counter_index: 0,
+            reason: "receiver_total",
+            discovered: 3,
             retained: 1,
-            per_wildcard_omitted: 0,
-            total_omitted: 2,
-        }
+            omitted: 2,
+        }]
     );
-    assert_eq!(failed.retained + success.retained, total_limit);
 }
 
 /// Scenario: Refresh returns the same duplicate-name membership in a different order.

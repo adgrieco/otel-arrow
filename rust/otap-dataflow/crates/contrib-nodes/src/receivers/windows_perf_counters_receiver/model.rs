@@ -144,6 +144,8 @@ pub(super) struct ExpansionOverflow {
 /// Bounded operational changes observed while producing one sample.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct SampleDiagnostics {
+    /// Whether at least one scheduled query reached native collection for this scrape.
+    pub(super) any_query_collected: bool,
     /// Number of currently active expanded wildcard counters.
     pub(super) active_expanded_counters: usize,
     /// Number of wildcard discovery refreshes attempted.
@@ -422,6 +424,7 @@ impl Sample {
 }
 
 pub(super) fn merge_diagnostics(target: &mut SampleDiagnostics, delta: SampleDiagnostics) {
+    target.any_query_collected |= delta.any_query_collected;
     target.discovery_refreshes += delta.discovery_refreshes;
     target.discovery_failures += delta.discovery_failures;
     target.instances_added += delta.instances_added;

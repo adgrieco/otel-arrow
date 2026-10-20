@@ -36,6 +36,30 @@ pub const WINDOWSPERFCOUNTERS_RECEIVER_URN: &str = "urn:otel:receiver:windowsper
 const WORKER_SHUTDOWN_MAX_WAIT: Duration = Duration::from_secs(1);
 const PIPELINE_COMPLETION_RESERVE: Duration = Duration::from_millis(500);
 
+fn next_future_collection_tick(
+    scheduled_tick: tokio::time::Instant,
+    now: tokio::time::Instant,
+    period: Duration,
+) -> Option<tokio::time::Instant> {
+    if period.is_zero() {
+        return None;
+    }
+    let elapsed = now.saturating_duration_since(scheduled_tick);
+    if elapsed < period {
+        return None;
+    }
+    let mut periods = elapsed.as_nanos() / period.as_nanos() + 1;
+    let mut next = scheduled_tick;
+    while periods > 0 {
+        let step = u32::try_from(periods.min(u128::from(u32::MAX))).unwrap_or(u32::MAX);
+        next += period
+            .checked_mul(step)
+            .expect("collection cadence duration must fit");
+        periods -= u128::from(step);
+    }
+    Some(next)
+}
+
 fn failed_counter_value_count(failures: &[SampleFailure]) -> u64 {
     u64::try_from(
         failures
@@ -259,6 +283,17 @@ impl WindowsPerfCountersReceiver {
         self.record_sample_diagnostics(sample);
     }
 
+    fn record_recovery_only_sample(&self, collection_duration: Duration, sample: &Sample) {
+        let mut metrics = self.metrics.borrow_mut();
+        metrics.record_scrape(Outcome::Failure);
+        metrics
+            .health
+            .scrape_duration
+            .record(collection_duration.as_secs_f64());
+        drop(metrics);
+        self.record_sample_diagnostics(sample);
+    }
+
     fn log_sample_events(&self, sample: &Sample) {
         for overflow in &sample.metadata.overflows {
             let path_template = &self.config.counters[overflow.counter_index].path;
@@ -321,8 +356,12 @@ impl WindowsPerfCountersReceiver {
                 return Err(CollectionLoopError::Projection(err));
             }
         };
-        self.record_successful_sample(collection_duration, &sample);
-        failure_logs.record_success(!overrun);
+        if sample.metadata.diagnostics.any_query_collected {
+            self.record_successful_sample(collection_duration, &sample);
+            failure_logs.record_success(!overrun);
+        } else {
+            self.record_recovery_only_sample(collection_duration, &sample);
+        }
         self.log_sample_events(&sample);
         failure_logs
             .log_counter_failures(self, &sample)
@@ -376,7 +415,7 @@ impl WindowsPerfCountersReceiver {
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut failure_logs = FailureLogState::default();
         loop {
-            let _ = interval.tick().await;
+            let scheduled_tick = interval.tick().await;
             let scrape_start = Instant::now();
             let collection = collect();
             tokio::pin!(collection);
@@ -394,6 +433,13 @@ impl WindowsPerfCountersReceiver {
                     (collection.await, true)
                 }
             };
+            if let Some(next_tick) = next_future_collection_tick(
+                scheduled_tick,
+                tokio::time::Instant::now(),
+                self.config.collection_interval,
+            ) {
+                interval.reset_at(next_tick);
+            }
             let collection_duration = scrape_start.elapsed();
             let sample = match result {
                 Ok(sample) => sample,
@@ -571,14 +617,23 @@ mod tests {
         Aggregation, CounterConfig, InstanceConfig, MetricKind,
     };
     use crate::receivers::windows_perf_counters_receiver::model::{
-        MonotonicPublicationCandidate, Number, SamplePoint, SampleValue,
+        MonotonicPublicationCandidate, Number, PendingMetadata, SampleDiagnostics, SamplePoint,
+        SampleValue,
     };
     use arrow::array::TimestampNanosecondArray;
     use otel_arrow_dfe_config::node::NodeUserConfig;
+    use otel_arrow_dfe_engine::capability::registry::Capabilities;
     use otel_arrow_dfe_engine::testing::receiver::TestRuntime;
     use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_ctx};
+    use otel_arrow_dfe_otap::OTAP_PIPELINE_FACTORY;
     use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric;
+    use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryIntoWithOptions};
+    use otel_arrow_dfe_pdata_codec::OtapPayload;
     use otel_arrow_dfe_pdata_codec::PayloadData;
+    use prost::Message;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -630,6 +685,16 @@ mod tests {
         }
     }
 
+    fn collected_metadata() -> PendingMetadata {
+        PendingMetadata {
+            diagnostics: SampleDiagnostics {
+                any_query_collected: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     /// Scenario: A sample contains one value failure and one query-level log entry.
     /// Guarantees: Only the actual counter-value omission contributes to failed-value metrics.
     #[test]
@@ -652,6 +717,87 @@ mod tests {
         ];
 
         assert_eq!(failed_counter_value_count(&failures), 1);
+    }
+
+    /// Scenario: One partial sample contains a failed query open and the next sample is empty only because that query remains in recovery.
+    /// Guarantees: The partial sample succeeds, recovery-only counts as an attempt failure, and only the failed open increments query-failure health.
+    #[tokio::test]
+    async fn failed_open_and_recovery_only_sample_have_distinct_accounting() {
+        let mut unavailable = test_counter(BTreeMap::new());
+        unavailable.path = r"\Unavailable\Value".to_owned();
+        unavailable.name = Arc::from("windows.unavailable");
+        let receiver = test_receiver(vec![test_counter(BTreeMap::new()), unavailable]);
+        let mut failure_logs = FailureLogState::default();
+        let sends = Rc::new(std::cell::Cell::new(0_usize));
+
+        let failed_open = Sample {
+            timestamp_unix_nano: 100,
+            points: vec![sample_point(0, 100, Number::Integer(42))],
+            metadata: PendingMetadata {
+                diagnostics: SampleDiagnostics {
+                    any_query_collected: true,
+                    scrape_failures: 1,
+                    ..Default::default()
+                },
+                failures: vec![SampleFailure {
+                    counter_index: 1,
+                    path: Arc::from(r"\Unavailable\Value"),
+                    reason: "PdhOpenQueryW",
+                    error: "PDH status 0x00000001".to_owned(),
+                    diagnostic_only: false,
+                }],
+                overflows: Vec::new(),
+            },
+        };
+        let sent = Rc::clone(&sends);
+        let publications = receiver
+            .process_collected_sample(
+                failed_open,
+                Duration::from_millis(1),
+                false,
+                &mut failure_logs,
+                move |_| {
+                    sent.set(sent.get() + 1);
+                    async { Ok(()) }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(publications.is_empty());
+
+        let recovery_only = Sample {
+            timestamp_unix_nano: 110,
+            points: Vec::new(),
+            metadata: PendingMetadata {
+                failures: vec![SampleFailure {
+                    counter_index: 1,
+                    path: Arc::from(r"\Unavailable\Value"),
+                    reason: "query_recovery_pending",
+                    error: "recovery deferred".to_owned(),
+                    diagnostic_only: true,
+                }],
+                ..Default::default()
+            },
+        };
+        let publications = receiver
+            .process_collected_sample(
+                recovery_only,
+                Duration::from_millis(1),
+                false,
+                &mut failure_logs,
+                |_| async { panic!("empty recovery sample must not be sent") },
+            )
+            .await
+            .unwrap();
+        assert!(publications.is_empty());
+
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(sends.get(), 1);
+        assert_eq!(metrics.scrape_attempts(Outcome::Success), 1);
+        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
+        assert_eq!(metrics.health.scrapes.get(), 1);
+        assert_eq!(metrics.health.scrape_failures.get(), 1);
+        assert_eq!(metrics.health.failed_counter_values.get(), 1);
     }
 
     /// Scenario: A concrete counter fails, is absent and omitted on later scrapes, then produces a valid value before failing again.
@@ -690,7 +836,7 @@ mod tests {
                 monotonic_publication: None,
                 value: SampleValue::NoObservation,
             }],
-            metadata: Default::default(),
+            metadata: collected_metadata(),
         };
         state.log_counter_failures(&receiver, &omitted).unwrap();
         assert_eq!(state.active_counter_failures.len(), 1);
@@ -698,7 +844,7 @@ mod tests {
         let recovered = Sample {
             timestamp_unix_nano: 40,
             points: vec![sample_point(0, 40, Number::Integer(42))],
-            metadata: Default::default(),
+            metadata: collected_metadata(),
         };
         state.log_counter_failures(&receiver, &recovered).unwrap();
         assert!(state.active_counter_failures.is_empty());
@@ -798,7 +944,7 @@ mod tests {
                 Sample {
                     timestamp_unix_nano: 10,
                     points: vec![sample_point(1, 10, Number::Integer(42))],
-                    metadata: Default::default(),
+                    metadata: collected_metadata(),
                 },
                 Duration::ZERO,
                 false,
@@ -831,7 +977,7 @@ mod tests {
                 Sample {
                     timestamp_unix_nano: 10,
                     points: vec![sample_point(0, 10, Number::Integer(42))],
-                    metadata: Default::default(),
+                    metadata: collected_metadata(),
                 },
                 Duration::from_secs(2),
                 false,
@@ -870,7 +1016,7 @@ mod tests {
                 Ok(Sample {
                     timestamp_unix_nano: timestamp,
                     points: vec![sample_point(0, timestamp, Number::Integer(call as i64))],
-                    metadata: Default::default(),
+                    metadata: collected_metadata(),
                 })
             }
         };
@@ -951,7 +1097,7 @@ mod tests {
                             Ok(Sample {
                                 timestamp_unix_nano: 100,
                                 points: vec![sample_point(0, 100, Number::Integer(1))],
-                                metadata: Default::default(),
+                                metadata: collected_metadata(),
                             })
                         } else {
                             Err(pdh::Error::WorkerStopped)
@@ -1049,7 +1195,7 @@ mod tests {
                         Ok(Sample {
                             timestamp_unix_nano: 100,
                             points: vec![sample_point(0, 100, Number::Integer(1))],
-                            metadata: Default::default(),
+                            metadata: collected_metadata(),
                         })
                     }
                 },
@@ -1110,7 +1256,7 @@ mod tests {
                         )),
                         value: SampleValue::Value(Number::Integer(call as i64 + 1)),
                     }],
-                    metadata: Default::default(),
+                    metadata: collected_metadata(),
                 };
                 if call == 0 {
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1212,7 +1358,7 @@ mod tests {
                     Ok(Sample {
                         timestamp_unix_nano: 100,
                         points: vec![sample_point(0, 100, Number::Integer(1))],
-                        metadata: Default::default(),
+                        metadata: collected_metadata(),
                     })
                 }
             },
@@ -1280,7 +1426,7 @@ mod tests {
                             Ok(Sample {
                                 timestamp_unix_nano: 100,
                                 points: vec![sample_point(0, 100, Number::Integer(1))],
-                                metadata: Default::default(),
+                                metadata: collected_metadata(),
                             })
                         } else {
                             Err(pdh::Error::WorkerStopped)
@@ -1321,7 +1467,7 @@ mod tests {
                             Ok(Sample {
                                 timestamp_unix_nano: 100,
                                 points: vec![sample_point(0, 100, Number::Integer(1))],
-                                metadata: Default::default(),
+                                metadata: collected_metadata(),
                             })
                         } else {
                             Err(pdh::Error::WorkerStopped)
@@ -1443,6 +1589,154 @@ mod tests {
             .run_validation(|_| async {});
     }
 
+    /// Scenario: The registered factory starts a live receiver with exact, aggregate, wildcard, and unavailable peer mappings.
+    /// Guarantees: The engine handoff decodes to Memory, _Total, and startup-expanded metrics while the unavailable peer is omitted.
+    #[test]
+    #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+    fn live_factory_collects_decodes_and_hands_off_metrics() {
+        let test_runtime = TestRuntime::<OtapPdata>::new();
+        let (pipeline, _) = test_pipeline_ctx();
+        let factory = OTAP_PIPELINE_FACTORY
+            .get_receiver_factory_map()
+            .get(WINDOWSPERFCOUNTERS_RECEIVER_URN)
+            .expect("registered windowsperfcounters factory");
+        let mut node_config = NodeUserConfig::new_receiver_config(WINDOWSPERFCOUNTERS_RECEIVER_URN);
+        node_config.config = serde_json::json!({
+            "metrics": {
+                "windows.memory.available": {
+                    "unit": "By",
+                    "gauge": {}
+                },
+                "windows.processor.time": {
+                    "unit": "%",
+                    "gauge": {}
+                },
+                "windows.process.id": {
+                    "unit": "1",
+                    "gauge": {}
+                },
+                "windows.memory.missing": {
+                    "unit": "By",
+                    "gauge": {}
+                }
+            },
+            "perfcounters": [
+                {
+                    "object": "Memory",
+                    "counters": [{
+                        "name": "Available Bytes",
+                        "metric": "windows.memory.available"
+                    }]
+                },
+                {
+                    "object": "Processor",
+                    "instances": ["_Total"],
+                    "counters": [{
+                        "name": "% Processor Time",
+                        "metric": "windows.processor.time"
+                    }]
+                },
+                {
+                    "object": "Process",
+                    "instances": ["*"],
+                    "counters": [{
+                        "name": "ID Process",
+                        "metric": "windows.process.id"
+                    }]
+                },
+                {
+                    "object": "Memory",
+                    "counters": [{
+                        "name": "otel-arrow-nonexistent-counter",
+                        "metric": "windows.memory.missing"
+                    }]
+                }
+            ],
+            "collection_interval": "10s",
+            "initial_delay": "500ms",
+            "timeout": "5s",
+            "wildcard_refresh_interval": "30s",
+            "max_instances_per_wildcard": 256,
+            "max_expanded_counters": 512
+        });
+        let receiver = (factory.create)(
+            pipeline,
+            test_node(test_runtime.config().name.clone()),
+            Arc::new(node_config),
+            test_runtime.config(),
+            &Capabilities::empty(),
+        )
+        .expect("factory should create the live receiver");
+
+        test_runtime
+            .set_receiver(receiver)
+            .run_test(|ctx| async move {
+                ctx.sleep(Duration::from_millis(1_500)).await;
+                ctx.send_shutdown(
+                    Instant::now() + Duration::from_secs(3),
+                    "live factory handoff complete",
+                )
+                .await
+                .unwrap();
+            })
+            .run_validation(|mut ctx| async move {
+                let pdata = ctx
+                    .recv()
+                    .await
+                    .expect("receiver should hand off one batch");
+                let (_, payload) = pdata.into_parts();
+                let PayloadData::OtapRecords(records) = payload.into_data() else {
+                    panic!("factory handoff must contain decoded OTAP records");
+                };
+                let bytes: OtlpProtoBytes = OtapPayload::from_otap(records)
+                    .try_into_with_default()
+                    .expect("OTAP records should decode to OTLP");
+                let request = ExportMetricsServiceRequest::decode(bytes.as_bytes())
+                    .expect("decoded OTLP metrics request");
+                let metrics = request
+                    .resource_metrics
+                    .iter()
+                    .flat_map(|resource| &resource.scope_metrics)
+                    .flat_map(|scope| &scope.metrics)
+                    .collect::<Vec<_>>();
+                let metric = |name: &str| metrics.iter().find(|metric| metric.name == name);
+
+                let memory = metric("windows.memory.available").expect("Memory metric");
+                let Some(metric::Data::Gauge(memory)) = &memory.data else {
+                    panic!("Memory metric must be a Gauge");
+                };
+                assert_eq!(memory.data_points.len(), 1);
+
+                let processor = metric("windows.processor.time").expect("_Total metric");
+                let Some(metric::Data::Gauge(processor)) = &processor.data else {
+                    panic!("_Total metric must be a Gauge");
+                };
+                assert_eq!(processor.data_points.len(), 1);
+                let aggregate = processor.data_points[0]
+                    .attributes
+                    .iter()
+                    .find(|attribute| attribute.key == "windows.perf_counter.instance")
+                    .expect("_Total instance identity");
+                assert!(matches!(
+                    aggregate.value.as_ref().and_then(|value| value.value.as_ref()),
+                    Some(any_value::Value::StringValue(value)) if value == "_Total"
+                ));
+
+                let process = metric("windows.process.id").expect("expanded Process metric");
+                let Some(metric::Data::Gauge(process)) = &process.data else {
+                    panic!("expanded Process metric must be a Gauge");
+                };
+                assert!(!process.data_points.is_empty());
+                assert!(process.data_points.iter().all(|point| {
+                    point
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute.key == "windows.perf_counter.instance")
+                }));
+                assert!(metric("windows.memory.missing").is_none());
+            });
+    }
+
     /// Scenario: The engine requests ingress drain and shutdown from a live receiver.
     /// Guarantees: Both lifecycle paths stop the PDH worker and complete before their deadlines.
     #[test]
@@ -1452,31 +1746,95 @@ mod tests {
         run_live_lifecycle(false);
     }
 
-    /// Scenario: One collection spans several scheduled interval ticks.
-    /// Guarantees: One immediate tick follows the overrun, then cadence resumes without a burst of every missed scrape.
+    async fn loop_collection_start_offsets(
+        period: Duration,
+        timeout: Option<Duration>,
+        first_collection_duration: Duration,
+    ) -> Vec<Duration> {
+        let mut receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        receiver.config.collection_interval = period;
+        receiver.config.timeout = timeout;
+        let origin = tokio::time::Instant::now();
+        let starts = Rc::new(RefCell::new(Vec::new()));
+        let collect_starts = Rc::clone(&starts);
+        let result = receiver
+            .collect_and_send_with(
+                move || {
+                    let call = collect_starts.borrow().len();
+                    collect_starts
+                        .borrow_mut()
+                        .push(tokio::time::Instant::now().duration_since(origin));
+                    async move {
+                        if call > 0 {
+                            return Err(pdh::Error::WorkerStopped);
+                        }
+                        tokio::time::sleep(first_collection_duration).await;
+                        Ok(Sample {
+                            timestamp_unix_nano: 100,
+                            points: vec![sample_point(0, 100, Number::Integer(1))],
+                            metadata: PendingMetadata {
+                                diagnostics: SampleDiagnostics {
+                                    any_query_collected: true,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                        })
+                    }
+                },
+                |_| async { Ok(()) },
+                |_| async { Ok(()) },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(CollectionLoopError::Native(pdh::Error::WorkerStopped))
+        ));
+        starts.borrow().clone()
+    }
+
+    /// Scenario: Timeout is omitted and one collection spans multiple original cadence points.
+    /// Guarantees: The loop skips elapsed ticks and starts next at the first future point on the original schedule.
     #[tokio::test(start_paused = true)]
-    async fn missed_collection_ticks_are_skipped() {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let _ = interval.tick().await;
+    async fn no_timeout_skips_to_next_original_cadence_point() {
+        assert_eq!(
+            loop_collection_start_offsets(
+                Duration::from_millis(10),
+                None,
+                Duration::from_millis(25),
+            )
+            .await,
+            [Duration::ZERO, Duration::from_millis(30)]
+        );
+    }
 
-        tokio::time::advance(Duration::from_millis(3_500)).await;
-        let _ = interval.tick().await;
-        let next = interval.tick();
-        tokio::pin!(next);
-        tokio::select! {
-            biased;
-            _ = &mut next => panic!("missed ticks queued an immediate extra scrape"),
-            () = tokio::task::yield_now() => {}
-        }
+    /// Scenario: Timeout exceeds the period and collection finishes after multiple scheduled ticks but before timeout.
+    /// Guarantees: Missed cadence is detected independently of timeout telemetry and no immediate catch-up collection runs.
+    #[tokio::test(start_paused = true)]
+    async fn long_timeout_still_skips_missed_collection_ticks() {
+        assert_eq!(
+            loop_collection_start_offsets(
+                Duration::from_millis(10),
+                Some(Duration::from_millis(50)),
+                Duration::from_millis(25),
+            )
+            .await,
+            [Duration::ZERO, Duration::from_millis(30)]
+        );
+    }
 
-        tokio::time::advance(Duration::from_millis(499)).await;
-        tokio::select! {
-            biased;
-            _ = &mut next => panic!("next scrape ran before the cadence boundary"),
-            () = tokio::task::yield_now() => {}
-        }
-        tokio::time::advance(Duration::from_millis(1)).await;
-        let _ = next.await;
+    /// Scenario: Timeout is shorter than the period and collection crosses timeout but finishes before the next scheduled tick.
+    /// Guarantees: Overrun telemetry does not move or drop the still-future original cadence point.
+    #[tokio::test(start_paused = true)]
+    async fn short_timeout_preserves_unmissed_collection_tick() {
+        assert_eq!(
+            loop_collection_start_offsets(
+                Duration::from_millis(20),
+                Some(Duration::from_millis(5)),
+                Duration::from_millis(10),
+            )
+            .await,
+            [Duration::ZERO, Duration::from_millis(20)]
+        );
     }
 }

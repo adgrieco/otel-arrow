@@ -404,7 +404,14 @@ where
             open,
         )?);
     }
-    prepare_initial_queries(&mut queries, query_retry_cap, max_native_counters)?;
+    if !prepare_initial_queries(
+        &mut queries,
+        query_retry_cap,
+        max_native_counters,
+        shutdown_requested,
+    )? {
+        return Ok(None);
+    }
     Ok(Some(queries))
 }
 
@@ -1054,12 +1061,14 @@ where
     F: FnMut(Vec<CounterConfig>, usize, Option<&QueryRecreationSeed>) -> Result<Query<A>, Error>,
 {
     let now = Instant::now();
-    let mut refresh_errors = refresh_wildcards_in_config_order(queries, max_native_counters);
+    let (mut refresh_errors, _) =
+        refresh_wildcards_in_config_order(queries, max_native_counters, None);
     let mut samples = Vec::with_capacity(queries.len());
     let mut recreation_eligible = vec![false; queries.len()];
     let mut first_collection_error = None;
     let mut query_failures = Vec::new();
     let mut scrape_failure_observed = false;
+    let mut any_query_collected = false;
     for query_index in 0..queries.len() {
         let refresh_failed = refresh_errors[query_index].is_some();
         if let Some(error) = refresh_errors[query_index].take() {
@@ -1077,6 +1086,7 @@ where
         let generation_before_collection = query.query_generation;
         match query.collect(now, query_retry_cap, query_limit, open) {
             Ok(sample) => {
+                any_query_collected = true;
                 recreation_eligible[query_index] =
                     !refresh_failed && query.query_generation == generation_before_collection;
                 samples.push(query.remap_sample(sample)?);
@@ -1107,6 +1117,7 @@ where
         )));
     }
     let mut sample = merge_query_samples(samples)?;
+    sample.metadata.diagnostics.any_query_collected = any_query_collected;
     if !query_failures.is_empty() {
         sample.metadata.merge(PendingMetadata {
             diagnostics: SampleDiagnostics {
@@ -1136,9 +1147,14 @@ fn prepare_initial_queries<A: PdhApi>(
     queries: &mut [QuerySlot<A>],
     query_retry_cap: Duration,
     max_native_counters: usize,
-) -> Result<(), Error> {
+    shutdown_requested: &AtomicBool,
+) -> Result<bool, Error> {
     let now = Instant::now();
-    let mut refresh_errors = refresh_wildcards_in_config_order(queries, max_native_counters);
+    let (mut refresh_errors, stopped) =
+        refresh_wildcards_in_config_order(queries, max_native_counters, Some(shutdown_requested));
+    if stopped {
+        return Ok(false);
+    }
     for (query_index, error) in refresh_errors.iter_mut().enumerate() {
         let Some(error) = error.take() else {
             continue;
@@ -1152,6 +1168,9 @@ fn prepare_initial_queries<A: PdhApi>(
         slot.update_refresh_recovery_state(now, query_retry_cap, &error);
     }
     for slot in queries {
+        if shutdown_requested.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         let Some(query) = slot.query.as_mut() else {
             continue;
         };
@@ -1168,13 +1187,14 @@ fn prepare_initial_queries<A: PdhApi>(
             slot.next_query_retry = now;
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn refresh_wildcards_in_config_order<A: PdhApi>(
     queries: &mut [QuerySlot<A>],
     max_native_counters: usize,
-) -> Vec<Option<Error>> {
+    shutdown_requested: Option<&AtomicBool>,
+) -> (Vec<Option<Error>>, bool) {
     let now = Instant::now();
     let due = queries
         .iter()
@@ -1208,6 +1228,9 @@ fn refresh_wildcards_in_config_order<A: PdhApi>(
         .take(queries.len())
         .collect::<Vec<_>>();
     for (_, query_index, config_index) in tasks {
+        if shutdown_requested.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+            return (errors, true);
+        }
         if errors[query_index].is_some() {
             continue;
         }
@@ -1232,7 +1255,7 @@ fn refresh_wildcards_in_config_order<A: PdhApi>(
             }
         }
     }
-    errors
+    (errors, false)
 }
 
 fn query_native_limit<A: PdhApi>(

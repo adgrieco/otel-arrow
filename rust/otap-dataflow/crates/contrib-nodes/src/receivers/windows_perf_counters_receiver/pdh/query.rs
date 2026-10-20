@@ -1644,7 +1644,6 @@ impl<C> CounterHandle<C> {
         if self.kind == CounterKind::CalculatedTwoSampleWithBase {
             match raw.second_value.cmp(&previous) {
                 std::cmp::Ordering::Less => {
-                    self.reset_readiness();
                     return Ok(Some(SampleValue::NoObservation));
                 }
                 std::cmp::Ordering::Equal => {

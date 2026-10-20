@@ -95,6 +95,7 @@ struct FakeState {
     timestamp_error: bool,
     remove_error: bool,
     expand_error: bool,
+    expand_errors: BTreeSet<String>,
     removed: Vec<usize>,
     expansions: BTreeMap<String, Vec<String>>,
 }
@@ -270,7 +271,7 @@ impl PdhApi for FakePdh {
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
         let mut state = self.state.borrow_mut();
         state.calls.expand += 1;
-        if state.expand_error {
+        if state.expand_error || state.expand_errors.contains(path) {
             return Err(Error::Pdh {
                 operation: PdhOperation::ExpandWildcardPath,
                 path: path.to_owned(),
@@ -454,6 +455,7 @@ fn fake_state(counters: Vec<FakeCounter>) -> Rc<RefCell<FakeState>> {
         timestamp_error: false,
         remove_error: false,
         expand_error: false,
+        expand_errors: BTreeSet::new(),
         removed: Vec::new(),
         expansions: BTreeMap::new(),
     }))
