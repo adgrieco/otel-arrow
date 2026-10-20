@@ -6,7 +6,7 @@ use super::config::InstanceConfig;
 use super::config::{Aggregation, CounterConfig, MetricKind};
 use super::model::{
     InstanceIdentity, MonotonicPublication, MonotonicPublicationCandidate, Number, Sample,
-    SamplePoint, SampleValue,
+    SampleMember, SamplePoint, SampleValue,
 };
 use arrow::error::ArrowError;
 use otel_arrow_dfe_pdata::encode::record::attributes::StrKeysAttributesRecordBatchBuilder;
@@ -30,6 +30,89 @@ fn instance_attribute_value(instance: &InstanceIdentity) -> String {
     }
 }
 
+fn output_attributes(counter: &CounterConfig, member: &SampleMember) -> BTreeMap<String, String> {
+    // Native path provenance identifies the source, not the exported metric series.
+    let mut attributes = counter.attributes.as_ref().clone();
+    if member.emit_instance_attribute
+        && let Some(instance) = &member.instance
+    {
+        let _ = attributes
+            .entry("instance".to_owned())
+            .or_insert_with(|| instance_attribute_value(instance));
+    }
+    attributes
+}
+
+fn output_ownership(
+    counters: &[CounterConfig],
+    sample: &Sample,
+) -> Result<(BTreeMap<OutputSource, bool>, Vec<OutputCollision>), ProjectionInvariantError> {
+    if sample.members.is_empty() {
+        return Ok((
+            sample
+                .points
+                .iter()
+                .map(|point| OutputSource {
+                    counter_index: point.counter_index,
+                    path: Arc::clone(&point.path),
+                })
+                .map(|source| (source, true))
+                .collect(),
+            Vec::new(),
+        ));
+    }
+    let mut groups = BTreeMap::<
+        (Arc<str>, BTreeMap<String, String>),
+        BTreeMap<(usize, String, Arc<str>, usize), OutputSource>,
+    >::new();
+    for member in &sample.members {
+        let counter = counters.get(member.counter_index).ok_or_else(|| {
+            ProjectionInvariantError(ArrowError::InvalidArgumentError(format!(
+                "sample membership references missing configured counter {}",
+                member.counter_index
+            )))
+        })?;
+        let source = OutputSource {
+            counter_index: member.counter_index,
+            path: Arc::clone(&member.path),
+        };
+        let _ = groups
+            .entry((
+                Arc::clone(&counter.name),
+                output_attributes(counter, member),
+            ))
+            .or_default()
+            .insert(
+                (
+                    counter.source_mapping_index,
+                    member.path.to_lowercase(),
+                    Arc::clone(&member.path),
+                    member.counter_index,
+                ),
+                source,
+            );
+    }
+    let mut ownership = BTreeMap::new();
+    let mut collisions = Vec::new();
+    for ((metric_name, attributes), sources) in groups {
+        let mut sources = sources.into_values();
+        let Some(winner) = sources.next() else {
+            continue;
+        };
+        let _ = ownership.insert(winner.clone(), true);
+        for suppressed in sources {
+            let _ = ownership.insert(suppressed.clone(), false);
+            collisions.push(OutputCollision {
+                metric_name: Arc::clone(&metric_name),
+                attributes: attributes.clone(),
+                winner: winner.clone(),
+                suppressed,
+            });
+        }
+    }
+    Ok((ownership, collisions))
+}
+
 struct ProjectionBuilder {
     metrics: MetricsRecordBatchBuilder,
     points: NumberDataPointsRecordBatchBuilder,
@@ -41,6 +124,21 @@ struct ProjectionBuilder {
 pub(super) struct ProjectionOutcome {
     pub(super) records: Option<OtapArrowRecords>,
     pub(super) monotonic_publications: Vec<MonotonicPublication>,
+    pub(super) collisions: Vec<OutputCollision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct OutputSource {
+    pub(super) counter_index: usize,
+    pub(super) path: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct OutputCollision {
+    pub(super) metric_name: Arc<str>,
+    pub(super) attributes: BTreeMap<String, String>,
+    pub(super) winner: OutputSource,
+    pub(super) suppressed: OutputSource,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -266,11 +364,29 @@ fn project(
 ) -> Result<ProjectionOutcome, ProjectionInvariantError> {
     let mut builder = ProjectionBuilder::new();
     let mut monotonic_publications = Vec::new();
-    let ready = sample.points.iter().filter_map(|point| match point.value {
-        SampleValue::Value(value) => Some((point, value)),
-        SampleValue::Warming | SampleValue::NoObservation => None,
-    });
-    for (point_count, (point, value)) in ready.enumerate() {
+    let (ownership, collisions) = output_ownership(counters, sample)?;
+    let mut ready = Vec::new();
+    for point in &sample.points {
+        let source = OutputSource {
+            counter_index: point.counter_index,
+            path: Arc::clone(&point.path),
+        };
+        let Some(is_owner) = ownership.get(&source) else {
+            return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
+                format!(
+                    "sample point {} ({}) is absent from admitted membership",
+                    point.counter_index, point.path
+                ),
+            )));
+        };
+        if !is_owner {
+            continue;
+        }
+        if let SampleValue::Value(value) = point.value {
+            ready.push((point, value));
+        }
+    }
+    for (point_count, (point, value)) in ready.into_iter().enumerate() {
         let prepared = prepare_point(counters, point, value)?;
         let point_id = u32::try_from(point_count).map_err(|_| {
             ProjectionInvariantError(ArrowError::InvalidArgumentError(
@@ -285,6 +401,7 @@ fn project(
         return Ok(ProjectionOutcome {
             records: None,
             monotonic_publications,
+            collisions,
         });
     }
     // Projection supplies valid UTF-8 and keeps every builder column aligned, so a finish error
@@ -293,6 +410,7 @@ fn project(
     Ok(ProjectionOutcome {
         records: Some(records),
         monotonic_publications,
+        collisions,
     })
 }
 
@@ -312,6 +430,7 @@ pub(super) fn into_otap(
     let ProjectionOutcome {
         records,
         monotonic_publications: _,
+        collisions: _,
     } = project_sample(counters, &sample).map_err(|error| error.0)?;
     Ok(records)
 }

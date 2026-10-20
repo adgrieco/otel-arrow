@@ -154,6 +154,7 @@ fn projects_implicit_path_named_metric_definition() {
         &config.counters,
         Sample {
             timestamp_unix_nano: 1,
+            members: Vec::new(),
             points: vec![point(
                 0,
                 r"\Memory\Available Bytes",
@@ -210,6 +211,7 @@ fn projects_configured_instance_spelling_for_path_metric() {
         &config.counters,
         Sample {
             timestamp_unix_nano: 1,
+            members: Vec::new(),
             points: vec![point(
                 0,
                 native_path,
@@ -289,6 +291,7 @@ fn projects_static_attribute_spelling_verbatim() {
             &config.counters,
             Sample {
                 timestamp_unix_nano: 10,
+                members: Vec::new(),
                 points,
                 metadata: Default::default(),
             },
@@ -342,6 +345,7 @@ fn projects_case_distinct_path_name_fallback() {
         &config.counters,
         Sample {
             timestamp_unix_nano: 1,
+            members: Vec::new(),
             points: vec![point(
                 0,
                 configured_path,
@@ -390,6 +394,7 @@ fn projects_integer_gauges() {
         &counters,
         Sample {
             timestamp_unix_nano: timestamp,
+            members: Vec::new(),
             points: vec![
                 point_at(
                     0,
@@ -483,6 +488,7 @@ fn projects_delta_with_its_query_timestamp() {
         &[counter],
         Sample {
             timestamp_unix_nano: 115,
+            members: Vec::new(),
             points: vec![point],
             metadata: Default::default(),
         },
@@ -522,6 +528,7 @@ fn projects_integer_non_monotonic_sum() {
         &counters,
         Sample {
             timestamp_unix_nano: 10,
+            members: Vec::new(),
             points: vec![sum_point(
                 0,
                 r"\Process(worker)\Private Bytes",
@@ -586,6 +593,7 @@ fn projects_integer_monotonic_sum() {
         &counters,
         Sample {
             timestamp_unix_nano: 10,
+            members: Vec::new(),
             points: vec![sum_point(
                 0,
                 r"\Custom Provider\Operations",
@@ -658,6 +666,7 @@ fn projects_delta_sum_intervals() {
         &counters,
         Sample {
             timestamp_unix_nano: 10,
+            members: Vec::new(),
             points: vec![
                 sum_point(0, r"\Provider\Delta A", 5, Number::Double(2.0)),
                 sum_point(1, r"\Provider\Delta B", 7, Number::Double(3.0)),
@@ -707,6 +716,7 @@ fn rejects_sum_without_start_time() {
         &counters,
         Sample {
             timestamp_unix_nano: 10,
+            members: Vec::new(),
             points: vec![point(
                 0,
                 r"\Process(worker)\Private Bytes",
@@ -738,6 +748,7 @@ fn gauge_ignores_irrelevant_start_time() {
             &counters,
             Sample {
                 timestamp_unix_nano: 1,
+                members: Vec::new(),
                 points: vec![point(
                     0,
                     r"\Memory\Available Bytes",
@@ -767,6 +778,7 @@ fn first_scrape_emits_ready_direct_gauge() {
         &counters,
         Sample {
             timestamp_unix_nano: 1,
+            members: Vec::new(),
             points: vec![
                 point(
                     0,
@@ -807,6 +819,7 @@ fn suppresses_all_warming_scrape() {
             &counters,
             Sample {
                 timestamp_unix_nano: 1,
+                members: Vec::new(),
                 points: vec![point(
                     0,
                     r"\Processor(_Total)\% Processor Time",
@@ -841,6 +854,7 @@ fn omits_idle_average_without_dropping_ready_values() {
         &counters,
         Sample {
             timestamp_unix_nano: 1,
+            members: Vec::new(),
             points: vec![
                 point(
                     0,
@@ -889,6 +903,7 @@ fn projects_healthy_points_when_a_peer_failed() {
         &counters,
         Sample {
             timestamp_unix_nano: 1,
+            members: Vec::new(),
             points: vec![point(
                 0,
                 r"\Memory\Available Bytes",
@@ -930,6 +945,7 @@ fn projects_calculated_double_gauge() {
         &counters,
         Sample {
             timestamp_unix_nano: 1,
+            members: Vec::new(),
             points: vec![point(
                 0,
                 r"\Processor(_Total)\% Processor Time",
@@ -968,6 +984,7 @@ fn rejects_missing_counter_index_as_invariant() {
         &counters,
         &Sample {
             timestamp_unix_nano: 1,
+            members: Vec::new(),
             points: vec![point(
                 1,
                 r"\Memory\Available Bytes",
@@ -981,6 +998,41 @@ fn rejects_missing_counter_index_as_invariant() {
     assert_eq!(
         error.to_string(),
         "Invalid argument error: sample references missing configured counter 1"
+    );
+}
+
+/// Scenario: A point references a concrete source absent from the worker's admitted membership snapshot.
+/// Guarantees: Corrupt membership cannot silently masquerade as a suppressed output collision.
+#[test]
+fn rejects_point_absent_from_admitted_membership() {
+    let counters = [counter(
+        r"\Process(*)\Private Bytes",
+        "process.private",
+        "By",
+    )];
+    let error = project_sample(
+        &counters,
+        &Sample {
+            timestamp_unix_nano: 1,
+            members: vec![SampleMember {
+                counter_index: 0,
+                path: Arc::from(r"\Process(owner)\Private Bytes"),
+                instance: None,
+                emit_instance_attribute: false,
+            }],
+            points: vec![point(
+                0,
+                r"\Process(untracked)\Private Bytes",
+                SampleValue::Value(Number::Integer(42)),
+            )],
+            metadata: Default::default(),
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        r"Invalid argument error: sample point 0 (\Process(untracked)\Private Bytes) is absent from admitted membership"
     );
 }
 
@@ -1001,6 +1053,7 @@ fn projects_wildcard_instance_identity() {
         &counters,
         Sample {
             timestamp_unix_nano: 1,
+            members: Vec::new(),
             points: vec![
                 SamplePoint {
                     counter_index: 0,
@@ -1089,6 +1142,7 @@ fn projects_aggregate_instance_selection() {
         &[aggregate_alone, explicitly_included],
         Sample {
             timestamp_unix_nano: 1,
+            members: Vec::new(),
             points: vec![
                 SamplePoint {
                     counter_index: 0,
@@ -1135,10 +1189,10 @@ fn projects_aggregate_instance_selection() {
     );
 }
 
-/// Scenario: Two native instances share one fixed user `instance` attribute.
-/// Guarantees: User precedence can collide emitted series without merging or dropping either point.
+/// Scenario: Two native instances in one mapping share a fixed user `instance` attribute.
+/// Guarantees: Concrete-name order fixes one owner and suppresses the colliding point without merging native sources.
 #[test]
-fn static_instance_override_preserves_distinct_points() {
+fn static_instance_override_uses_deterministic_output_owner() {
     let mut wildcard = counter(r"\Process(*)\Private Bytes", "process.private", "By");
     wildcard.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
@@ -1147,10 +1201,23 @@ fn static_instance_override_preserves_distinct_points() {
         "instance".to_owned(),
         "fixed".to_owned(),
     )]));
-    let records = into_otap(
+    let outcome = project_sample(
         &[wildcard],
-        Sample {
+        &Sample {
             timestamp_unix_nano: 1,
+            members: ["worker", "service"]
+                .into_iter()
+                .map(|name| SampleMember {
+                    counter_index: 0,
+                    path: Arc::from(format!(r"\Process({name})\Private Bytes")),
+                    instance: Some(Arc::new(InstanceIdentity {
+                        name: name.to_owned(),
+                        parent: None,
+                        index: 0,
+                    })),
+                    emit_instance_attribute: true,
+                })
+                .collect(),
             points: vec![
                 SamplePoint {
                     counter_index: 0,
@@ -1184,26 +1251,110 @@ fn static_instance_override_preserves_distinct_points() {
             metadata: Default::default(),
         },
     )
-    .unwrap()
     .unwrap();
+    let records = outcome.records.unwrap();
 
     assert_eq!(
         records
             .get(ArrowPayloadType::NumberDataPoints)
             .unwrap()
             .num_rows(),
-        2
+        1
     );
     assert_eq!(
         string_attributes(&records)
             .into_iter()
             .filter(|(_, key, _)| key == "instance")
             .collect::<Vec<_>>(),
-        [
-            ("0".to_owned(), "instance".to_owned(), "fixed".to_owned()),
-            ("1".to_owned(), "instance".to_owned(), "fixed".to_owned())
-        ]
+        [("0".to_owned(), "instance".to_owned(), "fixed".to_owned())]
     );
+    assert_eq!(outcome.collisions.len(), 1);
+    assert_eq!(
+        outcome.collisions[0].winner.path.as_ref(),
+        r"\Process(service)\Private Bytes"
+    );
+    assert_eq!(
+        outcome.collisions[0].suppressed.path.as_ref(),
+        r"\Process(worker)\Private Bytes"
+    );
+}
+
+/// Scenario: An earlier overlapping mapping is warming while a later mapping has a valid value for the same output.
+/// Guarantees: Admission ownership omits the series instead of substituting the valid loser, then publishes only the owner after recovery.
+#[test]
+fn invalid_output_owner_is_not_replaced_by_valid_collision() {
+    let concrete = r"\Process(svchost)\Private Bytes";
+    let instance = Arc::new(InstanceIdentity {
+        name: "svchost".to_owned(),
+        parent: None,
+        index: 0,
+    });
+    let mut first = counter(r"\Process(svc*)\Private Bytes", "process.private", "By");
+    first.source_mapping_index = 0;
+    first.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let mut second = counter(r"\Process(*host)\Private Bytes", "process.private", "By");
+    second.source_mapping_index = 1;
+    second.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let members = [0, 1]
+        .into_iter()
+        .map(|counter_index| SampleMember {
+            counter_index,
+            path: Arc::from(concrete),
+            instance: Some(Arc::clone(&instance)),
+            emit_instance_attribute: true,
+        })
+        .collect();
+    let mut sample = Sample {
+        timestamp_unix_nano: 1,
+        members,
+        points: vec![
+            SamplePoint {
+                counter_index: 0,
+                path: Arc::from(concrete),
+                instance: Some(Arc::clone(&instance)),
+                emit_instance_attribute: true,
+                timestamp_unix_nano: 1,
+                start_time_unix_nano: None,
+                monotonic_publication: None,
+                value: SampleValue::Warming,
+            },
+            SamplePoint {
+                counter_index: 1,
+                path: Arc::from(concrete),
+                instance: Some(instance),
+                emit_instance_attribute: true,
+                timestamp_unix_nano: 1,
+                start_time_unix_nano: None,
+                monotonic_publication: None,
+                value: SampleValue::Value(Number::Integer(20)),
+            },
+        ],
+        metadata: Default::default(),
+    };
+
+    let omitted = project_sample(&[first.clone(), second.clone()], &sample).unwrap();
+    assert!(omitted.records.is_none());
+    assert_eq!(omitted.collisions.len(), 1);
+    assert_eq!(omitted.collisions[0].winner.counter_index, 0);
+    assert_eq!(omitted.collisions[0].suppressed.counter_index, 1);
+
+    sample.points[0].value = SampleValue::Value(Number::Integer(10));
+    let recovered = project_sample(&[first, second], &sample).unwrap();
+    let records = recovered.records.unwrap();
+    let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
+    assert_eq!(points.num_rows(), 1);
+    let values = points
+        .column_by_name("int_value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 10);
+    assert_eq!(recovered.collisions, omitted.collisions);
 }
 
 /// Scenario: Two counters map to one metric and use custom attributes to distinguish their points.
@@ -1226,6 +1377,7 @@ fn projects_shared_metric_with_custom_attributes() {
         &[active, idle],
         Sample {
             timestamp_unix_nano: 1,
+            members: Vec::new(),
             points: vec![
                 point(
                     0,

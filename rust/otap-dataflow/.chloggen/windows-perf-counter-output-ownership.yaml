@@ -1,0 +1,5 @@
+change_type: bug_fix
+component: pipeline
+note: Prevent overlapping Windows performance-counter mappings from publishing duplicate OTLP series or substituting a later source when the owner is unavailable.
+issues: [4074]
+subtext: Output ownership follows admitted mapping order and changes only when membership changes. Persistent collisions produce one warning per membership episode.

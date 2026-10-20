@@ -111,6 +111,19 @@ pub(super) struct SamplePoint {
     pub(super) value: SampleValue,
 }
 
+/// One admitted native source eligible to own an output series.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SampleMember {
+    /// Index of the configured counter that defines metric metadata.
+    pub(super) counter_index: usize,
+    /// Exact configured path or concrete expanded wildcard path.
+    pub(super) path: Arc<str>,
+    /// Parsed identity for an expanded or exact instance path.
+    pub(super) instance: Option<Arc<InstanceIdentity>>,
+    /// Whether to emit the Go-compatible `instance` attribute for this member.
+    pub(super) emit_instance_attribute: bool,
+}
+
 /// One counter-local failure omitted from an otherwise successful collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SampleFailure {
@@ -407,6 +420,8 @@ fn merge_older_linearly<T>(current: &mut Vec<T>, older: Vec<T>, key: impl Fn(&T)
 pub(super) struct Sample {
     /// Collection time as nanoseconds since the Unix epoch.
     pub(super) timestamp_unix_nano: i64,
+    /// Admitted sources used to resolve stable output ownership before point filtering.
+    pub(super) members: Vec<SampleMember>,
     /// Exact and expanded points keyed by configured counter and concrete path.
     pub(super) points: Vec<SamplePoint>,
     /// Diagnostics and bounded counter-local evidence for this collection.
@@ -417,6 +432,7 @@ impl Sample {
     pub(super) fn empty(timestamp_unix_nano: i64) -> Self {
         Self {
             timestamp_unix_nano,
+            members: Vec::new(),
             points: Vec::new(),
             metadata: PendingMetadata::default(),
         }

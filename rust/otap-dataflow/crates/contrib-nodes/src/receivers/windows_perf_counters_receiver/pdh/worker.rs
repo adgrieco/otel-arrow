@@ -6,7 +6,7 @@
 use super::super::config::CounterConfig;
 use super::super::model::{
     MonotonicPublication, MonotonicPublicationCandidate, PendingMetadata, Sample,
-    SampleDiagnostics, SampleFailure,
+    SampleDiagnostics, SampleFailure, SampleMember,
 };
 use super::PdhApi;
 use super::error::Error;
@@ -557,6 +557,7 @@ pub(super) struct QuerySlot<A: PdhApi> {
     next_rebuild: Instant,
     rebuild_seed: Option<QueryRecreationSeed>,
     last_active_expanded_count: usize,
+    last_admitted_members: Vec<SampleMember>,
     pending: PendingMetadata,
 }
 
@@ -654,11 +655,13 @@ impl<A: PdhApi> QuerySlot<A> {
                     next_rebuild: now + retry_delay(1, query_retry_cap),
                     rebuild_seed: None,
                     last_active_expanded_count: 0,
+                    last_admitted_members: Vec::new(),
                 });
             }
             Err(error) => return Err(error),
         };
         let last_active_expanded_count = query.active_expanded_count();
+        let last_admitted_members = query.admitted_members();
         Ok(Self {
             plan,
             query: Some(query),
@@ -671,6 +674,7 @@ impl<A: PdhApi> QuerySlot<A> {
             next_rebuild: now,
             rebuild_seed: None,
             last_active_expanded_count,
+            last_admitted_members,
             pending: PendingMetadata::default(),
         })
     }
@@ -781,6 +785,7 @@ impl<A: PdhApi> QuerySlot<A> {
         self.pending.diagnostics.query_rebuild_recoveries += 1;
         let mut sample = Sample::empty(rebuilt.previous_timestamp_unix_nano);
         rebuilt.move_pending_metadata_to(&mut sample.metadata);
+        self.last_admitted_members = rebuilt.admitted_members();
         self.query_generation = self.query_generation.wrapping_add(1);
         self.rebuild_seed = None;
         self.query = Some(rebuilt);
@@ -866,6 +871,9 @@ impl<A: PdhApi> QuerySlot<A> {
             self.last_active_expanded_count,
             Query::active_expanded_count,
         );
+        if let Some(query) = self.query.as_ref() {
+            self.last_admitted_members = query.admitted_members();
+        }
         self.move_query_metadata_to_pending();
         self.rebuild_seed = self.query.as_ref().map(Query::recreation_seed);
         self.query = None;
@@ -910,6 +918,7 @@ impl<A: PdhApi> QuerySlot<A> {
         };
         match replacement {
             Ok(query) => {
+                self.last_admitted_members = query.admitted_members();
                 self.query = Some(query);
                 self.query_failure_attempts = 0;
                 self.next_query_retry = now;
@@ -965,6 +974,24 @@ impl<A: PdhApi> QuerySlot<A> {
             overflow.counter_index = remap(overflow.counter_index)?;
         }
         Ok(sample)
+    }
+
+    fn admitted_members(&self) -> Result<Vec<SampleMember>, Error> {
+        let mut members = self.query.as_ref().map_or_else(
+            || self.last_admitted_members.clone(),
+            Query::admitted_members,
+        );
+        for member in &mut members {
+            member.counter_index = self
+                .plan
+                .global_indices
+                .get(member.counter_index)
+                .copied()
+                .ok_or(Error::InvalidSample(
+                    "query membership references an unknown local counter index",
+                ))?;
+        }
+        Ok(members)
     }
 
     pub(super) fn active_expanded_count(&self) -> usize {
@@ -1028,6 +1055,7 @@ pub(super) fn merge_query_samples(samples: Vec<Sample>) -> Result<Sample, Error>
             target.metadata.diagnostics.active_expanded_counters +=
                 sample.metadata.diagnostics.active_expanded_counters;
             target.metadata.merge(sample.metadata);
+            target.members.extend(sample.members);
             target.points.extend(sample.points);
         } else {
             merged = Some(sample);
@@ -1136,6 +1164,16 @@ where
         open,
         &mut sample,
     );
+    sample.members = queries
+        .iter()
+        .map(QuerySlot::admitted_members)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    sample.members.sort_by(|left, right| {
+        (left.counter_index, &left.path).cmp(&(right.counter_index, &right.path))
+    });
     sample
         .metadata
         .failures

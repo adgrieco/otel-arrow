@@ -2246,6 +2246,9 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
     .unwrap();
 
     assert!(rebuilt.points.is_empty());
+    assert_eq!(rebuilt.members.len(), 1);
+    assert_eq!(rebuilt.members[0].counter_index, 0);
+    assert_eq!(rebuilt.members[0].path.as_ref(), path);
     assert_eq!(rebuilt.timestamp_unix_nano, 110);
     assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_attempts, 1);
     assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
@@ -2339,6 +2342,14 @@ fn rebuild_prime_failure_is_diagnostic_only() {
 
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.points[0].counter_index, 0);
+    assert_eq!(
+        sample
+            .members
+            .iter()
+            .map(|member| (member.counter_index, member.path.as_ref()))
+            .collect::<Vec<_>>(),
+        [(0, healthy_path), (1, rebuilding_path)]
+    );
     assert_eq!(sample.metadata.diagnostics.scrape_failures, 0);
     assert_eq!(sample.metadata.failures.len(), 1);
     assert_eq!(sample.metadata.failures[0].counter_index, 1);
@@ -2375,6 +2386,7 @@ fn simulated_blocked_worker(cleanup_complete: Arc<AtomicBool>) -> (Worker, mpsc:
 fn empty_sample() -> Sample {
     Sample {
         timestamp_unix_nano: 2,
+        members: Vec::new(),
         points: Vec::new(),
         metadata: PendingMetadata::default(),
     }
@@ -2603,6 +2615,7 @@ fn slot_metadata_merge_keeps_newer_failure() {
     };
     let mut sample = Sample {
         timestamp_unix_nano: 2,
+        members: Vec::new(),
         points: Vec::new(),
         metadata: PendingMetadata {
             failures: vec![SampleFailure {

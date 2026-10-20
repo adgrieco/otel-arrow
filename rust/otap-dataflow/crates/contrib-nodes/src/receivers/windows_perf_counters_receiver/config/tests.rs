@@ -1688,6 +1688,23 @@ fn allows_one_path_to_feed_multiple_mappings() {
         }),
         "duplicate counter output mapping",
     );
+    assert_config_error(
+        json!({
+            "metrics": {"available.bytes": {"unit": "By"}},
+            "perfcounters": [{
+                "object": "Memory",
+                "counters": [
+                    {"name": "Available Bytes", "metric": "available.bytes"},
+                    {
+                        "name": "Available Bytes",
+                        "metric": "available.bytes",
+                        "scale_power10": -3
+                    }
+                ]
+            }]
+        }),
+        "duplicate counter output mapping",
+    );
 }
 
 /// Scenario: Explicit instances and the aggregation name contain zero or leading-zero numeric suffixes.

@@ -6,7 +6,7 @@
 use super::super::config::{Aggregation, CounterConfig, MetricKind};
 use super::super::model::{
     ExpansionOverflow, InstanceIdentity, MonotonicPublicationCandidate, Number, PendingMetadata,
-    Sample, SampleFailure, SamplePoint, SampleValue, scale_double, scale_integer,
+    Sample, SampleFailure, SampleMember, SamplePoint, SampleValue, scale_double, scale_integer,
 };
 use super::counter_type::{CounterKind, classify_native_type, validate_metric_mapping};
 use super::error::{Error, sample_failure};
@@ -307,6 +307,26 @@ impl<A: PdhApi> Query<A> {
             exact_histories,
             wildcard_targets,
         }
+    }
+
+    pub(super) fn admitted_members(&self) -> Vec<SampleMember> {
+        self.counters
+            .iter()
+            .map(|(key, counter)| (key.clone(), counter.member()))
+            .chain(
+                self.retry_states
+                    .iter()
+                    .map(|(key, state)| (key.clone(), state.target.member())),
+            )
+            .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
+                removal
+                    .retry_target
+                    .as_ref()
+                    .map(|target| (key.clone(), target.member()))
+            }))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect()
     }
 
     fn initialize_exact_counters(
@@ -1166,6 +1186,7 @@ impl<A: PdhApi> Query<A> {
             );
             return Ok(Sample {
                 timestamp_unix_nano,
+                members: self.admitted_members(),
                 points: Vec::new(),
                 metadata,
             });
@@ -1208,6 +1229,7 @@ impl<A: PdhApi> Query<A> {
         metadata.diagnostics.active_expanded_counters = self.active_expanded_count();
         Ok(Sample {
             timestamp_unix_nano,
+            members: self.admitted_members(),
             points,
             metadata,
         })
@@ -1525,6 +1547,15 @@ impl CounterHistory {
 }
 
 impl CounterTarget {
+    fn member(&self) -> SampleMember {
+        SampleMember {
+            counter_index: self.config_index,
+            path: Arc::clone(&self.path),
+            instance: self.instance.clone(),
+            emit_instance_attribute: self.emit_instance_attribute,
+        }
+    }
+
     fn for_recreated_query(mut self) -> Self {
         self.history.restart_pdh_sampling();
         self
@@ -1558,6 +1589,15 @@ struct PendingRemoval<C> {
 }
 
 impl<C> CounterHandle<C> {
+    fn member(&self) -> SampleMember {
+        SampleMember {
+            counter_index: self.config_index,
+            path: Arc::clone(&self.path),
+            instance: self.instance.clone(),
+            emit_instance_attribute: self.emit_instance_attribute,
+        }
+    }
+
     fn target(&self) -> CounterTarget {
         CounterTarget {
             config_index: self.config_index,
