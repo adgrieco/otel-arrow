@@ -547,8 +547,7 @@ impl<A: PdhApi> Query<A> {
                     metadata,
                     &error,
                 );
-                self.reconcile_wildcards(desired, metadata)?;
-                return Err(error);
+                return self.reconcile_wildcards(desired, metadata);
             }
         };
         self.prepare_successful_discoveries(

@@ -549,6 +549,7 @@ pub(super) struct QuerySlot<A: PdhApi> {
     rebuild_attempts: u32,
     next_rebuild: Instant,
     rebuild_seed: Option<QueryRecreationSeed>,
+    last_active_expanded_count: usize,
     pending: PendingMetadata,
 }
 
@@ -645,10 +646,12 @@ impl<A: PdhApi> QuerySlot<A> {
                     rebuild_attempts: 1,
                     next_rebuild: now + retry_delay(1, query_retry_cap),
                     rebuild_seed: None,
+                    last_active_expanded_count: 0,
                 });
             }
             Err(error) => return Err(error),
         };
+        let last_active_expanded_count = query.active_expanded_count();
         Ok(Self {
             plan,
             query: Some(query),
@@ -660,6 +663,7 @@ impl<A: PdhApi> QuerySlot<A> {
             rebuild_attempts: 0,
             next_rebuild: now,
             rebuild_seed: None,
+            last_active_expanded_count,
             pending: PendingMetadata::default(),
         })
     }
@@ -851,6 +855,10 @@ impl<A: PdhApi> QuerySlot<A> {
         if self.query.is_none() {
             return;
         }
+        self.last_active_expanded_count = self.query.as_ref().map_or(
+            self.last_active_expanded_count,
+            Query::active_expanded_count,
+        );
         self.move_query_metadata_to_pending();
         self.rebuild_seed = self.query.as_ref().map(Query::recreation_seed);
         self.query = None;
@@ -952,9 +960,11 @@ impl<A: PdhApi> QuerySlot<A> {
         Ok(sample)
     }
 
-    #[cfg(test)]
     pub(super) fn active_expanded_count(&self) -> usize {
-        self.query.as_ref().map_or(0, Query::active_expanded_count)
+        self.query.as_ref().map_or(
+            self.last_active_expanded_count,
+            Query::active_expanded_count,
+        )
     }
 
     pub(super) fn reserved_native_entry_count(&self) -> usize {
@@ -1080,6 +1090,8 @@ where
                 append_query_failures(&mut query_failures, &query.plan, &error, recovery_only);
                 if recovery_only {
                     let mut sample = Sample::empty(query.recovery_timestamp_unix_nano());
+                    sample.metadata.diagnostics.active_expanded_counters =
+                        query.active_expanded_count();
                     query.move_pending_metadata_to(&mut sample.metadata);
                     samples.push(sample);
                 } else if first_collection_error.is_none() {

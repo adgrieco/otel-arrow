@@ -1036,14 +1036,19 @@ fn failed_rebuild_preserves_down_query_state() {
     assert_eq!(slot.reserved_native_entry_count(), 1);
 }
 
-/// Scenario: A wildcard refresh fails recoverably for the configured consecutive-failure threshold.
-/// Guarantees: Repeated refresh failures schedule a seeded query rebuild using the same bounded recovery policy as collection failures.
+/// Scenario: Two wildcard expansions repeatedly fail while an exact counter remains healthy.
+/// Guarantees: Every wildcard is retried on the refresh cadence without query backoff or rebuild.
 #[test]
-fn repeated_refresh_failures_schedule_query_rebuild() {
+fn repeated_refresh_failures_stay_on_refresh_cadence() {
     let exact_path = r"\Memory\Available Bytes";
-    let path = r"\Process(*)\Private Bytes";
-    let mut config = counter(path, "process.private");
-    config.instance_config = InstanceConfig::Wildcard {
+    let first_path = r"\Process(*)\Private Bytes";
+    let second_path = r"\Thread(*)\Thread State";
+    let mut first = counter(first_path, "process.private");
+    first.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let mut second = counter(second_path, "thread.state");
+    second.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
     };
     let open_calls = Rc::new(Cell::new(0_usize));
@@ -1073,30 +1078,95 @@ fn repeated_refresh_failures_schedule_query_rebuild() {
         factory_states.borrow_mut().push(state);
         Ok(query)
     };
-    let plan = query_plans(vec![counter(exact_path, "memory.available"), config])
+    let plan = query_plans(vec![counter(exact_path, "memory.available"), first, second])
         .pop()
         .unwrap();
     let slot = QuerySlot::open_initial(plan, 1, &mut open).unwrap();
     states.borrow()[0].borrow_mut().expand_error = true;
+    let initial_expand_calls = states.borrow()[0].borrow().calls.expand;
     let mut queries = vec![slot];
-    for attempt in 1..=QUERY_REBUILD_AFTER_FAILURES {
+    for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
         let sample = collect_queries(&mut queries, Duration::ZERO, 1, &mut open).unwrap();
-        if attempt < QUERY_REBUILD_AFTER_FAILURES {
-            assert_eq!(sample.points.len(), 1);
-            assert_eq!(sample.points[0].counter_index, 0);
-            assert_eq!(sample.metadata.diagnostics.discovery_failures, 1);
-            assert_eq!(sample.metadata.failures.len(), 1);
-            assert_eq!(sample.metadata.failures[0].reason, "PdhExpandWildCardPathW");
-            assert!(sample.metadata.failures[0].diagnostic_only);
-        } else {
-            assert_eq!(sample.metadata.diagnostics.query_rebuild_attempts, 1);
-            assert_eq!(sample.metadata.diagnostics.query_rebuild_recoveries, 1);
-        }
+        assert_eq!(sample.points.len(), 1);
+        assert_eq!(sample.points[0].counter_index, 0);
+        assert_eq!(sample.metadata.diagnostics.discovery_failures, 2);
+        assert_eq!(sample.metadata.diagnostics.query_rebuild_attempts, 0);
+        assert_eq!(sample.metadata.failures.len(), 2);
+        assert!(sample.metadata.failures.iter().all(|failure| {
+            failure.reason == "PdhExpandWildCardPathW" && failure.diagnostic_only
+        }));
     }
 
     assert!(queries[0].query.is_some());
     assert_eq!(queries[0].reserved_native_entry_count(), 1);
-    assert_eq!(open_calls.get(), 2);
+    assert_eq!(
+        states.borrow()[0].borrow().calls.expand,
+        initial_expand_calls + 2 * QUERY_REBUILD_AFTER_FAILURES as usize
+    );
+    assert_eq!(open_calls.get(), 1);
+}
+
+/// Scenario: A single wildcard query enters collection backoff with one admitted member.
+/// Guarantees: Recovery-only samples preserve the active expanded-counter gauge.
+#[test]
+fn query_backoff_preserves_active_expanded_count() {
+    let path = r"\Process(*)\Private Bytes";
+    let concrete = r"\Process(worker)\Private Bytes";
+    let mut config = counter(path, "process.private");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
+        let (state, query) = fake_query_with_seed(
+            configs,
+            vec![FakeCounter {
+                path: concrete.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+            Duration::ZERO,
+            Duration::ZERO,
+            max_native_counters,
+            seed,
+        );
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let plan = query_plans(vec![config]).pop().unwrap();
+    let slot = QuerySlot::open_initial(plan, 1, &mut open).unwrap();
+    let mut queries = vec![slot];
+    let _ = states.borrow()[0]
+        .borrow_mut()
+        .expansions
+        .insert(path.to_owned(), vec![concrete.to_owned()]);
+
+    let healthy = collect_queries(&mut queries, Duration::from_secs(30), 1, &mut open).unwrap();
+    assert_eq!(healthy.metadata.diagnostics.active_expanded_counters, 1);
+    states.borrow()[0].borrow_mut().collect_error = true;
+    let now = Instant::now();
+    for attempt_at in [
+        now,
+        now + Duration::from_secs(1),
+        now + Duration::from_secs(3),
+    ] {
+        let failure = queries[0].collect(attempt_at, Duration::from_secs(30), 1, &mut open);
+        assert!(failure.is_err_and(|error| error.is_query_collection_failure()));
+    }
+    assert!(queries[0].query.is_none());
+    assert_eq!(queries[0].active_expanded_count(), 1);
+
+    let pending = collect_queries(&mut queries, Duration::from_secs(30), 1, &mut open).unwrap();
+
+    assert!(pending.points.is_empty());
+    assert_eq!(pending.metadata.diagnostics.active_expanded_counters, 1);
 }
 
 /// Scenario: One query combines an exact mapping with a wildcard that discovers three paths under a two-entry limit.
