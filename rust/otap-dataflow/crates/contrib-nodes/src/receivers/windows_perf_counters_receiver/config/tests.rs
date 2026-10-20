@@ -1198,6 +1198,47 @@ fn warns_once_for_case_distinct_metric_definitions() {
     );
 }
 
+/// Scenario: A valid configuration has a case collision, an unused path definition, and a multi-instance static override.
+/// Guarantees: Parsing collects each warning exactly once for emission only after full validation succeeds.
+#[test]
+fn collects_config_warnings_after_validation() {
+    let config = Config::from_json(&json!({
+        "metrics": {
+            "cpu": {"unit": "1"},
+            "CPU": {"unit": "%"},
+            r"\Memory\Unused": {"unit": "By"}
+        },
+        "perfcounters": [{
+            "object": "Processor",
+            "instances": "*",
+            "counters": [{
+                "name": "% Processor Time",
+                "metric": "cpu",
+                "attributes": {"instance": "fixed"}
+            }]
+        }]
+    }))
+    .unwrap();
+
+    assert_eq!(config.warnings.len(), 3);
+    assert!(matches!(
+        &config.warnings[0],
+        ConfigWarning::CaseDistinctMetricDefinitions(names)
+            if names == &vec!["CPU".to_owned(), "cpu".to_owned()]
+    ));
+    assert_eq!(
+        config.warnings[1],
+        ConfigWarning::InstanceOverride {
+            object_index: 0,
+            counter_index: 0,
+        }
+    );
+    assert_eq!(
+        config.warnings[2],
+        ConfigWarning::UnusedPathMetricDefinition(r"\Memory\Unused".to_owned())
+    );
+}
+
 /// Scenario: Instances are empty, use a partial wildcard, or combine full wildcard with explicit names.
 /// Guarantees: Empty means no instance, partial patterns are preserved, and full wildcard follows Go selection.
 #[test]

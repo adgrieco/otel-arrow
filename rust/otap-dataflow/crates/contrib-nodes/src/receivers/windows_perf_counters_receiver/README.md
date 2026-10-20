@@ -221,18 +221,18 @@ aggregate explicitly included with `"*"` retains it. The receiver also emits
 `windows.perf_counter.parent_instance`, and
 `windows.perf_counter.instance_index` for lossless PDH identity.
 
-Explicit PDH duplicate-instance selectors preserve their configured spelling:
-`name`, `name#0`, `name#00`, and `name#01` remain distinct native paths and
-lookup identities and emitted exact-path instance attributes. Wildcard
-expansion still uses the concrete identity returned by PDH.
-An instance such as `#5` also keeps that literal native name. Numeric indexes
-are positional, not durable entity identifiers. If same-named processes churn
-while their count stays unchanged, PDH can reuse `name#n` for a different
-process and a two-sample calculation can span the old and new process. The
-receiver cannot detect that entity change from the reused instance identity
-alone. Where the target host provides it, prefer `Process V2`, whose instances
-include the process ID as `name:PID`; provider availability varies by Windows
-version and installed performance-counter set.
+Explicit PDH duplicate-instance selectors preserve configured spelling in
+their native paths and lookup identities. Emitted instance labels normalize
+the positional suffix: `name`, `name#0`, and `name#00` emit `instance=name`,
+while `name#01` emits `instance=name#1`; the path attribute retains the exact
+configured spelling. Wildcard expansion uses the concrete identity returned
+by PDH. Numeric indexes are positional, not durable entity identifiers. If
+same-named processes churn while their count stays unchanged, PDH can reuse
+`name#n` for a different process and a two-sample calculation can span the old
+and new process. The receiver cannot detect that entity change from the reused
+instance identity alone. Where the target host provides it, prefer `Process
+V2`, whose instances include the process ID as `name:PID`; provider
+availability varies by Windows version and installed performance-counter set.
 
 Unknown fields, explicit references to undefined metrics, duplicate instances,
 invalid intervals, unsupported scales, and duplicate outputs are configuration
@@ -336,7 +336,7 @@ For example, `\Memory\Available Bytes` remains an exact byte count with unit
 
 ## Collection behavior
 
-The receiver opens the PDH query on its worker and performs one startup
+The receiver opens its PDH queries on the worker and performs one startup
 collection without emitting points. This prime seeds valid native and
 receiver-side sample history before `initial_delay` and the first scheduled
 scrape. It records monotonic values for later reset detection but does not
@@ -509,7 +509,7 @@ once per Unicode lowercase identity group.
 The `receiver.windowsperfcounters.scrapes` measurement metric set attributes
 collection attempts by outcome. The `receiver.windowsperfcounters` health
 metric set records configured and active counters, scrape success/failure,
-overruns and duration, discovery refreshes, instance
+overruns and duration, worker-busy command rejections, discovery refreshes, instance
 adds/removals/overflow, failed counter values, retries/recoveries, query
 rebuilds, and warm-up omissions.
 

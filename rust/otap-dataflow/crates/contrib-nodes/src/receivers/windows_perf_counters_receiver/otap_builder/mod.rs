@@ -243,13 +243,20 @@ fn prepare_point<'a>(
             point.counter_index
         )))
     })?;
+    let start_time_unix_nano = match counter.metric_kind {
+        MetricKind::Gauge => None,
+        MetricKind::Sum { .. } => Some(point.start_time_unix_nano.ok_or_else(|| {
+            ProjectionInvariantError(ArrowError::InvalidArgumentError(format!(
+                "Sum {} ({}) has no start time",
+                counter.name, point.path
+            )))
+        })?),
+    };
     Ok(PreparedPoint {
         counter,
         point,
         value,
-        start_time_unix_nano: matches!(counter.metric_kind, MetricKind::Sum { .. })
-            .then_some(point.start_time_unix_nano)
-            .flatten(),
+        start_time_unix_nano,
     })
 }
 
@@ -289,7 +296,7 @@ fn project(
     })
 }
 
-/// Project one scrape while isolating expected point-data failures.
+/// Project one validated scrape into OTAP records and pending monotonic publications.
 pub(super) fn project_sample(
     counters: &[CounterConfig],
     sample: &Sample,

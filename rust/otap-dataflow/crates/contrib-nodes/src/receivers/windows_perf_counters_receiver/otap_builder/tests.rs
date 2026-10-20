@@ -694,6 +694,36 @@ fn projects_delta_sum_intervals() {
     assert_eq!([starts.value(0), starts.value(1)], [5, 7]);
 }
 
+/// Scenario: A ready Sum point reaches projection without its required cumulative or delta interval start.
+/// Guarantees: Projection reports an internal invariant error instead of emitting a Sum with an absent start time.
+#[test]
+fn rejects_sum_without_start_time() {
+    let counters = [non_monotonic_sum(
+        r"\Process(*)\Private Bytes",
+        "windows.process.private",
+        "By",
+    )];
+    let error = into_otap(
+        &counters,
+        Sample {
+            timestamp_unix_nano: 10,
+            points: vec![point(
+                0,
+                r"\Process(worker)\Private Bytes",
+                SampleValue::Value(Number::Integer(42)),
+            )],
+            metadata: Default::default(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ArrowError::InvalidArgumentError(message)
+            if message == "Sum windows.process.private (\\Process(worker)\\Private Bytes) has no start time"
+    ));
+}
+
 /// Scenario: A Gauge sample carries an unused start timestamp later than its collection timestamp.
 /// Guarantees: Gauge projection ignores cumulative start-time state and preserves existing output.
 #[test]

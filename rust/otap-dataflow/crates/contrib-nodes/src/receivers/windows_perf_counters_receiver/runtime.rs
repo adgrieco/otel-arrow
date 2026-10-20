@@ -195,6 +195,7 @@ pub static WINDOWSPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFa
             });
         }
         let config = Config::from_json(&node_config.config)?;
+        config.emit_warnings();
         let mut metrics = WindowsPerfCountersReceiverMetrics::register(&pipeline);
         metrics.health.configured_exact.set(
             config
@@ -226,7 +227,7 @@ pub static WINDOWSPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFa
 };
 
 impl WindowsPerfCountersReceiver {
-    fn record_completed_scrape(&self, scrape_start: Instant, succeeded: bool) {
+    fn record_completed_scrape(&self, collection_duration: Duration, succeeded: bool) {
         let mut metrics = self.metrics.borrow_mut();
         metrics.record_scrape(if succeeded {
             Outcome::Success
@@ -241,7 +242,7 @@ impl WindowsPerfCountersReceiver {
         metrics
             .health
             .scrape_duration
-            .record(scrape_start.elapsed().as_secs_f64());
+            .record(collection_duration.as_secs_f64());
     }
 
     fn record_sample_diagnostics(&self, sample: &Sample) {
@@ -253,8 +254,8 @@ impl WindowsPerfCountersReceiver {
             .add(failed_counter_value_count(&sample.metadata.failures));
     }
 
-    fn record_successful_sample(&self, scrape_start: Instant, sample: &Sample) {
-        self.record_completed_scrape(scrape_start, true);
+    fn record_successful_sample(&self, collection_duration: Duration, sample: &Sample) {
+        self.record_completed_scrape(collection_duration, true);
         self.record_sample_diagnostics(sample);
     }
 
@@ -304,7 +305,7 @@ impl WindowsPerfCountersReceiver {
     async fn process_collected_sample<F, Fut>(
         &self,
         sample: Sample,
-        scrape_start: Instant,
+        collection_duration: Duration,
         overrun: bool,
         failure_logs: &mut FailureLogState,
         send: F,
@@ -316,11 +317,11 @@ impl WindowsPerfCountersReceiver {
         let projection = match project_sample(&self.config.counters, &sample) {
             Ok(projection) => projection,
             Err(err) => {
-                self.record_completed_scrape(scrape_start, false);
+                self.record_completed_scrape(collection_duration, false);
                 return Err(CollectionLoopError::Projection(err));
             }
         };
-        self.record_successful_sample(scrape_start, &sample);
+        self.record_successful_sample(collection_duration, &sample);
         failure_logs.record_success(!overrun);
         self.log_sample_events(&sample);
         failure_logs
@@ -393,11 +394,15 @@ impl WindowsPerfCountersReceiver {
                     (collection.await, true)
                 }
             };
+            let collection_duration = scrape_start.elapsed();
             let sample = match result {
                 Ok(sample) => sample,
-                Err(pdh::Error::WorkerBusy) => continue,
+                Err(pdh::Error::WorkerBusy) => {
+                    self.metrics.borrow_mut().health.worker_busy.inc();
+                    continue;
+                }
                 Err(err) if err.is_collection_failure() => {
-                    self.record_completed_scrape(scrape_start, false);
+                    self.record_completed_scrape(collection_duration, false);
                     failure_logs.log_scrape_failure(&self.node, &err);
                     continue;
                 }
@@ -409,14 +414,17 @@ impl WindowsPerfCountersReceiver {
             let publications = self
                 .process_collected_sample(
                     sample,
-                    scrape_start,
+                    collection_duration,
                     overrun,
                     &mut failure_logs,
                     &mut send,
                 )
                 .await?;
             match publish(publications).await {
-                Ok(()) | Err(pdh::Error::WorkerBusy) => {}
+                Ok(()) => {}
+                Err(pdh::Error::WorkerBusy) => {
+                    self.metrics.borrow_mut().health.worker_busy.inc();
+                }
                 Err(error) => return Err(CollectionLoopError::Native(error)),
             }
         }
@@ -600,6 +608,7 @@ mod tests {
                 wildcard_refresh_interval: None,
                 max_instances_per_wildcard: 256,
                 max_expanded_counters: 4_096,
+                warnings: Vec::new(),
             },
             node: "windowsperfcounters".to_owned(),
             metrics: Rc::new(RefCell::new(WindowsPerfCountersReceiverMetrics::register(
@@ -791,7 +800,7 @@ mod tests {
                     points: vec![sample_point(1, 10, Number::Integer(42))],
                     metadata: Default::default(),
                 },
-                Instant::now(),
+                Duration::ZERO,
                 false,
                 &mut FailureLogState::default(),
                 move |pdata| async move {
@@ -810,6 +819,34 @@ mod tests {
         assert_eq!(metrics.health.scrape_failures.get(), 1);
         assert_eq!(metrics.health.counter_read_failures.get(), 0);
         assert_eq!(metrics.health.failed_counter_values.get(), 0);
+    }
+
+    /// Scenario: Projection and downstream delivery occur after a two-second native collection.
+    /// Guarantees: Scrape duration records only the supplied native collection interval.
+    #[tokio::test(start_paused = true)]
+    async fn scrape_duration_excludes_projection_and_delivery() {
+        let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        let publications = receiver
+            .process_collected_sample(
+                Sample {
+                    timestamp_unix_nano: 10,
+                    points: vec![sample_point(0, 10, Number::Integer(42))],
+                    metadata: Default::default(),
+                },
+                Duration::from_secs(2),
+                false,
+                &mut FailureLogState::default(),
+                |_| async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(publications.is_empty());
+        let distribution = receiver.metrics.borrow().health.scrape_duration.get();
+        assert_eq!(distribution.summary(), (1, 2.0, 2.0, 2.0));
     }
 
     /// Scenario: Two collections each finish after the cadence while timeout is unset.
@@ -898,7 +935,7 @@ mod tests {
     }
 
     /// Scenario: Delivery succeeds, but the worker command queue is busy when the monotonic start acknowledgement is published.
-    /// Guarantees: The busy acknowledgement is best-effort, so collection continues until a later fatal worker stop.
+    /// Guarantees: The rejected acknowledgement is counted without changing scrape outcome or stopping collection.
     #[tokio::test]
     async fn worker_busy_after_delivery_does_not_stop_collection() {
         let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
@@ -931,6 +968,10 @@ mod tests {
             Err(CollectionLoopError::Native(pdh::Error::WorkerStopped))
         ));
         assert_eq!(collect_calls.get(), 2);
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(metrics.health.worker_busy.get(), 1);
+        assert_eq!(metrics.health.scrape_overruns.get(), 0);
+        assert_eq!(metrics.health.scrape_failures.get(), 0);
     }
 
     /// Scenario: A native collection request is rejected because the capacity-one worker queue is busy.
@@ -966,6 +1007,7 @@ mod tests {
         assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
         assert_eq!(metrics.health.scrape_failures.get(), 0);
         assert_eq!(metrics.health.scrape_overruns.get(), 0);
+        assert_eq!(metrics.health.worker_busy.get(), 1);
     }
 
     /// Scenario: Native collection reports an impossible internal sample invariant.
@@ -1366,6 +1408,7 @@ mod tests {
                 wildcard_refresh_interval: None,
                 max_instances_per_wildcard: 256,
                 max_expanded_counters: 4_096,
+                warnings: Vec::new(),
             },
             node: "windowsperfcounters".to_owned(),
             metrics: Rc::new(RefCell::new(WindowsPerfCountersReceiverMetrics::register(

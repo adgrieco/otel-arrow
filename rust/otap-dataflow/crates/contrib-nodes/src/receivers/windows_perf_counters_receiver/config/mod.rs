@@ -36,6 +36,7 @@ pub(super) struct Config {
     pub(super) max_instances_per_wildcard: usize,
     /// Receiver-wide entries reserved for exact or retained expanded native counters.
     pub(super) max_expanded_counters: usize,
+    pub(super) warnings: Vec<ConfigWarning>,
 }
 
 impl Config {
@@ -45,9 +46,31 @@ impl Config {
             serde_json::from_value(value.clone()).map_err(|err| invalid(err.to_string()))?;
         validate_user_config(&user)?;
         let metrics = normalize_metrics(&user.metrics)?;
-        let counters = normalize_counters(user.perfcounters, &metrics, user.max_expanded_counters)?;
+        let mut warnings = case_distinct_metric_definitions(metrics.keys().map(Arc::as_ref))
+            .into_values()
+            .map(|group| {
+                ConfigWarning::CaseDistinctMetricDefinitions(
+                    group.into_iter().map(str::to_owned).collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let counters = normalize_counters(
+            user.perfcounters,
+            &metrics,
+            user.max_expanded_counters,
+            &mut warnings,
+        )?;
         validate_counter_outputs(&counters)?;
-        warn_for_unused_path_metric_definitions(&metrics, &counters);
+        warnings.extend(
+            unused_path_metric_definitions(
+                metrics
+                    .iter()
+                    .map(|(name, metric)| (name.as_ref(), metric.path_shaped)),
+                counters.iter().map(|counter| counter.name.as_ref()),
+            )
+            .into_iter()
+            .map(|definition| ConfigWarning::UnusedPathMetricDefinition(definition.to_owned())),
+        );
 
         Ok(Self {
             counters,
@@ -61,9 +84,63 @@ impl Config {
             wildcard_refresh_interval: user.wildcard_refresh_interval,
             max_instances_per_wildcard: user.max_instances_per_wildcard,
             max_expanded_counters: user.max_expanded_counters,
+            warnings,
         })
     }
 
+    pub(super) fn emit_warnings(&self) {
+        for warning in &self.warnings {
+            warning.emit();
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ConfigWarning {
+    CaseDistinctMetricDefinitions(Vec<String>),
+    UnusedPathMetricDefinition(String),
+    InstanceOverride {
+        object_index: usize,
+        counter_index: usize,
+    },
+}
+
+impl ConfigWarning {
+    fn emit(&self) {
+        match self {
+            Self::CaseDistinctMetricDefinitions(names) => {
+                otel_arrow_dfe_telemetry::otel_warn!(
+                    "windows_perf_counters_receiver.config.metric_definition.case_collision",
+                    message = "metric definitions differ only by case; exact lookup keeps them distinct, \
+                               but this may be a configuration typo",
+                    names = ?names
+                );
+            }
+            Self::UnusedPathMetricDefinition(definition) => {
+                otel_arrow_dfe_telemetry::otel_warn!(
+                    "windows_perf_counters_receiver.config.metric_definition.unused_path",
+                    message =
+                        "path-shaped metric definition is not selected by any counter mapping",
+                    definition = definition
+                );
+            }
+            Self::InstanceOverride {
+                object_index,
+                counter_index,
+            } => {
+                otel_arrow_dfe_telemetry::otel_warn!(
+                    "windows_perf_counters_receiver.config.instance_override",
+                    message = "a static instance attribute overrides generated instance identity for \
+                               multiple or wildcard instances and may merge distinct series",
+                    object_index = *object_index,
+                    counter_index = *counter_index
+                );
+            }
+        }
+    }
+}
+
+impl Config {
     /// Effective wildcard refresh interval.
     #[must_use]
     pub(super) fn wildcard_refresh_interval(&self) -> Duration {
@@ -504,14 +581,6 @@ fn normalize_metrics(
             },
         );
     }
-    for group in case_distinct_metric_definitions(metrics.keys().map(Arc::as_ref)).into_values() {
-        otel_arrow_dfe_telemetry::otel_warn!(
-            "windows_perf_counters_receiver.config.metric_definition.case_collision",
-            message = "metric definitions differ only by case; exact lookup keeps them distinct, \
-                       but this may be a configuration typo",
-            names = ?group
-        );
-    }
     Ok(metrics)
 }
 
@@ -537,28 +606,11 @@ fn unused_path_metric_definitions<'a>(
         .collect()
 }
 
-fn warn_for_unused_path_metric_definitions(
-    metrics: &BTreeMap<Arc<str>, NormalizedMetric>,
-    counters: &[CounterConfig],
-) {
-    for definition in unused_path_metric_definitions(
-        metrics
-            .iter()
-            .map(|(name, metric)| (name.as_ref(), metric.path_shaped)),
-        counters.iter().map(|counter| counter.name.as_ref()),
-    ) {
-        otel_arrow_dfe_telemetry::otel_warn!(
-            "windows_perf_counters_receiver.config.metric_definition.unused_path",
-            message = "path-shaped metric definition is not selected by any counter mapping",
-            definition = definition
-        );
-    }
-}
-
 fn normalize_counters(
     objects: Vec<ObjectConfig>,
     metrics: &BTreeMap<Arc<str>, NormalizedMetric>,
     max_native_counters: usize,
+    warnings: &mut Vec<ConfigWarning>,
 ) -> Result<Vec<CounterConfig>, Error> {
     let mut counters = Vec::new();
     let mut source_mapping_index = 0;
@@ -572,6 +624,7 @@ fn normalize_counters(
             &mut exact_counter_count,
             &mut counters,
             &mut source_mapping_index,
+            warnings,
         )?;
     }
     Ok(counters)
@@ -585,6 +638,7 @@ fn normalize_object(
     exact_counter_count: &mut usize,
     output: &mut Vec<CounterConfig>,
     source_mapping_index: &mut usize,
+    warnings: &mut Vec<ConfigWarning>,
 ) -> Result<(), Error> {
     let object_field = format!("perfcounters[{object_index}]");
     let object_name = validate_native_component(&format!("{object_field}.object"), &object.object)?;
@@ -611,6 +665,7 @@ fn normalize_object(
             max_native_counters,
             exact_counter_count,
             output,
+            warnings,
         )?;
         *source_mapping_index += 1;
     }
@@ -637,6 +692,7 @@ impl ObjectNormalizer<'_> {
         max_native_counters: usize,
         exact_counter_count: &mut usize,
         output: &mut Vec<CounterConfig>,
+        warnings: &mut Vec<ConfigWarning>,
     ) -> Result<(), Error> {
         let counter_field = format!(
             "perfcounters[{}].counters[{counter_index}]",
@@ -650,6 +706,7 @@ impl ObjectNormalizer<'_> {
             &counter_field,
             metric_name,
             &mapping.attributes,
+            warnings,
         )?;
         for expanded in self
             .instances
@@ -713,6 +770,7 @@ impl ObjectNormalizer<'_> {
         counter_field: &str,
         metric_name: Option<&str>,
         configured_attributes: &BTreeMap<String, String>,
+        warnings: &mut Vec<ConfigWarning>,
     ) -> Result<Option<ResolvedMetric>, Error> {
         let Some(name) = metric_name else {
             return Ok(None);
@@ -725,13 +783,10 @@ impl ObjectNormalizer<'_> {
         validate_attribute_keys(counter_field, configured_attributes)?;
         let attributes = configured_attributes.clone();
         if should_warn_instance_override(self.instances.has_multiple_or_wildcard(), &attributes) {
-            otel_arrow_dfe_telemetry::otel_warn!(
-                "windows_perf_counters_receiver.config.instance_override",
-                message = "a static instance attribute overrides generated instance identity for \
-                           multiple or wildcard instances and may merge distinct series",
-                object_index = self.object_index,
-                counter_index = counter_index
-            );
+            warnings.push(ConfigWarning::InstanceOverride {
+                object_index: self.object_index,
+                counter_index,
+            });
         }
         Ok(Some(ResolvedMetric {
             name: Arc::clone(name),

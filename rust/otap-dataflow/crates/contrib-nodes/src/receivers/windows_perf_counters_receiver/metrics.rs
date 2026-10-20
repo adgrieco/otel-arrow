@@ -43,9 +43,12 @@ pub(super) struct WindowsPerfCountersMetrics {
     /// Query-level collection failures.
     #[metric(unit = "{scrape}")]
     pub scrape_failures: Counter<u64>,
-    /// Scrapes that exceeded their cadence, timed out, or found the worker busy.
+    /// Accepted scrapes that crossed their timing threshold.
     #[metric(unit = "{scrape}")]
     pub scrape_overruns: Counter<u64>,
+    /// Worker commands rejected because another command was already pending.
+    #[metric(unit = "{rejection}")]
+    pub worker_busy: Counter<u64>,
     /// Collection duration.
     #[metric(unit = "s")]
     pub scrape_duration: HistogramNormal,
