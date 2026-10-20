@@ -7,11 +7,53 @@ use super::*;
 /// Guarantees: The next point begins a new cumulative sequence that later scrapes retain.
 #[test]
 fn cumulative_start_time_resets_after_clock_rollback() {
-    let mut start = 10;
-    let mut previous = 10;
-    assert_eq!(cumulative_start_time(&mut start, &mut previous, 20), 10);
-    assert_eq!(cumulative_start_time(&mut start, &mut previous, 15), 15);
-    assert_eq!(cumulative_start_time(&mut start, &mut previous, 16), 15);
+    let path = r"\Memory\Available Bytes";
+    let config = CounterConfig {
+        metric_kind: MetricKind::Sum {
+            aggregation: Aggregation::Cumulative,
+            monotonic: false,
+        },
+        ..counter(path, "memory")
+    };
+    let (state, mut query) = fake_query(
+        vec![config.clone()],
+        vec![fake_counter(path, Number::Integer(42))],
+    );
+    for (time, has_data, expected_start) in [
+        (120, true, 100),
+        (120, true, 100),
+        (115, false, 115),
+        (116, true, 115),
+    ] {
+        {
+            let mut state = state.borrow_mut();
+            state.timestamp = time;
+            state.collect_has_data = has_data;
+            state.counters[0].formatted = Some(Number::Integer(1));
+        }
+        let sample = query.collect().unwrap();
+        assert_eq!(query.start_time_unix_nano, expected_start);
+        assert_eq!(sample.timestamp_unix_nano, time);
+        assert_eq!(sample.points[0].timestamp_unix_nano, time);
+        if has_data {
+            assert_eq!(sample.points[0].start_time_unix_nano, Some(expected_start));
+            assert!(
+                into_otap(std::slice::from_ref(&config), sample)
+                    .unwrap()
+                    .is_some()
+            );
+        } else {
+            assert_eq!(sample.points[0].value, SampleValue::NoObservation);
+        }
+    }
+    state.borrow_mut().collect_error = true;
+    assert!(query.collect().is_err());
+    state.borrow_mut().collect_error = false;
+    state.borrow_mut().timestamp = 130;
+    assert_eq!(
+        query.collect().unwrap().points[0].start_time_unix_nano,
+        Some(115)
+    );
 }
 
 /// Scenario: A monotonic raw count advances, resets, and then advances from its new value.

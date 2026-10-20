@@ -292,6 +292,13 @@ and descriptions must preserve the emitted semantics; Windows Private Bytes
 includes committed memory that may reside in RAM or the page file and must not
 be labeled as the physical-memory metric `process.memory.usage`.
 
+Cumulative non-monotonic points retain the positive query initialization time
+across ordinary scrapes and omissions. A backwards observation clock, including
+a no-data collection, resets that start to the new observation time. Equal
+timestamps and non-monotonic value decreases alone do not reset it. Projection
+requires `0 < start <= time`; missing or invalid starts are invariant errors.
+This start is an observation boundary, not provider creation time.
+
 A delta Sum accepts only the two native delta-count types. Its first valid
 sample establishes an interval baseline and emits no point. Each later point
 uses the immediately preceding valid sample timestamp as its start time.

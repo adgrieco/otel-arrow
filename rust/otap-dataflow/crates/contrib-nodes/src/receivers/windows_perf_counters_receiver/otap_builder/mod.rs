@@ -343,12 +343,23 @@ fn prepare_point<'a>(
     })?;
     let start_time_unix_nano = match counter.metric_kind {
         MetricKind::Gauge => None,
-        MetricKind::Sum { .. } => Some(point.start_time_unix_nano.ok_or_else(|| {
-            ProjectionInvariantError(ArrowError::InvalidArgumentError(format!(
-                "Sum {} ({}) has no start time",
-                counter.name, point.path
-            )))
-        })?),
+        MetricKind::Sum { .. } => {
+            let start = point.start_time_unix_nano.ok_or_else(|| {
+                ProjectionInvariantError(ArrowError::InvalidArgumentError(format!(
+                    "Sum {} ({}) has no start time",
+                    counter.name, point.path
+                )))
+            })?;
+            if start <= 0 || start > point.timestamp_unix_nano {
+                return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
+                    format!(
+                        "Sum {} ({}) requires 0 < start <= observation time",
+                        counter.name, point.path
+                    ),
+                )));
+            }
+            Some(start)
+        }
     };
     Ok(PreparedPoint {
         counter,
@@ -414,7 +425,8 @@ fn project(
     })
 }
 
-/// Project one validated scrape into OTAP records and pending monotonic publications.
+/// Project concrete observations using their own timestamps and required Sum starts.
+/// Missing/invalid starts and malformed membership are receiver invariant errors.
 pub(super) fn project_sample(
     counters: &[CounterConfig],
     sample: &Sample,

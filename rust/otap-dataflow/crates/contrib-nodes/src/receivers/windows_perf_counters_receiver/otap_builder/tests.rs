@@ -734,6 +734,37 @@ fn rejects_sum_without_start_time() {
     ));
 }
 
+/// Scenario: A ready cumulative Sum carries a non-positive start or a start after its observation.
+/// Guarantees: Invalid starts fail projection explicitly instead of producing malformed Sum points.
+#[test]
+fn rejects_sum_with_invalid_start_time() {
+    let counters = [non_monotonic_sum(
+        r"\Memory\Available Bytes",
+        "memory",
+        "By",
+    )];
+    for start in [-1, 0, 11] {
+        let mut observation = point(
+            0,
+            r"\Memory\Available Bytes",
+            SampleValue::Value(Number::Integer(42)),
+        );
+        observation.timestamp_unix_nano = 10;
+        observation.start_time_unix_nano = Some(start);
+        let error = into_otap(
+            &counters,
+            Sample {
+                timestamp_unix_nano: 10,
+                members: Vec::new(),
+                points: vec![observation],
+                metadata: Default::default(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("0 < start <= observation time"));
+    }
+}
+
 /// Scenario: A Gauge sample carries an unused start timestamp later than its collection timestamp.
 /// Guarantees: Gauge projection ignores cumulative start-time state and preserves existing output.
 #[test]
