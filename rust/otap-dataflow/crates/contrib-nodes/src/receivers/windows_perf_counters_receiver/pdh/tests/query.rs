@@ -435,10 +435,10 @@ fn invalid_handle_cleanup_failure_requires_query_rebuild() {
 #[test]
 fn same_path_mappings_use_independent_query_entries() {
     let path = r"\Memory\Available Bytes";
-    let configs = vec![
-        counter(path, "windows.memory.available"),
-        counter(path, "windows.memory.available_copy"),
-    ];
+    let first = counter(path, "windows.memory.available");
+    let mut second = counter(path, "windows.memory.available_copy");
+    second.source_mapping_index = 1;
+    let configs = vec![first, second];
     let (state, mut query) = fake_query(
         configs,
         vec![FakeCounter {
@@ -468,6 +468,52 @@ fn same_path_mappings_use_independent_query_entries() {
             .iter()
             .all(|point| matches!(point.value, SampleValue::Value(Number::Integer(42))))
     );
+}
+
+/// Scenario: One source mapping selects an exact instance and an overlapping English wildcard whose member differs by case and may include a machine prefix.
+/// Guarantees: Both expansion forms reuse the exact handle through one lowercased, machine-neutral key.
+#[test]
+fn exact_and_overlapping_wildcard_share_native_key() {
+    let exact_path = r"\Process(worker)\Private Bytes";
+    let wildcard_path = r"\Process(*)\Private Bytes";
+    for expanded_path in [
+        r"\PROCESS(worker)\PRIVATE BYTES",
+        r"\\MACHINE\PROCESS(worker)\PRIVATE BYTES",
+    ] {
+        let mut exact = counter(exact_path, "process.private");
+        exact.instance_config = InstanceConfig::Exact {
+            emit_attribute: true,
+        };
+        exact.source_mapping_index = 7;
+        let mut wildcard = counter(wildcard_path, "process.private");
+        wildcard.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
+        wildcard.source_mapping_index = 7;
+        let (state, mut query) = fake_query_with_cadences(
+            vec![exact, wildcard],
+            vec![fake_counter(exact_path, Number::Integer(42))],
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let _ = state
+            .borrow_mut()
+            .expansions
+            .insert(wildcard_path.to_owned(), vec![expanded_path.to_owned()]);
+
+        let sample = query.collect().unwrap();
+
+        assert_eq!(state.borrow().added, [exact_path.to_owned()]);
+        assert_eq!(query.active_expanded_count(), 0);
+        assert_eq!(
+            sample
+                .points
+                .iter()
+                .map(|point| (point.counter_index, point.path.as_ref()))
+                .collect::<Vec<_>>(),
+            [(0, exact_path)]
+        );
+    }
 }
 
 /// Scenario: Startup priming reads a calculated Gauge and native delta Sum before their first scrape.
@@ -1451,11 +1497,11 @@ fn pending_wildcard_removal_consumes_one_budget_entry() {
         };
         config
     };
+    let first = wildcard(first_template, "process.private");
+    let mut second = wildcard(second_template, "thread.context_switches");
+    second.source_mapping_index = 1;
     let (state, mut query) = fake_query_with_seed(
-        vec![
-            wildcard(first_template, "process.private"),
-            wildcard(second_template, "thread.context_switches"),
-        ],
+        vec![first, second],
         vec![
             FakeCounter {
                 path: first_expanded.to_owned(),

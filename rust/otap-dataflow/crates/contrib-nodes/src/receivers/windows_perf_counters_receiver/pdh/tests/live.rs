@@ -385,6 +385,7 @@ async fn live_pdh_ascii_case_variants_share_native_membership() {
     variant.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
     };
+    variant.source_mapping_index = 1;
     let mut query = open_live_query(vec![canonical, variant], "ascii-case");
     let sample = query.collect().unwrap();
     assert!(

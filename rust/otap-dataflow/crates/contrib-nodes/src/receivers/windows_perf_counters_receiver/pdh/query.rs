@@ -311,7 +311,8 @@ impl<A: PdhApi> Query<A> {
     }
 
     pub(super) fn admitted_members(&self) -> Vec<SampleMember> {
-        self.counters
+        let mut members = self
+            .counters
             .iter()
             .map(|(key, counter)| (key.clone(), counter.member()))
             .chain(
@@ -327,7 +328,13 @@ impl<A: PdhApi> Query<A> {
             }))
             .collect::<BTreeMap<_, _>>()
             .into_values()
-            .collect()
+            .collect::<Vec<_>>();
+        members.sort_by(|left, right| {
+            left.counter_index
+                .cmp(&right.counter_index)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        members
     }
 
     fn initialize_exact_counters(
@@ -339,7 +346,7 @@ impl<A: PdhApi> Query<A> {
                 continue;
             }
             let path = Arc::<str>::from(self.configs[config_index].path.as_str());
-            let key = CounterKey::new(config_index, &path);
+            let key = CounterKey::new(self.configs[config_index].source_mapping_index, &path);
             let instance = if self.configs[config_index].instance_config.has_instance() {
                 match self.api.parse_instance(&path) {
                     Ok(instance) => Some(Arc::new(instance)),
@@ -414,7 +421,10 @@ impl<A: PdhApi> Query<A> {
                 error,
             ));
         }
-        let key = CounterKey::new(target.config_index, &target.path);
+        let key = CounterKey::new(
+            self.configs[target.config_index].source_mapping_index,
+            &target.path,
+        );
         let _ = self.counters.insert(
             key,
             CounterHandle {
@@ -587,12 +597,13 @@ impl<A: PdhApi> Query<A> {
         self.counters
             .iter()
             .filter_map(|(key, counter)| {
-                (key.config_index != config_index && counter.origin.is_wildcard())
+                (counter.config_index != config_index && counter.origin.is_wildcard())
                     .then(|| {
                         counter.instance.clone().map(|instance| {
                             (
                                 key.clone(),
                                 DesiredCounter::new(
+                                    counter.config_index,
                                     counter.path.clone(),
                                     instance,
                                     counter.emit_instance_attribute,
@@ -603,12 +614,13 @@ impl<A: PdhApi> Query<A> {
                     .flatten()
             })
             .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                (key.config_index != config_index && state.target.origin.is_wildcard())
+                (state.target.config_index != config_index && state.target.origin.is_wildcard())
                     .then(|| {
                         state.target.instance.clone().map(|instance| {
                             (
                                 key.clone(),
                                 DesiredCounter::new(
+                                    state.target.config_index,
                                     state.target.path.clone(),
                                     instance,
                                     state.target.emit_instance_attribute,
@@ -619,13 +631,14 @@ impl<A: PdhApi> Query<A> {
                     .flatten()
             }))
             .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
-                (key.config_index != config_index)
+                (removal.counter.config_index != config_index)
                     .then(|| {
                         removal.retry_target.as_ref().and_then(|target| {
                             target.instance.clone().map(|instance| {
                                 (
                                     key.clone(),
                                     DesiredCounter::new(
+                                        target.config_index,
                                         target.path.clone(),
                                         instance,
                                         target.emit_instance_attribute,
@@ -643,11 +656,11 @@ impl<A: PdhApi> Query<A> {
         self.counters
             .iter()
             .filter_map(|(key, counter)| {
-                (key.config_index != config_index && counter.origin.is_wildcard())
+                (counter.config_index != config_index && counter.origin.is_wildcard())
                     .then_some(key.clone())
             })
             .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                (key.config_index != config_index && state.target.origin.is_wildcard())
+                (state.target.config_index != config_index && state.target.origin.is_wildcard())
                     .then_some(key.clone())
             }))
             .collect::<BTreeSet<_>>()
@@ -670,7 +683,7 @@ impl<A: PdhApi> Query<A> {
             .counters
             .iter()
             .filter_map(|(key, counter)| {
-                (key.config_index == config_index && counter.origin.is_wildcard()).then_some((
+                (counter.config_index == config_index && counter.origin.is_wildcard()).then_some((
                     counter.admission_order.unwrap_or(u64::MAX),
                     key,
                     &counter.path,
@@ -679,13 +692,14 @@ impl<A: PdhApi> Query<A> {
                 ))
             })
             .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                (key.config_index == config_index && state.target.origin.is_wildcard()).then_some((
-                    state.target.admission_order.unwrap_or(u64::MAX),
-                    key,
-                    &state.target.path,
-                    &state.target.instance,
-                    state.target.emit_instance_attribute,
-                ))
+                (state.target.config_index == config_index && state.target.origin.is_wildcard())
+                    .then_some((
+                        state.target.admission_order.unwrap_or(u64::MAX),
+                        key,
+                        &state.target.path,
+                        &state.target.instance,
+                        state.target.emit_instance_attribute,
+                    ))
             }))
             .filter_map(
                 |(admission_order, key, path, instance, emit_instance_attribute)| {
@@ -693,7 +707,12 @@ impl<A: PdhApi> Query<A> {
                         (
                             admission_order,
                             key.clone(),
-                            DesiredCounter::new(path.clone(), instance, emit_instance_attribute),
+                            DesiredCounter::new(
+                                config_index,
+                                path.clone(),
+                                instance,
+                                emit_instance_attribute,
+                            ),
                         )
                     })
                 },
@@ -752,7 +771,8 @@ impl<A: PdhApi> Query<A> {
                 });
                 paths.retain(|path| path.encode_utf16().count() < PDH_MAX_COUNTER_PATH as usize);
             }
-            let mut paths = keyed_expanded_paths(config_index, paths);
+            let mut paths =
+                keyed_expanded_paths(self.configs[config_index].source_mapping_index, paths);
             let discovered = paths.len();
             let discovered_keys = paths
                 .iter()
@@ -763,11 +783,11 @@ impl<A: PdhApi> Query<A> {
                 .counters
                 .iter()
                 .filter_map(|(key, counter)| {
-                    (key.config_index == config_index && counter.origin.is_wildcard())
+                    (counter.config_index == config_index && counter.origin.is_wildcard())
                         .then_some((key.clone(), counter.admission_order.unwrap_or(u64::MAX)))
                 })
                 .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                    (key.config_index == config_index && state.target.origin.is_wildcard())
+                    (state.target.config_index == config_index && state.target.origin.is_wildcard())
                         .then_some((
                             key.clone(),
                             state.target.admission_order.unwrap_or(u64::MAX),
@@ -795,7 +815,12 @@ impl<A: PdhApi> Query<A> {
                                 && !aggregation_only;
                         let _ = desired.insert(
                             key,
-                            DesiredCounter::new(path, Arc::new(instance), emit_instance_attribute),
+                            DesiredCounter::new(
+                                config_index,
+                                path,
+                                Arc::new(instance),
+                                emit_instance_attribute,
+                            ),
                         );
                     }
                     Err(error) => {
@@ -866,13 +891,23 @@ impl<A: PdhApi> Query<A> {
                 .iter()
                 .map(|(key, counter)| (key, counter.instance.as_ref())),
         );
-        let (removed, added) = refresh_changes_with_group_resets(
+        let (removed, mut added) = refresh_changes_with_group_resets(
             &live,
             &retrying,
             &wanted,
             &known_groups,
             &wanted_groups,
         );
+        added.retain(|key| {
+            !self
+                .counters
+                .get(key)
+                .is_some_and(|counter| !counter.origin.is_wildcard())
+                && !self
+                    .retry_states
+                    .get(key)
+                    .is_some_and(|state| !state.target.origin.is_wildcard())
+        });
         WildcardReconciliation {
             live,
             wanted,
@@ -948,6 +983,7 @@ impl<A: PdhApi> Query<A> {
                 continue;
             }
             let Some(DesiredCounter {
+                config_index,
                 path,
                 instance,
                 emit_instance_attribute,
@@ -960,7 +996,7 @@ impl<A: PdhApi> Query<A> {
             self.next_wildcard_admission_order =
                 self.next_wildcard_admission_order.saturating_add(1);
             let target = CounterTarget {
-                config_index: key.config_index,
+                config_index,
                 path,
                 origin: CounterOrigin::Wildcard,
                 instance: Some(instance),
@@ -1027,7 +1063,7 @@ impl<A: PdhApi> Query<A> {
         path: &Arc<str>,
         timestamp_unix_nano: i64,
     ) -> bool {
-        let key = CounterKey::new(config_index, path);
+        let key = CounterKey::new(self.configs[config_index].source_mapping_index, path);
         self.counters.get_mut(&key).is_some_and(|counter| {
             publish_monotonic_start(&mut counter.history.monotonic_sequence, timestamp_unix_nano)
         })
@@ -1040,7 +1076,10 @@ impl<A: PdhApi> Query<A> {
         path: &Arc<str>,
     ) -> Option<MonotonicSequence> {
         self.counters
-            .get(&CounterKey::new(config_index, path))
+            .get(&CounterKey::new(
+                self.configs[config_index].source_mapping_index,
+                path,
+            ))
             .map(|counter| counter.history.monotonic_sequence)
     }
 
@@ -1301,6 +1340,11 @@ impl<A: PdhApi> Query<A> {
                 value,
             });
         }
+        points.sort_by(|left, right| {
+            left.counter_index
+                .cmp(&right.counter_index)
+                .then_with(|| left.path.cmp(&right.path))
+        });
         let now = Instant::now();
         for (key, target) in retired {
             let counter = self.counters.remove(&key).ok_or(Error::InvalidSample(
@@ -1366,6 +1410,7 @@ fn validate_positive_multi_base(path: &str, base: u32) -> Result<(), Error> {
 }
 
 struct DesiredCounter {
+    config_index: usize,
     path: Arc<str>,
     instance: Arc<InstanceIdentity>,
     emit_instance_attribute: bool,
@@ -1373,11 +1418,13 @@ struct DesiredCounter {
 
 impl DesiredCounter {
     fn new(
+        config_index: usize,
         path: impl Into<Arc<str>>,
         instance: Arc<InstanceIdentity>,
         emit_instance_attribute: bool,
     ) -> Self {
         Self {
+            config_index,
             path: path.into(),
             instance,
             emit_instance_attribute,

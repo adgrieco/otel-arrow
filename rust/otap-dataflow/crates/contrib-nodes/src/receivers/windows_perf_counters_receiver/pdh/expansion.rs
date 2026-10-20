@@ -13,14 +13,14 @@ pub(super) fn parse_instance(path: &str) -> Result<InstanceIdentity, Error> {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct CounterKey {
-    pub(super) config_index: usize,
+    pub(super) source_mapping_index: usize,
     normalized_path: String,
 }
 
 impl CounterKey {
-    pub(super) fn new(config_index: usize, path: &str) -> Self {
+    pub(super) fn new(source_mapping_index: usize, path: &str) -> Self {
         Self {
-            config_index,
+            source_mapping_index,
             normalized_path: local_counter_path(path).to_lowercase(),
         }
     }
@@ -46,14 +46,14 @@ pub(super) fn normalize_expanded_path(path: String) -> String {
 }
 
 pub(super) fn keyed_expanded_paths(
-    config_index: usize,
+    source_mapping_index: usize,
     paths: Vec<String>,
 ) -> Vec<(CounterKey, String)> {
     let mut keyed = paths
         .into_iter()
         .map(|path| {
             let path = normalize_expanded_path(path);
-            (CounterKey::new(config_index, &path), path)
+            (CounterKey::new(source_mapping_index, &path), path)
         })
         .collect::<Vec<_>>();
     keyed.sort_by(|(left_key, left_path), (right_key, right_path)| {
@@ -147,7 +147,7 @@ pub(super) fn instance_groups<'a>(
     let mut groups = BTreeMap::new();
     for (key, instance) in counters {
         let _ = groups
-            .entry(InstanceGroupKey::new(key.config_index, instance))
+            .entry(InstanceGroupKey::new(key.source_mapping_index, instance))
             .or_insert_with(BTreeSet::new)
             .insert(key.clone());
     }
