@@ -59,6 +59,12 @@ pub(super) trait PdhApi {
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error>;
     /// Parses the instance identity from one concrete English path.
     fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error>;
+    /// Parses the concrete English counter-name component from one expanded path.
+    fn parse_counter_name(&mut self, _path: &str) -> Result<String, Error> {
+        Err(Error::InvalidSample(
+            "counter-name parsing is unavailable for this PDH adapter",
+        ))
+    }
 }
 
 #[cfg(test)]

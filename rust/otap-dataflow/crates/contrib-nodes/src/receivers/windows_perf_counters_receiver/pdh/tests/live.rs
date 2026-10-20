@@ -1097,6 +1097,87 @@ async fn live_pdh_collects_parsed_instance_paths() {
     std::fs::remove_dir(directory).unwrap();
 }
 
+/// Scenario: The live Memory object expands a whole-counter template before concrete English adds.
+/// Guarantees: Decoded output includes Available Bytes with `windows.perf_counter.name` and no fabricated `instance`.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+async fn live_pdh_collects_and_decodes_whole_counter_expansion() {
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric;
+    use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryIntoWithOptions};
+    use otel_arrow_dfe_pdata_codec::OtapPayload;
+    use prost::Message;
+
+    let _serial = TEST_PDH_LOCK.lock().await;
+    let config = Config::from_json(&serde_json::json!({
+        "metrics": {
+            "memory.all": {"unit": "1", "gauge": {}}
+        },
+        "perfcounters": [{
+            "object": "Memory",
+            "counters": [{"name": "*", "metric": "memory.all"}]
+        }]
+    }))
+    .unwrap();
+    let mut worker = Worker::start(
+        config.counters.clone(),
+        QueryCadence::uniform(Duration::from_secs(30)),
+        256,
+        4_096,
+        "whole-counter".to_owned(),
+    )
+    .await
+    .unwrap();
+    let sample = worker.collect().await.unwrap();
+    let available = sample
+        .points
+        .iter()
+        .find(|point| point.path.as_ref() == r"\Memory\Available Bytes")
+        .expect("expanded Available Bytes point");
+    assert!(available.instance.is_none());
+    assert_eq!(available.counter_name.as_deref(), Some("Available Bytes"));
+
+    let records = into_otap(&config.counters, sample).unwrap().unwrap();
+    let bytes: OtlpProtoBytes = OtapPayload::from_otap(records)
+        .try_into_with_default()
+        .unwrap();
+    let decoded = ExportMetricsServiceRequest::decode(bytes.as_bytes()).unwrap();
+    let metric = decoded.resource_metrics[0].scope_metrics[0]
+        .metrics
+        .iter()
+        .find(|metric| metric.name == "memory.all")
+        .expect("whole-counter metric");
+    let Some(metric::Data::Gauge(gauge)) = &metric.data else {
+        panic!("whole-counter metric must be a Gauge");
+    };
+    assert!(gauge.data_points.iter().any(|point| {
+        let mut counter_name = None;
+        for attribute in &point.attributes {
+            if attribute.key == "instance" {
+                return false;
+            }
+            if attribute.key == "windows.perf_counter.name" {
+                counter_name = attribute
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.value.as_ref())
+                    .and_then(|value| match value {
+                        any_value::Value::StringValue(value) => Some(value.as_str()),
+                        _ => None,
+                    });
+            }
+        }
+        counter_name == Some("Available Bytes")
+    }));
+    assert!(
+        worker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap()
+    );
+}
+
 /// Scenario: One live PDH query maps Available Bytes to two metrics with different attributes.
 /// Guarantees: Both mappings emit integers on two collections, and OTAP preserves each metric's name, value, path, and attributes.
 #[tokio::test(flavor = "current_thread")]

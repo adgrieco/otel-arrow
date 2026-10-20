@@ -22,6 +22,7 @@ fn counter(path: &str, name: &str, unit: &str) -> CounterConfig {
         metric_kind: MetricKind::Gauge,
         attributes: Arc::new(BTreeMap::new()),
         instance_config: InstanceConfig::None,
+        counter_name_wildcard: false,
         scale_power10: 0,
         recreate_query: false,
         source_mapping_index: 0,
@@ -72,6 +73,7 @@ fn point_at(
         counter_index,
         path: Arc::from(path),
         instance: None,
+        counter_name: None,
         emit_instance_attribute: false,
         timestamp_unix_nano,
         start_time_unix_nano: None,
@@ -280,6 +282,7 @@ fn projects_static_attribute_spelling_verbatim() {
                 parent: None,
                 index: 0,
             })),
+            counter_name: None,
             emit_instance_attribute: true,
             timestamp_unix_nano: 10,
             start_time_unix_nano: None,
@@ -1009,6 +1012,7 @@ fn rejects_point_absent_from_admitted_membership() {
                 counter_index: 0,
                 path: Arc::from(r"\Process(owner)\Private Bytes"),
                 instance: None,
+                counter_name: None,
                 emit_instance_attribute: false,
             }],
             points: vec![point(
@@ -1054,6 +1058,7 @@ fn projects_wildcard_instance_identity() {
                         parent: None,
                         index: 0,
                     })),
+                    counter_name: None,
                     emit_instance_attribute: true,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
@@ -1068,6 +1073,7 @@ fn projects_wildcard_instance_identity() {
                         parent: Some("service".to_owned()),
                         index: 1,
                     })),
+                    counter_name: None,
                     emit_instance_attribute: true,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
@@ -1100,6 +1106,116 @@ fn projects_wildcard_instance_identity() {
     );
 }
 
+/// Scenario: Whole-counter expansion returns non-instanced Memory counters and an instanced Process counter.
+/// Guarantees: Every point emits only its concrete English counter name, plus `instance` when the native path has one.
+#[test]
+fn projects_whole_counter_identity_without_fabricating_instances() {
+    let mut memory = counter(r"\Memory\*", "windows.memory.counters", "1");
+    memory.counter_name_wildcard = true;
+    let mut process = counter(r"\Process(*)\*", "windows.process.counters", "1");
+    process.counter_name_wildcard = true;
+    process.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let records = into_otap(
+        &[memory, process],
+        Sample {
+            timestamp_unix_nano: 1,
+            members: vec![
+                SampleMember {
+                    counter_index: 0,
+                    path: Arc::from(r"\Memory\Available Bytes"),
+                    instance: None,
+                    counter_name: Some(Arc::from("Available Bytes")),
+                    emit_instance_attribute: false,
+                },
+                SampleMember {
+                    counter_index: 0,
+                    path: Arc::from(r"\Memory\Cache Bytes"),
+                    instance: None,
+                    counter_name: Some(Arc::from("Cache Bytes")),
+                    emit_instance_attribute: false,
+                },
+                SampleMember {
+                    counter_index: 1,
+                    path: Arc::from(r"\Process(svchost)\ID Process"),
+                    instance: Some(Arc::new(InstanceIdentity {
+                        name: "svchost".to_owned(),
+                        parent: None,
+                        index: 0,
+                    })),
+                    counter_name: Some(Arc::from("ID Process")),
+                    emit_instance_attribute: true,
+                },
+            ],
+            points: vec![
+                SamplePoint {
+                    counter_index: 0,
+                    path: Arc::from(r"\Memory\Available Bytes"),
+                    instance: None,
+                    counter_name: Some(Arc::from("Available Bytes")),
+                    emit_instance_attribute: false,
+                    timestamp_unix_nano: 1,
+                    start_time_unix_nano: None,
+                    monotonic_publication: None,
+                    value: SampleValue::Value(Number::Integer(10)),
+                },
+                SamplePoint {
+                    counter_index: 0,
+                    path: Arc::from(r"\Memory\Cache Bytes"),
+                    instance: None,
+                    counter_name: Some(Arc::from("Cache Bytes")),
+                    emit_instance_attribute: false,
+                    timestamp_unix_nano: 1,
+                    start_time_unix_nano: None,
+                    monotonic_publication: None,
+                    value: SampleValue::Value(Number::Integer(15)),
+                },
+                SamplePoint {
+                    counter_index: 1,
+                    path: Arc::from(r"\Process(svchost)\ID Process"),
+                    instance: Some(Arc::new(InstanceIdentity {
+                        name: "svchost".to_owned(),
+                        parent: None,
+                        index: 0,
+                    })),
+                    counter_name: Some(Arc::from("ID Process")),
+                    emit_instance_attribute: true,
+                    timestamp_unix_nano: 1,
+                    start_time_unix_nano: None,
+                    monotonic_publication: None,
+                    value: SampleValue::Value(Number::Integer(20)),
+                },
+            ],
+            metadata: Default::default(),
+        },
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        string_attributes(&records),
+        [
+            (
+                "0".to_owned(),
+                "windows.perf_counter.name".to_owned(),
+                "Available Bytes".to_owned(),
+            ),
+            (
+                "1".to_owned(),
+                "windows.perf_counter.name".to_owned(),
+                "Cache Bytes".to_owned(),
+            ),
+            ("2".to_owned(), "instance".to_owned(), "svchost".to_owned(),),
+            (
+                "2".to_owned(),
+                "windows.perf_counter.name".to_owned(),
+                "ID Process".to_owned(),
+            ),
+        ]
+    );
+}
+
 /// Scenario: An aggregate is collected alone or explicitly included with other instances.
 /// Guarantees: Go's `instance` attribute is omitted only for the aggregate-only mapping.
 #[test]
@@ -1127,6 +1243,7 @@ fn projects_aggregate_instance_selection() {
                     counter_index: 0,
                     path: Arc::from(r"\Processor(_Total)\Counter"),
                     instance: Some(aggregate.clone()),
+                    counter_name: None,
                     emit_instance_attribute: false,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
@@ -1137,6 +1254,7 @@ fn projects_aggregate_instance_selection() {
                     counter_index: 1,
                     path: Arc::from(r"\Processor(_Total)\Counter"),
                     instance: Some(aggregate),
+                    counter_name: None,
                     emit_instance_attribute: true,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
@@ -1188,6 +1306,7 @@ fn static_instance_override_uses_deterministic_output_owner() {
                         parent: None,
                         index: 0,
                     })),
+                    counter_name: None,
                     emit_instance_attribute: true,
                 })
                 .collect(),
@@ -1200,6 +1319,7 @@ fn static_instance_override_uses_deterministic_output_owner() {
                         parent: None,
                         index: 0,
                     })),
+                    counter_name: None,
                     emit_instance_attribute: true,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
@@ -1214,6 +1334,7 @@ fn static_instance_override_uses_deterministic_output_owner() {
                         parent: None,
                         index: 0,
                     })),
+                    counter_name: None,
                     emit_instance_attribute: true,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
@@ -1278,6 +1399,7 @@ fn invalid_output_owner_is_not_replaced_by_valid_collision() {
             counter_index,
             path: Arc::from(concrete),
             instance: Some(Arc::clone(&instance)),
+            counter_name: None,
             emit_instance_attribute: true,
         })
         .collect();
@@ -1289,6 +1411,7 @@ fn invalid_output_owner_is_not_replaced_by_valid_collision() {
                 counter_index: 0,
                 path: Arc::from(concrete),
                 instance: Some(Arc::clone(&instance)),
+                counter_name: None,
                 emit_instance_attribute: true,
                 timestamp_unix_nano: 1,
                 start_time_unix_nano: None,
@@ -1299,6 +1422,7 @@ fn invalid_output_owner_is_not_replaced_by_valid_collision() {
                 counter_index: 1,
                 path: Arc::from(concrete),
                 instance: Some(instance),
+                counter_name: None,
                 emit_instance_attribute: true,
                 timestamp_unix_nano: 1,
                 start_time_unix_nano: None,

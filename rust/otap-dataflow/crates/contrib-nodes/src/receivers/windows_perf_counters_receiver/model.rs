@@ -101,6 +101,8 @@ pub(super) struct SamplePoint {
     pub(super) path: Arc<str>,
     /// Parsed identity for an expanded wildcard instance.
     pub(super) instance: Option<Arc<InstanceIdentity>>,
+    /// Concrete English counter name for whole-counter expansion.
+    pub(super) counter_name: Option<Arc<str>>,
     /// Whether to emit the Go-compatible `instance` attribute for this point.
     pub(super) emit_instance_attribute: bool,
     /// End of this point's observation or delta interval.
@@ -122,6 +124,8 @@ pub(super) struct SampleMember {
     pub(super) path: Arc<str>,
     /// Parsed identity for an expanded or exact instance path.
     pub(super) instance: Option<Arc<InstanceIdentity>>,
+    /// Concrete English counter name for whole-counter expansion.
+    pub(super) counter_name: Option<Arc<str>>,
     /// Whether to emit the Go-compatible `instance` attribute for this member.
     pub(super) emit_instance_attribute: bool,
 }

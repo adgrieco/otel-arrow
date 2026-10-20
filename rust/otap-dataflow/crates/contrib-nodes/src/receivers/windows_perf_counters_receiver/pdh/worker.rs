@@ -93,9 +93,7 @@ impl Worker {
         max_native_counters: usize,
         node: String,
     ) -> Result<Self, Error> {
-        let has_wildcards = counters
-            .iter()
-            .any(|counter| counter.instance_config.is_wildcard());
+        let has_wildcards = counters.iter().any(CounterConfig::is_expanded);
         let mut settings = QuerySettings {
             cadence,
             max_instances_per_wildcard,
@@ -535,7 +533,7 @@ impl QueryPlan {
     fn exact_counter_reservations(&self) -> usize {
         self.configs
             .iter()
-            .filter(|config| !config.instance_config.is_wildcard())
+            .filter(|config| !config.is_expanded())
             .count()
     }
 }
@@ -1314,7 +1312,7 @@ pub(super) fn refresh_wildcards_in_config_order<A: PdhApi>(
                 .configs
                 .iter()
                 .enumerate()
-                .filter(|(_, config)| config.instance_config.is_wildcard())
+                .filter(|(_, config)| config.is_expanded())
                 .map(move |(config_index, _)| {
                     (
                         slot.plan.global_indices[config_index],

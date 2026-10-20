@@ -186,7 +186,7 @@ impl<A: PdhApi> Query<A> {
     ) -> Result<Self, Error> {
         let exact_counter_reservations = configs
             .iter()
-            .filter(|config| !config.instance_config.is_wildcard())
+            .filter(|config| !config.is_expanded())
             .count();
         if exact_counter_reservations > max_native_counters {
             return Err(Error::InvalidSample(
@@ -236,9 +236,7 @@ impl<A: PdhApi> Query<A> {
     }
 
     fn has_wildcard_configs(&self) -> bool {
-        self.configs
-            .iter()
-            .any(|config| config.instance_config.is_wildcard())
+        self.configs.iter().any(CounterConfig::is_expanded)
     }
 
     fn initialize_seeded_wildcards(
@@ -343,7 +341,7 @@ impl<A: PdhApi> Query<A> {
         seed: Option<&QueryRecreationSeed>,
     ) -> Result<(), Error> {
         for config_index in 0..self.configs.len() {
-            if self.configs[config_index].instance_config.is_wildcard() {
+            if self.configs[config_index].is_expanded() {
                 continue;
             }
             let path = Arc::<str>::from(self.configs[config_index].path.as_str());
@@ -366,6 +364,7 @@ impl<A: PdhApi> Query<A> {
                 path,
                 origin: CounterOrigin::Exact,
                 instance: instance.clone(),
+                counter_name: None,
                 emit_instance_attribute: self.configs[config_index]
                     .instance_config
                     .emit_attribute()
@@ -437,6 +436,7 @@ impl<A: PdhApi> Query<A> {
                 history: target.history,
                 origin: target.origin,
                 instance: target.instance,
+                counter_name: target.counter_name,
                 emit_instance_attribute: target.emit_instance_attribute,
                 admission_order: target.admission_order,
                 removal_counted: target.removal_counted,
@@ -508,9 +508,7 @@ impl<A: PdhApi> Query<A> {
             .configs
             .iter()
             .enumerate()
-            .filter_map(|(config_index, config)| {
-                config.instance_config.is_wildcard().then_some(config_index)
-            })
+            .filter_map(|(config_index, config)| config.is_expanded().then_some(config_index))
             .collect::<Vec<_>>();
         for config_index in wildcard_configs {
             self.refresh_wildcard_config(config_index, metadata)?;
@@ -545,7 +543,7 @@ impl<A: PdhApi> Query<A> {
         if !self
             .configs
             .get(config_index)
-            .is_some_and(|config| config.instance_config.is_wildcard())
+            .is_some_and(CounterConfig::is_expanded)
         {
             return Err(Error::InvalidSample(
                 "managed wildcard refresh selected a non-wildcard counter",
@@ -555,6 +553,24 @@ impl<A: PdhApi> Query<A> {
         let result = self.refresh_wildcard_config(config_index, &mut metadata);
         self.pending.merge(metadata);
         result
+    }
+
+    fn expanded_identity(
+        &mut self,
+        config_index: usize,
+        path: &str,
+    ) -> Result<(Option<Arc<InstanceIdentity>>, Option<Arc<str>>), Error> {
+        let instance = if self.configs[config_index].instance_config.has_instance() {
+            Some(Arc::new(self.api.parse_instance(path)?))
+        } else {
+            None
+        };
+        let counter_name = if self.configs[config_index].counter_name_wildcard {
+            Some(Arc::from(self.api.parse_counter_name(path)?))
+        } else {
+            None
+        };
+        Ok((instance, counter_name))
     }
 
     pub(super) fn plan_wildcard_refresh_managed(
@@ -605,17 +621,21 @@ impl<A: PdhApi> Query<A> {
                                 .retry_states
                                 .get(&key)
                                 .is_some_and(|state| !state.target.origin.is_wildcard());
-                        let desired = self.api.parse_instance(&path).map(|instance| {
-                            let emit_instance_attribute =
-                                self.configs[config_index].instance_config.emit_attribute()
-                                    && !aggregation_only;
-                            DesiredCounter::new(
-                                config_index,
-                                path.clone(),
-                                Arc::new(instance),
-                                emit_instance_attribute,
-                            )
-                        });
+                        let desired = self.expanded_identity(config_index, &path).map(
+                            |(instance, counter_name)| {
+                                let emit_instance_attribute =
+                                    self.configs[config_index].instance_config.emit_attribute()
+                                        && instance.is_some()
+                                        && !aggregation_only;
+                                DesiredCounter::new(
+                                    config_index,
+                                    path.clone(),
+                                    instance,
+                                    counter_name,
+                                    emit_instance_attribute,
+                                )
+                            },
+                        );
                         WildcardCandidate {
                             key,
                             desired,
@@ -792,55 +812,55 @@ impl<A: PdhApi> Query<A> {
     fn desired_wildcards_excluding(&self, config_index: usize) -> DesiredCounters {
         self.counters
             .iter()
-            .filter_map(|(key, counter)| {
-                (counter.config_index != config_index && counter.origin.is_wildcard())
-                    .then(|| {
-                        counter.instance.clone().map(|instance| {
-                            (
-                                key.clone(),
-                                DesiredCounter::new(
-                                    counter.config_index,
-                                    counter.path.clone(),
-                                    instance,
-                                    counter.emit_instance_attribute,
-                                ),
-                            )
-                        })
-                    })
-                    .flatten()
+            .filter(|(_, counter)| {
+                counter.config_index != config_index && counter.origin.is_wildcard()
             })
-            .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                (state.target.config_index != config_index && state.target.origin.is_wildcard())
-                    .then(|| {
-                        state.target.instance.clone().map(|instance| {
-                            (
-                                key.clone(),
-                                DesiredCounter::new(
-                                    state.target.config_index,
-                                    state.target.path.clone(),
-                                    instance,
-                                    state.target.emit_instance_attribute,
-                                ),
-                            )
-                        })
+            .map(|(key, counter)| {
+                (
+                    key.clone(),
+                    DesiredCounter::new(
+                        counter.config_index,
+                        counter.path.clone(),
+                        counter.instance.clone(),
+                        counter.counter_name.clone(),
+                        counter.emit_instance_attribute,
+                    ),
+                )
+            })
+            .chain(
+                self.retry_states
+                    .iter()
+                    .filter(|(_, state)| {
+                        state.target.config_index != config_index
+                            && state.target.origin.is_wildcard()
                     })
-                    .flatten()
-            }))
+                    .map(|(key, state)| {
+                        (
+                            key.clone(),
+                            DesiredCounter::new(
+                                state.target.config_index,
+                                state.target.path.clone(),
+                                state.target.instance.clone(),
+                                state.target.counter_name.clone(),
+                                state.target.emit_instance_attribute,
+                            ),
+                        )
+                    }),
+            )
             .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
                 (removal.counter.config_index != config_index)
                     .then(|| {
-                        removal.retry_target.as_ref().and_then(|target| {
-                            target.instance.clone().map(|instance| {
-                                (
-                                    key.clone(),
-                                    DesiredCounter::new(
-                                        target.config_index,
-                                        target.path.clone(),
-                                        instance,
-                                        target.emit_instance_attribute,
-                                    ),
-                                )
-                            })
+                        removal.retry_target.as_ref().map(|target| {
+                            (
+                                key.clone(),
+                                DesiredCounter::new(
+                                    target.config_index,
+                                    target.path.clone(),
+                                    target.instance.clone(),
+                                    target.counter_name.clone(),
+                                    target.emit_instance_attribute,
+                                ),
+                            )
                         })
                     })
                     .flatten()
@@ -858,59 +878,57 @@ impl<A: PdhApi> Query<A> {
     fn current_wildcards_excluding(&self, excluded_configs: &BTreeSet<usize>) -> DesiredCounters {
         self.counters
             .iter()
-            .filter_map(|(key, counter)| {
-                (counter.origin.is_wildcard() && !excluded_configs.contains(&counter.config_index))
-                    .then(|| {
-                        counter.instance.clone().map(|instance| {
-                            (
-                                key.clone(),
-                                DesiredCounter::new(
-                                    counter.config_index,
-                                    counter.path.clone(),
-                                    instance,
-                                    counter.emit_instance_attribute,
-                                ),
-                            )
-                        })
-                    })
-                    .flatten()
+            .filter(|(_, counter)| {
+                counter.origin.is_wildcard() && !excluded_configs.contains(&counter.config_index)
             })
-            .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                (state.target.origin.is_wildcard()
-                    && !excluded_configs.contains(&state.target.config_index))
-                .then(|| {
-                    state.target.instance.clone().map(|instance| {
+            .map(|(key, counter)| {
+                (
+                    key.clone(),
+                    DesiredCounter::new(
+                        counter.config_index,
+                        counter.path.clone(),
+                        counter.instance.clone(),
+                        counter.counter_name.clone(),
+                        counter.emit_instance_attribute,
+                    ),
+                )
+            })
+            .chain(
+                self.retry_states
+                    .iter()
+                    .filter(|(_, state)| {
+                        state.target.origin.is_wildcard()
+                            && !excluded_configs.contains(&state.target.config_index)
+                    })
+                    .map(|(key, state)| {
                         (
                             key.clone(),
                             DesiredCounter::new(
                                 state.target.config_index,
                                 state.target.path.clone(),
-                                instance,
+                                state.target.instance.clone(),
+                                state.target.counter_name.clone(),
                                 state.target.emit_instance_attribute,
                             ),
                         )
-                    })
-                })
-                .flatten()
-            }))
+                    }),
+            )
             .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
                 removal.retry_target.as_ref().and_then(|target| {
                     (target.origin.is_wildcard()
                         && !excluded_configs.contains(&target.config_index))
                     .then(|| {
-                        target.instance.clone().map(|instance| {
-                            (
-                                key.clone(),
-                                DesiredCounter::new(
-                                    target.config_index,
-                                    target.path.clone(),
-                                    instance,
-                                    target.emit_instance_attribute,
-                                ),
-                            )
-                        })
+                        (
+                            key.clone(),
+                            DesiredCounter::new(
+                                target.config_index,
+                                target.path.clone(),
+                                target.instance.clone(),
+                                target.counter_name.clone(),
+                                target.emit_instance_attribute,
+                            ),
+                        )
                     })
-                    .flatten()
                 })
             }))
             .collect()
@@ -952,6 +970,7 @@ impl<A: PdhApi> Query<A> {
                     key,
                     &counter.path,
                     &counter.instance,
+                    &counter.counter_name,
                     counter.emit_instance_attribute,
                 ))
             })
@@ -962,23 +981,23 @@ impl<A: PdhApi> Query<A> {
                         key,
                         &state.target.path,
                         &state.target.instance,
+                        &state.target.counter_name,
                         state.target.emit_instance_attribute,
                     ))
             }))
-            .filter_map(
-                |(admission_order, key, path, instance, emit_instance_attribute)| {
-                    instance.clone().map(|instance| {
-                        (
-                            admission_order,
-                            key.clone(),
-                            DesiredCounter::new(
-                                config_index,
-                                path.clone(),
-                                instance,
-                                emit_instance_attribute,
-                            ),
-                        )
-                    })
+            .map(
+                |(admission_order, key, path, instance, counter_name, emit_instance_attribute)| {
+                    (
+                        admission_order,
+                        key.clone(),
+                        DesiredCounter::new(
+                            config_index,
+                            path.clone(),
+                            instance.clone(),
+                            counter_name.clone(),
+                            emit_instance_attribute,
+                        ),
+                    )
                 },
             )
             .collect::<Vec<_>>();
@@ -1072,17 +1091,19 @@ impl<A: PdhApi> Query<A> {
             metadata.record_expansion_overflows(config_index, discovered, allocation);
             expanded_total += paths.len();
             for (key, path) in paths {
-                match self.api.parse_instance(&path) {
-                    Ok(instance) => {
+                match self.expanded_identity(config_index, &path) {
+                    Ok((instance, counter_name)) => {
                         let emit_instance_attribute =
                             self.configs[config_index].instance_config.emit_attribute()
+                                && instance.is_some()
                                 && !aggregation_only;
                         let _ = desired.insert(
                             key,
                             DesiredCounter::new(
                                 config_index,
                                 path,
-                                Arc::new(instance),
+                                instance,
+                                counter_name,
                                 emit_instance_attribute,
                             ),
                         );
@@ -1150,11 +1171,9 @@ impl<A: PdhApi> Query<A> {
                         .map(|instance| (key, instance))
                 })),
         );
-        let wanted_groups = instance_groups(
-            desired
-                .iter()
-                .map(|(key, counter)| (key, counter.instance.as_ref())),
-        );
+        let wanted_groups = instance_groups(desired.iter().filter_map(|(key, counter)| {
+            counter.instance.as_deref().map(|instance| (key, instance))
+        }));
         let (removed, mut added) = refresh_changes_with_group_resets(
             &live,
             &retrying,
@@ -1250,6 +1269,7 @@ impl<A: PdhApi> Query<A> {
                 config_index,
                 path,
                 instance,
+                counter_name,
                 emit_instance_attribute,
             }) = desired.remove(key)
             else {
@@ -1263,7 +1283,8 @@ impl<A: PdhApi> Query<A> {
                 config_index,
                 path,
                 origin: CounterOrigin::Wildcard,
-                instance: Some(instance),
+                instance,
+                counter_name,
                 emit_instance_attribute,
                 admission_order: Some(admission_order),
                 removal_counted: false,
@@ -1608,6 +1629,7 @@ impl<A: PdhApi> Query<A> {
                 counter_index: counter.config_index,
                 path: counter.path.clone(),
                 instance: counter.instance.clone(),
+                counter_name: counter.counter_name.clone(),
                 emit_instance_attribute: counter.emit_instance_attribute,
                 timestamp_unix_nano,
                 start_time_unix_nano: point_start_time,
@@ -1698,7 +1720,8 @@ fn validate_positive_multi_base(path: &str, base: u32) -> Result<(), Error> {
 struct DesiredCounter {
     config_index: usize,
     path: Arc<str>,
-    instance: Arc<InstanceIdentity>,
+    instance: Option<Arc<InstanceIdentity>>,
+    counter_name: Option<Arc<str>>,
     emit_instance_attribute: bool,
 }
 
@@ -1706,13 +1729,15 @@ impl DesiredCounter {
     fn new(
         config_index: usize,
         path: impl Into<Arc<str>>,
-        instance: Arc<InstanceIdentity>,
+        instance: Option<Arc<InstanceIdentity>>,
+        counter_name: Option<Arc<str>>,
         emit_instance_attribute: bool,
     ) -> Self {
         Self {
             config_index,
             path: path.into(),
             instance,
+            counter_name,
             emit_instance_attribute,
         }
     }
@@ -1816,6 +1841,7 @@ struct CounterTarget {
     path: Arc<str>,
     origin: CounterOrigin,
     instance: Option<Arc<InstanceIdentity>>,
+    counter_name: Option<Arc<str>>,
     emit_instance_attribute: bool,
     admission_order: Option<u64>,
     removal_counted: bool,
@@ -1940,6 +1966,7 @@ impl CounterTarget {
             counter_index: self.config_index,
             path: Arc::clone(&self.path),
             instance: self.instance.clone(),
+            counter_name: self.counter_name.clone(),
             emit_instance_attribute: self.emit_instance_attribute,
         }
     }
@@ -1965,6 +1992,7 @@ struct CounterHandle<C> {
     history: CounterHistory,
     origin: CounterOrigin,
     instance: Option<Arc<InstanceIdentity>>,
+    counter_name: Option<Arc<str>>,
     emit_instance_attribute: bool,
     admission_order: Option<u64>,
     removal_counted: bool,
@@ -1982,6 +2010,7 @@ impl<C> CounterHandle<C> {
             counter_index: self.config_index,
             path: Arc::clone(&self.path),
             instance: self.instance.clone(),
+            counter_name: self.counter_name.clone(),
             emit_instance_attribute: self.emit_instance_attribute,
         }
     }
@@ -1992,6 +2021,7 @@ impl<C> CounterHandle<C> {
             path: self.path.clone(),
             origin: self.origin,
             instance: self.instance.clone(),
+            counter_name: self.counter_name.clone(),
             emit_instance_attribute: self.emit_instance_attribute,
             admission_order: self.admission_order,
             removal_counted: self.removal_counted,
@@ -2209,6 +2239,7 @@ mod tests {
                 parent: None,
                 index: 0,
             })),
+            counter_name: None,
             emit_instance_attribute: true,
             admission_order: Some(0),
             removal_counted: false,

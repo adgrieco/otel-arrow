@@ -12,11 +12,14 @@
 
 ## Overview
 
-Reads configured exact or instance-wildcard Windows performance-counter paths
-through PDH and emits OTel Gauges or cumulative or delta Sums. Data points
+Reads configured exact, instance-wildcard, or whole-counter Windows
+performance-counter paths through PDH and emits OTel Gauges or cumulative or
+delta Sums. Data points
 include configured static attributes and, for selected named instances, the
-Go-compatible `instance` identity. Native path provenance is not exported as
-metric attributes. The resource includes `os.type=windows`.
+Go-compatible `instance` identity. Whole-counter `*` mappings also include the
+concrete English counter name as `windows.perf_counter.name`. Native path
+provenance is not exported as metric attributes. The resource includes
+`os.type=windows`.
 
 The receiver constructs PDH paths from configured performance objects,
 instances, and counters, and periodically refreshes wildcard instances.
@@ -75,7 +78,7 @@ config:
 | `collection_interval` | No | `1m` | Any positive collection interval |
 | `timeout` | No | `collection_interval` | Scrape lateness warning threshold; `0s` uses the collection interval |
 | `wildcard_refresh_interval` | No | See below | Wildcard discovery cadence |
-| `max_instances_per_wildcard` | No | `256` | Per-path expansion limit |
+| `max_instances_per_wildcard` | No | `256` | Per-template instance or whole-counter expansion limit |
 | `max_expanded_counters` | No | `4096` | Receiver-wide exact plus expanded native-counter limit |
 
 <!-- markdownlint-enable MD013 -->
@@ -87,8 +90,9 @@ counter limits must be between
 limit. `max_expanded_counters` is retained for configuration compatibility but
 limits the combined exact and expanded native counters owned by the receiver.
 Exact paths reserve entries even while unavailable so later retry cannot exceed
-the limit. Wildcard templates do not consume entries until they resolve to
-concrete paths. Zero or negative `initial_delay` starts collection immediately.
+the limit. Instance and whole-counter templates do not consume entries until
+they resolve to concrete paths. Zero or negative `initial_delay` starts
+collection immediately.
 Sub-second collection intervals are accepted, matching Go, but rate and other
 two-sample counters generally need about one second or more between samples to
 produce meaningful values.
@@ -189,13 +193,19 @@ because providers may use them as part of valid native identity. An invalid or
 unavailable constructed path is diagnosed for that counter without rejecting
 unrelated mappings.
 
-Configure performance object and counter names in English. Exact paths are
-added through PDH's language-neutral English API. Before wildcard expansion,
-the receiver asks PDH to translate the English template to its localized full
-path, expands that localized template, and adds the resulting concrete paths
-through the localized API. Localized exact object, instance, or counter names
-are not accepted as configuration aliases, and exact-path collection does not
-fall back to the localized API.
+Configure performance object and counter names in English. Object names must
+be exact and cannot contain `*` or `?`. Counter names may be exact or the
+literal whole-counter wildcard `"*"`; partial patterns such as `Avail*` and
+`* MBytes` are rejected because native expansion can silently widen them to
+every counter in the object.
+
+The PDH worker pins and verifies English UI language before its first native
+call. When any expansion template is configured, startup refreshes the
+process-wide PDH object-name cache, expands the English template directly, and
+adds each concrete path through the English API. Localized object, instance,
+or counter names are not accepted as aliases, and collection does not fall
+back to localized paths. The startup refresh affects process-wide PDH lookup
+state; exact-only configurations do not perform it.
 
 Omit `instances`, or use an empty list, for objects without instances. Specify
 one name or a list for exact instances. Partial patterns such as `"worker*"` are
@@ -229,6 +239,25 @@ and new process. The receiver cannot detect that entity change from the reused
 instance identity alone. Where the target host provides it, prefer `Process
 V2`, whose instances include the process ID as `name:PID`; provider
 availability varies by Windows version and installed performance-counter set.
+
+Use `name: "*"` to expand every concrete counter in one object, including
+objects such as `Memory` that have no instances. The mapping keeps one
+configured metric name, kind, unit, description, scale, and static attribute
+set for every concrete counter; the receiver does not generate metrics or
+infer metadata per counter. Each point adds only
+`windows.perf_counter.name=<English counter name>` for counter identity.
+Combined instance and whole-counter templates emit both `instance` and
+`windows.perf_counter.name`; non-instanced counters never fabricate
+`instance`.
+
+Whole-object mappings such as `\Memory\*` can place counters with different
+units and meanings under one metric. Prefer Gauge for exploratory
+whole-counter collection, do not aggregate across
+`windows.perf_counter.name`, and use exact paths with defined metrics whenever
+correct units or stable semantic identity matter. The existing
+`max_instances_per_wildcard` limit applies independently to each instance or
+whole-counter expansion template, and `max_expanded_counters` still bounds all
+exact plus expanded native entries receiver-wide.
 
 Unknown fields, explicit references to undefined metrics, duplicate instances,
 invalid intervals, unsupported scales, and duplicate outputs are configuration

@@ -306,6 +306,11 @@ impl NativePdh {
     }
 
     #[cfg(test)]
+    pub(super) fn parse_counter_name_path(path: &str) -> Result<String, Error> {
+        NativePdh::parse_counter_name(path)
+    }
+
+    #[cfg(test)]
     fn counter_info_buffer_with(
         path: &str,
         mut info: impl FnMut(&mut u32, Option<&mut [usize]>) -> u32,
@@ -500,10 +505,59 @@ impl NativePdh {
         })
     }
 
+    fn parse_counter_name(path: &str) -> Result<String, Error> {
+        let wide_path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        Self::parse_counter_name_with(path, |size, buffer| {
+            // SAFETY: The path is NUL-terminated. Sizing uses null and zero;
+            // filling uses an aligned writable slice.
+            unsafe {
+                PdhParseCounterPathW(
+                    wide_path.as_ptr(),
+                    buffer.map_or(null_mut(), |buffer| buffer.as_mut_ptr().cast()),
+                    size,
+                    0,
+                )
+            }
+        })
+    }
+
     fn parse_instance_identity_with(
         path: &str,
-        mut parse: impl FnMut(&mut u32, Option<&mut [usize]>) -> u32,
+        parse: impl FnMut(&mut u32, Option<&mut [usize]>) -> u32,
     ) -> Result<InstanceIdentity, Error> {
+        Self::parse_counter_path_with(path, parse, |elements, buffer, filled_size| {
+            let name = Self::wide_string(elements.szInstanceName, buffer, filled_size)?.ok_or(
+                Error::InvalidSample("expanded path has no instance identity"),
+            )?;
+            let parent = Self::wide_string(elements.szParentInstance, buffer, filled_size)?;
+            Ok(InstanceIdentity {
+                name,
+                parent: parent.filter(|value| !value.is_empty()),
+                index: elements.dwInstanceIndex,
+            })
+        })
+    }
+
+    fn parse_counter_name_with(
+        path: &str,
+        parse: impl FnMut(&mut u32, Option<&mut [usize]>) -> u32,
+    ) -> Result<String, Error> {
+        Self::parse_counter_path_with(path, parse, |elements, buffer, filled_size| {
+            Self::wide_string(elements.szCounterName, buffer, filled_size)?.ok_or(
+                Error::InvalidSample("expanded path has no counter-name identity"),
+            )
+        })
+    }
+
+    fn parse_counter_path_with<T>(
+        path: &str,
+        mut parse: impl FnMut(&mut u32, Option<&mut [usize]>) -> u32,
+        decode: impl FnOnce(
+            &PDH_COUNTER_PATH_ELEMENTS_W,
+            &NativeBuffer<usize>,
+            usize,
+        ) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let mut size = 0;
         let status = parse(&mut size, None);
         if status != PDH_MORE_DATA {
@@ -538,15 +592,7 @@ impl NativePdh {
         // SAFETY: Successful parsing initialized the fixed pointer fields.
         let elements = unsafe { &*elements };
         let filled_size = size as usize;
-        let name = Self::wide_string(elements.szInstanceName, &buffer, filled_size)?.ok_or(
-            Error::InvalidSample("expanded path has no instance identity"),
-        )?;
-        let parent = Self::wide_string(elements.szParentInstance, &buffer, filled_size)?;
-        Ok(InstanceIdentity {
-            name,
-            parent: parent.filter(|value| !value.is_empty()),
-            index: elements.dwInstanceIndex,
-        })
+        decode(elements, &buffer, filled_size)
     }
 
     fn counter_handle(&self, counter: &CounterToken, path: &str) -> Result<PDH_HCOUNTER, Error> {
@@ -745,6 +791,10 @@ impl PdhApi for NativePdh {
 
     fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
         Self::parse_instance_identity(path)
+    }
+
+    fn parse_counter_name(&mut self, path: &str) -> Result<String, Error> {
+        Self::parse_counter_name(path)
     }
 }
 
@@ -1152,6 +1202,37 @@ mod tests {
             NativePdh::wide_string(pointer, &buffer, 2 * size_of::<u16>()),
             Err(Error::InvalidSample(_))
         ));
+    }
+
+    /// Scenario: Native path parsing returns a concrete whole-counter name in the filled path-elements buffer.
+    /// Guarantees: Counter-name identity is decoded verbatim through PDH path parsing and remains bounded by the reported fill size.
+    #[test]
+    fn parses_concrete_counter_name_from_native_path_elements() {
+        let name = "Available Bytes";
+        let encoded = name.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let header = size_of::<PDH_COUNTER_PATH_ELEMENTS_W>();
+        let filled_size = u32::try_from(header + encoded.len() * size_of::<u16>()).unwrap();
+
+        let parsed = NativePdh::parse_counter_name_with("fixture", |size, buffer| {
+            let Some(buffer) = buffer else {
+                *size = filled_size;
+                return PDH_MORE_DATA;
+            };
+            let base = buffer.as_mut_ptr().cast::<u8>();
+            let elements = base.cast::<PDH_COUNTER_PATH_ELEMENTS_W>();
+            let counter_name = unsafe { base.add(header).cast::<u16>() };
+            // SAFETY: The fixture allocation contains the fixed header followed
+            // by exactly the encoded, NUL-terminated counter name.
+            unsafe {
+                (*elements).szCounterName = counter_name;
+                std::ptr::copy_nonoverlapping(encoded.as_ptr(), counter_name, encoded.len());
+            }
+            *size = filled_size;
+            0
+        })
+        .unwrap();
+
+        assert_eq!(parsed, name);
     }
 
     /// Scenario: Native formatting is requested for an exact large integer and a double above 100.

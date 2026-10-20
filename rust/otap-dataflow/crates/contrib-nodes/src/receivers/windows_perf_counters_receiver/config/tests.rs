@@ -718,8 +718,8 @@ fn identifies_risky_instance_overrides() {
     assert!(!should_warn_instance_override(true, &ignored_attributes));
 }
 
-/// Scenario: Native object, instance, and counter components contain PDH-significant delimiters.
-/// Guarantees: Configuration preserves parentheses, backslashes, question marks, and asterisks for PDH to interpret.
+/// Scenario: Native object, instance, and exact counter components contain PDH-significant delimiters.
+/// Guarantees: Configuration preserves parentheses, backslashes, and instance wildcards while keeping the counter exact.
 #[test]
 fn preserves_native_component_delimiters() {
     let config = Config::from_json(&json!({
@@ -727,13 +727,13 @@ fn preserves_native_component_delimiters() {
         "perfcounters": [{
             "object": "Object (IPv4)",
             "instances": r"C:\pagefile.sys(parent)?",
-            "counters": [{"name": r"Counter (value)\*?", "metric": "test"}]
+            "counters": [{"name": r"Counter (value)\literal", "metric": "test"}]
         }]
     }))
     .unwrap();
     assert_eq!(
         config.counters[0].path,
-        r"\Object (IPv4)(C:\pagefile.sys(parent)?)\Counter (value)\*?"
+        r"\Object (IPv4)(C:\pagefile.sys(parent)?)\Counter (value)\literal"
     );
 }
 
@@ -1531,6 +1531,72 @@ fn wildcard_templates_do_not_consume_exact_counter_budget() {
             .instance_config
             .is_wildcard()
     );
+}
+
+/// Scenario: Literal whole-counter wildcards are configured with no instance and with an instance wildcard.
+/// Guarantees: Both mappings remain expansion templates, share the existing per-pattern/global admission path, and do not reserve exact entries.
+#[test]
+fn normalizes_whole_counter_wildcards_as_expansion_templates() {
+    let config = Config::from_json(&json!({
+        "metrics": {"memory": metric(), "process": metric()},
+        "perfcounters": [
+            {
+                "object": "Memory",
+                "counters": [{"name": "*", "metric": "memory"}]
+            },
+            {
+                "object": "Process",
+                "instances": ["svc*"],
+                "counters": [{"name": "*", "metric": "process"}]
+            },
+            {
+                "object": "System",
+                "counters": [{"name": "Processes"}]
+            }
+        ],
+        "max_instances_per_wildcard": 1,
+        "max_expanded_counters": 1
+    }))
+    .unwrap();
+
+    assert_eq!(config.counters.len(), 3);
+    assert_eq!(config.counters[0].path, r"\Memory\*");
+    assert!(config.counters[0].counter_name_wildcard);
+    assert!(config.counters[0].is_expanded());
+    assert!(!config.counters[0].instance_config.has_instance());
+    assert_eq!(config.counters[1].path, r"\Process(svc*)\*");
+    assert!(config.counters[1].counter_name_wildcard);
+    assert!(config.counters[1].instance_config.is_wildcard());
+    assert!(config.counters[1].is_expanded());
+    assert!(!config.counters[2].is_expanded());
+}
+
+/// Scenario: Object names and partial counter names contain native wildcard characters.
+/// Guarantees: Configuration accepts only exact object names and either exact counters or the literal whole-counter wildcard.
+#[test]
+fn rejects_object_and_partial_counter_patterns() {
+    for object in ["Mem*", "Proc?ss"] {
+        assert_config_error(
+            json!({
+                "perfcounters": [{
+                    "object": object,
+                    "counters": [{"name": "Available Bytes"}]
+                }]
+            }),
+            "must be an exact object name without wildcard characters",
+        );
+    }
+    for counter in ["Avail*", "* MBytes", "? Processor Time"] {
+        assert_config_error(
+            json!({
+                "perfcounters": [{
+                    "object": "Memory",
+                    "counters": [{"name": counter}]
+                }]
+            }),
+            "must be an exact counter name or the whole-counter wildcard \"*\"",
+        );
+    }
 }
 
 /// Scenario: One definition is expanded, referenced again, and the normalized config is cloned.

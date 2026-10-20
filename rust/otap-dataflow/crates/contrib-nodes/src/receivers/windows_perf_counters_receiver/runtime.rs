@@ -331,14 +331,14 @@ pub static WINDOWSPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFa
             config
                 .counters
                 .iter()
-                .filter(|counter| !counter.instance_config.is_wildcard())
+                .filter(|counter| !counter.is_expanded())
                 .count() as u64,
         );
         metrics.health.configured_wildcard.set(
             config
                 .counters
                 .iter()
-                .filter(|counter| counter.instance_config.is_wildcard())
+                .filter(|counter| counter.is_expanded())
                 .count() as u64,
         );
         let receiver = WindowsPerfCountersReceiver {
@@ -739,6 +739,7 @@ mod tests {
     use otel_arrow_dfe_otap::OTAP_PIPELINE_FACTORY;
     use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value;
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric;
     use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryIntoWithOptions};
     use otel_arrow_dfe_pdata_codec::OtapPayload;
@@ -756,6 +757,7 @@ mod tests {
             metric_kind: MetricKind::Gauge,
             attributes: Arc::new(attributes),
             instance_config: InstanceConfig::None,
+            counter_name_wildcard: false,
             scale_power10: 0,
             recreate_query: false,
             source_mapping_index: 0,
@@ -787,6 +789,7 @@ mod tests {
             counter_index,
             path: Arc::from(r"\Memory\Available Bytes"),
             instance: None,
+            counter_name: None,
             emit_instance_attribute: false,
             timestamp_unix_nano: timestamp,
             start_time_unix_nano: None,
@@ -922,6 +925,7 @@ mod tests {
             counter_index: 0,
             path: Arc::clone(&path),
             instance: None,
+            counter_name: None,
             emit_instance_attribute: false,
         };
         let failure = SampleFailure {
@@ -951,6 +955,7 @@ mod tests {
                 counter_index: 0,
                 path: Arc::clone(&path),
                 instance: None,
+                counter_name: None,
                 emit_instance_attribute: false,
                 timestamp_unix_nano: 30,
                 start_time_unix_nano: None,
@@ -989,12 +994,14 @@ mod tests {
             counter_index: 0,
             path: Arc::clone(&path),
             instance: None,
+            counter_name: None,
             emit_instance_attribute: false,
         };
         let point = |timestamp_unix_nano, value| SamplePoint {
             counter_index: 0,
             path: Arc::clone(&path),
             instance: None,
+            counter_name: None,
             emit_instance_attribute: false,
             timestamp_unix_nano,
             start_time_unix_nano: None,
@@ -1461,6 +1468,7 @@ mod tests {
                         counter_index: 0,
                         path: Arc::from(r"\Memory\Available Bytes"),
                         instance: None,
+                        counter_name: None,
                         emit_instance_attribute: false,
                         timestamp_unix_nano: timestamp,
                         start_time_unix_nano: Some(start.get().unwrap_or(timestamp)),
@@ -1765,6 +1773,7 @@ mod tests {
                     metric_kind: MetricKind::Gauge,
                     attributes: Arc::new(BTreeMap::new()),
                     instance_config: InstanceConfig::None,
+                    counter_name_wildcard: false,
                     scale_power10: 0,
                     recreate_query: false,
                     source_mapping_index: 0,
@@ -1810,8 +1819,8 @@ mod tests {
             .run_validation(|_| async {});
     }
 
-    /// Scenario: The registered factory starts a live receiver with exact, aggregate, wildcard, and unavailable peer mappings.
-    /// Guarantees: The engine handoff decodes to Memory, _Total, and startup-expanded metrics while the unavailable peer is omitted.
+    /// Scenario: The registered factory starts a live receiver with exact, aggregate, instance, whole-counter, and unavailable peer mappings.
+    /// Guarantees: The engine handoff decodes every supported identity shape while the unavailable peer is omitted.
     #[test]
     #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
     fn live_factory_collects_decodes_and_hands_off_metrics() {
@@ -1836,12 +1845,23 @@ mod tests {
                     "unit": "1",
                     "gauge": {}
                 },
+                "windows.memory.all": {
+                    "unit": "1",
+                    "gauge": {}
+                },
                 "windows.memory.missing": {
                     "unit": "By",
                     "gauge": {}
                 }
             },
             "perfcounters": [
+                {
+                    "object": "Memory",
+                    "counters": [{
+                        "name": "*",
+                        "metric": "windows.memory.all"
+                    }]
+                },
                 {
                     "object": "Memory",
                     "counters": [{
@@ -1945,6 +1965,27 @@ mod tests {
                         .attributes
                         .iter()
                         .any(|attribute| attribute.key == "instance")
+                }));
+
+                let all_memory = metric("windows.memory.all").expect("whole-counter metric");
+                let Some(metric::Data::Gauge(all_memory)) = &all_memory.data else {
+                    panic!("whole-counter metric must be a Gauge");
+                };
+                assert!(all_memory.data_points.iter().any(|point| {
+                    point.attributes.iter().any(|attribute| {
+                        attribute.key == "windows.perf_counter.name"
+                            && matches!(
+                                attribute
+                                    .value
+                                    .as_ref()
+                                    .and_then(|value| value.value.as_ref()),
+                                Some(any_value::Value::StringValue(value))
+                                    if value == "Available Bytes"
+                            )
+                    }) && point
+                        .attributes
+                        .iter()
+                        .all(|attribute| attribute.key != "instance")
                 }));
                 assert!(metric("windows.memory.missing").is_none());
             });

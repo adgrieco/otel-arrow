@@ -33,18 +33,26 @@ fn instance_attribute_value(instance: &InstanceIdentity) -> String {
 fn output_attributes(
     counter: &CounterConfig,
     instance: Option<&InstanceIdentity>,
+    counter_name: Option<&str>,
     emit_instance_attribute: bool,
 ) -> BTreeMap<String, String> {
     let mut attributes = BTreeMap::new();
-    for_each_output_attribute(counter, instance, emit_instance_attribute, |key, value| {
-        let _ = attributes.insert(key.to_owned(), value.to_owned());
-    });
+    for_each_output_attribute(
+        counter,
+        instance,
+        counter_name,
+        emit_instance_attribute,
+        |key, value| {
+            let _ = attributes.insert(key.to_owned(), value.to_owned());
+        },
+    );
     attributes
 }
 
 fn for_each_output_attribute(
     counter: &CounterConfig,
     instance: Option<&InstanceIdentity>,
+    counter_name: Option<&str>,
     emit_instance_attribute: bool,
     mut visit: impl FnMut(&str, &str),
 ) {
@@ -58,6 +66,9 @@ fn for_each_output_attribute(
     {
         let value = instance_attribute_value(instance);
         visit("instance", &value);
+    }
+    if let Some(counter_name) = counter_name {
+        visit("windows.perf_counter.name", counter_name);
     }
 }
 
@@ -100,6 +111,7 @@ fn output_ownership(
                 output_attributes(
                     counter,
                     member.instance.as_deref(),
+                    member.counter_name.as_deref(),
                     member.emit_instance_attribute,
                 ),
             ))
@@ -328,6 +340,7 @@ fn append_attributes(
     for_each_output_attribute(
         counter,
         point.instance.as_deref(),
+        point.counter_name.as_deref(),
         point.emit_instance_attribute,
         |key, value| {
             attributes.append_parent_id(&point_id);

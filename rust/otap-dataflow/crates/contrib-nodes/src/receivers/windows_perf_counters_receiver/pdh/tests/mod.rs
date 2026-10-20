@@ -40,6 +40,7 @@ fn counter(path: &str, name: &str) -> CounterConfig {
         metric_kind: MetricKind::Gauge,
         attributes: Arc::new(BTreeMap::new()),
         instance_config: InstanceConfig::None,
+        counter_name_wildcard: false,
         scale_power10: 0,
         recreate_query: false,
         source_mapping_index: 0,
@@ -295,6 +296,10 @@ impl PdhApi for FakePdh {
 
     fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
         NativePdh::parse_instance_path(path)
+    }
+
+    fn parse_counter_name(&mut self, path: &str) -> Result<String, Error> {
+        NativePdh::parse_counter_name_path(path)
     }
 }
 

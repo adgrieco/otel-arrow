@@ -167,7 +167,7 @@ impl Config {
 /// One normalized counter consumed by the existing PDH worker and OTAP builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CounterConfig {
-    /// PDH path, optionally wildcarding only the instance segment.
+    /// PDH path, optionally wildcarding the instance or whole counter segment.
     pub(super) path: String,
     /// OTel metric name shared by counters that use the same definition.
     pub(super) name: Arc<str>,
@@ -181,12 +181,20 @@ pub(super) struct CounterConfig {
     pub(super) attributes: Arc<BTreeMap<String, String>>,
     /// Instance parsing, attribute, and wildcard aggregation behavior.
     pub(super) instance_config: InstanceConfig,
+    /// Whether the whole counter-name component is expanded before collection.
+    pub(super) counter_name_wildcard: bool,
     /// Base-10 scaling applied after PDH calculates the native value.
     pub(super) scale_power10: i32,
     /// Whether this configured mapping receives a fresh, primed query after each scrape.
     pub(super) recreate_query: bool,
     /// Identity shared by normalized paths expanded from one configured mapping.
     pub(super) source_mapping_index: usize,
+}
+
+impl CounterConfig {
+    pub(super) fn is_expanded(&self) -> bool {
+        self.instance_config.is_wildcard() || self.counter_name_wildcard
+    }
 }
 
 /// Valid instance behavior for one normalized counter path.
@@ -641,7 +649,7 @@ fn normalize_object(
     warnings: &mut Vec<ConfigWarning>,
 ) -> Result<(), Error> {
     let object_field = format!("perfcounters[{object_index}]");
-    let object_name = validate_native_component(&format!("{object_field}.object"), &object.object)?;
+    let object_name = validate_object_name(&format!("{object_field}.object"), &object.object)?;
     if object.counters.is_empty() {
         return Err(invalid(format!(
             "{object_field}.counters must contain at least one entry"
@@ -698,8 +706,8 @@ impl ObjectNormalizer<'_> {
             "perfcounters[{}].counters[{counter_index}]",
             self.object_index
         );
-        let counter_name =
-            validate_native_component(&format!("{counter_field}.name"), &mapping.name)?;
+        let counter_name = validate_counter_name(&format!("{counter_field}.name"), &mapping.name)?;
+        let counter_name_wildcard = counter_name == "*";
         let metric_name = normalize_metric_reference(&counter_field, &mapping.metric)?;
         let explicit_metric = self.normalize_explicit_metric(
             counter_index,
@@ -713,7 +721,7 @@ impl ObjectNormalizer<'_> {
             .expand(self.object_name, counter_name, self.aggregation_name)
         {
             let metric = self.resolve_metric(&expanded.native, explicit_metric.as_ref());
-            if !expanded.instance_config.is_wildcard() {
+            if !expanded.instance_config.is_wildcard() && !counter_name_wildcard {
                 *exact_counter_count = exact_counter_count.saturating_add(1);
                 if *exact_counter_count > max_native_counters {
                     return Err(invalid(format!(
@@ -729,6 +737,7 @@ impl ObjectNormalizer<'_> {
                 metric_kind: metric.kind,
                 attributes: metric.attributes,
                 instance_config: expanded.instance_config,
+                counter_name_wildcard,
                 scale_power10: mapping.scale_power10,
                 recreate_query: mapping.recreate_query,
                 source_mapping_index,
@@ -814,6 +823,26 @@ fn normalize_metric_reference<'a>(
             "{counter_field}.metric must be a string when present; null metric is invalid"
         ))),
     }
+}
+
+fn validate_object_name<'a>(field: &str, configured: &'a str) -> Result<&'a str, Error> {
+    let configured = validate_native_component(field, configured)?;
+    if configured.contains(['*', '?']) {
+        return Err(invalid(format!(
+            "{field} must be an exact object name without wildcard characters"
+        )));
+    }
+    Ok(configured)
+}
+
+fn validate_counter_name<'a>(field: &str, configured: &'a str) -> Result<&'a str, Error> {
+    let configured = validate_native_component(field, configured)?;
+    if configured != "*" && configured.contains(['*', '?']) {
+        return Err(invalid(format!(
+            "{field} must be an exact counter name or the whole-counter wildcard \"*\""
+        )));
+    }
+    Ok(configured)
 }
 
 impl NormalizedInstances {

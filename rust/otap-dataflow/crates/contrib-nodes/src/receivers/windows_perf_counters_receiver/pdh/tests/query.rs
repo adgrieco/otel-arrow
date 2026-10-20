@@ -130,6 +130,10 @@ impl PdhApi for InvalidHandlePdh {
     fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
         NativePdh::parse_instance_path(path)
     }
+
+    fn parse_counter_name(&mut self, path: &str) -> Result<String, Error> {
+        NativePdh::parse_counter_name_path(path)
+    }
 }
 
 fn invalid_handle_query(
@@ -516,6 +520,137 @@ fn exact_and_overlapping_wildcard_share_native_key() {
             [(0, exact_path)]
         );
     }
+}
+
+/// Scenario: Non-instanced and instance-qualified whole-counter templates expand to concrete English members.
+/// Guarantees: Query admission retains each concrete counter name and only parses `instance` for paths that have an instance segment.
+#[test]
+fn whole_counter_expansion_preserves_counter_and_instance_identity() {
+    let memory_template = r"\Memory\*";
+    let memory_path = r"\Memory\Available Bytes";
+    let process_template = r"\Process(*)\*";
+    let process_path = r"\Process(svchost)\ID Process";
+    let aggregate_template = r"\Processor(_Total)\*";
+    let aggregate_path = r"\Processor(_Total)\% Processor Time";
+    let mut memory = counter(memory_template, "windows.memory.counters");
+    memory.counter_name_wildcard = true;
+    let mut process = counter(process_template, "windows.process.counters");
+    process.counter_name_wildcard = true;
+    process.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let mut aggregate = counter(aggregate_template, "windows.processor.counters");
+    aggregate.counter_name_wildcard = true;
+    aggregate.instance_config = InstanceConfig::Exact {
+        emit_attribute: false,
+    };
+    let (state, mut query) = fake_query_with_cadences(
+        vec![memory, process, aggregate],
+        vec![
+            fake_counter(memory_path, Number::Integer(10)),
+            fake_counter(process_path, Number::Integer(20)),
+            fake_counter(aggregate_path, Number::Integer(30)),
+        ],
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+    {
+        let mut state = state.borrow_mut();
+        let _ = state
+            .expansions
+            .insert(memory_template.to_owned(), vec![memory_path.to_owned()]);
+        let _ = state
+            .expansions
+            .insert(process_template.to_owned(), vec![process_path.to_owned()]);
+        let _ = state.expansions.insert(
+            aggregate_template.to_owned(),
+            vec![aggregate_path.to_owned()],
+        );
+    }
+
+    let sample = query.collect().unwrap();
+
+    assert_eq!(
+        state.borrow().added,
+        [
+            memory_path.to_owned(),
+            process_path.to_owned(),
+            aggregate_path.to_owned(),
+        ]
+    );
+    assert_eq!(sample.points.len(), 3);
+    assert_eq!(sample.points[0].path.as_ref(), memory_path);
+    assert!(sample.points[0].instance.is_none());
+    assert_eq!(
+        sample.points[0].counter_name.as_deref(),
+        Some("Available Bytes")
+    );
+    assert_eq!(sample.points[1].path.as_ref(), process_path);
+    assert_eq!(
+        sample.points[1]
+            .instance
+            .as_deref()
+            .map(|instance| instance.name.as_str()),
+        Some("svchost")
+    );
+    assert_eq!(sample.points[1].counter_name.as_deref(), Some("ID Process"));
+    assert_eq!(sample.points[2].path.as_ref(), aggregate_path);
+    assert_eq!(
+        sample.points[2]
+            .instance
+            .as_deref()
+            .map(|instance| instance.name.as_str()),
+        Some("_Total")
+    );
+    assert!(!sample.points[2].emit_instance_attribute);
+    assert_eq!(
+        sample.points[2].counter_name.as_deref(),
+        Some("% Processor Time")
+    );
+}
+
+/// Scenario: A whole-counter template discovers two concrete Memory counters under a one-member per-pattern limit.
+/// Guarantees: The existing wildcard limit admits one deterministic member and reports the other as a per-pattern omission.
+#[test]
+fn whole_counter_expansion_uses_existing_per_pattern_limit() {
+    let template = r"\Memory\*";
+    let paths = [r"\Memory\Available Bytes", r"\Memory\Cache Bytes"];
+    let mut config = counter(template, "windows.memory.counters");
+    config.counter_name_wildcard = true;
+    let state = fake_state(
+        paths
+            .iter()
+            .map(|path| fake_counter(path, Number::Integer(10)))
+            .collect(),
+    );
+    let mut query = Query::open_with_seed(
+        FakePdh::new(Rc::clone(&state)),
+        vec![config],
+        Duration::ZERO,
+        Duration::ZERO,
+        1,
+        4_096,
+        None,
+    )
+    .unwrap();
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(template.to_owned(), paths.map(str::to_owned).to_vec());
+
+    let sample = query.collect().unwrap();
+
+    assert_eq!(sample.points.len(), 1);
+    assert_eq!(sample.points[0].path.as_ref(), paths[0]);
+    assert_eq!(
+        sample.points[0].counter_name.as_deref(),
+        Some("Available Bytes")
+    );
+    assert_eq!(sample.metadata.overflows.len(), 1);
+    assert_eq!(sample.metadata.overflows[0].discovered, 2);
+    assert_eq!(sample.metadata.overflows[0].retained, 1);
+    assert_eq!(sample.metadata.overflows[0].omitted, 1);
+    assert_eq!(sample.metadata.overflows[0].reason, "per_wildcard");
 }
 
 /// Scenario: Startup priming reads a calculated Gauge and native delta Sum before their first scrape.
