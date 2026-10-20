@@ -60,62 +60,6 @@ impl PdhApi for StartupTestPdh {
     }
 }
 
-struct CancellingStartupPdh {
-    shutdown_requested: Arc<AtomicBool>,
-    expansions: Arc<std::sync::atomic::AtomicUsize>,
-    collections: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl PdhApi for CancellingStartupPdh {
-    type Counter = String;
-
-    fn add(&mut self, path: &str, _localized: bool) -> Result<Self::Counter, Error> {
-        Ok(path.to_owned())
-    }
-
-    fn remove(&mut self, _counter: &Self::Counter, _path: &str) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn counter_type(&mut self, _counter: &Self::Counter, _path: &str) -> Result<u32, Error> {
-        Ok(0x0001_0100)
-    }
-
-    fn collect(&mut self) -> Result<bool, Error> {
-        let _ = self.collections.fetch_add(1, Ordering::AcqRel);
-        Ok(true)
-    }
-
-    fn raw(&mut self, _counter: &Self::Counter, _path: &str) -> Result<Option<RawSample>, Error> {
-        Ok(None)
-    }
-
-    fn formatted(
-        &mut self,
-        _counter: &Self::Counter,
-        _path: &str,
-        _format: ValueFormat,
-    ) -> Result<Option<Number>, Error> {
-        Ok(Some(Number::Integer(42)))
-    }
-
-    fn timestamp(&mut self) -> Result<i64, Error> {
-        Ok(1)
-    }
-
-    fn expand(&mut self, _path: &str) -> Result<Vec<String>, Error> {
-        let _ = self.expansions.fetch_add(1, Ordering::AcqRel);
-        self.shutdown_requested.store(true, Ordering::Release);
-        Ok(Vec::new())
-    }
-
-    fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
-        Err(Error::InvalidCounterToken {
-            path: path.to_owned(),
-        })
-    }
-}
-
 struct RecoveringRefreshPdh {
     add_calls: Arc<std::sync::atomic::AtomicUsize>,
     timestamp: i64,
@@ -329,29 +273,15 @@ fn wildcard_admission_across_queries_follows_config_order() {
                 _ => unreachable!("test config index"),
             };
             let _ = expansions.insert(config.path.clone(), paths.clone());
-            counters.extend(paths.into_iter().map(|path| FakeCounter {
-                path,
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(42)),
-                raw_error: false,
-                formatted_error: false,
-            }));
+            counters.extend(
+                paths
+                    .into_iter()
+                    .map(|path| fake_counter(&path, Number::Integer(42))),
+            );
         }
         let state = Rc::new(RefCell::new(FakeState {
-            counters,
-            added: Vec::new(),
-            calls: FakeNativeCalls::default(),
-            collect_has_data: true,
-            collect_error: false,
-            timestamp: 100,
-            timestamp_error: false,
-            remove_error: false,
-            expand_error: false,
-            expand_errors: BTreeSet::new(),
-            removed: Vec::new(),
             expansions,
+            ..fake_state_value(counters)
         }));
         let query = Query::open_managed_with_seed(
             FakePdh::new(Rc::clone(&state)),
@@ -531,15 +461,7 @@ fn interleaved_query_failures_keep_global_indices() {
 #[test]
 fn recovery_only_sample_reports_no_query_collected() {
     let path = r"\Unavailable\Value";
-    let state = fake_state(vec![FakeCounter {
-        path: path.to_owned(),
-        native_type: 0x0001_0100,
-        raw: None,
-        multi_count: 1,
-        formatted: Some(Number::Integer(42)),
-        raw_error: false,
-        formatted_error: false,
-    }]);
+    let state = fake_state(vec![fake_counter(path, Number::Integer(42))]);
     let factory_state = Rc::clone(&state);
     let mut open = move |configs: Vec<CounterConfig>,
                          max_native_counters: usize,
@@ -724,35 +646,18 @@ fn recreated_queries_share_receiver_native_entry_limit() {
         } else {
             vec![template.clone()]
         };
+        let counters = paths
+            .iter()
+            .map(|path| fake_counter(path, Number::Integer(42)))
+            .collect();
         let state = Rc::new(RefCell::new(FakeState {
-            counters: paths
-                .iter()
-                .map(|path| FakeCounter {
-                    path: path.clone(),
-                    native_type: 0x0001_0100,
-                    raw: None,
-                    multi_count: 1,
-                    formatted: Some(Number::Integer(42)),
-                    raw_error: false,
-                    formatted_error: false,
-                })
-                .collect(),
-            added: Vec::new(),
-            calls: FakeNativeCalls::default(),
-            collect_has_data: true,
-            collect_error: false,
-            timestamp: 100,
-            timestamp_error: false,
-            remove_error: false,
-            expand_error: false,
-            expand_errors: BTreeSet::new(),
-            removed: Vec::new(),
             expansions: configs[0]
                 .instance_config
                 .is_wildcard()
                 .then_some((template, paths))
                 .into_iter()
                 .collect(),
+            ..fake_state_value(counters)
         }));
         Query::open_with_seed(
             FakePdh::new(state),
@@ -834,31 +739,13 @@ fn initial_wildcard_reserves_later_exact_native_entry() {
                     vec![config.path.clone()]
                 }
             })
-            .map(|path| FakeCounter {
-                path,
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(42)),
-                raw_error: false,
-                formatted_error: false,
-            })
+            .map(|path| fake_counter(&path, Number::Integer(42)))
             .collect();
         let state = Rc::new(RefCell::new(FakeState {
-            counters,
-            added: Vec::new(),
-            calls: FakeNativeCalls::default(),
-            collect_has_data: true,
-            collect_error: false,
-            timestamp: 100,
-            timestamp_error: false,
-            remove_error: false,
-            expand_error: false,
-            expand_errors: BTreeSet::new(),
-            removed: Vec::new(),
             expansions: [(wildcard_path.to_owned(), expanded.clone())]
                 .into_iter()
                 .collect(),
+            ..fake_state_value(counters)
         }));
         Query::open_with_seed(
             FakePdh::new(state),
@@ -1020,28 +907,10 @@ fn down_query_reserves_seeded_wildcard_membership() {
                          max_native_counters: usize,
                          seed: Option<&QueryRecreationSeed>| {
         let state = Rc::new(RefCell::new(FakeState {
-            counters: vec![FakeCounter {
-                path: concrete.to_owned(),
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(42)),
-                raw_error: false,
-                formatted_error: false,
-            }],
-            added: Vec::new(),
-            calls: FakeNativeCalls::default(),
-            collect_has_data: true,
-            collect_error: false,
-            timestamp: 100,
-            timestamp_error: false,
-            remove_error: false,
-            expand_error: false,
-            expand_errors: BTreeSet::new(),
-            removed: Vec::new(),
             expansions: [(path.to_owned(), vec![concrete.to_owned()])]
                 .into_iter()
                 .collect(),
+            ..fake_state_value(vec![fake_counter(concrete, Number::Integer(42))])
         }));
         let query = Query::open_with_seed(
             FakePdh::new(Rc::clone(&state)),
@@ -1085,28 +954,10 @@ fn failed_rebuild_preserves_down_query_state() {
         excluded_aggregation: None,
     };
     let state = Rc::new(RefCell::new(FakeState {
-        counters: vec![FakeCounter {
-            path: concrete.to_owned(),
-            native_type: 0x0001_0100,
-            raw: None,
-            multi_count: 1,
-            formatted: Some(Number::Integer(42)),
-            raw_error: false,
-            formatted_error: false,
-        }],
-        added: Vec::new(),
-        calls: FakeNativeCalls::default(),
-        collect_has_data: true,
-        collect_error: false,
-        timestamp: 100,
-        timestamp_error: false,
-        remove_error: false,
-        expand_error: false,
-        expand_errors: BTreeSet::new(),
-        removed: Vec::new(),
         expansions: [(path.to_owned(), vec![concrete.to_owned()])]
             .into_iter()
             .collect(),
+        ..fake_state_value(vec![fake_counter(concrete, Number::Integer(42))])
     }));
     let initial_state = Rc::clone(&state);
     let mut open_initial = move |configs: Vec<CounterConfig>,
@@ -1306,30 +1157,13 @@ fn exact_reservation_reduces_same_query_expansion_capacity() {
     let expanded = (0..3)
         .map(|index| format!(r"\Process(worker{index})\Private Bytes"))
         .collect::<Vec<_>>();
+    let counters = std::iter::once(exact_path.to_owned())
+        .chain(expanded.iter().cloned())
+        .map(|path| fake_counter(&path, Number::Integer(42)))
+        .collect();
     let state = Rc::new(RefCell::new(FakeState {
-        counters: std::iter::once(exact_path.to_owned())
-            .chain(expanded.iter().cloned())
-            .map(|path| FakeCounter {
-                path,
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(42)),
-                raw_error: false,
-                formatted_error: false,
-            })
-            .collect(),
-        added: Vec::new(),
-        calls: FakeNativeCalls::default(),
-        collect_has_data: true,
-        collect_error: false,
-        timestamp: 100,
-        timestamp_error: false,
-        remove_error: false,
-        expand_error: false,
-        expand_errors: BTreeSet::new(),
-        removed: Vec::new(),
         expansions: [(wildcard_path.to_owned(), expanded)].into_iter().collect(),
+        ..fake_state_value(counters)
     }));
     let mut wildcard = counter(wildcard_path, "process.private");
     wildcard.instance_config = InstanceConfig::Wildcard {
@@ -2121,8 +1955,8 @@ async fn cancelling_startup_stops_between_initialization_units() {
 #[test]
 fn cancelling_startup_stops_between_expansion_and_priming() {
     let shutdown_requested = Arc::new(AtomicBool::new(false));
-    let expansions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let collections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state = fake_state(Vec::new());
+    state.borrow_mut().stop_after_expand = Some(Arc::clone(&shutdown_requested));
     let mut counters = vec![
         counter(r"\Process(*)\Private Bytes", "process.private"),
         counter(r"\Thread(*)\% Processor Time", "thread.cpu.time"),
@@ -2132,18 +1966,12 @@ fn cancelling_startup_stops_between_expansion_and_priming() {
             excluded_aggregation: None,
         };
     }
-    let factory_shutdown = Arc::clone(&shutdown_requested);
-    let factory_expansions = Arc::clone(&expansions);
-    let factory_collections = Arc::clone(&collections);
+    let factory_state = Rc::clone(&state);
     let mut open = move |configs: Vec<CounterConfig>,
                          max_native_counters: usize,
                          seed: Option<&QueryRecreationSeed>| {
         Query::open_managed_with_seed(
-            CancellingStartupPdh {
-                shutdown_requested: Arc::clone(&factory_shutdown),
-                expansions: Arc::clone(&factory_expansions),
-                collections: Arc::clone(&factory_collections),
-            },
+            FakePdh::new(Rc::clone(&factory_state)),
             configs,
             Duration::from_secs(30),
             Duration::from_secs(30),
@@ -2163,8 +1991,8 @@ fn cancelling_startup_stops_between_expansion_and_priming() {
     .unwrap();
 
     assert!(queries.is_none());
-    assert_eq!(expansions.load(Ordering::Acquire), 1);
-    assert_eq!(collections.load(Ordering::Acquire), 0);
+    assert_eq!(state.borrow().calls.expand, 1);
+    assert_eq!(state.borrow().calls.collect, 0);
 }
 
 /// Scenario: Initial query opens fail transiently for every slot or beside one healthy isolated slot.
@@ -2336,15 +2164,7 @@ fn rebuild_only_sample_reports_no_query_collected() {
         }
         let (_, query) = fake_query_with_seed(
             configs,
-            vec![FakeCounter {
-                path: path.to_owned(),
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(42)),
-                raw_error: false,
-                formatted_error: false,
-            }],
+            vec![fake_counter(path, Number::Integer(42))],
             Duration::ZERO,
             Duration::from_secs(30),
             max_native_counters,

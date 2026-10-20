@@ -763,30 +763,13 @@ fn high_cardinality_collection_preserves_native_call_counts() {
     let paths = (0..256)
         .map(|index| format!(r"\Process(worker{index})\Private Bytes"))
         .collect::<Vec<_>>();
+    let counters = paths
+        .iter()
+        .map(|path| fake_counter(path, Number::Integer(42)))
+        .collect();
     let state = Rc::new(RefCell::new(FakeState {
-        counters: paths
-            .iter()
-            .map(|path| FakeCounter {
-                path: path.clone(),
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(42)),
-                raw_error: false,
-                formatted_error: false,
-            })
-            .collect(),
-        added: Vec::new(),
-        calls: FakeNativeCalls::default(),
-        collect_has_data: true,
-        collect_error: false,
-        timestamp: 100,
-        timestamp_error: false,
-        remove_error: false,
-        expand_error: false,
-        expand_errors: BTreeSet::new(),
-        removed: Vec::new(),
         expansions: [(template.to_owned(), paths)].into_iter().collect(),
+        ..fake_state_value(counters)
     }));
     let mut config = counter(template, "process.private");
     config.instance_config = InstanceConfig::Wildcard {
@@ -821,26 +804,12 @@ fn high_cardinality_collection_preserves_native_call_counts() {
 fn setup_cleanup_failure_requires_query_rebuild() {
     let path = r"\Object\Unsupported";
     let state = Rc::new(RefCell::new(FakeState {
-        counters: vec![FakeCounter {
-            path: path.to_owned(),
-            native_type: 0x4003_0401,
-            raw: None,
-            multi_count: 1,
-            formatted: None,
-            raw_error: false,
-            formatted_error: false,
-        }],
-        added: Vec::new(),
-        calls: FakeNativeCalls::default(),
-        collect_has_data: true,
-        collect_error: false,
-        timestamp: 100,
-        timestamp_error: false,
         remove_error: true,
-        expand_error: false,
-        expand_errors: BTreeSet::new(),
-        removed: Vec::new(),
-        expansions: BTreeMap::new(),
+        ..fake_state_value(vec![FakeCounter {
+            native_type: 0x4003_0401,
+            formatted: None,
+            ..fake_counter(path, Number::Integer(42))
+        }])
     }));
     let result = Query::open_with(
         FakePdh::new(Rc::clone(&state)),
@@ -1656,15 +1625,7 @@ fn failed_discovery_retention_reserves_global_capacity_first() {
         .iter()
         .chain(second_paths.iter())
         .enumerate()
-        .map(|(index, path)| FakeCounter {
-            path: (*path).to_owned(),
-            native_type: 0x0001_0100,
-            raw: None,
-            multi_count: 1,
-            formatted: Some(Number::Integer(i64::try_from(index + 1).unwrap())),
-            raw_error: false,
-            formatted_error: false,
-        })
+        .map(|(index, path)| fake_counter(path, Number::Integer(i64::try_from(index + 1).unwrap())))
         .collect();
     let (state, mut query) = fake_query_with_seed(
         vec![

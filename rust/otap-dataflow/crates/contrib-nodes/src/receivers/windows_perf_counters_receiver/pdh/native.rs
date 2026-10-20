@@ -752,6 +752,100 @@ mod tests {
         counters.insert(generation, std::ptr::dangling_mut())
     }
 
+    #[derive(Clone, Copy)]
+    enum BufferApi {
+        CounterInfo,
+        CounterType,
+        ParseInstance,
+    }
+
+    impl BufferApi {
+        fn header_size(self) -> u32 {
+            u32::try_from(match self {
+                Self::CounterInfo | Self::CounterType => size_of::<PDH_COUNTER_INFO_W>(),
+                Self::ParseInstance => size_of::<PDH_COUNTER_PATH_ELEMENTS_W>(),
+            })
+            .unwrap()
+        }
+
+        fn size_operation(self) -> PdhOperation {
+            match self {
+                Self::CounterInfo | Self::CounterType => PdhOperation::GetCounterInfoSize,
+                Self::ParseInstance => PdhOperation::ParseCounterPathSize,
+            }
+        }
+
+        fn malformed_error(self, case: MalformedBuffer) -> Error {
+            let header = self.header_size();
+            let status = |size: &mut u32, filling: bool| match case {
+                MalformedBuffer::NonSizingStatus => {
+                    *size = header;
+                    PDH_INVALID_ARGUMENT
+                }
+                MalformedBuffer::UndersizedRequest => {
+                    *size = header - 1;
+                    PDH_MORE_DATA
+                }
+                MalformedBuffer::UndersizedFill if filling => {
+                    *size = header - 1;
+                    0
+                }
+                MalformedBuffer::OversizedFill if filling => {
+                    *size = u32::MAX;
+                    0
+                }
+                MalformedBuffer::UndersizedFill | MalformedBuffer::OversizedFill => {
+                    *size = header;
+                    PDH_MORE_DATA
+                }
+            };
+            match self {
+                Self::CounterInfo => {
+                    NativePdh::counter_info_buffer_with("fixture", |size, buffer| {
+                        status(size, buffer.is_some())
+                    })
+                    .map(|_| ())
+                }
+                Self::CounterType => NativePdh::counter_type_with("fixture", |size, buffer| {
+                    Ok(status(size, buffer.is_some()))
+                })
+                .map(|_| ()),
+                Self::ParseInstance => {
+                    NativePdh::parse_instance_identity_with("fixture", |size, buffer| {
+                        status(size, buffer.is_some())
+                    })
+                    .map(|_| ())
+                }
+            }
+            .unwrap_err()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum MalformedBuffer {
+        NonSizingStatus,
+        UndersizedRequest,
+        UndersizedFill,
+        OversizedFill,
+    }
+
+    fn parse_instance_fixture_error(
+        filled_size: u32,
+        mut configure: impl FnMut(*mut u8, *mut PDH_COUNTER_PATH_ELEMENTS_W),
+    ) -> Error {
+        NativePdh::parse_instance_identity_with("fixture", |size, buffer| {
+            let Some(buffer) = buffer else {
+                *size = filled_size;
+                return PDH_MORE_DATA;
+            };
+            let base = buffer.as_mut_ptr().cast::<u8>();
+            configure(base, base.cast());
+            *size = filled_size;
+            0
+        })
+        .unwrap_err()
+    }
+
     /// Scenario: A long-lived query repeatedly adds and removes a fixed peak number of counters.
     /// Guarantees: Generational bookkeeping retains storage proportional to peak concurrent ownership, not lifetime additions.
     #[test]
@@ -853,161 +947,54 @@ mod tests {
         assert_eq!(counters.next_generation, u64::MAX);
     }
 
-    /// Scenario: Counter metadata sizing or filling reports a non-sizing status, an undersized header, or an impossible filled size.
-    /// Guarantees: The counter-info buffer rejects every malformed two-call size/fill contract before metadata is read.
+    /// Scenario: Native metadata APIs return malformed sizing and filling results.
+    /// Guarantees: Counter info, counter type, and parsed instance paths all reject non-sizing status, undersized headers, and invalid filled sizes.
     #[test]
-    fn counter_info_buffer_rejects_invalid_size_and_fill_results() {
-        let header = u32::try_from(size_of::<PDH_COUNTER_INFO_W>()).unwrap();
-        let error = NativePdh::counter_info_buffer_with("fixture", |size, _| {
-            *size = header;
-            PDH_INVALID_ARGUMENT
-        })
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            Error::Pdh {
-                operation: PdhOperation::GetCounterInfoSize,
-                status: PDH_INVALID_ARGUMENT,
-                ..
-            }
-        ));
-
-        let error = NativePdh::counter_info_buffer_with("fixture", |size, _| {
-            *size = header - 1;
-            PDH_MORE_DATA
-        })
-        .unwrap_err();
-        assert!(matches!(error, Error::InvalidSample(_)));
-
-        for filled in [header - 1, u32::MAX] {
-            let error = NativePdh::counter_info_buffer_with("fixture", |size, buffer| {
-                if buffer.is_none() {
-                    *size = header;
-                    PDH_MORE_DATA
+    fn native_metadata_buffers_reject_malformed_size_and_fill_contracts() {
+        for api in [
+            BufferApi::CounterInfo,
+            BufferApi::CounterType,
+            BufferApi::ParseInstance,
+        ] {
+            for case in [
+                MalformedBuffer::NonSizingStatus,
+                MalformedBuffer::UndersizedRequest,
+                MalformedBuffer::UndersizedFill,
+                MalformedBuffer::OversizedFill,
+            ] {
+                let error = api.malformed_error(case);
+                if matches!(case, MalformedBuffer::NonSizingStatus) {
+                    assert!(matches!(
+                        error,
+                        Error::Pdh {
+                            operation,
+                            status: PDH_INVALID_ARGUMENT,
+                            ..
+                        } if operation == api.size_operation()
+                    ));
                 } else {
-                    *size = filled;
-                    0
+                    assert!(matches!(error, Error::InvalidSample(_)));
                 }
-            })
-            .unwrap_err();
-            assert!(matches!(error, Error::InvalidSample(_)));
+            }
         }
     }
 
-    /// Scenario: Counter-type metadata sizing or filling reports a non-sizing status, an undersized header, or an impossible filled size.
-    /// Guarantees: Native counter classification cannot inspect storage outside the validated filled header.
+    /// Scenario: Native metadata strings point outside filled bytes, start in allocation slack, or omit a terminator.
+    /// Guarantees: Instance and direct string decoding never reads beyond the native filled-size boundary.
     #[test]
-    fn counter_type_rejects_invalid_size_and_fill_results() {
-        let header = u32::try_from(size_of::<PDH_COUNTER_INFO_W>()).unwrap();
-        let error = NativePdh::counter_type_with("fixture", |size, _| {
-            *size = header;
-            Ok(PDH_INVALID_ARGUMENT)
-        })
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            Error::Pdh {
-                operation: PdhOperation::GetCounterInfoSize,
-                status: PDH_INVALID_ARGUMENT,
-                ..
-            }
-        ));
-
-        let error = NativePdh::counter_type_with("fixture", |size, _| {
-            *size = header - 1;
-            Ok(PDH_MORE_DATA)
-        })
-        .unwrap_err();
-        assert!(matches!(error, Error::InvalidSample(_)));
-
-        for filled in [header - 1, u32::MAX] {
-            let error = NativePdh::counter_type_with("fixture", |size, buffer| {
-                if buffer.is_none() {
-                    *size = header;
-                    Ok(PDH_MORE_DATA)
-                } else {
-                    *size = filled;
-                    Ok(0)
-                }
-            })
-            .unwrap_err();
-            assert!(matches!(error, Error::InvalidSample(_)));
-        }
-    }
-
-    /// Scenario: Parsed-path sizing or filling reports a non-sizing status, an undersized header, or an impossible filled size.
-    /// Guarantees: Instance decoding begins only after the complete native path-elements header is validated.
-    #[test]
-    fn parse_instance_rejects_invalid_size_and_fill_results() {
-        let header = u32::try_from(size_of::<PDH_COUNTER_PATH_ELEMENTS_W>()).unwrap();
-        let error = NativePdh::parse_instance_identity_with("fixture", |size, _| {
-            *size = header;
-            PDH_INVALID_ARGUMENT
-        })
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            Error::Pdh {
-                operation: PdhOperation::ParseCounterPathSize,
-                status: PDH_INVALID_ARGUMENT,
-                ..
-            }
-        ));
-
-        let error = NativePdh::parse_instance_identity_with("fixture", |size, _| {
-            *size = header - 1;
-            PDH_MORE_DATA
-        })
-        .unwrap_err();
-        assert!(matches!(error, Error::InvalidSample(_)));
-
-        for filled in [header - 1, u32::MAX] {
-            let error = NativePdh::parse_instance_identity_with("fixture", |size, buffer| {
-                if buffer.is_none() {
-                    *size = header;
-                    PDH_MORE_DATA
-                } else {
-                    *size = filled;
-                    0
-                }
-            })
-            .unwrap_err();
-            assert!(matches!(error, Error::InvalidSample(_)));
-        }
-    }
-
-    /// Scenario: Parsed path elements point outside the filled bytes or to a string without a terminator.
-    /// Guarantees: Instance identity parsing never follows native pointers beyond the reported fill boundary.
-    #[test]
-    fn parse_instance_rejects_invalid_string_pointers() {
+    fn native_strings_are_bounded_by_reported_fill_size() {
         let header = size_of::<PDH_COUNTER_PATH_ELEMENTS_W>();
         let filled = u32::try_from(header + 4 * size_of::<u16>()).unwrap();
-
-        let error = NativePdh::parse_instance_identity_with("fixture", |size, buffer| {
-            let Some(buffer) = buffer else {
-                *size = filled;
-                return PDH_MORE_DATA;
-            };
-            let base = buffer.as_mut_ptr().cast::<u8>();
-            let elements = base.cast::<PDH_COUNTER_PATH_ELEMENTS_W>();
+        let error = parse_instance_fixture_error(filled, |base, elements| {
             // SAFETY: The fixture buffer is aligned for the header, and the
             // pointer intentionally targets the first byte outside filled data.
             unsafe {
                 (*elements).szInstanceName = base.add(filled as usize).cast();
             }
-            *size = filled;
-            0
-        })
-        .unwrap_err();
+        });
         assert!(matches!(error, Error::InvalidSample(_)));
 
-        let error = NativePdh::parse_instance_identity_with("fixture", |size, buffer| {
-            let Some(buffer) = buffer else {
-                *size = filled;
-                return PDH_MORE_DATA;
-            };
-            let base = buffer.as_mut_ptr().cast::<u8>();
-            let elements = base.cast::<PDH_COUNTER_PATH_ELEMENTS_W>();
+        let error = parse_instance_fixture_error(filled, |base, elements| {
             let name = unsafe { base.add(header).cast::<u16>() };
             // SAFETY: Four UTF-16 units fit in the reported fixture bytes.
             unsafe {
@@ -1016,17 +1003,9 @@ mod tests {
                     *name.add(index) = b'a' as u16;
                 }
             }
-            *size = filled;
-            0
-        })
-        .unwrap_err();
+        });
         assert!(matches!(error, Error::InvalidSample(_)));
-    }
 
-    /// Scenario: A native string starts in allocation slack or has no terminator inside the reported filled bytes.
-    /// Guarantees: String decoding is bounded by filled size rather than rounded buffer capacity.
-    #[test]
-    fn wide_string_rejects_slack_and_unterminated_data() {
         let mut buffer = NativeBuffer::<usize>::with_byte_capacity(
             4 * u32::try_from(size_of::<u16>()).unwrap(),
             "fixture",

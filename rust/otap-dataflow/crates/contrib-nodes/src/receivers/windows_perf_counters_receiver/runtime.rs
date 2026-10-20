@@ -1793,48 +1793,24 @@ mod tests {
         starts.borrow().clone()
     }
 
-    /// Scenario: Timeout is omitted and one collection spans multiple original cadence points.
-    /// Guarantees: The loop skips elapsed ticks and starts next at the first future point on the original schedule.
+    /// Scenario: Collection timing crosses zero or multiple cadence points with timeout omitted, longer, or shorter than the period.
+    /// Guarantees: Every case starts next at the first future original cadence point without catch-up or dropping an unmissed tick.
     #[tokio::test(start_paused = true)]
-    async fn no_timeout_skips_to_next_original_cadence_point() {
-        assert_eq!(
-            loop_collection_start_offsets(
-                Duration::from_millis(10),
-                None,
-                Duration::from_millis(25),
-            )
-            .await,
-            [Duration::ZERO, Duration::from_millis(30)]
-        );
-    }
-
-    /// Scenario: Timeout exceeds the period and collection finishes after multiple scheduled ticks but before timeout.
-    /// Guarantees: Missed cadence is detected independently of timeout telemetry and no immediate catch-up collection runs.
-    #[tokio::test(start_paused = true)]
-    async fn long_timeout_still_skips_missed_collection_ticks() {
-        assert_eq!(
-            loop_collection_start_offsets(
-                Duration::from_millis(10),
-                Some(Duration::from_millis(50)),
-                Duration::from_millis(25),
-            )
-            .await,
-            [Duration::ZERO, Duration::from_millis(30)]
-        );
-    }
-
-    /// Scenario: Timeout is shorter than the period and collection crosses timeout but finishes before the next scheduled tick.
-    /// Guarantees: Overrun telemetry does not move or drop the still-future original cadence point.
-    #[tokio::test(start_paused = true)]
-    async fn short_timeout_preserves_unmissed_collection_tick() {
-        assert_eq!(
-            loop_collection_start_offsets(
-                Duration::from_millis(20),
-                Some(Duration::from_millis(5)),
-                Duration::from_millis(10),
-            )
-            .await,
-            [Duration::ZERO, Duration::from_millis(20)]
-        );
+    async fn collection_loop_preserves_original_cadence_across_timeout_modes() {
+        for (period_ms, timeout_ms, collection_ms, expected_ms) in [
+            (10, None, 25, 30),
+            (10, Some(50), 25, 30),
+            (20, Some(5), 10, 20),
+        ] {
+            assert_eq!(
+                loop_collection_start_offsets(
+                    Duration::from_millis(period_ms),
+                    timeout_ms.map(Duration::from_millis),
+                    Duration::from_millis(collection_ms),
+                )
+                .await,
+                [Duration::ZERO, Duration::from_millis(expected_ms)]
+            );
+        }
     }
 }

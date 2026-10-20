@@ -85,6 +85,18 @@ struct FakeCounter {
     formatted_error: bool,
 }
 
+fn fake_counter(path: &str, formatted: Number) -> FakeCounter {
+    FakeCounter {
+        path: path.to_owned(),
+        native_type: 0x0001_0100,
+        raw: None,
+        multi_count: 1,
+        formatted: Some(formatted),
+        raw_error: false,
+        formatted_error: false,
+    }
+}
+
 struct FakeState {
     counters: Vec<FakeCounter>,
     added: Vec<(String, bool)>,
@@ -96,6 +108,7 @@ struct FakeState {
     remove_error: bool,
     expand_error: bool,
     expand_errors: BTreeSet<String>,
+    stop_after_expand: Option<Arc<AtomicBool>>,
     removed: Vec<usize>,
     expansions: BTreeMap<String, Vec<String>>,
 }
@@ -271,6 +284,9 @@ impl PdhApi for FakePdh {
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
         let mut state = self.state.borrow_mut();
         state.calls.expand += 1;
+        if let Some(stop) = &state.stop_after_expand {
+            stop.store(true, Ordering::Release);
+        }
         if state.expand_error || state.expand_errors.contains(path) {
             return Err(Error::Pdh {
                 operation: PdhOperation::ExpandWildcardPath,
@@ -444,8 +460,8 @@ fn fake_query_with_cadences(
     (state, query)
 }
 
-fn fake_state(counters: Vec<FakeCounter>) -> Rc<RefCell<FakeState>> {
-    Rc::new(RefCell::new(FakeState {
+fn fake_state_value(counters: Vec<FakeCounter>) -> FakeState {
+    FakeState {
         counters,
         added: Vec::new(),
         calls: FakeNativeCalls::default(),
@@ -456,9 +472,14 @@ fn fake_state(counters: Vec<FakeCounter>) -> Rc<RefCell<FakeState>> {
         remove_error: false,
         expand_error: false,
         expand_errors: BTreeSet::new(),
+        stop_after_expand: None,
         removed: Vec::new(),
         expansions: BTreeMap::new(),
-    }))
+    }
+}
+
+fn fake_state(counters: Vec<FakeCounter>) -> Rc<RefCell<FakeState>> {
+    Rc::new(RefCell::new(fake_state_value(counters)))
 }
 
 fn fake_query_with_seed(
