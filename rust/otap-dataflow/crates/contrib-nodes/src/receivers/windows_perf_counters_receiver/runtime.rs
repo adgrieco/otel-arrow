@@ -6,7 +6,7 @@
 use super::config::Config;
 use super::metrics::WindowsPerfCountersReceiverMetrics;
 use super::model::{MonotonicPublication, Sample, SampleFailure, SampleValue};
-use super::otap_builder::{OutputCollision, ProjectionInvariantError, project_sample};
+use super::otap_builder::{ProjectionInvariantError, project_sample};
 use super::pdh;
 use async_trait::async_trait;
 use linkme::distributed_slice;
@@ -103,7 +103,6 @@ struct FailureLogState {
     scrape_failure_active: bool,
     scrape_timeout_active: bool,
     active_counter_failures: BTreeSet<(usize, Arc<str>, &'static str)>,
-    active_output_collisions: BTreeSet<OutputCollision>,
 }
 
 impl FailureLogState {
@@ -176,40 +175,6 @@ impl FailureLogState {
             let _ = self.active_counter_failures.insert(key);
         }
         Ok(())
-    }
-
-    fn reconcile_output_collisions(
-        &mut self,
-        collisions: &[OutputCollision],
-    ) -> Vec<OutputCollision> {
-        let current = collisions.iter().cloned().collect::<BTreeSet<_>>();
-        let newly_active = current
-            .difference(&self.active_output_collisions)
-            .cloned()
-            .collect();
-        self.active_output_collisions = current;
-        newly_active
-    }
-
-    fn log_output_collisions(
-        &mut self,
-        receiver: &WindowsPerfCountersReceiver,
-        collisions: &[OutputCollision],
-    ) {
-        for collision in self.reconcile_output_collisions(collisions) {
-            let winner = &receiver.config.counters[collision.winner.counter_index];
-            let suppressed = &receiver.config.counters[collision.suppressed.counter_index];
-            otel_arrow_dfe_telemetry::otel_warn!(
-                "windows_perf_counters_receiver.output.collision",
-                node = receiver.node.as_str(),
-                metric_name = collision.metric_name.as_ref(),
-                attributes = ?collision.attributes,
-                winner_path_template = winner.path.as_str(),
-                winner_path = collision.winner.path.as_ref(),
-                suppressed_path_template = suppressed.path.as_str(),
-                suppressed_path = collision.suppressed.path.as_ref()
-            );
-        }
     }
 }
 
@@ -394,7 +359,6 @@ impl WindowsPerfCountersReceiver {
         } else {
             self.record_recovery_only_sample(collection_duration, &sample);
         }
-        failure_logs.log_output_collisions(self, &projection.collisions);
         self.log_sample_events(&sample);
         failure_logs
             .log_counter_failures(self, &sample)
@@ -677,7 +641,6 @@ mod tests {
         MonotonicPublicationCandidate, Number, PendingMetadata, SampleDiagnostics, SamplePoint,
         SampleValue,
     };
-    use crate::receivers::windows_perf_counters_receiver::otap_builder::OutputSource;
     use arrow::array::TimestampNanosecondArray;
     use otel_arrow_dfe_config::node::NodeUserConfig;
     use otel_arrow_dfe_engine::capability::registry::Capabilities;
@@ -917,36 +880,6 @@ mod tests {
 
         state.log_counter_failures(&receiver, &failed).unwrap();
         assert_eq!(state.active_counter_failures.len(), 1);
-    }
-
-    /// Scenario: One output collision persists across invalid and recovered samples, clears with membership, then recurs.
-    /// Guarantees: Warning state activates once per membership episode and sample validity cannot re-arm it.
-    #[test]
-    fn output_collision_warning_state_tracks_membership_episodes() {
-        let collision = OutputCollision {
-            metric_name: Arc::from("process.private"),
-            attributes: BTreeMap::from([("instance".to_owned(), "svchost".to_owned())]),
-            winner: OutputSource {
-                counter_index: 0,
-                path: Arc::from(r"\Process(svchost)\Private Bytes"),
-            },
-            suppressed: OutputSource {
-                counter_index: 1,
-                path: Arc::from(r"\Process(svchost)\Private Bytes"),
-            },
-        };
-        let mut state = FailureLogState::default();
-
-        let newly_active = state.reconcile_output_collisions(std::slice::from_ref(&collision));
-        assert_eq!(newly_active.as_slice(), std::slice::from_ref(&collision));
-        assert!(
-            state
-                .reconcile_output_collisions(std::slice::from_ref(&collision))
-                .is_empty()
-        );
-        assert!(state.reconcile_output_collisions(&[]).is_empty());
-        let newly_active = state.reconcile_output_collisions(std::slice::from_ref(&collision));
-        assert_eq!(newly_active.as_slice(), std::slice::from_ref(&collision));
     }
 
     /// Scenario: A timeout warning is followed by a distinct native collection failure before any successful scrape.
@@ -1782,7 +1715,7 @@ mod tests {
                         "name": "Available Bytes",
                         "metric": "windows.memory.available"
                     }, {
-                        "name": "Available Bytes",
+                        "name": "Committed Bytes",
                         "metric": "windows.memory.available.sum"
                     }]
                 },

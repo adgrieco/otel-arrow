@@ -147,15 +147,14 @@ such as "host" and " host" remain distinct. The `instance` key is allowed and
 overwrites the receiver-generated Go-compatible value. On an object with
 multiple or wildcard instances, this override produces a configuration warning
 because a fixed value can collapse distinct points into the same OTel series
-when no other attributes distinguish them. This is a series collision, not
-automatic summation; internal counter histories and point values remain
-independent. Metric-less mappings do not warn because their configured
-attributes are ignored.
-One normalized PDH path may feed multiple distinct metric mappings. The
-receiver opens an independent handle for each mapping and routes each sample by
-its configured mapping identity. Repeating the same path, metric name, and
-static attributes is rejected because it would emit duplicate points for one
-series.
+if consumers remove the retained native provenance attributes. The receiver
+publishes each valid mapping independently; it does not sum sources, select an
+output owner or suppress collisions. Metric-less mappings do not warn because
+their configured attributes are ignored.
+Repeating a configured PDH path ignoring case is rejected, even with different
+metric names, scaling or static attributes. Distinct configured paths and
+overlapping instance patterns retain their own valid points, concrete paths
+and template attributes.
 `scale_power10` defaults to zero and accepts values from `-18` through `18`.
 `recreate_query` defaults to `false`, and explicit `false` is supported.
 `recreate_query: true` is rejected. All mappings share one persistent query.
@@ -218,9 +217,8 @@ V2`, whose instances include the process ID as `name:PID`; provider
 availability varies by Windows version and installed performance-counter set.
 
 Unknown fields, explicit references to undefined metrics, duplicate instances,
-invalid intervals, unsupported scales, and duplicate outputs are configuration
-errors. A duplicate output has the same path ignoring case, the same metric
-name, and the same static attributes. Optional metadata may be empty and metric
+invalid intervals, unsupported scales, and duplicate configured paths are
+configuration errors. Optional metadata may be empty and metric
 definitions may be unused. Metric definition names, explicit references, and
 attribute keys and values preserve their exact configured spelling. Lookup is
 case-sensitive and does not trim, so "cpu" and " cpu" are distinct names.

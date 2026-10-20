@@ -1667,11 +1667,11 @@ fn preserves_space_distinct_native_paths() {
     );
 }
 
-/// Scenario: One normalized PDH path feeds different metric mappings.
-/// Guarantees: Distinct output identities are retained while duplicate series mappings are rejected.
+/// Scenario: One normalized PDH path is configured repeatedly with different output metadata.
+/// Guarantees: MVP rejects duplicate paths regardless of metric, scaling or static attributes before starting a worker.
 #[test]
-fn allows_one_path_to_feed_multiple_mappings() {
-    let config = Config::from_json(&json!({
+fn rejects_duplicate_paths_across_output_mappings() {
+    let error = Config::from_json(&json!({
         "metrics": {
             "available.bytes": {"unit": "By"},
             "available.scaled": {"unit": "KiBy"}
@@ -1688,12 +1688,8 @@ fn allows_one_path_to_feed_multiple_mappings() {
             ]
         }]
     }))
-    .unwrap();
-
-    assert_eq!(config.counters.len(), 2);
-    assert_eq!(config.counters[0].path, config.counters[1].path);
-    assert_eq!(config.counters[0].name.as_ref(), "available.bytes");
-    assert_eq!(config.counters[1].name.as_ref(), "available.scaled");
+    .unwrap_err();
+    assert!(error.to_string().contains("duplicate counter path"));
 
     assert_config_error(
         json!({
@@ -1705,7 +1701,7 @@ fn allows_one_path_to_feed_multiple_mappings() {
                 ]
             }]
         }),
-        "duplicate counter output mapping",
+        "duplicate counter path",
     );
     assert_config_error(
         json!({
@@ -1717,12 +1713,13 @@ fn allows_one_path_to_feed_multiple_mappings() {
                     {
                         "name": "Available Bytes",
                         "metric": "available.bytes",
-                        "scale_power10": -3
+                        "scale_power10": -3,
+                        "attributes": {"source": "second"}
                     }
                 ]
             }]
         }),
-        "duplicate counter output mapping",
+        "duplicate counter path",
     );
 }
 

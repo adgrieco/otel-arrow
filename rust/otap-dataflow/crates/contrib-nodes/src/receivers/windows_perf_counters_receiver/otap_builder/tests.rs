@@ -1221,9 +1221,9 @@ fn projects_aggregate_instance_selection() {
 }
 
 /// Scenario: Two native instances in one mapping share a fixed user `instance` attribute.
-/// Guarantees: Concrete-name order fixes one owner and suppresses the colliding point without merging native sources.
+/// Guarantees: Both decoded points retain the static override and distinct native path/instance provenance without suppression.
 #[test]
-fn static_instance_override_uses_deterministic_output_owner() {
+fn static_instance_override_preserves_both_native_sources() {
     let mut wildcard = counter(r"\Process(*)\Private Bytes", "process.private", "By");
     wildcard.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
@@ -1283,37 +1283,31 @@ fn static_instance_override_uses_deterministic_output_owner() {
         },
     )
     .unwrap();
-    let records = outcome.records.unwrap();
-
-    assert_eq!(
-        records
-            .get(ArrowPayloadType::NumberDataPoints)
-            .unwrap()
-            .num_rows(),
-        1
-    );
-    assert_eq!(
-        string_attributes(&records)
-            .into_iter()
-            .filter(|(_, key, _)| key == "instance")
-            .collect::<Vec<_>>(),
-        [("0".to_owned(), "instance".to_owned(), "fixed".to_owned())]
-    );
-    assert_eq!(outcome.collisions.len(), 1);
-    assert_eq!(
-        outcome.collisions[0].winner.path.as_ref(),
-        r"\Process(service)\Private Bytes"
-    );
-    assert_eq!(
-        outcome.collisions[0].suppressed.path.as_ref(),
-        r"\Process(worker)\Private Bytes"
-    );
+    let request = decode(outcome.records.unwrap());
+    let metric = &request.resource_metrics[0].scope_metrics[0].metrics[0];
+    let Some(metric::Data::Gauge(gauge)) = &metric.data else {
+        panic!("expected Gauge");
+    };
+    assert_eq!(gauge.data_points.len(), 2);
+    for (point, name) in gauge.data_points.iter().zip(["worker", "service"]) {
+        let attrs = decoded_attributes(&point.attributes);
+        assert_eq!(attrs["instance"], "fixed");
+        assert_eq!(attrs["windows.perf_counter.instance"], name);
+        assert_eq!(
+            attrs["windows.perf_counter.path"],
+            format!(r"\Process({name})\Private Bytes")
+        );
+        assert_eq!(
+            attrs["windows.perf_counter.path_template"],
+            r"\Process(*)\Private Bytes"
+        );
+    }
 }
 
-/// Scenario: An earlier overlapping mapping is warming while a later mapping has a valid value for the same output.
-/// Guarantees: Admission ownership omits the series instead of substituting the valid loser, then publishes only the owner after recovery.
+/// Scenario: Distinct configured patterns overlap one concrete path while the first mapping initially warms.
+/// Guarantees: Decoded output publishes each valid mapping independently and preserves both template-qualified points when ready.
 #[test]
-fn invalid_output_owner_is_not_replaced_by_valid_collision() {
+fn overlapping_patterns_publish_each_valid_mapping() {
     let concrete = r"\Process(svchost)\Private Bytes";
     let instance = Arc::new(InstanceIdentity {
         name: "svchost".to_owned(),
@@ -1367,25 +1361,104 @@ fn invalid_output_owner_is_not_replaced_by_valid_collision() {
         metadata: Default::default(),
     };
 
-    let omitted = project_sample(&[first.clone(), second.clone()], &sample).unwrap();
-    assert!(omitted.records.is_none());
-    assert_eq!(omitted.collisions.len(), 1);
-    assert_eq!(omitted.collisions[0].winner.counter_index, 0);
-    assert_eq!(omitted.collisions[0].suppressed.counter_index, 1);
+    let first_request = decode(
+        project_sample(&[first.clone(), second.clone()], &sample)
+            .unwrap()
+            .records
+            .unwrap(),
+    );
+    let Some(metric::Data::Gauge(gauge)) =
+        &first_request.resource_metrics[0].scope_metrics[0].metrics[0].data
+    else {
+        panic!("expected Gauge");
+    };
+    assert_eq!(gauge.data_points.len(), 1);
+    assert_eq!(
+        decoded_attributes(&gauge.data_points[0].attributes)["windows.perf_counter.path_template"],
+        second.path
+    );
 
     sample.points[0].value = SampleValue::Value(Number::Integer(10));
     let recovered = project_sample(&[first, second], &sample).unwrap();
-    let records = recovered.records.unwrap();
-    let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
-    assert_eq!(points.num_rows(), 1);
-    let values = points
-        .column_by_name("int_value")
+    let request = decode(recovered.records.unwrap());
+    let Some(metric::Data::Gauge(gauge)) =
+        &request.resource_metrics[0].scope_metrics[0].metrics[0].data
+    else {
+        panic!("expected Gauge");
+    };
+    assert_eq!(gauge.data_points.len(), 2);
+    for (point, template) in gauge.data_points.iter().zip([
+        r"\Process(svc*)\Private Bytes",
+        r"\Process(*host)\Private Bytes",
+    ]) {
+        let attrs = decoded_attributes(&point.attributes);
+        assert_eq!(attrs["windows.perf_counter.path_template"], template);
+        assert_eq!(attrs["windows.perf_counter.path"], concrete);
+        assert_eq!(attrs["instance"], "svchost");
+    }
+}
+
+/// Scenario: Two different exact native paths feed one metric without static disambiguation.
+/// Guarantees: Both decoded Gauge points survive under their retained concrete-path attributes.
+#[test]
+fn distinct_exact_paths_publish_both_points_of_shared_metric() {
+    let config = Config::from_json(&serde_json::json!({
+        "metrics": {"memory.value": {"unit": "By", "gauge": {}}},
+        "perfcounters": [{"object": "Memory", "counters": [
+            {"name": "Available Bytes", "metric": "memory.value"},
+            {"name": "Committed Bytes", "metric": "memory.value"}
+        ]}]
+    }))
+    .unwrap();
+    let points = config
+        .counters
+        .iter()
+        .enumerate()
+        .map(|(index, counter)| {
+            point(
+                index,
+                &counter.path,
+                SampleValue::Value(Number::Integer(10 + index as i64)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let members = points
+        .iter()
+        .map(|point| SampleMember {
+            counter_index: point.counter_index,
+            path: Arc::clone(&point.path),
+            instance: None,
+            emit_instance_attribute: false,
+        })
+        .collect();
+    let request = decode(
+        into_otap(
+            &config.counters,
+            Sample {
+                timestamp_unix_nano: 1,
+                members,
+                points,
+                metadata: Default::default(),
+            },
+        )
         .unwrap()
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
-    assert_eq!(values.value(0), 10);
-    assert_eq!(recovered.collisions, omitted.collisions);
+        .unwrap(),
+    );
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    assert_eq!(metrics.len(), 1);
+    let Some(metric::Data::Gauge(gauge)) = &metrics[0].data else {
+        panic!("expected Gauge");
+    };
+    assert_eq!(gauge.data_points.len(), 2);
+    let paths = gauge
+        .data_points
+        .iter()
+        .map(|point| decoded_attributes(&point.attributes)["windows.perf_counter.path"])
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        paths,
+        BTreeSet::from([r"\Memory\Available Bytes", r"\Memory\Committed Bytes"])
+    );
 }
 
 /// Scenario: Two counters map to one metric and use custom attributes to distinguish their points.

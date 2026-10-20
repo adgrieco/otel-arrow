@@ -966,14 +966,9 @@ fn validate_counter_outputs(counters: &[CounterConfig]) -> Result<(), Error> {
     let mut output_identities = HashSet::with_capacity(counters.len());
     for (counter, lowercase_path) in counters.iter().zip(&lowercase_paths) {
         validate_counter(counter)?;
-        let identity = (
-            lowercase_path.as_str(),
-            counter.name.as_ref(),
-            counter.attributes.as_ref(),
-        );
-        if !output_identities.insert(identity) {
+        if !output_identities.insert(lowercase_path) {
             return Err(invalid(format!(
-                "duplicate counter output mapping for path {} and metric {}",
+                "duplicate counter path {} for metric {}",
                 counter.path, counter.name
             )));
         }

@@ -1091,11 +1091,11 @@ async fn live_pdh_collects_parsed_instance_paths() {
     std::fs::remove_dir(directory).unwrap();
 }
 
-/// Scenario: One live PDH query maps Available Bytes to two metrics with different attributes.
+/// Scenario: One live PDH query maps two distinct Memory paths to metrics with different attributes.
 /// Guarantees: Both mappings emit integers on two collections, and OTAP preserves each metric's name, value, path, and attributes.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
-async fn live_pdh_collects_distinct_mappings_of_one_native_path() {
+async fn live_pdh_collects_distinct_native_paths_and_outputs() {
     use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value;
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{metric, number_data_point};
@@ -1104,27 +1104,33 @@ async fn live_pdh_collects_distinct_mappings_of_one_native_path() {
     use prost::Message;
 
     let _serial = TEST_PDH_LOCK.lock().await;
-    let path = r"\Memory\Available Bytes";
+    let paths = [r"\Memory\Available Bytes", r"\Memory\Committed Bytes"];
     let config = Config::from_json(&serde_json::json!({
         "metrics": {
             "memory.available": {"unit": "By", "gauge": {}},
-            "memory.free": {"unit": "By", "gauge": {}}
+            "memory.committed": {"unit": "By", "gauge": {}}
         },
         "perfcounters": [{
             "object": "Memory",
             "counters": [
                 {"name": "Available Bytes", "metric": "memory.available"},
                 {
-                    "name": "Available Bytes",
-                    "metric": "memory.free",
-                    "attributes": {"state": "free"}
+                    "name": "Committed Bytes",
+                    "metric": "memory.committed",
+                    "attributes": {"state": "committed"}
                 }
             ]
         }]
     }))
     .unwrap();
     assert_eq!(config.counters.len(), 2);
-    assert!(config.counters.iter().all(|counter| counter.path == path));
+    assert!(
+        config
+            .counters
+            .iter()
+            .zip(paths)
+            .all(|(counter, path)| counter.path == path)
+    );
     let mut query = open_live_query(config.counters.clone(), "distinct-mappings");
 
     for _ in 0..2 {
@@ -1154,10 +1160,14 @@ async fn live_pdh_collects_distinct_mappings_of_one_native_path() {
         let decoded = ExportMetricsServiceRequest::decode(bytes.as_bytes()).unwrap();
         let metrics = &decoded.resource_metrics[0].scope_metrics[0].metrics;
         assert_eq!(metrics.len(), 2);
-        for ((metric, (name, state)), value) in metrics
+        for (((metric, (name, state)), value), path) in metrics
             .iter()
-            .zip([("memory.available", None), ("memory.free", Some("free"))])
+            .zip([
+                ("memory.available", None),
+                ("memory.committed", Some("committed")),
+            ])
             .zip(values)
+            .zip(paths)
         {
             assert_eq!(metric.name, name);
             let Some(metric::Data::Gauge(gauge)) = &metric.data else {
