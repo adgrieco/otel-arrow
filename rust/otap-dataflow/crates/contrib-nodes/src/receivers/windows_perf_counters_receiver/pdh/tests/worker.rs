@@ -2315,6 +2315,62 @@ async fn startup_prime_query_failure_starts_and_recovers() {
     );
 }
 
+/// Scenario: The only query is unavailable at startup and successfully rebuilds during the first requested scrape.
+/// Guarantees: Rebuild and priming maintenance produce an empty sample marked as no query collection, so runtime accounting treats the attempt as failed.
+#[test]
+fn rebuild_only_sample_reports_no_query_collected() {
+    let path = r"\Unavailable\Value";
+    let open_calls = Rc::new(Cell::new(0_usize));
+    let factory_open_calls = Rc::clone(&open_calls);
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
+        let call = factory_open_calls.get();
+        factory_open_calls.set(call + 1);
+        if call == 0 {
+            return Err(Error::Pdh {
+                operation: PdhOperation::OpenQuery,
+                path: "<query>".to_owned(),
+                status: 1,
+            });
+        }
+        let (_, query) = fake_query_with_seed(
+            configs,
+            vec![FakeCounter {
+                path: path.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(42)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+            Duration::ZERO,
+            Duration::from_secs(30),
+            max_native_counters,
+            seed,
+        );
+        Ok(query)
+    };
+    let mut queries = open_initial_queries(
+        query_plans(vec![counter(path, "windows.unavailable")]),
+        Duration::ZERO,
+        4_096,
+        &mut open,
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+
+    let rebuilt = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
+
+    assert!(rebuilt.points.is_empty());
+    assert!(!rebuilt.metadata.diagnostics.any_query_collected);
+    assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_attempts, 1);
+    assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
+    assert_eq!(open_calls.get(), 2);
+}
+
 /// Scenario: A calculated query configured for planned recreation reaches the failure threshold and is rebuilt during a scrape.
 /// Guarantees: The rebuild scrape skips same-scrape recreation, remains empty after priming, and the following scrape emits over the full post-prime interval.
 #[test]

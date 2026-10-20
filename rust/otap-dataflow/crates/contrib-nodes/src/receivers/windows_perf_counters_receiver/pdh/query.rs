@@ -1129,7 +1129,9 @@ impl<A: PdhApi> Query<A> {
     }
 
     pub(super) fn collect_managed(&mut self) -> Result<Sample, Error> {
-        self.collect_with_monotonic_candidate(true, false)
+        let mut sample = self.collect_with_monotonic_candidate(true, false)?;
+        sample.metadata.diagnostics.any_query_collected = true;
+        Ok(sample)
     }
 
     fn collect_with_monotonic_candidate(

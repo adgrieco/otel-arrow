@@ -1086,7 +1086,7 @@ where
         let generation_before_collection = query.query_generation;
         match query.collect(now, query_retry_cap, query_limit, open) {
             Ok(sample) => {
-                any_query_collected = true;
+                any_query_collected |= sample.metadata.diagnostics.any_query_collected;
                 recreation_eligible[query_index] =
                     !refresh_failed && query.query_generation == generation_before_collection;
                 samples.push(query.remap_sample(sample)?);
