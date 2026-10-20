@@ -1976,8 +1976,8 @@ fn duplicate_group_churn_recreates_retained_paths() {
     assert!(!added.contains(&unrelated));
 }
 
-/// Scenario: A wildcard expansion contains exact-case, case-distinct, and concrete instances.
-/// Guarantees: Aggregate matching is case-sensitive and does not confuse other provider instances.
+/// Scenario: A wildcard expansion contains exact-case, case-distinct, duplicate-suffixed, and concrete instances.
+/// Guarantees: Aggregate matching is case-sensitive and excludes only the exact configured aggregate identity.
 #[test]
 fn identifies_provider_aggregation_instances() {
     assert!(is_aggregation_instance(
@@ -2000,6 +2000,26 @@ fn identifies_provider_aggregation_instances() {
         r"\Process(_Total#1)\Private Bytes",
         "_Total"
     ));
+}
+
+/// Scenario: Pinned Go parity suffixes a duplicate `_Total` as `_Total#1` before filtering the exact aggregate.
+/// Guarantees: Wildcard cleanup removes `_Total` but retains `_Total#1` and ordinary concrete instances.
+#[test]
+fn retains_duplicate_aggregation_suffix_like_pinned_go() {
+    let mut paths = vec![
+        r"\Process(_Total)\Private Bytes".to_owned(),
+        r"\Process(_Total#1)\Private Bytes".to_owned(),
+        r"\Process(worker)\Private Bytes".to_owned(),
+    ];
+
+    assert!(!cleanup_aggregation_instances(&mut paths, Some("_Total")));
+    assert_eq!(
+        paths,
+        [
+            r"\Process(_Total#1)\Private Bytes",
+            r"\Process(worker)\Private Bytes",
+        ]
+    );
 }
 
 /// Scenario: A wildcard aggregate sorts before concrete instances under a one-instance limit.
