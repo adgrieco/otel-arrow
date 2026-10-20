@@ -470,8 +470,12 @@ fn run_command_loop<A, F>(
             Ok(Command::Collect(response)) => {
                 let accepted = AcceptedCollectGuard::new(Arc::clone(accepted));
                 let result = collect_queries(queries, query_retry_cap, max_native_counters, open);
+                let terminal = result.as_ref().is_err_and(Error::is_invalid_query);
                 drop(accepted);
                 let _ = response.send(result);
+                if terminal {
+                    break;
+                }
             }
             Ok(Command::PublishMonotonic(publications, response)) => {
                 publish_monotonic_starts(queries, publications);
@@ -737,7 +741,8 @@ impl<A: PdhApi> QuerySlot<A> {
     }
 
     fn is_recoverable_collection_error(&self, error: &Error) -> bool {
-        error.is_collection_failure() || error.is_recoverable_query_open_failure()
+        !error.is_invalid_query()
+            && (error.is_collection_failure() || error.is_recoverable_query_open_failure())
     }
 
     pub(super) fn collect<F>(
@@ -760,6 +765,9 @@ impl<A: PdhApi> QuerySlot<A> {
             self.pending.diagnostics.retry_attempts += 1;
         }
         let mut result = self.collect_or_rebuild(now, max_native_counters, query_retry_cap, open);
+        if result.as_ref().is_err_and(Error::is_invalid_query) {
+            return result;
+        }
         self.update_recovery_state(now, query_retry_cap, was_query_retry, &result);
         if let Ok(sample) = &mut result {
             sample

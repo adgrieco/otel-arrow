@@ -299,6 +299,12 @@ timestamps and non-monotonic value decreases alone do not reset it. Projection
 requires `0 < start <= time`; missing or invalid starts are invariant errors.
 This start is an observation boundary, not provider creation time.
 
+An invalid query handle terminates the receiver with a typed native error and
+one failed scheduled collection. No later points are published and the invalid
+query is not rebuilt or retried. Restart the receiver to resume collection;
+this does not promise an automatic engine restart. Cleanup remains owned by
+the worker when its current native call returns.
+
 Native setup observes shutdown between operations and before priming. A blocked
 PDH call is not cancelled; the worker closes its owned query after that call
 returns. Scrape duration stops at native-result receipt, before projection and

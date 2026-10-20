@@ -141,6 +141,17 @@ impl Error {
         )
     }
 
+    pub(in super::super) fn is_invalid_query(&self) -> bool {
+        matches!(
+            self,
+            Self::Pdh {
+                operation: PdhOperation::CollectQueryData,
+                status: PDH_INVALID_HANDLE,
+                ..
+            }
+        )
+    }
+
     pub(super) fn requires_immediate_query_rebuild(&self) -> bool {
         matches!(
             self,

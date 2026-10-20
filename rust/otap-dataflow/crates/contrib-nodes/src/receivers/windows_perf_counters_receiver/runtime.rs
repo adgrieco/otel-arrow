@@ -502,6 +502,15 @@ impl WindowsPerfCountersReceiver {
                     self.metrics.borrow_mut().health.worker_busy.inc();
                     continue;
                 }
+                Err(err) if err.is_invalid_query() => {
+                    self.record_completed_scrape(collection_duration, false);
+                    otel_arrow_dfe_telemetry::otel_error!(
+                        "windows_perf_counters_receiver.query.invalid",
+                        node = self.node.as_str(),
+                        error = %err
+                    );
+                    return Err(CollectionLoopError::Native(err));
+                }
                 Err(err) if err.is_collection_failure() => {
                     self.record_completed_scrape(collection_duration, false);
                     failure_logs.log_scrape_failure(&self.node, &err);
@@ -1266,6 +1275,39 @@ mod tests {
         assert_eq!(metrics.health.scrape_failures.get(), 0);
         assert_eq!(metrics.health.scrape_overruns.get(), 0);
         assert_eq!(metrics.health.worker_busy.get(), 1);
+    }
+
+    /// Scenario: A scheduled native collection reports an invalid query handle.
+    /// Guarantees: Exactly one failed scrape is counted and the typed error terminates before any later collect or send.
+    #[tokio::test(start_paused = true)]
+    async fn invalid_query_is_terminal_and_counted_once() {
+        let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        let calls = std::cell::Cell::new(0);
+        let result = receiver
+            .collect_and_send_with(
+                || {
+                    calls.set(calls.get() + 1);
+                    async {
+                        Err(pdh::Error::Pdh {
+                            operation: pdh::PdhOperation::CollectQueryData,
+                            path: "<query>".to_owned(),
+                            status: windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE,
+                        })
+                    }
+                },
+                |_| async { panic!("invalid query must never publish") },
+                |_| async { panic!("invalid query must never acknowledge") },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(CollectionLoopError::Native(error)) if error.is_invalid_query())
+        );
+        assert_eq!(calls.get(), 1);
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
+        assert_eq!(metrics.health.scrape_failures.get(), 1);
+        assert_eq!(metrics.health.scrapes.get(), 0);
+        assert_eq!(metrics.health.counter_read_failures.get(), 0);
     }
 
     /// Scenario: Native collection reports an impossible internal sample invariant.
