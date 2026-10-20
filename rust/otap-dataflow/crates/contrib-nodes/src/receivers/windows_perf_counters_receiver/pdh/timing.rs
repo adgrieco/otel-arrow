@@ -28,6 +28,7 @@ pub(super) fn cumulative_start_time(
 pub(super) struct MonotonicSequence {
     pub(super) start_time_unix_nano: Option<i64>,
     pub(super) pending_start_time_unix_nano: Option<i64>,
+    pub(super) pending_publication_token: Option<u64>,
     pub(super) previous_value: Option<i64>,
     pub(super) previous_timestamp_unix_nano: Option<i64>,
 }
@@ -55,19 +56,39 @@ pub(super) fn pending_monotonic_start_time(
         Ok(start)
     } else {
         sequence.pending_start_time_unix_nano = Some(timestamp_unix_nano);
+        sequence.pending_publication_token = None;
         Ok(timestamp_unix_nano)
+    }
+}
+
+pub(super) fn authorize_monotonic_start(
+    sequence: &mut MonotonicSequence,
+    timestamp_unix_nano: i64,
+    sequence_token: u64,
+) -> bool {
+    if sequence.start_time_unix_nano.is_none()
+        && sequence.pending_start_time_unix_nano == Some(timestamp_unix_nano)
+        && sequence.pending_publication_token.is_none()
+    {
+        sequence.pending_publication_token = Some(sequence_token);
+        true
+    } else {
+        false
     }
 }
 
 pub(super) fn publish_monotonic_start(
     sequence: &mut MonotonicSequence,
     timestamp_unix_nano: i64,
+    sequence_token: u64,
 ) -> bool {
     if sequence.start_time_unix_nano.is_none()
         && sequence.pending_start_time_unix_nano == Some(timestamp_unix_nano)
+        && sequence.pending_publication_token == Some(sequence_token)
     {
         sequence.start_time_unix_nano = Some(timestamp_unix_nano);
         sequence.pending_start_time_unix_nano = None;
+        sequence.pending_publication_token = None;
         true
     } else {
         false
@@ -106,10 +127,12 @@ fn update_monotonic_sequence(
     if reset {
         sequence.start_time_unix_nano = None;
         sequence.pending_start_time_unix_nano = None;
+        sequence.pending_publication_token = None;
     }
     if publish && sequence.start_time_unix_nano.is_none() {
         sequence.start_time_unix_nano = Some(timestamp_unix_nano);
         sequence.pending_start_time_unix_nano = None;
+        sequence.pending_publication_token = None;
     }
     sequence.previous_value = Some(value);
     sequence.previous_timestamp_unix_nano = Some(timestamp_unix_nano);

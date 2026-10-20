@@ -1433,6 +1433,141 @@ fn discarded_monotonic_collection_does_not_consume_start() {
     assert_eq!(retained.points[0].start_time_unix_nano, Some(120));
 }
 
+/// Scenario: A delayed acknowledgement arrives after a monotonic counter reset produced a new pending sequence at the same series identity.
+/// Guarantees: The stale sequence token cannot publish the reset sequence, while the current token can.
+#[test]
+fn stale_monotonic_acknowledgement_cannot_publish_reset_sequence() {
+    let path = r"\TCPv4\Connection Failures";
+    let config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
+    let mut open = move |configs: Vec<CounterConfig>,
+                         _max_native_counters: usize,
+                         _seed: Option<&QueryRecreationSeed>| {
+        let (state, query) = fake_query(
+            configs,
+            vec![FakeCounter {
+                path: path.to_owned(),
+                native_type: 0x0001_0100,
+                raw: None,
+                multi_count: 1,
+                formatted: Some(Number::Integer(10)),
+                raw_error: false,
+                formatted_error: false,
+            }],
+        );
+        factory_states.borrow_mut().push(state);
+        Ok(query)
+    };
+    let plan = query_plans(vec![config]).pop().unwrap();
+    let mut queries = vec![QuerySlot::open_initial(plan, 4_096, &mut open).unwrap()];
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 110;
+        state.counters[0].formatted = Some(Number::Integer(20));
+    }
+    let first = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
+    let first_publication = collected_monotonic_publications(&first).pop().unwrap();
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 120;
+        state.counters[0].formatted = Some(Number::Integer(5));
+    }
+    let reset = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
+    let reset_publication = collected_monotonic_publications(&reset).pop().unwrap();
+    assert_ne!(
+        first_publication.sequence_token,
+        reset_publication.sequence_token
+    );
+    assert!(!queries[0].publish_monotonic_start(&first_publication));
+    assert!(queries[0].publish_monotonic_start(&reset_publication));
+
+    {
+        let states = states.borrow();
+        let mut state = states[0].borrow_mut();
+        state.timestamp = 130;
+        state.counters[0].formatted = Some(Number::Integer(15));
+    }
+    let retained = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
+    assert_eq!(retained.points[0].start_time_unix_nano, Some(120));
+}
+
+/// Scenario: A wildcard monotonic series is removed and a new series later appears at the same concrete path before the old acknowledgement arrives.
+/// Guarantees: The replacement receives a distinct token and rejects the removed identity's stale acknowledgement.
+#[test]
+fn readded_monotonic_identity_rejects_removed_publication() {
+    let template = r"\Process(*)\Operations";
+    let concrete = r"\Process(worker)\Operations";
+    let mut config = monotonic_sum(template, "process.operations", "{operation}");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let state = Rc::new(RefCell::new(FakeState {
+        expansions: BTreeMap::from([(template.to_owned(), vec![concrete.to_owned()])]),
+        ..fake_state_value(vec![FakeCounter {
+            path: concrete.to_owned(),
+            native_type: 0x0001_0100,
+            raw: None,
+            multi_count: 1,
+            formatted: Some(Number::Integer(10)),
+            raw_error: false,
+            formatted_error: false,
+        }])
+    }));
+    let factory_state = Rc::clone(&state);
+    let mut open = move |configs: Vec<CounterConfig>,
+                         max_native_counters: usize,
+                         seed: Option<&QueryRecreationSeed>| {
+        Query::open_managed_with_seed(
+            FakePdh::new(Rc::clone(&factory_state)),
+            configs,
+            Duration::from_secs(30),
+            Duration::ZERO,
+            256,
+            max_native_counters,
+            seed,
+        )
+    };
+    let plan = query_plans(vec![config]).pop().unwrap();
+    let mut queries = vec![QuerySlot::open_initial(plan, 4_096, &mut open).unwrap()];
+
+    {
+        let mut state = state.borrow_mut();
+        state.timestamp = 110;
+        state.counters[0].formatted = Some(Number::Integer(20));
+    }
+    let first = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
+    let removed_publication = collected_monotonic_publications(&first).pop().unwrap();
+
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(template.to_owned(), Vec::new());
+    let removed = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
+    assert!(removed.members.is_empty());
+
+    {
+        let mut state = state.borrow_mut();
+        let _ = state
+            .expansions
+            .insert(template.to_owned(), vec![concrete.to_owned()]);
+        state.timestamp = 120;
+        state.counters[0].formatted = Some(Number::Integer(30));
+    }
+    let readded = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
+    let readded_publication = collected_monotonic_publications(&readded).pop().unwrap();
+    assert_ne!(
+        removed_publication.sequence_token,
+        readded_publication.sequence_token
+    );
+    assert!(!queries[0].publish_monotonic_start(&removed_publication));
+    assert!(queries[0].publish_monotonic_start(&readded_publication));
+}
+
 /// Scenario: A delta mapping and a recreated peer collect through separate queries with different clocks.
 /// Guarantees: Each delta interval starts exactly at that series' previous point timestamp without overlap from the later peer timestamp.
 #[test]
@@ -1848,10 +1983,10 @@ fn scaled_monotonic_sum_publishes_and_retains_start() {
     assert!(projection.records.is_some());
 }
 
-/// Scenario: A published monotonic direct-count sequence is rebuilt after repeated collection failures and primed successfully.
-/// Guarantees: Rebuild priming preserves the unchanged series' published start/value/time instead of beginning a fresh sequence.
+/// Scenario: Delivery succeeds, repeated collection failures take the query down, and its delayed monotonic acknowledgement arrives before rebuild.
+/// Guarantees: The rebuild seed accepts the per-series token and the replacement preserves the acknowledged start/value/time.
 #[test]
-fn rebuilt_monotonic_query_preserves_published_start() {
+fn rebuilt_monotonic_query_accepts_pending_publication() {
     let path = r"\TCPv4\Connection Failures";
     let states = Rc::new(RefCell::new(Vec::new()));
     let factory_states = Rc::clone(&states);
@@ -1895,7 +2030,11 @@ fn rebuilt_monotonic_query_preserves_published_start() {
     let first = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
     assert_eq!(first.points[0].start_time_unix_nano, Some(110));
     let projection = project_sample(std::slice::from_ref(&config), &first).unwrap();
-    publish_monotonic_starts(&mut queries, projection.monotonic_publications);
+    let publication = projection
+        .monotonic_publications
+        .into_iter()
+        .next()
+        .unwrap();
 
     states.borrow()[0].borrow_mut().collect_error = true;
     let now = Instant::now();
@@ -1906,6 +2045,8 @@ fn rebuilt_monotonic_query_preserves_published_start() {
                 .is_err()
         );
     }
+    assert!(queries[0].query.is_none());
+    assert!(queries[0].publish_monotonic_start(&publication));
 
     let rebuilt = queries[0]
         .collect(now, Duration::ZERO, 4_096, &mut open)

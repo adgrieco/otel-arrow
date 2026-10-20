@@ -1356,7 +1356,7 @@ mod tests {
                             MonotonicPublication {
                                 counter_index: 0,
                                 path: Arc::from(r"\Memory\Available Bytes"),
-                                query_generation: 0,
+                                sequence_token: 0,
                                 timestamp_unix_nano: timestamp,
                             },
                         )),

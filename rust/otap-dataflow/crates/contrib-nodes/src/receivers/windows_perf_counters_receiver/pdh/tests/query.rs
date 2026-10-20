@@ -338,7 +338,8 @@ fn invalid_handle_readd_preserves_cumulative_sequence() {
     }
     let first = query.collect().unwrap();
     assert_eq!(first.points[0].start_time_unix_nano, Some(110));
-    assert!(query.publish_monotonic_start(0, &first.points[0].path, 110));
+    assert!(query.authorize_monotonic_start(0, &first.points[0].path, 110, 0));
+    assert!(query.publish_monotonic_start(0, &first.points[0].path, 110, 0));
 
     let old_handle = handle_for_path(&state.borrow(), path);
     {

@@ -17,8 +17,9 @@ use super::expansion::{
 };
 use super::native::NativePdh;
 use super::timing::{
-    MonotonicSequence, advance_collection_time, delta_interval_start, pending_monotonic_start_time,
-    positive_timestamp, prime_monotonic_sequence, publish_monotonic_start,
+    MonotonicSequence, advance_collection_time, authorize_monotonic_start, delta_interval_start,
+    pending_monotonic_start_time, positive_timestamp, prime_monotonic_sequence,
+    publish_monotonic_start,
 };
 use super::{PdhApi, ValueFormat};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1325,10 +1326,32 @@ impl<A: PdhApi> Query<A> {
         config_index: usize,
         path: &Arc<str>,
         timestamp_unix_nano: i64,
+        sequence_token: u64,
     ) -> bool {
         let key = CounterKey::new(self.configs[config_index].source_mapping_index, path);
         self.counters.get_mut(&key).is_some_and(|counter| {
-            publish_monotonic_start(&mut counter.history.monotonic_sequence, timestamp_unix_nano)
+            publish_monotonic_start(
+                &mut counter.history.monotonic_sequence,
+                timestamp_unix_nano,
+                sequence_token,
+            )
+        })
+    }
+
+    pub(super) fn authorize_monotonic_start(
+        &mut self,
+        config_index: usize,
+        path: &Arc<str>,
+        timestamp_unix_nano: i64,
+        sequence_token: u64,
+    ) -> bool {
+        let key = CounterKey::new(self.configs[config_index].source_mapping_index, path);
+        self.counters.get_mut(&key).is_some_and(|counter| {
+            authorize_monotonic_start(
+                &mut counter.history.monotonic_sequence,
+                timestamp_unix_nano,
+                sequence_token,
+            )
         })
     }
 
@@ -1708,6 +1731,31 @@ pub(super) struct QueryRecreationSeed {
 impl QueryRecreationSeed {
     pub(super) fn reserved_native_entry_count(&self, exact_counter_reservations: usize) -> usize {
         exact_counter_reservations.saturating_add(self.wildcard_targets.len())
+    }
+
+    pub(super) fn publish_monotonic_start(
+        &mut self,
+        key: &CounterKey,
+        timestamp_unix_nano: i64,
+        sequence_token: u64,
+    ) -> bool {
+        if let Some(history) = self.exact_histories.get_mut(key) {
+            return publish_monotonic_start(
+                &mut history.monotonic_sequence,
+                timestamp_unix_nano,
+                sequence_token,
+            );
+        }
+        self.wildcard_targets
+            .iter_mut()
+            .find(|(candidate, _)| candidate == key)
+            .is_some_and(|(_, target)| {
+                publish_monotonic_start(
+                    &mut target.history.monotonic_sequence,
+                    timestamp_unix_nano,
+                    sequence_token,
+                )
+            })
     }
 }
 

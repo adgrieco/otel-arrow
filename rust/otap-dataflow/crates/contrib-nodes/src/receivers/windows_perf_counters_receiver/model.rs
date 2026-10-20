@@ -77,7 +77,7 @@ pub(super) struct InstanceIdentity {
 pub(super) struct MonotonicPublication {
     pub(super) counter_index: usize,
     pub(super) path: Arc<str>,
-    pub(super) query_generation: u64,
+    pub(super) sequence_token: u64,
     pub(super) timestamp_unix_nano: i64,
 }
 

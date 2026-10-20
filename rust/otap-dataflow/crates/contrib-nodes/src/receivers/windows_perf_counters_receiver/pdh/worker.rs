@@ -10,6 +10,7 @@ use super::super::model::{
 };
 use super::PdhApi;
 use super::error::Error;
+use super::expansion::CounterKey;
 use super::query::{
     Query, QueryRecreationSeed, WildcardRefreshAdditions, WildcardRefreshPlan,
     WildcardRefreshSelection, retry_delay,
@@ -583,6 +584,7 @@ pub(super) struct QuerySlot<A: PdhApi> {
     rebuild_seed: Option<QueryRecreationSeed>,
     last_active_expanded_count: usize,
     last_admitted_members: Vec<SampleMember>,
+    next_monotonic_publication_token: u64,
     pending: PendingMetadata,
 }
 
@@ -681,6 +683,7 @@ impl<A: PdhApi> QuerySlot<A> {
                     rebuild_seed: None,
                     last_active_expanded_count: 0,
                     last_admitted_members: Vec::new(),
+                    next_monotonic_publication_token: 0,
                 });
             }
             Err(error) => return Err(error),
@@ -700,6 +703,7 @@ impl<A: PdhApi> QuerySlot<A> {
             rebuild_seed: None,
             last_active_expanded_count,
             last_admitted_members,
+            next_monotonic_publication_token: 0,
             pending: PendingMetadata::default(),
         })
     }
@@ -967,7 +971,7 @@ impl<A: PdhApi> QuerySlot<A> {
         }
     }
 
-    pub(super) fn remap_sample(&self, mut sample: Sample) -> Result<Sample, Error> {
+    pub(super) fn remap_sample(&mut self, mut sample: Sample) -> Result<Sample, Error> {
         let remap = |local_index: usize| {
             self.plan
                 .global_indices
@@ -978,16 +982,33 @@ impl<A: PdhApi> QuerySlot<A> {
                 ))
         };
         for point in &mut sample.points {
+            let local_index = point.counter_index;
             point.counter_index = remap(point.counter_index)?;
             if matches!(
                 point.monotonic_publication,
                 Some(MonotonicPublicationCandidate::Pending)
             ) {
+                let sequence_token = self.next_monotonic_publication_token;
+                self.next_monotonic_publication_token =
+                    self.next_monotonic_publication_token.wrapping_add(1);
+                let authorized = self.query.as_mut().is_some_and(|query| {
+                    query.authorize_monotonic_start(
+                        local_index,
+                        &point.path,
+                        point.timestamp_unix_nano,
+                        sequence_token,
+                    )
+                });
+                if !authorized {
+                    return Err(Error::InvalidSample(
+                        "monotonic publication candidate could not be authorized",
+                    ));
+                }
                 point.monotonic_publication =
                     Some(MonotonicPublicationCandidate::Ready(MonotonicPublication {
                         counter_index: point.counter_index,
                         path: Arc::clone(&point.path),
-                        query_generation: self.query_generation,
+                        sequence_token,
                         timestamp_unix_nano: point.timestamp_unix_nano,
                     }));
             }
@@ -1041,9 +1062,6 @@ impl<A: PdhApi> QuerySlot<A> {
     }
 
     pub(super) fn publish_monotonic_start(&mut self, publication: &MonotonicPublication) -> bool {
-        if publication.query_generation != self.query_generation {
-            return false;
-        }
         let Ok(config_index) = self
             .plan
             .global_indices
@@ -1051,11 +1069,25 @@ impl<A: PdhApi> QuerySlot<A> {
         else {
             return false;
         };
-        self.query.as_mut().is_some_and(|query| {
+        let key = CounterKey::new(
+            self.plan.configs[config_index].source_mapping_index,
+            &publication.path,
+        );
+        if self.query.as_mut().is_some_and(|query| {
             query.publish_monotonic_start(
                 config_index,
                 &publication.path,
                 publication.timestamp_unix_nano,
+                publication.sequence_token,
+            )
+        }) {
+            return true;
+        }
+        self.rebuild_seed.as_mut().is_some_and(|seed| {
+            seed.publish_monotonic_start(
+                &key,
+                publication.timestamp_unix_nano,
+                publication.sequence_token,
             )
         })
     }
@@ -1257,7 +1289,7 @@ struct PlannedWildcardRefresh {
     query_index: usize,
     plan: WildcardRefreshPlan,
     eligible: Vec<usize>,
-    selected: BTreeSet<super::expansion::CounterKey>,
+    selected: BTreeSet<CounterKey>,
 }
 
 pub(super) fn refresh_wildcards_in_config_order<A: PdhApi>(
