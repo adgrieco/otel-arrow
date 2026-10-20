@@ -12,7 +12,8 @@ use super::counter_type::{CounterKind, classify_native_type, validate_metric_map
 use super::error::{Error, sample_failure};
 use super::expansion::{
     CounterKey, ExpansionAllocation, cleanup_aggregation_instances, expansion_allocation,
-    instance_groups, keyed_expanded_paths, limit_expanded_paths, refresh_changes_with_group_resets,
+    instance_groups, keyed_expanded_paths, limit_expanded_paths, normalize_expanded_path,
+    refresh_changes_with_group_resets,
 };
 use super::native::NativePdh;
 use super::timing::{
@@ -719,9 +720,13 @@ impl<A: PdhApi> Query<A> {
         metadata: &mut PendingMetadata,
     ) {
         for discovery in discoveries {
-            let Ok(mut paths) = discovery.paths else {
+            let Ok(paths) = discovery.paths else {
                 continue;
             };
+            let mut paths = paths
+                .into_iter()
+                .map(normalize_expanded_path)
+                .collect::<Vec<_>>();
             let config_index = discovery.config_index;
             let aggregation_only = cleanup_aggregation_instances(
                 &mut paths,

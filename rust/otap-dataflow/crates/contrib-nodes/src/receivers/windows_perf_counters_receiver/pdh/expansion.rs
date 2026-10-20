@@ -21,8 +21,27 @@ impl CounterKey {
     pub(super) fn new(config_index: usize, path: &str) -> Self {
         Self {
             config_index,
-            normalized_path: path.to_lowercase(),
+            normalized_path: local_counter_path(path).to_lowercase(),
         }
+    }
+}
+
+fn local_counter_path(path: &str) -> &str {
+    let Some(rest) = path.strip_prefix(r"\\") else {
+        return path;
+    };
+    match rest.find('\\') {
+        Some(separator) if separator > 0 => &rest[separator..],
+        _ => path,
+    }
+}
+
+pub(super) fn normalize_expanded_path(path: String) -> String {
+    let local_path = local_counter_path(&path);
+    if local_path.len() == path.len() {
+        path
+    } else {
+        local_path.to_owned()
     }
 }
 
@@ -32,7 +51,10 @@ pub(super) fn keyed_expanded_paths(
 ) -> Vec<(CounterKey, String)> {
     let mut keyed = paths
         .into_iter()
-        .map(|path| (CounterKey::new(config_index, &path), path))
+        .map(|path| {
+            let path = normalize_expanded_path(path);
+            (CounterKey::new(config_index, &path), path)
+        })
         .collect::<Vec<_>>();
     keyed.sort_by(|(left_key, left_path), (right_key, right_path)| {
         left_key

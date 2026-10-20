@@ -1539,6 +1539,19 @@ fn stable_keys_do_not_depend_on_expansion_order() {
     );
 }
 
+/// Scenario: English wildcard expansion returns a local path with an optional machine prefix.
+/// Guarantees: The emitted path and stable identity match the equivalent configured local exact path.
+#[test]
+fn machine_prefixed_expansion_uses_local_path_identity() {
+    let local = r"\Process(worker)\Private Bytes";
+    let prefixed = r"\\MACHINE\Process(worker)\Private Bytes";
+
+    let paths = keyed_expanded_paths(0, vec![prefixed.to_owned()]);
+
+    assert_eq!(paths, [(CounterKey::new(0, local), local.to_owned())]);
+    assert_eq!(CounterKey::new(0, prefixed), CounterKey::new(0, local));
+}
+
 /// Scenario: Discovery returns two non-ASCII case variants of one path plus one distinct path at the budget limit.
 /// Guarantees: CounterKey identity removes the collision before counting so aliases cannot consume capacity or replace native spelling by order.
 #[test]
