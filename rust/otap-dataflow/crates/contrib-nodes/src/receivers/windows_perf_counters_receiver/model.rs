@@ -57,6 +57,8 @@ pub(super) enum SampleValue {
     Value(Number),
     /// A two-sample counter is in its bounded first-scrape warm-up.
     Warming,
+    /// Native data or readiness was temporarily unavailable.
+    Unavailable,
     /// A valid base did not advance because no operations were observed.
     NoObservation,
 }

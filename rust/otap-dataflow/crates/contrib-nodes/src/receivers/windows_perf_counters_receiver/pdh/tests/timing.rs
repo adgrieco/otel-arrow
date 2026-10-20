@@ -105,7 +105,7 @@ fn primed_monotonic_query_tracks_published_sequence_only() {
     }
     assert_eq!(
         query.collect().unwrap().points[0].value,
-        SampleValue::NoObservation
+        SampleValue::Unavailable
     );
 
     {
@@ -205,7 +205,7 @@ fn query_rollback_during_omission_resets_monotonic_sequence() {
     }
     let sample = query.collect().unwrap();
     assert_eq!(sample.timestamp_unix_nano, 115);
-    assert_eq!(sample.points[0].value, SampleValue::NoObservation);
+    assert_eq!(sample.points[0].value, SampleValue::Unavailable);
 
     {
         let mut state = state.borrow_mut();
@@ -278,21 +278,23 @@ fn calculated_readiness_distinguishes_base_decrease_from_failures() {
         }],
     );
 
-    assert_eq!(
-        query.collect().unwrap().points[0].value,
-        SampleValue::Warming
-    );
+    let warming = query.collect().unwrap();
+    assert_eq!(warming.points[0].value, SampleValue::Warming);
+    assert_eq!(warming.metadata.diagnostics.warmup_omissions, 1);
     state.borrow_mut().counters[0].raw = Some(12);
     assert!(matches!(
         query.collect().unwrap().points[0].value,
         SampleValue::Value(Number::Double(4.0))
     ));
 
+    let idle = query.collect().unwrap();
+    assert_eq!(idle.points[0].value, SampleValue::NoObservation);
+    assert_eq!(idle.metadata.diagnostics.warmup_omissions, 0);
+
     state.borrow_mut().counters[0].raw = Some(5);
-    assert_eq!(
-        query.collect().unwrap().points[0].value,
-        SampleValue::NoObservation
-    );
+    let regressed = query.collect().unwrap();
+    assert_eq!(regressed.points[0].value, SampleValue::NoObservation);
+    assert_eq!(regressed.metadata.diagnostics.warmup_omissions, 0);
     state.borrow_mut().counters[0].raw = Some(6);
     assert!(matches!(
         query.collect().unwrap().points[0].value,
@@ -304,10 +306,9 @@ fn calculated_readiness_distinguishes_base_decrease_from_failures() {
         state.counters[0].raw = Some(14);
         state.counters[0].formatted = None;
     }
-    assert_eq!(
-        query.collect().unwrap().points[0].value,
-        SampleValue::NoObservation
-    );
+    let unavailable = query.collect().unwrap();
+    assert_eq!(unavailable.points[0].value, SampleValue::Unavailable);
+    assert_eq!(unavailable.metadata.diagnostics.warmup_omissions, 1);
     state.borrow_mut().counters[0].raw = Some(16);
     assert_eq!(
         query.collect().unwrap().points[0].value,
@@ -657,10 +658,9 @@ fn delta_sum_tracks_previous_valid_sample_intervals() {
         state.counters[0].raw = Some(30);
         state.counters[0].formatted = Some(Number::Double(4.0));
     }
-    assert_eq!(
-        query.collect().unwrap().points[0].value,
-        SampleValue::NoObservation
-    );
+    let warming = query.collect().unwrap();
+    assert_eq!(warming.points[0].value, SampleValue::Warming);
+    assert_eq!(warming.metadata.diagnostics.warmup_omissions, 1);
 
     {
         let mut state = state.borrow_mut();
@@ -681,10 +681,9 @@ fn delta_sum_tracks_previous_valid_sample_intervals() {
         state.counters[0].raw = Some(50);
         state.counters[0].formatted = Some(Number::Double(6.0));
     }
-    assert_eq!(
-        query.collect().unwrap().points[0].value,
-        SampleValue::NoObservation
-    );
+    let warming = query.collect().unwrap();
+    assert_eq!(warming.points[0].value, SampleValue::Warming);
+    assert_eq!(warming.metadata.diagnostics.warmup_omissions, 1);
 
     {
         let mut state = state.borrow_mut();
@@ -724,10 +723,9 @@ fn delta_sum_transient_restarts_interval_readiness() {
         state.counters[0].raw = Some(20);
         state.counters[0].formatted = None;
     }
-    assert_eq!(
-        query.collect().unwrap().points[0].value,
-        SampleValue::NoObservation
-    );
+    let unavailable = query.collect().unwrap();
+    assert_eq!(unavailable.points[0].value, SampleValue::Unavailable);
+    assert_eq!(unavailable.metadata.diagnostics.warmup_omissions, 1);
 
     {
         let mut state = state.borrow_mut();
@@ -848,7 +846,7 @@ fn delta_sum_negative_values_follow_monotonicity() {
         }
         let sample = query.collect().unwrap();
         if monotonic {
-            assert_eq!(sample.points[0].value, SampleValue::NoObservation);
+            assert_eq!(sample.points[0].value, SampleValue::Warming);
         } else {
             assert_eq!(sample.points[0].start_time_unix_nano, Some(100));
             let SampleValue::Value(Number::Double(value)) = sample.points[0].value else {

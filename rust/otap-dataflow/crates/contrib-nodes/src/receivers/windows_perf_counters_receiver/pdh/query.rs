@@ -1584,7 +1584,7 @@ impl<A: PdhApi> Query<A> {
                     emit_monotonic_candidate,
                 )
             } else {
-                Ok((SampleValue::NoObservation, None))
+                Ok((SampleValue::Unavailable, None))
             };
             let (value, point_start_time) = match result {
                 Ok(result) => result,
@@ -1601,7 +1601,7 @@ impl<A: PdhApi> Query<A> {
                     continue;
                 }
             };
-            if matches!(value, SampleValue::Warming) {
+            if matches!(value, SampleValue::Warming | SampleValue::Unavailable) {
                 metadata.diagnostics.warmup_omissions += 1;
             }
             points.push(SamplePoint {
@@ -2015,7 +2015,7 @@ impl<C> CounterHandle<C> {
         }
 
         let Some(number) = self.read_formatted_number(api)? else {
-            return Ok((SampleValue::NoObservation, None));
+            return Ok((SampleValue::Unavailable, None));
         };
         let delta_start_time = self.delta_start_time(metric_kind, number, timestamp_unix_nano)?;
         if matches!(
@@ -2026,7 +2026,7 @@ impl<C> CounterHandle<C> {
             }
         ) && delta_start_time.is_none()
         {
-            return Ok((SampleValue::NoObservation, None));
+            return Ok((SampleValue::Warming, None));
         }
         let scaled = self.scale_number(number)?;
         let point_start_time = self.point_start_time(
@@ -2054,7 +2054,7 @@ impl<C> CounterHandle<C> {
             Ok(Some(raw)) => raw,
             Ok(None) => {
                 self.reset_readiness();
-                return Ok(Some(SampleValue::NoObservation));
+                return Ok(Some(SampleValue::Unavailable));
             }
             Err(error) => {
                 self.reset_readiness();

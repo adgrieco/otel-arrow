@@ -365,10 +365,10 @@ fn invalid_handle_readd_preserves_cumulative_sequence() {
     ));
 }
 
-/// Scenario: A counter read produces normal no-observation results without an invalid native handle.
-/// Guarantees: No-observation resets readiness without removing, re-adding, or retrying the counter.
+/// Scenario: A counter read reports expected native unavailability without an invalid handle.
+/// Guarantees: Unavailability resets readiness and counts the omission without removing, re-adding, or retrying the counter.
 #[test]
-fn no_observation_does_not_recover_counter_handle() {
+fn unavailable_observation_does_not_recover_counter_handle() {
     let path = r"\Provider\Operations Delta";
     let (state, mut query) = invalid_handle_query(
         vec![delta_sum(path, "provider.operations", false)],
@@ -379,9 +379,10 @@ fn no_observation_does_not_recover_counter_handle() {
     for timestamp in [110, 120] {
         state.borrow_mut().timestamp = timestamp;
         let sample = query.collect().unwrap();
-        assert!(matches!(sample.points[0].value, SampleValue::NoObservation));
+        assert!(matches!(sample.points[0].value, SampleValue::Unavailable));
         assert_eq!(sample.metadata.diagnostics.counter_read_failures, 0);
         assert_eq!(sample.metadata.diagnostics.retry_attempts, 0);
+        assert_eq!(sample.metadata.diagnostics.warmup_omissions, 1);
     }
 
     let state = state.borrow();

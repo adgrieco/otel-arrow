@@ -88,6 +88,7 @@ struct FailureLogState {
     scrape_failure_active: bool,
     scrape_timeout_active: bool,
     active_counter_failures: BTreeSet<(usize, Arc<str>, &'static str)>,
+    active_omissions: BTreeSet<(usize, Arc<str>)>,
     active_output_collisions: BTreeSet<OutputCollision>,
 }
 
@@ -175,6 +176,60 @@ impl FailureLogState {
                 );
             }
             let _ = self.active_counter_failures.insert(key);
+        }
+        Ok(())
+    }
+
+    fn reconcile_omissions(&mut self, sample: &Sample) -> Vec<(usize, Arc<str>, &'static str)> {
+        let current_sources = sample
+            .members
+            .iter()
+            .map(|member| (member.counter_index, Arc::clone(&member.path)))
+            .chain(
+                sample
+                    .points
+                    .iter()
+                    .map(|point| (point.counter_index, Arc::clone(&point.path))),
+            )
+            .collect::<BTreeSet<_>>();
+        self.active_omissions
+            .retain(|source| current_sources.contains(source));
+
+        let mut newly_active = Vec::new();
+        for point in &sample.points {
+            let source = (point.counter_index, Arc::clone(&point.path));
+            let reason = match point.value {
+                SampleValue::Value(_) => {
+                    let _ = self.active_omissions.remove(&source);
+                    continue;
+                }
+                SampleValue::Warming => "warming",
+                SampleValue::Unavailable => "unavailable",
+                SampleValue::NoObservation => "no_observation",
+            };
+            if self.active_omissions.insert(source.clone()) {
+                newly_active.push((source.0, source.1, reason));
+            }
+        }
+        newly_active
+    }
+
+    fn log_omissions(
+        &mut self,
+        receiver: &WindowsPerfCountersReceiver,
+        sample: &Sample,
+    ) -> Result<(), usize> {
+        for (counter_index, path, reason) in self.reconcile_omissions(sample) {
+            let Some(counter) = receiver.config.counters.get(counter_index) else {
+                return Err(counter_index);
+            };
+            otel_arrow_dfe_telemetry::otel_debug!(
+                "windows_perf_counters_receiver.counter.omitted",
+                node = receiver.node.as_str(),
+                path_template = counter.path.as_str(),
+                path = path.as_ref(),
+                reason = reason
+            );
         }
         Ok(())
     }
@@ -415,6 +470,9 @@ impl WindowsPerfCountersReceiver {
         }
         failure_logs.log_output_collisions(self, &projection.collisions);
         self.log_sample_events(&sample);
+        failure_logs
+            .log_omissions(self, &sample)
+            .map_err(CollectionLoopError::MissingCounter)?;
         failure_logs
             .log_counter_failures(self, &sample)
             .map_err(CollectionLoopError::MissingCounter)?;
@@ -921,6 +979,61 @@ mod tests {
         };
         state.log_counter_failures(&receiver, &recovered).unwrap();
         assert!(state.active_counter_failures.is_empty());
+    }
+
+    /// Scenario: One concrete source warms, changes omission reason, recovers, idles, leaves membership, and later becomes unavailable.
+    /// Guarantees: Omission diagnostics emit once per episode, valid values re-arm them, and removed sources release suppression state.
+    #[test]
+    fn omission_diagnostics_track_concrete_recovery_and_membership() {
+        let path = Arc::<str>::from(r"\Memory\Available Bytes");
+        let member = SampleMember {
+            counter_index: 0,
+            path: Arc::clone(&path),
+            instance: None,
+            emit_instance_attribute: false,
+        };
+        let point = |timestamp_unix_nano, value| SamplePoint {
+            counter_index: 0,
+            path: Arc::clone(&path),
+            instance: None,
+            emit_instance_attribute: false,
+            timestamp_unix_nano,
+            start_time_unix_nano: None,
+            monotonic_publication: None,
+            value,
+        };
+        let sample = |timestamp_unix_nano, value| Sample {
+            timestamp_unix_nano,
+            members: vec![member.clone()],
+            points: vec![point(timestamp_unix_nano, value)],
+            metadata: collected_metadata(),
+        };
+        let mut state = FailureLogState::default();
+
+        assert_eq!(
+            state.reconcile_omissions(&sample(10, SampleValue::Warming)),
+            [(0, Arc::clone(&path), "warming")]
+        );
+        assert!(
+            state
+                .reconcile_omissions(&sample(20, SampleValue::Unavailable))
+                .is_empty()
+        );
+        assert!(
+            state
+                .reconcile_omissions(&sample(30, SampleValue::Value(Number::Integer(42))))
+                .is_empty()
+        );
+        assert_eq!(
+            state.reconcile_omissions(&sample(40, SampleValue::NoObservation)),
+            [(0, Arc::clone(&path), "no_observation")]
+        );
+        assert!(state.reconcile_omissions(&Sample::empty(50)).is_empty());
+        assert!(state.active_omissions.is_empty());
+        assert_eq!(
+            state.reconcile_omissions(&sample(60, SampleValue::Unavailable)),
+            [(0, path, "unavailable")]
+        );
     }
 
     /// Scenario: One output collision persists across invalid and recovered samples, clears with membership, then recurs.
