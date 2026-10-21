@@ -1,0 +1,49 @@
+# platform: windows-only
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation: { type: core_count, count: 1 }
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          perf:
+            type: receiver:windowsperfcounters
+            config:
+              metrics:
+                smoke.memory.available: { unit: By, gauge: {} }
+                smoke.processor.total: { unit: "%", gauge: {} }
+                smoke.processor.time: { unit: "%", gauge: {} }
+                smoke.process.id: { unit: "1", gauge: {} }
+                smoke.disk.time: { unit: "%", gauge: {} }
+                smoke.german.selector: { unit: "%", gauge: {} }
+                smoke.missing.selector: { unit: "1", gauge: {} }
+              perfcounters:
+                - object: Memory
+                  counters: [{ name: Available Bytes, metric: smoke.memory.available }]
+                - object: Processor
+                  instances: ["_Total"]
+                  counters: [{ name: "% Processor Time", metric: smoke.processor.total }]
+                - object: Processor
+                  instances: ["*"]
+                  counters: [{ name: "% Processor Time", metric: smoke.processor.time }]
+                - object: Process
+                  instances: ["svchos?"]
+                  counters: [{ name: ID Process, metric: smoke.process.id }]
+                - object: PhysicalDisk
+                  instances: ["*"]
+                  counters: [{ name: "% Disk Time", metric: smoke.disk.time }]
+                - object: Prozessor
+                  instances: ["_Total"]
+                  counters: [{ name: "Prozessorzeit (%)", metric: smoke.german.selector }]
+                - object: AldoTel Smoke Missing
+                  counters: [{ name: Missing Counter, metric: smoke.missing.selector }]
+              collection_interval: 10s
+              wildcard_refresh_interval: 60s
+          console:
+            type: exporter:console
+            config: { format: pretty, unicode: false, color: false }
+        connections:
+          - { from: perf, to: console }
