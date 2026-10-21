@@ -919,6 +919,13 @@ impl InstanceSegment {
             ))
         } else {
             let configured = validate_native_component(field, &configured)?.to_owned();
+            if configured.strip_prefix('#').is_some_and(|index| {
+                !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+            }) {
+                return Err(invalid(format!(
+                    "{field} must include an instance name before its index"
+                )));
+            }
             Ok(Self::Exact(configured))
         }
     }

@@ -1912,7 +1912,7 @@ fn rejects_instance_alias_duplicates() {
     }
 }
 
-/// Scenario: Instance text has padding, nonnumeric/non-ASCII suffixes, empty prefixes or repeated hashes.
+/// Scenario: Instance text has padding, nonnumeric/non-ASCII suffixes or repeated hashes.
 /// Guarantees: Comparison canonicalizes only one final ASCII numeric suffix without trimming or recursion.
 #[test]
 fn preserves_literal_instance_suffix_text() {
@@ -1925,8 +1925,6 @@ fn preserves_literal_instance_suffix_text() {
         "app#01x",
         "app#\u{0660}",
         "app#0#0",
-        "#0",
-        "#00",
         "app#",
     ];
     for separate_entries in [false, true] {
@@ -1955,21 +1953,54 @@ fn preserves_literal_instance_suffix_text() {
     }
 }
 
-/// Scenario: An instance name starts with `#` and otherwise resembles a PDH duplicate suffix.
-/// Guarantees: `#5` remains a literal native instance because duplicate indexes require a nonempty name before `#`.
+/// Scenario: A complete exact instance name consists only of a numeric index suffix.
+/// Guarantees: Index-only names reject with PR1's missing-instance-name error.
 #[test]
-fn preserves_hash_prefixed_instance_name() {
-    let config = Config::from_json(&json!({
-        "metrics": {"test": metric()},
-        "perfcounters": [{
-            "object": "Process",
-            "instances": "#5",
-            "counters": [{"name": "Private Bytes", "metric": "test"}]
-        }]
-    }))
-    .unwrap();
+fn rejects_numeric_suffix_only_instances() {
+    for instance in ["#0", "#1", "#00", "#5"] {
+        assert_config_error(
+            json!({
+                "metrics": {"test": metric()},
+                "perfcounters": [{
+                    "object": "Process",
+                    "instances": instance,
+                    "counters": [{"name": "Private Bytes", "metric": "test"}]
+                }]
+            }),
+            "must include an instance name before its index",
+        );
+    }
+}
 
-    assert_eq!(config.counters[0].path, r"\Process(#5)\Private Bytes");
+/// Scenario: The first three occurrences are selected in one list or separate object entries.
+/// Guarantees: Duplicate validation admits distinct indexes together and preserves each configured path.
+#[test]
+fn accepts_distinct_instance_indexes_together() {
+    let instances = ["app", "app#1", "app#2"];
+    for separate_entries in [false, true] {
+        let perfcounters = if separate_entries {
+            instances
+                .iter()
+                .map(|instance| {
+                    json!({
+                        "object": "Process", "instances": instance,
+                        "counters": [{"name": "Private Bytes"}]
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![json!({
+                "object": "Process", "instances": instances,
+                "counters": [{"name": "Private Bytes"}]
+            })]
+        };
+        let config = Config::from_json(&json!({"perfcounters": perfcounters})).unwrap();
+        assert_eq!(config.counters.len(), instances.len());
+        for (counter, instance) in config.counters.iter().zip(instances) {
+            assert_eq!(counter.path, format!(r"\Process({instance})\Private Bytes"));
+            assert_eq!(counter.name.as_ref(), counter.path);
+        }
+    }
 }
 
 /// Scenario: YAML shorthand selects an empty Gauge with a null value.
