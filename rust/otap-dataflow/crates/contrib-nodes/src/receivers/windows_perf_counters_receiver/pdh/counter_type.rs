@@ -249,7 +249,7 @@ mod tests {
     }
 
     /// Scenario: SDK metadata describes DWORD and LARGE delta-count counters.
-    /// Guarantees: Only the two raw-difference types receive delta Sum eligibility.
+    /// Guarantees: Only the two SDK raw-difference types are classified as native Delta counters.
     #[test]
     fn classifies_delta_counts() {
         for native_type in [

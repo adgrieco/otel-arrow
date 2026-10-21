@@ -1781,6 +1781,75 @@ fn queued_retry_cleanup_failure_requires_query_rebuild() {
     assert_eq!(state.borrow().removed, [0]);
 }
 
+/// Scenario: One normalized mapping selects an English exact instance and a stable localized wildcard for the same instance.
+/// Guarantees: Repeated production refreshes retain both identities and calculated values without spurious native replacement or renewed warm-up.
+#[test]
+fn mixed_language_exact_and_wildcard_group_preserves_calculated_readiness() {
+    let config = Config::from_json(&serde_json::json!({
+        "metrics": {"processor": {"unit": "%", "gauge": {}}},
+        "perfcounters": [{
+            "object": "Processor", "instances": ["0", "?"],
+            "counters": [{"name": "% Processor Time", "metric": "processor"}]
+        }]
+    }))
+    .unwrap();
+    let exact = r"\Processor(0)\% Processor Time";
+    let template = r"\Processor(?)\% Processor Time";
+    let localized = r"\Prozessor(0)\Prozessorzeit (%)";
+    assert_eq!(config.counters.len(), 2);
+    assert_eq!(
+        config.counters[0].source_mapping_index,
+        config.counters[1].source_mapping_index
+    );
+    let (state, mut query) = fake_query_with_cadences(
+        config.counters,
+        [exact, localized]
+            .into_iter()
+            .map(|path| FakeCounter {
+                native_type: 0x2151_0500,
+                raw: Some(10),
+                ..fake_counter(path, Number::Double(7.0))
+            })
+            .collect(),
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(template.to_owned(), vec![localized.to_owned()]);
+    let first = query.collect().unwrap();
+    assert_eq!(first.points.len(), 2);
+    assert!(
+        first
+            .points
+            .iter()
+            .all(|point| point.value == SampleValue::Warming)
+    );
+    for _ in 0..3 {
+        {
+            let mut state = state.borrow_mut();
+            state.timestamp += 10;
+            for counter in &mut state.counters {
+                counter.raw = counter.raw.map(|value| value + 1);
+            }
+        }
+        let sample = query.collect().unwrap();
+        assert_eq!(sample.points.len(), 2);
+        assert!(
+            sample
+                .points
+                .iter()
+                .all(|point| point.value == SampleValue::Value(Number::Double(7.0)))
+        );
+        assert_eq!(
+            state.borrow().added,
+            [exact.to_owned(), localized.to_owned()]
+        );
+        assert!(state.borrow().removed.is_empty());
+    }
+}
+
 /// Scenario: English exact and wildcard selectors resolve beside German and absent English inputs.
 /// Guarantees: Exact adds stay English, expanded adds use localized identity, projection preserves configured metadata, and unresolved inputs warn once.
 #[test]

@@ -828,6 +828,7 @@ impl<A: PdhApi> Query<A> {
     fn wildcard_instance_groups(&self) -> BTreeMap<InstanceGroupKey, BTreeSet<CounterKey>> {
         let instances = self
             .counter_targets()
+            .filter(|(_, target)| target.origin.is_wildcard())
             .filter_map(|(key, target)| target.instance.map(|instance| (key, instance)))
             .collect::<Vec<_>>();
         instance_groups(
