@@ -205,7 +205,6 @@ fn invalid_handle_retries_one_counter_with_fresh_history() {
         retired.points[0].value,
         SampleValue::Value(Number::Double(20.0))
     ));
-    assert_eq!(retired.metadata.diagnostics.counter_read_failures, 1);
     assert_eq!(retired.metadata.failures[0].counter_index, 0);
     {
         let state = state.borrow();
@@ -296,7 +295,6 @@ fn formatted_invalid_handle_retries_exact_counter() {
 
     let retired = query.collect().unwrap();
     assert!(retired.points.is_empty());
-    assert_eq!(retired.metadata.diagnostics.counter_read_failures, 1);
     {
         let state = state.borrow();
         assert_eq!(state.cleanup_attempts, [old_handle]);
@@ -422,7 +420,6 @@ fn invalid_handle_cleanup_failure_requires_query_rebuild() {
         }
     ));
     assert_eq!(query.pending.failures.len(), 2);
-    assert_eq!(query.pending.diagnostics.counter_read_failures, 1);
     let state = state.borrow();
     assert_eq!(state.cleanup_attempts, [handle]);
     assert_eq!(state.active, BTreeSet::from([handle, 1]));
@@ -547,10 +544,31 @@ fn startup_aggregate_filter_stops_between_native_parses() {
         256,
         4096,
     );
-    assert!(matches!(result, Err(Error::WorkerInitStopped)));
+    assert!(matches!(result, Err(Error::WorkerStopRequested)));
     assert_eq!(state.borrow().calls.parse, 1);
     assert_eq!(state.borrow().calls.add, 0);
     assert_eq!(state.borrow().calls.collect, 0);
+}
+
+/// Scenario: A serving query observes a stop request before its next scheduled native collection.
+/// Guarantees: The query returns a typed stop request, not a startup failure, without another collection or read.
+#[test]
+fn runtime_collection_stop_is_not_an_initialization_failure() {
+    let path = r"\Memory\Available Bytes";
+    let state = fake_state(vec![fake_counter(path, Number::Integer(42))]);
+    let mut query = Query::open_with(
+        FakePdh::new(Rc::clone(&state)),
+        vec![counter(path, "memory")],
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        256,
+        4096,
+    )
+    .unwrap();
+    state.borrow_mut().stop_after_add = Some(Arc::new(AtomicBool::new(true)));
+    assert!(matches!(query.collect(), Err(Error::WorkerStopRequested)));
+    assert_eq!(state.borrow().calls.collect, 0);
+    assert_eq!(state.borrow().calls.formatted, 0);
 }
 
 /// Scenario: Seventeen startup patterns each discover 257 available members under the fixed MVP bounds.
@@ -899,7 +917,6 @@ fn startup_prime_preserves_counter_failures() {
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.metadata.failures.len(), 1);
     assert_eq!(sample.metadata.failures[0].counter_index, 0);
-    assert_eq!(sample.metadata.diagnostics.counter_read_failures, 1);
     assert!(state.borrow().removed.is_empty());
 }
 

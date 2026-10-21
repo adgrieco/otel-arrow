@@ -24,7 +24,7 @@ pub(super) struct WindowsPerfCountersScrapeMetrics {
     pub attempts: Counter<u64>,
 }
 
-/// Lifecycle, recovery, and collection metrics.
+/// Lifecycle, inventory, and collection metrics.
 #[metric_set(name = "receiver.windowsperfcounters")]
 #[derive(Debug, Default, Clone)]
 pub(super) struct WindowsPerfCountersMetrics {
@@ -52,7 +52,7 @@ pub(super) struct WindowsPerfCountersMetrics {
     /// Collection duration.
     #[metric(unit = "s")]
     pub scrape_duration: HistogramNormal,
-    /// Counter reads, statuses, or projections that failed.
+    /// Counter observations lost to read, status, calculation, or scaling failures.
     #[metric(unit = "{failure}")]
     pub counter_read_failures: Counter<u64>,
 }

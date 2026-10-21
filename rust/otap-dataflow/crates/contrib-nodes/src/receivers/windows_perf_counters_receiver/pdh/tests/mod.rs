@@ -173,7 +173,7 @@ impl PdhApi for FakePdh {
             .chain(state.stop_after_parse.iter())
             .any(|stop| stop.load(Ordering::Acquire))
         {
-            Err(Error::WorkerInitStopped)
+            Err(Error::WorkerStopRequested)
         } else {
             Ok(())
         }

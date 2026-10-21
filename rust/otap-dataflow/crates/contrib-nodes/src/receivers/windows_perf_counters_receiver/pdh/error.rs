@@ -107,6 +107,8 @@ pub(in super::super) enum Error {
     StartupQuery(#[source] Box<Error>),
     #[error("PDH worker stopped before initialization completed")]
     WorkerInitStopped,
+    #[error("PDH worker stop was requested")]
+    WorkerStopRequested,
     #[error("a performance-counter collection request is already pending")]
     WorkerBusy,
     #[error("PDH worker stopped unexpectedly")]
@@ -210,6 +212,7 @@ impl Error {
             Self::NoUsableCounters { .. } => "no_usable_counters",
             Self::StartupQuery(_) => "startup_query",
             Self::WorkerInitStopped => "worker_init_stopped",
+            Self::WorkerStopRequested => "worker_stop_requested",
             Self::WorkerBusy => "worker_busy",
             Self::WorkerStopped => "worker_stopped",
             Self::WorkerPanicked => "worker_panicked",

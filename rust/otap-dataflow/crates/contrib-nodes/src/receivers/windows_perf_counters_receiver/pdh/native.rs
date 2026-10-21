@@ -45,12 +45,10 @@ pub(super) fn initialize_worker(
             }
         },
         |refresh, size, buffer| {
-            if check_running(Some(shutdown)).is_err() {
-                return PDH_INVALID_ARGUMENT;
-            }
+            check_running(Some(shutdown))?;
             // SAFETY: Null selects the local live source and machine. The optional
             // output slice is writable for the supplied UTF-16 element count.
-            unsafe {
+            Ok(unsafe {
                 PdhEnumObjectsW(
                     null(),
                     null(),
@@ -59,7 +57,7 @@ pub(super) fn initialize_worker(
                     PERF_DETAIL_WIZARD,
                     refresh.into(),
                 )
-            }
+            })
         },
     );
     check_running(Some(shutdown))?;
@@ -70,7 +68,7 @@ fn initialize_worker_with(
     node: &str,
     refresh_objects: bool,
     pin_language: impl FnOnce() -> (u16, u16),
-    mut enumerate_objects: impl FnMut(bool, &mut u32, Option<&mut [u16]>) -> u32,
+    mut enumerate_objects: impl FnMut(bool, &mut u32, Option<&mut [u16]>) -> Result<u32, Error>,
 ) -> Result<(), Error> {
     let (language_result, verified_language) = pin_language();
     let mut refresh_status = None;
@@ -95,13 +93,15 @@ fn initialize_worker_with(
         }
     } else if refresh_objects {
         let mut size = 0;
-        let status = enumerate_objects(true, &mut size, None);
+        let status = enumerate_objects(true, &mut size, None)?;
         refresh_status = Some(status);
-        if status != PDH_MORE_DATA || size == 0 {
+        if !matches!(status, 0 | PDH_MORE_DATA) || (status == PDH_MORE_DATA && size == 0) {
             Err(Error::WorkerObjectRefresh {
                 stage: "refresh sizing",
                 status,
             })
+        } else if size == 0 {
+            Ok(())
         } else {
             let mut buffer = vec![
                 0_u16;
@@ -114,8 +114,28 @@ fn initialize_worker_with(
                 stage: "enumeration buffer size",
                 status,
             })?;
-            let status = enumerate_objects(false, &mut size, Some(&mut buffer));
+            let mut status = enumerate_objects(false, &mut size, Some(&mut buffer))?;
             enumeration_status = Some(status);
+            if status == PDH_MORE_DATA {
+                let capacity =
+                    u32::try_from(buffer.len()).map_err(|_| Error::WorkerObjectRefresh {
+                        stage: "enumeration buffer size",
+                        status,
+                    })?;
+                size = size.max(capacity.checked_mul(2).ok_or(Error::WorkerObjectRefresh {
+                    stage: "enumeration buffer growth",
+                    status,
+                })?);
+                buffer.resize(
+                    usize::try_from(size).map_err(|_| Error::WorkerObjectRefresh {
+                        stage: "enumeration size conversion",
+                        status,
+                    })?,
+                    0,
+                );
+                status = enumerate_objects(false, &mut size, Some(&mut buffer))?;
+                enumeration_status = Some(status);
+            }
             if status == 0 {
                 Ok(())
             } else {
@@ -448,10 +468,10 @@ impl NativePdh {
 
     fn expanded_path_buffer_with(
         path: &str,
-        mut expand: impl FnMut(&mut u32, Option<&mut [u16]>) -> u32,
+        mut expand: impl FnMut(&mut u32, Option<&mut [u16]>) -> Result<u32, Error>,
     ) -> Result<Vec<u16>, Error> {
         let mut size = 0;
-        let size_status = expand(&mut size, None);
+        let size_status = expand(&mut size, None)?;
         if matches!(size_status, 0 | PDH_CSTATUS_NO_INSTANCE) && size == 0 {
             return Ok(Vec::new());
         }
@@ -473,7 +493,7 @@ impl NativePdh {
             size = u32::try_from(capacity)
                 .map_err(|_| Error::InvalidSample("wildcard path list size exceeds u32"))?;
             let mut buffer = vec![0_u16; capacity];
-            let status = expand(&mut size, Some(&mut buffer));
+            let status = expand(&mut size, Some(&mut buffer))?;
             if matches!(status, 0 | PDH_CSTATUS_NO_INSTANCE) {
                 if status == PDH_CSTATUS_NO_INSTANCE || size == 0 {
                     return Ok(Vec::new());
@@ -510,12 +530,10 @@ impl NativePdh {
     fn expand_wildcard(&mut self, path: &str) -> Result<Vec<String>, Error> {
         let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
         let buffer = Self::expanded_path_buffer_with(path, |size, buffer| {
-            if check_running(self.shutdown.as_deref()).is_err() {
-                return PDH_INVALID_ARGUMENT;
-            }
+            self.check_running()?;
             // SAFETY: The path is NUL-terminated. The optional buffer, when present,
             // is writable for the size supplied to PDH.
-            unsafe {
+            Ok(unsafe {
                 PdhExpandWildCardPathW(
                     null(),
                     wide.as_ptr(),
@@ -523,7 +541,7 @@ impl NativePdh {
                     size,
                     PDH_REFRESHCOUNTERS,
                 )
-            }
+            })
         });
         self.check_running()?;
         let buffer = buffer?;
@@ -545,19 +563,17 @@ impl NativePdh {
     ) -> Result<InstanceIdentity, Error> {
         let wide_path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
         let result = Self::parse_instance_identity_with(path, |size, buffer| {
-            if check_running(shutdown).is_err() {
-                return PDH_INVALID_ARGUMENT;
-            }
+            check_running(shutdown)?;
             // SAFETY: The path is NUL-terminated. Sizing uses null and zero;
             // filling uses an aligned writable slice.
-            unsafe {
+            Ok(unsafe {
                 PdhParseCounterPathW(
                     wide_path.as_ptr(),
                     buffer.map_or(null_mut(), |buffer| buffer.as_mut_ptr().cast()),
                     size,
                     0,
                 )
-            }
+            })
         });
         check_running(shutdown)?;
         result
@@ -565,10 +581,10 @@ impl NativePdh {
 
     fn parse_instance_identity_with(
         path: &str,
-        mut parse: impl FnMut(&mut u32, Option<&mut [usize]>) -> u32,
+        mut parse: impl FnMut(&mut u32, Option<&mut [usize]>) -> Result<u32, Error>,
     ) -> Result<InstanceIdentity, Error> {
         let mut size = 0;
-        let status = parse(&mut size, None);
+        let status = parse(&mut size, None)?;
         if status != PDH_MORE_DATA {
             return Err(Error::Pdh {
                 operation: PdhOperation::ParseCounterPathSize,
@@ -591,7 +607,7 @@ impl NativePdh {
         check(
             PdhOperation::ParseCounterPath,
             path,
-            parse(&mut size, Some(buffer.as_mut_slice())),
+            parse(&mut size, Some(buffer.as_mut_slice()))?,
         )?;
         if (size as usize) < size_of::<PDH_COUNTER_PATH_ELEMENTS_W>() || size > capacity {
             return Err(Error::InvalidSample(
@@ -822,7 +838,7 @@ impl PdhApi for NativePdh {
 
 fn check_running(shutdown: Option<&AtomicBool>) -> Result<(), Error> {
     if shutdown.is_some_and(|stop| stop.load(Ordering::Acquire)) {
-        Err(Error::WorkerInitStopped)
+        Err(Error::WorkerStopRequested)
     } else {
         Ok(())
     }
@@ -864,32 +880,49 @@ mod tests {
         .unwrap();
     }
 
-    /// Scenario: A wildcard worker starts on an uninitialized thread and refreshes the object list.
-    /// Guarantees: Pinning precedes one refreshing size call and one non-refreshing fill call.
+    /// Scenario: Object-list sizing succeeds or requests a buffer, and the first fill may require growth.
+    /// Guarantees: Pinning precedes one refresh; fill retries once with a larger buffer without another refresh.
     #[test]
     fn wildcard_worker_pins_then_refreshes_object_list() {
-        let pinned = Cell::new(false);
-        let calls = RefCell::new(Vec::new());
-        initialize_worker_with(
-            "wildcard",
-            true,
-            || {
-                pinned.set(true);
-                (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE)
-            },
-            |refresh, size, buffer| {
-                assert!(pinned.get());
-                calls.borrow_mut().push((refresh, buffer.is_some()));
-                if buffer.is_none() {
-                    *size = 8;
-                    PDH_MORE_DATA
-                } else {
-                    0
+        for sizing_status in [0, PDH_MORE_DATA] {
+            for grow in [false, true] {
+                let pinned = Cell::new(false);
+                let calls = RefCell::new(Vec::new());
+                initialize_worker_with(
+                    "wildcard",
+                    true,
+                    || {
+                        pinned.set(true);
+                        (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE)
+                    },
+                    |refresh, size, buffer| {
+                        assert!(pinned.get());
+                        calls.borrow_mut().push((refresh, buffer.is_some()));
+                        match buffer {
+                            None => {
+                                *size = 8;
+                                Ok(sizing_status)
+                            }
+                            Some(buffer) if grow && calls.borrow().len() == 2 => {
+                                assert_eq!(buffer.len(), 8);
+                                *size = 24;
+                                Ok(PDH_MORE_DATA)
+                            }
+                            Some(buffer) => {
+                                assert_eq!(buffer.len(), if grow { 24 } else { 8 });
+                                Ok(0)
+                            }
+                        }
+                    },
+                )
+                .unwrap();
+                let mut expected = vec![(true, false), (false, true)];
+                if grow {
+                    expected.push((false, true));
                 }
-            },
-        )
-        .unwrap();
-        assert_eq!(calls.into_inner(), [(true, false), (false, true)]);
+                assert_eq!(calls.into_inner(), expected);
+            }
+        }
     }
 
     /// Scenario: SetThreadUILanguage fails or returns a language other than en-US.
@@ -938,7 +971,7 @@ mod tests {
             "refresh-failure",
             true,
             || (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE),
-            |_, _, _| 5,
+            |_, _, _| Ok(5),
         )
         .unwrap_err();
         assert!(matches!(
@@ -956,9 +989,9 @@ mod tests {
             |_, size, buffer| {
                 if buffer.is_none() {
                     *size = 8;
-                    PDH_MORE_DATA
+                    Ok(PDH_MORE_DATA)
                 } else {
-                    6
+                    Ok(6)
                 }
             },
         )
@@ -969,6 +1002,87 @@ mod tests {
                 stage: "enumeration fill",
                 status: 6,
             }
+        ));
+    }
+
+    /// Scenario: Object membership keeps growing beyond the single allowed fill retry.
+    /// Guarantees: Startup returns a typed refresh failure after two fills and never refreshes a second time.
+    #[test]
+    fn object_refresh_fill_growth_is_bounded() {
+        let mut calls = 0;
+        let error = initialize_worker_with(
+            "growth",
+            true,
+            || (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE),
+            |refresh, size, buffer| {
+                calls += 1;
+                assert_eq!(refresh, buffer.is_none());
+                *size = size.saturating_add(8);
+                Ok(PDH_MORE_DATA)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 3);
+        assert!(matches!(
+            error,
+            Error::WorkerObjectRefresh {
+                stage: "enumeration fill",
+                status: PDH_MORE_DATA
+            }
+        ));
+    }
+
+    /// Scenario: A stop request arrives between native sizing and fill operations.
+    /// Guarantees: Object refresh, expansion and path parsing return a typed stop immediately without regrowing buffers.
+    #[test]
+    fn native_buffer_calls_propagate_stop_without_retry() {
+        let mut calls = 0;
+        let error = initialize_worker_with(
+            "stop",
+            true,
+            || (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE),
+            |_, size, buffer| {
+                calls += 1;
+                if buffer.is_none() {
+                    *size = 8;
+                    Ok(PDH_MORE_DATA)
+                } else {
+                    Err(Error::WorkerStopRequested)
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::WorkerStopRequested));
+        assert_eq!(calls, 2);
+        calls = 0;
+        let error = NativePdh::expanded_path_buffer_with("fixture", |size, buffer| {
+            calls += 1;
+            if buffer.is_none() {
+                *size = 8;
+                Ok(PDH_MORE_DATA)
+            } else {
+                Err(Error::WorkerStopRequested)
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(error, Error::WorkerStopRequested));
+        assert_eq!(calls, 2);
+        calls = 0;
+        let error = NativePdh::parse_instance_identity_with("fixture", |size, buffer| {
+            calls += 1;
+            if buffer.is_none() {
+                *size = u32::try_from(size_of::<PDH_COUNTER_PATH_ELEMENTS_W>()).unwrap();
+                Ok(PDH_MORE_DATA)
+            } else {
+                Err(Error::WorkerStopRequested)
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(error, Error::WorkerStopRequested));
+        assert_eq!(calls, 2);
+        assert!(matches!(
+            check_running(Some(&AtomicBool::new(true))),
+            Err(Error::WorkerStopRequested)
         ));
     }
 
@@ -1037,7 +1151,7 @@ mod tests {
                 .map(|_| ()),
                 Self::ParseInstance => {
                     NativePdh::parse_instance_identity_with("fixture", |size, buffer| {
-                        status(size, buffer.is_some())
+                        Ok(status(size, buffer.is_some()))
                     })
                     .map(|_| ())
                 }
@@ -1061,12 +1175,12 @@ mod tests {
         NativePdh::parse_instance_identity_with("fixture", |size, buffer| {
             let Some(buffer) = buffer else {
                 *size = filled_size;
-                return PDH_MORE_DATA;
+                return Ok(PDH_MORE_DATA);
             };
             let base = buffer.as_mut_ptr().cast::<u8>();
             configure(base, base.cast());
             *size = filled_size;
-            0
+            Ok(0)
         })
         .unwrap_err()
     }
@@ -1218,7 +1332,7 @@ mod tests {
                 "overflow must fail before fill allocation"
             );
             *size = u32::MAX;
-            PDH_MORE_DATA
+            Ok(PDH_MORE_DATA)
         })
         .unwrap_err();
         assert!(matches!(error, Error::InvalidSample(_)));
@@ -1594,7 +1708,7 @@ mod tests {
         let mut calls = 0;
         let buffer = NativePdh::expanded_path_buffer_with("fixture", |size, buffer| {
             calls += 1;
-            match buffer {
+            Ok(match buffer {
                 None => {
                     *size = 4;
                     PDH_MORE_DATA
@@ -1608,7 +1722,7 @@ mod tests {
                     *size = 3;
                     0
                 }
-            }
+            })
         })
         .unwrap();
 
@@ -1626,7 +1740,7 @@ mod tests {
                 calls += 1;
                 assert!(buffer.is_none());
                 *size = 0;
-                status
+                Ok(status)
             })
             .unwrap();
             assert!(buffer.is_empty());

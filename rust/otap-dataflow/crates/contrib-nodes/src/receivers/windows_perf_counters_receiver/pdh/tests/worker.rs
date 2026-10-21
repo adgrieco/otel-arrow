@@ -2122,7 +2122,7 @@ fn cancelling_startup_stops_between_exact_native_operations() {
         256,
         4_096,
     );
-    assert!(matches!(result, Err(Error::WorkerInitStopped)));
+    assert!(matches!(result, Err(Error::WorkerStopRequested)));
     let state = state.borrow();
     assert_eq!(state.added, [first]);
     assert_eq!(state.calls.counter_type, 0);

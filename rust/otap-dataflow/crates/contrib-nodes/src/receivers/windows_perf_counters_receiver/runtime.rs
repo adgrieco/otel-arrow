@@ -75,7 +75,6 @@ fn failed_counter_value_count(failures: &[SampleFailure]) -> u64 {
                         | "counter CStatus"
                         | "calculation"
                         | "scale"
-                        | "projection"
                 )
             })
             .map(|failure| (failure.counter_index, &failure.path))

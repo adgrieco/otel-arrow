@@ -400,6 +400,7 @@ impl<A: PdhApi> Query<A> {
             let instance = if self.configs[config_index].instance_config.has_instance() {
                 match self.api.parse_instance(&path) {
                     Ok(instance) => Some(Arc::new(instance)),
+                    Err(error @ Error::WorkerStopRequested) => return Err(error),
                     Err(error) => {
                         let mut failure = sample_failure(config_index, &error);
                         failure.diagnostic_only = true;
@@ -883,6 +884,7 @@ impl<A: PdhApi> Query<A> {
                             ),
                         );
                     }
+                    Err(error @ Error::WorkerStopRequested) => return Err(error),
                     Err(error) => {
                         metadata.diagnostics.counter_add_failures += 1;
                         metadata.failures.push(sample_failure(config_index, &error));
@@ -1367,11 +1369,11 @@ impl<A: PdhApi> Query<A> {
             };
             let (value, point_start_time) = match result {
                 Ok(result) => result,
+                Err(error @ Error::WorkerStopRequested) => return Err(error),
                 Err(error) => {
                     metadata
                         .failures
                         .push(sample_failure(counter.config_index, &error));
-                    metadata.diagnostics.counter_read_failures += 1;
                     if !self.membership_frozen && error.is_invalid_counter_handle_read() {
                         let mut target = counter.target();
                         target.history.restart_pdh_sampling();

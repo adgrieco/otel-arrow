@@ -130,7 +130,11 @@ pub(super) fn cleanup_aggregation_instances(
     for path in paths.drain(..) {
         let aggregate = match parse(&path) {
             Ok(instance) => matches_aggregation(instance, aggregation_name),
-            Err(error @ (Error::WorkerStopped | Error::WorkerInitStopped)) => return Err(error),
+            Err(
+                error @ (Error::WorkerStopRequested
+                | Error::WorkerStopped
+                | Error::WorkerInitStopped),
+            ) => return Err(error),
             // Invalid paths remain available for ordinary admission diagnostics.
             Err(_) => false,
         };
