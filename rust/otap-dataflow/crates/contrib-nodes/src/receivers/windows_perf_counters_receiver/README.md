@@ -8,7 +8,7 @@
 | URN | `urn:otel:receiver:windowsperfcounters` |
 | Feature | `windows-perf-counters` |
 | Platform | Windows only |
-| Stability | Experimental |
+| Stability | Development |
 
 ## Overview
 

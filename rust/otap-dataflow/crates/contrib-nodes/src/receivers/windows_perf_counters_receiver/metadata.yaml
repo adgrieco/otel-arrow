@@ -1,6 +1,7 @@
 type: windowsperfcounters
 status:
   class: receiver
+  stability: development
   codeowners:
     active:
       - adgrieco

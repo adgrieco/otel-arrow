@@ -686,6 +686,7 @@ mod tests {
     use arrow::array::TimestampNanosecondArray;
     use otel_arrow_dfe_config::node::NodeUserConfig;
     use otel_arrow_dfe_engine::capability::registry::Capabilities;
+    use otel_arrow_dfe_engine::context::ControllerContext;
     use otel_arrow_dfe_engine::testing::receiver::TestRuntime;
     use otel_arrow_dfe_engine::testing::{test_node, test_pipeline_ctx};
     use otel_arrow_dfe_otap::OTAP_PIPELINE_FACTORY;
@@ -696,8 +697,9 @@ mod tests {
     use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryIntoWithOptions};
     use otel_arrow_dfe_pdata_codec::OtapPayload;
     use otel_arrow_dfe_pdata_codec::PayloadData;
+    use otel_arrow_dfe_telemetry::registry::TelemetryRegistryHandle;
     use prost::Message;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
     fn test_counter(attributes: BTreeMap<String, String>) -> CounterConfig {
@@ -1623,6 +1625,39 @@ mod tests {
             worker_shutdown_deadline(now, now + Duration::from_millis(250)),
             now
         );
+    }
+
+    /// Scenario: The factory is invoked for a host-wide source pipeline allocated two cores.
+    /// Guarantees: Configuration fails before receiver construction so one host is never collected twice.
+    #[test]
+    fn factory_rejects_multi_core_pipeline() {
+        let test_runtime = TestRuntime::<OtapPdata>::new();
+        let controller = ControllerContext::new(TelemetryRegistryHandle::new());
+        let pipeline = controller
+            .pipeline_context_with("test_group".into(), "test_pipeline".into(), 0, 2, 0)
+            .with_node_context(
+                "windowsperfcounters".into(),
+                WINDOWSPERFCOUNTERS_RECEIVER_URN.into(),
+                otel_arrow_dfe_config::node::NodeKind::Receiver,
+                HashMap::new(),
+            );
+        let factory = OTAP_PIPELINE_FACTORY
+            .get_receiver_factory_map()
+            .get(WINDOWSPERFCOUNTERS_RECEIVER_URN)
+            .expect("registered windowsperfcounters factory");
+        let result = (factory.create)(
+            pipeline,
+            test_node(test_runtime.config().name.clone()),
+            Arc::new(NodeUserConfig::new_receiver_config(
+                WINDOWSPERFCOUNTERS_RECEIVER_URN,
+            )),
+            test_runtime.config(),
+            &Capabilities::empty(),
+        );
+        let Err(otel_arrow_dfe_config::error::Error::InvalidUserConfig { error }) = result else {
+            panic!("multi-core factory construction must fail as invalid user configuration");
+        };
+        assert!(error.contains("requires a one-core source pipeline"));
     }
 
     fn run_live_lifecycle(drain: bool) {

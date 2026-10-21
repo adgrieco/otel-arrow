@@ -61,7 +61,7 @@ Receivers ingest data into a pipeline.
 | [`urn:otel:receiver:oracle`](src/receivers/oracle_receiver/README.md) | `oracle` | Experimental | Polls Oracle queries into logs; explicitly opt-in and requires separately installed Oracle Client libraries. |
 | [`urn:otel:receiver:postgresql`](src/receivers/postgresql_receiver/README.md) | `postgresql` | Experimental | Development-only PostgreSQL polling over unencrypted TCP; explicitly opt-in. |
 | [`receiver:user_events`](src/receivers/user_events_receiver/README.md) | `user-events` | Experimental | Ingests Linux `user_events` tracepoints as logs. |
-| [`receiver:windowsperfcounters`](src/receivers/windows_perf_counters_receiver/README.md) | `windows-perf-counters` | Experimental | Collects configured Windows performance counters as metrics. |
+| [`receiver:windowsperfcounters`](src/receivers/windows_perf_counters_receiver/README.md) | `windows-perf-counters` | Development | Collects configured Windows performance counters as metrics. |
 
 ## Processors
 
