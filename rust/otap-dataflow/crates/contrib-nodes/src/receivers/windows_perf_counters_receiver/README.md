@@ -374,8 +374,9 @@ The worker opens and primes one query before scheduled collection. Recoverable
 open or setup failures instead create one pending slot with bounded retries.
 Readiness means the initial pass has finished, not that every provider is
 available: the `ready` event and `query_pending` gauge expose pending recovery
-or an empty installed set. Configuration, invariant, worker-language and
-startup object-refresh failures remain fatal. There is no fixed startup
+or an empty installed set. Configuration and invariant failures remain fatal.
+Object-list refresh failures are informational and count in `discovery_failures`.
+There is no fixed startup
 deadline or promise of partial publication during a blocked native call.
 
 - Wildcards refresh at the configured cadence, on scheduled collections.

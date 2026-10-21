@@ -954,11 +954,18 @@ fn query_backoff_preserves_active_expanded_count() {
     assert_eq!(healthy.metadata.diagnostics.active_expanded_counters, 1);
     states.borrow()[0].borrow_mut().collect_error = true;
     let now = Instant::now();
-    for attempt_at in [
-        now,
-        now + Duration::from_secs(1),
-        now + Duration::from_secs(3),
-    ] {
+    let failure = queries.collect(now, Duration::from_secs(30), 1, &mut open);
+    assert!(failure.is_err_and(|error| error.is_query_collection_failure()));
+    let native_collects = states.borrow()[0].borrow().calls.collect;
+    let pending = collect_query(&mut queries, Duration::from_secs(30), 1, &mut open).unwrap();
+    assert!(pending.points.is_empty());
+    assert!(!pending.metadata.diagnostics.any_query_collected);
+    assert_eq!(states.borrow()[0].borrow().calls.collect, native_collects);
+    let mut metrics = super::super::super::metrics::WindowsPerfCountersMetrics::default();
+    metrics.active_expanded.set(1);
+    metrics.apply(&pending.metadata.diagnostics);
+    assert_eq!(metrics.active_expanded.get(), 1);
+    for attempt_at in [now + Duration::from_secs(1), now + Duration::from_secs(3)] {
         let failure = queries.collect(attempt_at, Duration::from_secs(30), 1, &mut open);
         assert!(failure.is_err_and(|error| error.is_query_collection_failure()));
     }

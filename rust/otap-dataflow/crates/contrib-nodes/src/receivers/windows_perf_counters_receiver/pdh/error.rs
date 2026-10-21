@@ -85,6 +85,8 @@ pub(in super::super) enum Error {
     InvalidCounterToken { path: String },
     #[error("invalid performance-counter sample: {0}")]
     InvalidSample(&'static str),
+    #[error("performance-counter timestamp read failed: {0}")]
+    Timestamp(&'static str),
     #[error("no usable performance counters or recoverable availability work: {detail}")]
     NoUsableCounters { detail: String },
     #[error("counter calculation for {path} failed: {message}")]
@@ -129,6 +131,7 @@ impl Error {
                 | Self::Calculation { .. }
                 | Self::Scale { .. }
                 | Self::QueryRecoveryPending { .. }
+                | Self::Timestamp(_)
         )
     }
 
@@ -192,6 +195,7 @@ impl Error {
             Self::CounterSetup { .. } => "counter_setup",
             Self::InvalidCounterToken { .. } => "invalid_counter_token",
             Self::InvalidSample(_) => "invalid_sample",
+            Self::Timestamp(_) => "timestamp",
             Self::NoUsableCounters { .. } => "no_usable_counters",
             Self::Calculation { .. } => "calculation",
             Self::Scale { .. } => "scale",
@@ -217,7 +221,7 @@ impl Error {
             }
             Self::CounterSetup { message, .. } => message.clone(),
             Self::InvalidCounterToken { .. } => self.to_string(),
-            Self::InvalidSample(message) => (*message).to_owned(),
+            Self::InvalidSample(message) | Self::Timestamp(message) => (*message).to_owned(),
             Self::Calculation { message, .. } => message.clone(),
             Self::Scale { source, .. } => source.to_string(),
             other => other.to_string(),
@@ -233,6 +237,7 @@ impl Error {
             | Self::InvalidCounterToken { path }
             | Self::Calculation { path, .. }
             | Self::Scale { path, .. } => Some(path),
+            Self::UnsupportedType(error) => Some(&error.path),
             _ => None,
         }
     }

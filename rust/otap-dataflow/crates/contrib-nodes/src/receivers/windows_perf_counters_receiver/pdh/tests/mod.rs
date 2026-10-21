@@ -283,7 +283,7 @@ impl PdhApi for FakePdh {
         let mut state = self.state.borrow_mut();
         state.calls.timestamp += 1;
         if state.timestamp_error {
-            Err(Error::InvalidSample("test timestamp failure"))
+            Err(Error::Timestamp("test timestamp failure"))
         } else {
             Ok(state.timestamp)
         }

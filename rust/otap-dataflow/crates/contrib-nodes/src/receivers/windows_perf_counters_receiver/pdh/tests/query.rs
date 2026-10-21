@@ -2,6 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+
+/// Scenario: An unsupported native type is reported for a configured counter.
+/// Guarantees: The contextual sample failure retains the actual path rather than the worker placeholder.
+#[test]
+fn unsupported_type_failure_retains_counter_path() {
+    let path = r"\Object\Unsupported";
+    let error = Error::UnsupportedType(counter_type::UnsupportedNativeType {
+        path: path.to_owned(),
+        native_type: u32::MAX,
+    });
+    let failure = error::sample_failure(0, &error);
+    assert_eq!(failure.path.as_ref(), path);
+    assert_eq!(failure.reason, "unsupported_type");
+}
 use windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE;
 
 struct InvalidHandleState {

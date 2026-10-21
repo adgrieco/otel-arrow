@@ -816,10 +816,9 @@ impl PdhApi for NativePdh {
     fn timestamp(&mut self) -> Result<i64, Error> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| Error::InvalidSample("system clock precedes Unix epoch"))?
+            .map_err(|_| Error::Timestamp("system clock precedes Unix epoch"))?
             .as_nanos();
-        i64::try_from(timestamp)
-            .map_err(|_| Error::InvalidSample("timestamp exceeds i64 nanoseconds"))
+        i64::try_from(timestamp).map_err(|_| Error::Timestamp("timestamp exceeds i64 nanoseconds"))
     }
 
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {

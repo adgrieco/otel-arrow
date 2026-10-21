@@ -7,7 +7,7 @@ pub(super) fn positive_timestamp(timestamp: i64) -> Result<i64, Error> {
     if timestamp > 0 {
         Ok(timestamp)
     } else {
-        Err(Error::InvalidSample("timestamp must be positive"))
+        Err(Error::Timestamp("timestamp must be positive"))
     }
 }
 

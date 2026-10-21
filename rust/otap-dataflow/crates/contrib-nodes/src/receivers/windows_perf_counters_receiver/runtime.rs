@@ -402,7 +402,7 @@ impl WindowsPerfCountersReceiver {
         let projection = match project_sample(&self.config.counters, &sample) {
             Ok(projection) => projection,
             Err(err) => {
-                self.record_completed_scrape(collection_duration, false);
+                self.metrics.borrow_mut().record_scrape(Outcome::Failure);
                 return Err(CollectionLoopError::Projection(err));
             }
         };
@@ -672,6 +672,14 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
                 );
             }
             Err(err) => {
+                otel_arrow_dfe_telemetry::otel_warn!(
+                    "windows_perf_counters_receiver.shutdown.fail",
+                    node = self.node.as_str(),
+                    error = %err
+                );
+                if let Some(Err(primary)) = collection_result {
+                    return Err(primary);
+                }
                 return Err(receiver_error(&effect_handler, err.to_string(), ""));
             }
         }
@@ -1131,7 +1139,7 @@ mod tests {
     }
 
     /// Scenario: A collected sample references a counter index outside the validated configuration.
-    /// Guarantees: Runtime processing returns a fatal invariant and records a failed scrape instead of silently dropping structurally corrupt telemetry.
+    /// Guarantees: A fatal invariant records a failed receiver attempt, not a query-collection failure, and publishes nothing.
     #[tokio::test]
     async fn runtime_terminates_on_projection_invariant() {
         let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
@@ -1161,8 +1169,49 @@ mod tests {
         assert_eq!(metrics.scrape_attempts(Outcome::Success), 0);
         assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
         assert_eq!(metrics.health.scrapes.get(), 0);
-        assert_eq!(metrics.health.scrape_failures.get(), 1);
+        assert_eq!(metrics.health.scrape_failures.get(), 0);
         assert_eq!(metrics.health.counter_read_failures.get(), 0);
+    }
+
+    /// Scenario: A scheduled timestamp read fails, then the next native scrape returns a valid point.
+    /// Guarantees: The receiver counts one failed collection, remains running, and publishes the next scrape.
+    #[tokio::test(start_paused = true)]
+    async fn timestamp_read_failure_recovers_on_next_scrape() {
+        let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        let calls = std::cell::Cell::new(0);
+        let sends = std::cell::Cell::new(0);
+        let result = receiver.collect_and_send_with(
+            || {
+                calls.set(calls.get() + 1);
+                let call = calls.get();
+                async move {
+                    if call == 1 {
+                        Err(pdh::Error::Timestamp("injected read failure"))
+                    } else {
+                        Ok(Sample {
+                            timestamp_unix_nano: 10,
+                            members: Vec::new(),
+                            points: vec![sample_point(0, 10, Number::Integer(42))],
+                            metadata: collected_metadata(),
+                        })
+                    }
+                }
+            },
+            |_| {
+                sends.set(sends.get() + 1);
+                std::future::pending::<Result<(), Error>>()
+            },
+        );
+        tokio::pin!(result);
+        tokio::select! {
+            _ = &mut result => panic!("receiver stopped before the next successful scrape"),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
+        assert_eq!(calls.get(), 2);
+        assert_eq!(sends.get(), 1);
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(metrics.health.scrape_failures.get(), 1);
+        assert_eq!(metrics.health.scrapes.get(), 1);
     }
 
     /// Scenario: Projection and downstream delivery occur after a two-second native collection.
@@ -1670,6 +1719,42 @@ mod tests {
             panic!("multi-core factory construction must fail as invalid user configuration");
         };
         assert!(error.contains("requires a one-core source pipeline"));
+    }
+
+    /// Scenario: Public node shorthand is resolved and operational metrics are registered.
+    /// Guarantees: The executable node type, factory URN and both emitted metric-set names agree.
+    #[test]
+    fn public_receiver_names_match_registration_and_metrics() {
+        let node: NodeUserConfig = serde_json::from_value(serde_json::json!({
+            "type": "receiver:windows_perf_counters"
+        }))
+        .unwrap();
+        assert_eq!(
+            node.r#type.as_str(),
+            "urn:otel:receiver:windows_perf_counters"
+        );
+        assert!(
+            OTAP_PIPELINE_FACTORY
+                .get_receiver_factory_map()
+                .contains_key(node.r#type.as_str())
+        );
+        let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        let mut metrics = receiver.metrics.borrow_mut();
+        metrics.record_scrape(Outcome::Success);
+        let snapshots = metrics.terminal_snapshots();
+        let names = snapshots
+            .iter()
+            .map(|snapshot| snapshot.descriptor().name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            [
+                "receiver.windows_perf_counters",
+                "receiver.windows_perf_counters.scrapes"
+            ]
+            .into_iter()
+            .collect()
+        );
     }
 
     fn run_live_lifecycle(drain: bool) {

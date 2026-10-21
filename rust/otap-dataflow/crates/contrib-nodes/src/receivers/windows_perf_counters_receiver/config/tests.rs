@@ -1064,6 +1064,63 @@ fn resolves_exact_malformed_and_overlong_path_references() {
     }
 }
 
+/// Scenario: Generated paths sit immediately below, at, or above the native UTF-16 length limit.
+/// Guarantees: Exactly 2047 units is accepted, 2048 rejects, and surrogate pairs count as two units.
+#[test]
+fn bounds_generated_native_path_length() {
+    for (tail, padding) in [("x", 1), ("\u{1f600}", 2)] {
+        for length in [2046, 2047, 2048] {
+            let name = format!("{}{tail}", "x".repeat(length - 3 - padding));
+            let value = json!({"perfcounters": [{
+                "object": "O", "counters": [{"name": name}]
+            }]});
+            if length <= 2047 {
+                let config = Config::from_json(&value).unwrap();
+                assert_eq!(config.counters[0].path.encode_utf16().count(), length);
+            } else {
+                assert_config_error(value, "must contain at most 2047 UTF-16 code units");
+            }
+        }
+    }
+}
+
+/// Scenario: Scale exponents reach either supported boundary or exceed it by one.
+/// Guarantees: Both signs accept 18 and reject 19 with the configured scale diagnostic.
+#[test]
+fn bounds_configured_scale_power() {
+    for scale in [-19, -18, 18, 19] {
+        let value = json!({"perfcounters": [{
+            "object": "Memory",
+            "counters": [{"name": "Available Bytes", "scale_power10": scale}]
+        }]});
+        if (-18..=18).contains(&scale) {
+            assert_eq!(
+                Config::from_json(&value).unwrap().counters[0].scale_power10,
+                scale
+            );
+        } else {
+            assert_config_error(value, "scale_power10 must be between -18 and 18");
+        }
+    }
+}
+
+/// Scenario: The receiver or a later object's counter list is explicitly empty.
+/// Guarantees: Validation identifies the empty list, including the object's configuration index.
+#[test]
+fn rejects_empty_counter_lists_with_context() {
+    assert_config_error(
+        json!({"perfcounters": []}),
+        "perfcounters must contain at least one entry",
+    );
+    assert_config_error(
+        json!({"perfcounters": [
+            {"object": "Memory", "counters": [{"name": "Available Bytes"}]},
+            {"object": "Process", "counters": []}
+        ]}),
+        "perfcounters[1].counters must contain at least one entry",
+    );
+}
+
 /// Scenario: Metric units are empty or contain unrestricted OTLP unit text.
 /// Guarantees: Literal empty defaults to "1"; every nonempty value remains verbatim.
 #[test]
@@ -1655,6 +1712,17 @@ fn bounds_all_configured_selectors() {
 /// Guarantees: Normalization rejects at the default 4097th selector instead of materializing the product.
 #[test]
 fn rejects_large_wildcard_selector_product() {
+    let config = Config::from_json(&json!({
+        "max_expanded_counters": 16,
+        "max_instances_per_wildcard": 1,
+        "perfcounters": [{
+            "object": "Process",
+            "instances": ["a*", "b*", "c*", "d*"],
+            "counters": (0..4).map(|i| json!({"name": format!("Counter {i}")})).collect::<Vec<_>>()
+        }]
+    }))
+    .unwrap();
+    assert_eq!(config.counters.len(), 16);
     assert_config_error(
         json!({"perfcounters": [{
             "object": "Process",
@@ -1890,6 +1958,7 @@ fn preserves_explicit_instance_indexes() {
 #[test]
 fn rejects_instance_alias_duplicates() {
     for [first, second] in [
+        ["app", "APP"],
         ["app", "app#0"],
         ["app#1", "app#01"],
         ["App", "app#00"],
