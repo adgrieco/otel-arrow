@@ -391,7 +391,7 @@ deadline or promise of partial publication during a blocked native call.
   `collection_interval`; omitting it or setting `0s` uses the next scheduled
   collection tick. The warning re-arms only after an on-time scrape. No
   concurrent request is queued while the native call remains in flight.
-- Wildcard expansion is sorted before applying configured limits. Excess
+- Limits apply after retained-first, configuration-order admission. Excess
   instances are omitted and reported explicitly, never presented as a complete
   expansion. Each affected pattern emits at most one bounded limit summary
   per refresh, including when both limits apply.
@@ -469,6 +469,7 @@ and low-cardinality reason. Other runtime events are:
 
 - `windows_perf_counters_receiver.instance_limit.exceeded`
 - `windows_perf_counters_receiver.instances.change`
+- `windows_perf_counters_receiver.recovery.change`
 - `windows_perf_counters_receiver.scrape.fail`
 - `windows_perf_counters_receiver.scrape.timeout`
 - `windows_perf_counters_receiver.shutdown.timeout`

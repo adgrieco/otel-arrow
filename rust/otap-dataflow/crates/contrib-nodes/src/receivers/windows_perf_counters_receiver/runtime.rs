@@ -123,11 +123,14 @@ struct FailureLogState {
 }
 
 impl FailureLogState {
-    fn record_success(&mut self, on_time: bool) {
-        self.scrape_failure_active = false;
+    fn record_completion(&mut self, on_time: bool) {
         if on_time {
             self.scrape_timeout_active = false;
         }
+    }
+
+    fn record_success(&mut self) {
+        self.scrape_failure_active = false;
     }
 
     fn log_scrape_failure(&mut self, node: &str, error: &pdh::Error) {
@@ -372,6 +375,21 @@ impl WindowsPerfCountersReceiver {
                 timestamp_unix_nano = sample.timestamp_unix_nano
             );
         }
+        let diagnostics = &sample.metadata.diagnostics;
+        if diagnostics.retry_attempts > 0
+            || diagnostics.retry_recoveries > 0
+            || diagnostics.query_rebuild_attempts > 0
+            || diagnostics.query_rebuild_recoveries > 0
+        {
+            otel_arrow_dfe_telemetry::otel_info!(
+                "windows_perf_counters_receiver.recovery.change",
+                node = self.node.as_str(),
+                retry_attempts = diagnostics.retry_attempts,
+                retry_recoveries = diagnostics.retry_recoveries,
+                query_rebuild_attempts = diagnostics.query_rebuild_attempts,
+                query_rebuild_recoveries = diagnostics.query_rebuild_recoveries
+            );
+        }
     }
 
     async fn process_collected_sample<F, Fut>(
@@ -393,9 +411,10 @@ impl WindowsPerfCountersReceiver {
                 return Err(CollectionLoopError::Projection(err));
             }
         };
+        failure_logs.record_completion(!overrun);
         if sample.metadata.diagnostics.any_query_collected {
             self.record_successful_sample(collection_duration, &sample);
-            failure_logs.record_success(!overrun);
+            failure_logs.record_success();
         } else {
             self.record_recovery_only_sample(collection_duration, &sample);
         }
@@ -493,6 +512,7 @@ impl WindowsPerfCountersReceiver {
                 }
                 Err(err) if err.is_collection_failure() => {
                     self.record_completed_scrape(collection_duration, false);
+                    failure_logs.record_completion(!overrun);
                     failure_logs.log_scrape_failure(&self.node, &err);
                     continue;
                 }
@@ -1030,18 +1050,72 @@ mod tests {
         assert!(state.scrape_failure_active);
     }
 
-    /// Scenario: A timeout warning is followed first by a late success and then by an on-time success.
-    /// Guarantees: Late success keeps warning suppression armed, while the first on-time success re-arms the warning.
+    /// Scenario: A timeout warning is followed first by a late completion and then by an on-time failed completion.
+    /// Guarantees: Late completion keeps suppression armed, while an on-time completion re-arms the timeout independently of failure-warning suppression.
     #[test]
-    fn timeout_warning_rearms_only_after_on_time_success() {
+    fn timeout_warning_rearms_only_after_on_time_completion() {
         let mut state = FailureLogState::default();
         state.log_scrape_timeout("test", Duration::from_secs(1));
 
-        state.record_success(false);
+        state.record_completion(false);
         assert!(state.scrape_timeout_active);
 
-        state.record_success(true);
+        state.scrape_failure_active = true;
+        state.record_completion(true);
         assert!(!state.scrape_timeout_active);
+        assert!(state.scrape_failure_active);
+    }
+
+    /// Scenario: Steady samples surround each counter-retry and query-rebuild transition.
+    /// Guarantees: Only recovery activity emits a contextual recovery.change event, including a rebuild recovery without an attempt in the same sample.
+    #[test]
+    fn recovery_events_are_silent_without_activity() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // Tracing subscribers require thread-safe storage; capture stays scoped to this test.
+        struct Events(Arc<std::sync::Mutex<Vec<&'static str>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push(event.metadata().name());
+            }
+        }
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Events(Arc::clone(&events)));
+        let receiver = test_receiver(Vec::new());
+        tracing::subscriber::with_default(subscriber, || {
+            let mut sample = Sample::empty(100);
+            receiver.log_sample_events(&sample);
+            for diagnostics in [
+                SampleDiagnostics {
+                    retry_attempts: 1,
+                    ..Default::default()
+                },
+                SampleDiagnostics {
+                    retry_recoveries: 1,
+                    ..Default::default()
+                },
+                SampleDiagnostics {
+                    query_rebuild_attempts: 1,
+                    ..Default::default()
+                },
+                SampleDiagnostics {
+                    query_rebuild_recoveries: 1,
+                    ..Default::default()
+                },
+            ] {
+                sample.metadata.diagnostics = diagnostics;
+                receiver.log_sample_events(&sample);
+            }
+            receiver.log_sample_events(&Sample::empty(101));
+        });
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["windows_perf_counters_receiver.recovery.change"; 4]
+        );
     }
 
     /// Scenario: The initial PDH pass remains pending before it eventually succeeds.
