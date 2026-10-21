@@ -427,7 +427,7 @@ impl WindowsPerfCountersReceiver {
             let collection = collect();
             tokio::pin!(collection);
             let threshold = self.config.scrape_timeout_threshold();
-            let (result, overrun) = tokio::select! {
+            let (result, mut overrun) = tokio::select! {
                 biased;
                 result = &mut collection => {
                     (result, false)
@@ -439,6 +439,14 @@ impl WindowsPerfCountersReceiver {
                 }
             };
             let collection_duration = scrape_start.elapsed();
+            if !overrun
+                && collection_duration > threshold
+                && !matches!(&result, Err(pdh::Error::WorkerBusy))
+            {
+                self.metrics.borrow_mut().health.scrape_overruns.inc();
+                failure_logs.log_scrape_timeout(&self.node, threshold);
+                overrun = true;
+            }
             let sample = match result {
                 Ok(sample) => sample,
                 Err(pdh::Error::WorkerBusy) => {
@@ -1527,6 +1535,61 @@ mod tests {
         let metrics = receiver.metrics.borrow();
         assert_eq!(metrics.health.scrapes.get(), 1);
         assert_eq!(metrics.health.scrape_overruns.get(), 0);
+    }
+
+    /// Scenario: A late native result and its timeout are both ready before the collection loop is polled again.
+    /// Guarantees: The completion-first branch still counts one overrun for an accepted result, but never for WorkerBusy.
+    #[tokio::test(start_paused = true)]
+    async fn ready_late_result_counts_overrun_unless_worker_busy() {
+        for busy in [false, true] {
+            let mut receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+            receiver.config.timeout = Some(Duration::from_millis(10));
+            receiver.config.collection_interval = Duration::from_secs(1);
+            let calls = std::cell::Cell::new(0);
+            let sent = std::cell::Cell::new(0);
+            let run = receiver.collect_and_send_with(
+                || {
+                    calls.set(calls.get() + 1);
+                    async {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        if busy {
+                            Err(pdh::Error::WorkerBusy)
+                        } else {
+                            Ok(Sample {
+                                timestamp_unix_nano: 100,
+                                members: Vec::new(),
+                                points: vec![sample_point(0, 100, Number::Integer(1))],
+                                metadata: collected_metadata(),
+                            })
+                        }
+                    }
+                },
+                |_| {
+                    sent.set(sent.get() + 1);
+                    async { Ok(()) }
+                },
+                |_| async { Ok(()) },
+            );
+            tokio::pin!(run);
+            std::future::poll_fn(|cx| {
+                assert!(run.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(calls.get(), 1);
+            tokio::time::advance(Duration::from_millis(20)).await;
+            std::future::poll_fn(|cx| {
+                assert!(run.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(calls.get(), 1);
+            assert_eq!(sent.get(), usize::from(!busy));
+            let metrics = receiver.metrics.borrow();
+            assert_eq!(metrics.health.scrape_overruns.get(), u64::from(!busy));
+            assert_eq!(metrics.health.worker_busy.get(), u64::from(busy));
+            assert_eq!(metrics.health.scrapes.get(), u64::from(!busy));
+        }
     }
 
     /// Scenario: Native collection completes at the same instant as the configured timeout threshold.
