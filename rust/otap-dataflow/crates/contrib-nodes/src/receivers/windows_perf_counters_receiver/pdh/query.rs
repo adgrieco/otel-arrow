@@ -1575,6 +1575,8 @@ impl PendingMetadata {
                 discovered,
                 retained: allocation.retained,
                 omitted,
+                per_wildcard_omitted: allocation.per_wildcard_omitted,
+                total_omitted: allocation.total_omitted,
                 examples: examples.into_iter().take(3).collect(),
             });
         }

@@ -342,6 +342,8 @@ impl WindowsPerfCountersReceiver {
                 discovered = overflow.discovered as u64,
                 retained = overflow.retained as u64,
                 omitted = overflow.omitted as u64,
+                per_wildcard_omitted = overflow.per_wildcard_omitted as u64,
+                total_omitted = overflow.total_omitted as u64,
                 examples = ?overflow.examples
             );
         }

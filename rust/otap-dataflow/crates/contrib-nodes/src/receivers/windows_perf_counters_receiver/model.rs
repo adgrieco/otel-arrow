@@ -132,6 +132,10 @@ pub(super) struct ExpansionOverflow {
     pub(super) retained: usize,
     /// Number of concrete paths omitted by this limit.
     pub(super) omitted: usize,
+    /// Number omitted by the per-pattern member limit.
+    pub(super) per_wildcard_omitted: usize,
+    /// Additional omissions caused by the receiver-wide entry limit.
+    pub(super) total_omitted: usize,
     /// Up to three concrete paths omitted by this admission limit.
     pub(super) examples: Vec<Arc<str>>,
 }

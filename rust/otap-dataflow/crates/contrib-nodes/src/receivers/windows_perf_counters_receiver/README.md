@@ -161,6 +161,8 @@ and template attributes.
 `scale_power10` defaults to zero and accepts values from `-18` through `18`.
 `recreate_query` defaults to `false`, and explicit `false` is supported.
 `recreate_query: true` is rejected. All mappings share one persistent query.
+A query-level failure, invalidation or rebuild pauses every mapping until the
+shared query recovers; automatic recovery does not require receiver restart.
 Attribute keys beginning with `windows.perf_counter.` are reserved for
 receiver-generated counter identity.
 Object, instance, aggregation, and counter components preserve their configured
@@ -395,7 +397,10 @@ deadline or promise of partial publication during a blocked native call.
   instances are omitted and reported explicitly, never presented as a complete
   expansion. Each affected pattern emits at most one bounded limit summary
   per refresh, including when both limits apply, with exact admission counts
-  and at most three omitted concrete example paths.
+  and at most three omitted concrete example paths. The `admission_limit`
+  record separates `per_wildcard_omitted` (the `max_instances_per_wildcard`
+  limit) from `total_omitted` (additional omissions due to
+  `max_expanded_counters`), identifying which limit needs more capacity.
 
 Drain and shutdown stay responsive between native operations, including
 aggregate filtering and before priming. An in-progress PDH call cannot be

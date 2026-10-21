@@ -2461,6 +2461,8 @@ fn failed_discovery_retention_reserves_global_capacity_first() {
             discovered: 3,
             retained: 1,
             omitted: 2,
+            per_wildcard_omitted: 0,
+            total_omitted: 2,
             examples: first_paths[1..]
                 .iter()
                 .map(|path| Arc::from(*path))
@@ -2514,6 +2516,8 @@ fn wildcard_overflow_is_one_bounded_admission_record() {
             discovered: 8,
             retained: 1,
             omitted: 7,
+            per_wildcard_omitted: 6,
+            total_omitted: 1,
             examples: paths[1..4]
                 .iter()
                 .map(|path| Arc::from(path.as_str()))

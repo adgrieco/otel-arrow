@@ -48,7 +48,7 @@ impl Config {
             for (counter_index, counter) in object.counters.iter().enumerate() {
                 if counter.recreate_query {
                     return Err(invalid(format!(
-                        "perfcounters[{object_index}].counters[{counter_index}].recreate_query: true is not supported; restart the receiver instead"
+                        "perfcounters[{object_index}].counters[{counter_index}].recreate_query: true is not supported; query rebuilds after invalidation are automatic"
                     )));
                 }
             }

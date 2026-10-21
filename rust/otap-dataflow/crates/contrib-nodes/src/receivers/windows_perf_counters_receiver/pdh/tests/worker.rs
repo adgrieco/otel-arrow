@@ -43,8 +43,8 @@ fn permanently_rejected_exact_startup_is_fatal() {
     assert_eq!(state.borrow().calls.collect, 0);
 }
 
-/// Scenario: Initial open or setup cleanup fails recoverably before a later successful open.
-/// Guarantees: Readiness exposes pending state, bounded backoff does not reopen early, and rebuild primes before publication.
+/// Scenario: Initial and replacement open or setup cleanup fail recoverably before a later successful open.
+/// Guarantees: Pending readiness and bounded retry preserve contextual diagnostic-only warnings, and successful rebuild primes before publication.
 #[tokio::test(flavor = "current_thread")]
 async fn recoverable_startup_errors_become_pending_and_rebuild() {
     for cleanup_failed in [false, true] {
@@ -57,7 +57,7 @@ async fn recoverable_startup_errors_become_pending_and_rebuild() {
             Duration::from_millis(20),
             4096,
             move |configs, limit, _seed| {
-                if factory_opens.fetch_add(1, Ordering::AcqRel) == 0 {
+                if factory_opens.fetch_add(1, Ordering::AcqRel) < 2 {
                     return Err(if cleanup_failed {
                         Error::CounterSetup {
                             path: configs[0].path.clone(),
@@ -103,6 +103,27 @@ async fn recoverable_startup_errors_become_pending_and_rebuild() {
                 && failure.diagnostic_only
         }));
         tokio::time::sleep(Duration::from_millis(30)).await;
+        let failed_rebuild = worker.collect().await.unwrap();
+        assert!(failed_rebuild.points.is_empty());
+        assert!(!failed_rebuild.metadata.diagnostics.any_query_collected);
+        assert!(failed_rebuild.metadata.diagnostics.query_pending);
+        assert_eq!(
+            failed_rebuild.metadata.diagnostics.query_rebuild_attempts,
+            1
+        );
+        assert!(failed_rebuild.metadata.failures.iter().any(|failure| {
+            failure.path.as_ref() == r"\Memory\Available Bytes"
+                && failure.reason
+                    == if cleanup_failed {
+                        "counter_setup"
+                    } else {
+                        "PdhOpenQueryW"
+                    }
+                && failure.diagnostic_only
+                && !failure.error.is_empty()
+        }));
+        assert_eq!(opens.load(Ordering::Acquire), 2);
+        tokio::time::sleep(Duration::from_millis(30)).await;
         let rebuilt = worker.collect().await.unwrap();
         assert!(!rebuilt.metadata.diagnostics.any_query_collected);
         assert!(!rebuilt.metadata.diagnostics.query_pending);
@@ -112,7 +133,7 @@ async fn recoverable_startup_errors_become_pending_and_rebuild() {
         let ready = worker.collect().await.unwrap();
         assert!(ready.metadata.diagnostics.any_query_collected);
         assert_eq!(ready.points.len(), 1);
-        assert_eq!(opens.load(Ordering::Acquire), 2);
+        assert_eq!(opens.load(Ordering::Acquire), 3);
         assert!(
             worker
                 .shutdown(Instant::now() + Duration::from_secs(1))
@@ -392,6 +413,8 @@ struct PeakPdh {
     ownership: Arc<PeakOwnership>,
     owned: usize,
     expansions: BTreeMap<String, Vec<String>>,
+    shutdown: Option<Arc<AtomicBool>>,
+    collect_gate: Option<(oneshot::Sender<()>, mpsc::Receiver<()>)>,
 }
 
 impl Drop for PeakPdh {
@@ -406,6 +429,17 @@ impl Drop for PeakPdh {
 
 impl PdhApi for PeakPdh {
     type Counter = String;
+
+    fn check_running(&self) -> Result<(), Error> {
+        if self
+            .shutdown
+            .as_ref()
+            .is_some_and(|shutdown| shutdown.load(Ordering::Acquire))
+        {
+            return Err(Error::WorkerStopRequested);
+        }
+        Ok(())
+    }
 
     fn add(&mut self, path: &str) -> Result<Self::Counter, Error> {
         self.owned += 1;
@@ -426,6 +460,11 @@ impl PdhApi for PeakPdh {
 
     fn collect(&mut self) -> Result<bool, Error> {
         let _ = self.ownership.collect_calls.fetch_add(1, Ordering::AcqRel);
+        if let Some((entered, release)) = self.collect_gate.take() {
+            entered.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(2)).unwrap();
+            self.check_running()?;
+        }
         let status = self.ownership.collect_status.load(Ordering::Acquire);
         if status != 0 {
             return Err(Error::Pdh {
@@ -1462,6 +1501,8 @@ async fn invalid_query_rebuilds_worker_and_closes_old_handles() {
                     ownership: Arc::clone(&factory_ownership),
                     owned: 0,
                     expansions: BTreeMap::new(),
+                    shutdown: None,
+                    collect_gate: None,
                 },
                 configs,
                 Duration::ZERO,
@@ -1508,6 +1549,111 @@ async fn invalid_query_rebuilds_worker_and_closes_old_handles() {
     assert_eq!(ownership.closed_queries.load(Ordering::Acquire), 2);
     assert_eq!(ownership.collect_calls.load(Ordering::Acquire), 4);
     assert_eq!(opens.load(Ordering::Acquire), 2);
+}
+
+/// Scenario: Shutdown arrives during retry backoff, a returning rebuild open, or replacement priming.
+/// Guarantees: Backoff exits immediately, returning native work observes stop, and every owned query and counter closes without publication.
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_during_recovery_closes_all_handles() {
+    for stage in ["retry_backoff", "rebuild_open", "rebuild_prime"] {
+        let ownership = Arc::new(PeakOwnership::default());
+        let factory_ownership = Arc::clone(&ownership);
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_opens = Arc::clone(&opens);
+        let shutdown = Arc::new(std::sync::OnceLock::<Arc<AtomicBool>>::new());
+        let factory_shutdown = Arc::clone(&shutdown);
+        let (entered, pending) = oneshot::channel();
+        let (release, blocked) = mpsc::sync_channel(1);
+        let mut gate = Some((entered, blocked));
+        let retry_cap = if stage == "retry_backoff" {
+            Duration::from_secs(60)
+        } else {
+            Duration::ZERO
+        };
+        let mut worker = Worker::start_with(
+            vec![counter(r"\Memory\Available Bytes", "memory")],
+            retry_cap,
+            4096,
+            move |configs, limit, _seed| {
+                let rebuilding = factory_opens.fetch_add(1, Ordering::AcqRel) > 0;
+                let mut api = PeakPdh {
+                    ownership: Arc::clone(&factory_ownership),
+                    owned: 0,
+                    expansions: BTreeMap::new(),
+                    shutdown: factory_shutdown.get().cloned(),
+                    collect_gate: None,
+                };
+                if rebuilding {
+                    let (entered, blocked) = gate.take().unwrap();
+                    if stage == "rebuild_open" {
+                        entered.send(()).unwrap();
+                        blocked.recv_timeout(Duration::from_secs(2)).unwrap();
+                    } else {
+                        api.collect_gate = Some((entered, blocked));
+                    }
+                }
+                Query::open_with(
+                    api,
+                    configs,
+                    Duration::ZERO,
+                    Duration::from_secs(60),
+                    256,
+                    limit,
+                )
+            },
+        )
+        .await
+        .unwrap();
+        shutdown
+            .set(Arc::clone(&worker.shutdown_requested))
+            .unwrap();
+        ownership.collect_status.store(
+            if stage == "retry_backoff" {
+                1
+            } else {
+                windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE
+            },
+            Ordering::Release,
+        );
+        assert!(worker.collect().await.is_err());
+        ownership.collect_status.store(0, Ordering::Release);
+        if stage == "retry_backoff" {
+            let pending = worker.collect().await.unwrap();
+            assert!(!pending.metadata.diagnostics.any_query_collected);
+            assert_eq!(ownership.current.load(Ordering::Acquire), 1);
+            assert_eq!(ownership.collect_calls.load(Ordering::Acquire), 2);
+        } else {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::select! {
+                    result = worker.collect() => panic!("rebuild returned before release: {result:?}"),
+                    result = pending => result.unwrap(),
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                !worker
+                    .shutdown(Instant::now() + Duration::from_millis(20))
+                    .await
+                    .unwrap()
+            );
+            release.send(()).unwrap();
+        }
+        assert!(
+            worker
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap()
+        );
+        assert_eq!(ownership.current.load(Ordering::Acquire), 0, "{stage}");
+        let expected_queries = if stage == "retry_backoff" { 1 } else { 2 };
+        assert_eq!(
+            ownership.closed_queries.load(Ordering::Acquire),
+            expected_queries,
+            "{stage}"
+        );
+        assert_eq!(opens.load(Ordering::Acquire), expected_queries, "{stage}");
+    }
 }
 
 /// Scenario: Initial query construction returns a non-availability invariant error.
@@ -1874,6 +2020,8 @@ fn sample_metadata_merge_preserves_pending_evidence() {
             discovered: 3,
             retained: 2,
             omitted: 1,
+            per_wildcard_omitted: 1,
+            total_omitted: 0,
             examples: vec![Arc::from(r"\Initial\Omitted")],
         }],
     };
@@ -1896,6 +2044,8 @@ fn sample_metadata_merge_preserves_pending_evidence() {
             discovered: 4,
             retained: 3,
             omitted: 1,
+            per_wildcard_omitted: 0,
+            total_omitted: 1,
             examples: vec![Arc::from(r"\Recovery\Omitted")],
         }],
     });
@@ -1932,6 +2082,8 @@ fn sample_metadata_merge_preserves_pending_evidence() {
             discovered: 5,
             retained: 2,
             omitted: 3,
+            per_wildcard_omitted: 2,
+            total_omitted: 1,
             examples: vec![Arc::from(r"\Initial\Latest")],
         }],
     });
@@ -1968,6 +2120,8 @@ fn slot_metadata_merge_keeps_newer_failure() {
             discovered: 3,
             retained: 2,
             omitted: 1,
+            per_wildcard_omitted: 1,
+            total_omitted: 0,
             examples: vec![Arc::from(r"\Counter\Older")],
         }],
     };
@@ -1989,6 +2143,8 @@ fn slot_metadata_merge_keeps_newer_failure() {
                 discovered: 4,
                 retained: 3,
                 omitted: 1,
+                per_wildcard_omitted: 0,
+                total_omitted: 1,
                 examples: vec![Arc::from(r"\Counter\Current")],
             }],
             diagnostics: SampleDiagnostics {
