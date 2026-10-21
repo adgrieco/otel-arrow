@@ -728,6 +728,156 @@ fn runtime_collection_stop_is_not_an_initialization_failure() {
     assert_eq!(state.borrow().calls.formatted, 0);
 }
 
+/// Scenario: A wildcard add succeeds natively just as the worker stop flag is raised.
+/// Guarantees: Stop escapes before failure accounting or retry admission, while query ownership still covers the newly added handle.
+#[test]
+fn wildcard_add_stop_is_not_a_counter_failure_or_retry() {
+    let template = r"\Process(*)\Private Bytes";
+    let expanded = r"\Process(worker)\Private Bytes";
+    let mut config = counter(template, "private");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let (state, mut query) = fake_query_with_seed(
+        vec![config],
+        vec![fake_counter(expanded, Number::Integer(1))],
+        Duration::ZERO,
+        Duration::ZERO,
+        4096,
+        None,
+    );
+    {
+        let mut state = state.borrow_mut();
+        let _ = state
+            .expansions
+            .insert(template.to_owned(), vec![expanded.to_owned()]);
+        state.stop_after_add = Some(Arc::new(AtomicBool::new(false)));
+    }
+    assert!(query.refresh_all_wildcards_managed().unwrap_err().is_stop());
+    assert_eq!(query.pending.diagnostics.counter_add_failures, 0);
+    assert!(query.pending.failures.is_empty());
+    assert!(query.admitted_members().is_empty());
+    assert_eq!(state.borrow().calls.add, 1);
+    assert_eq!(state.borrow().calls.counter_type, 0);
+}
+
+/// Scenario: A duplicate-instance group changes while removal of both departed and still-wanted native members fails.
+/// Guarantees: Wanted ownership survives in the recreation seed, successful cleanup re-adds it, and failed deferred cleanup counts once more and requests query recovery.
+#[test]
+fn wanted_pending_removal_retains_seed_and_cleanup_outcome() {
+    let template = r"\Process(*)\Private Bytes";
+    let wanted = r"\Process(worker)\Private Bytes";
+    let departed = r"\Process(worker#1)\Private Bytes";
+    for cleanup_succeeds in [false, true] {
+        let mut config = counter(template, "private");
+        config.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
+        let (state, mut query) = fake_query_with_cadences(
+            vec![config.clone()],
+            [wanted, departed]
+                .into_iter()
+                .map(|path| FakeCounter {
+                    native_type: 0x0040_0500,
+                    raw: Some(10),
+                    ..fake_counter(path, Number::Double(1.0))
+                })
+                .collect(),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let _ = state.borrow_mut().expansions.insert(
+            template.to_owned(),
+            vec![wanted.to_owned(), departed.to_owned()],
+        );
+        let _ = query.collect().unwrap();
+        {
+            let mut state = state.borrow_mut();
+            let _ = state
+                .expansions
+                .insert(template.to_owned(), vec![wanted.to_owned()]);
+            state.remove_error = true;
+        }
+        query.refresh_all_wildcards_managed().unwrap();
+        assert_eq!(query.reserved_native_entry_count(), 2);
+        assert_eq!(query.admitted_members().len(), 1);
+        assert_eq!(query.admitted_members()[0].path.as_ref(), wanted);
+        assert_eq!(query.pending.diagnostics.discovery_failures, 2);
+        let seed = query.recreation_seed();
+        let restored_state = fake_state(vec![fake_counter(wanted, Number::Integer(1))]);
+        let restored = Query::open_managed_with_seed(
+            FakePdh::new(Rc::clone(&restored_state)),
+            vec![config],
+            Duration::ZERO,
+            Duration::from_secs(3600),
+            2,
+            2,
+            Some(&seed),
+        )
+        .unwrap();
+        assert_eq!(restored.admitted_members().len(), 1);
+        assert_eq!(restored.admitted_members()[0].path.as_ref(), wanted);
+        assert_eq!(restored_state.borrow().calls.expand, 0);
+
+        state.borrow_mut().remove_error = !cleanup_succeeds;
+        if cleanup_succeeds {
+            let recovered = query.collect_managed().unwrap();
+            assert_eq!(recovered.points.len(), 1);
+            assert_eq!(recovered.points[0].path.as_ref(), wanted);
+            assert_eq!(recovered.points[0].value, SampleValue::Warming);
+            assert_eq!(query.reserved_native_entry_count(), 1);
+            assert_eq!(recovered.metadata.diagnostics.discovery_failures, 2);
+            assert_eq!(state.borrow().added.len(), 3);
+        } else {
+            let error = query.collect_managed().unwrap_err();
+            assert!(error.requires_immediate_query_rebuild());
+            assert_eq!(query.reserved_native_entry_count(), 2);
+            assert_eq!(query.pending.diagnostics.discovery_failures, 3);
+            assert_eq!(query.admitted_members()[0].path.as_ref(), wanted);
+        }
+    }
+}
+
+/// Scenario: A departed member's first removal fails and more collections arrive before the cleanup retry deadline.
+/// Guarantees: Pending ownership retains capacity without another native removal or repeated failure record on each intervening collection.
+#[test]
+fn pending_removal_waits_for_cleanup_backoff() {
+    let template = r"\Process(*)\Private Bytes";
+    let expanded = r"\Process(worker)\Private Bytes";
+    let mut config = counter(template, "private");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let (state, mut query) = fake_query_with_seed(
+        vec![config],
+        vec![fake_counter(expanded, Number::Integer(1))],
+        Duration::from_secs(60),
+        Duration::ZERO,
+        1,
+        None,
+    );
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(template.to_owned(), vec![expanded.to_owned()]);
+    query.refresh_all_wildcards_managed().unwrap();
+    let _ = query.collect_managed().unwrap();
+    {
+        let mut state = state.borrow_mut();
+        let _ = state.expansions.insert(template.to_owned(), Vec::new());
+        state.remove_error = true;
+    }
+    query.refresh_all_wildcards_managed().unwrap();
+    let first = query.collect_managed().unwrap();
+    let second = query.collect_managed().unwrap();
+    assert_eq!(state.borrow().removed, [0]);
+    assert_eq!(query.reserved_native_entry_count(), 1);
+    assert_eq!(first.metadata.diagnostics.discovery_failures, 1);
+    assert_eq!(first.metadata.failures.len(), 1);
+    assert_eq!(second.metadata.diagnostics.discovery_failures, 0);
+    assert!(second.metadata.failures.is_empty());
+}
+
 /// Scenario: Seventeen startup patterns each discover 257 available members under the fixed MVP bounds.
 /// Guarantees: Each pattern admits at most 256 and the receiver installs at most 4096 entries with explicit overflow diagnostics.
 #[test]
@@ -2084,11 +2234,11 @@ fn global_refresh_preserves_failed_removal_reservation() {
         state.remove_error = true;
     }
     query.refresh_all_wildcards_managed().unwrap();
-    let blocked = query.collect_managed().unwrap();
-    assert!(blocked.points.is_empty());
+    let error = query.collect_managed().unwrap_err();
+    assert!(error.requires_immediate_query_rebuild());
     assert_eq!(query.reserved_native_entry_count(), 1);
     assert_eq!(state.borrow().added, [later_old.to_owned()]);
-    assert_eq!(blocked.metadata.diagnostics.instances_omitted_over_limit, 1);
+    assert_eq!(query.pending.diagnostics.instances_omitted_over_limit, 1);
     state.borrow_mut().remove_error = false;
     let _ = query.collect_managed().unwrap();
     assert_eq!(query.reserved_native_entry_count(), 0);
@@ -2102,8 +2252,8 @@ fn global_refresh_preserves_failed_removal_reservation() {
     );
 }
 
-/// Scenario: A wildcard remains empty through startup and later discovery passes.
-/// Guarantees: Startup diagnoses the configured mapping once without inventing a concrete observation or repeated empty-expansion warnings.
+/// Scenario: A wildcard is empty at startup and one refresh before an instance appears.
+/// Guarantees: Every refresh discovers again, startup diagnoses emptiness only once, and the late member publishes without a restart.
 #[test]
 fn empty_startup_expansion_is_diagnosed_once() {
     let template = r"\Process(*)\Private Bytes";
@@ -2111,8 +2261,14 @@ fn empty_startup_expansion_is_diagnosed_once() {
     config.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
     };
-    let (_, mut query) =
-        fake_query_with_cadences(vec![config], Vec::new(), Duration::ZERO, Duration::ZERO);
+    let (state, mut query) = fake_query_with_seed(
+        vec![config],
+        Vec::new(),
+        Duration::ZERO,
+        Duration::ZERO,
+        4096,
+        None,
+    );
     let startup = query.collect().unwrap();
     assert_eq!(
         startup
@@ -2139,6 +2295,20 @@ fn empty_startup_expansion_is_diagnosed_once() {
             .any(|failure| failure.reason == "empty_expansion")
     );
     assert!(!later.metadata.diagnostics.any_query_collected);
+    assert_eq!(state.borrow().calls.expand, 2);
+    let expanded = r"\Process(late)\Private Bytes";
+    {
+        let mut state = state.borrow_mut();
+        state
+            .counters
+            .push(fake_counter(expanded, Number::Integer(7)));
+        let _ = state
+            .expansions
+            .insert(template.to_owned(), vec![expanded.to_owned()]);
+    }
+    let admitted = query.collect().unwrap();
+    assert_eq!(state.borrow().calls.expand, 3);
+    assert_eq!(admitted.points[0].path.as_ref(), expanded);
 }
 
 /// Scenario: A refresh reorders retained instances while adding one and removing another.

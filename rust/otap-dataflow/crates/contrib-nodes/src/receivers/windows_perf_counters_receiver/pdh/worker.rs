@@ -800,7 +800,12 @@ where
         Err(error)
             if error.is_collection_failure() || error.is_recoverable_query_open_failure() =>
         {
-            if !was_rebuilding && !matches!(error, Error::QueryRecoveryPending { .. }) {
+            let maintenance_cleanup = error.requires_immediate_query_rebuild()
+                && !slot.pending.diagnostics.any_query_collected;
+            if !was_rebuilding
+                && !matches!(error, Error::QueryRecoveryPending { .. })
+                && !maintenance_cleanup
+            {
                 return Err(error);
             }
             slot.record_query_failure(&error);

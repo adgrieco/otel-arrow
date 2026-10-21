@@ -377,7 +377,7 @@ impl<A: PdhApi> Query<A> {
                 history: CounterHistory::default(),
             };
             if let Err(error) = self.add_counter(target.clone()) {
-                if error.requires_immediate_query_rebuild() {
+                if error.is_stop() || error.requires_immediate_query_rebuild() {
                     return Err(error);
                 }
                 self.pending.diagnostics.counter_add_failures += 1;
@@ -456,6 +456,7 @@ impl<A: PdhApi> Query<A> {
                 }
                 Ok(true)
             }
+            Err(error) if error.is_stop() => Err(error),
             Err(error) => {
                 metadata.diagnostics.counter_add_failures += 1;
                 metadata
@@ -722,7 +723,7 @@ impl<A: PdhApi> Query<A> {
             })
             .collect::<Vec<_>>();
         self.discard_unwanted_wildcard_retries(&discovered_keys, metadata);
-        self.remove_wildcard_counters(&disappeared, &discovered_keys, metadata);
+        self.remove_wildcard_counters(&disappeared, &discovered_keys, metadata)?;
         let admitted = self
             .counters
             .iter()
@@ -885,7 +886,7 @@ impl<A: PdhApi> Query<A> {
         }
         let changes = self.plan_wildcard_reconciliation(&desired, known_groups);
         self.discard_unwanted_wildcard_retries(&changes.wanted, metadata);
-        self.remove_wildcard_counters(&changes.removed, &changes.wanted, metadata);
+        self.remove_wildcard_counters(&changes.removed, &changes.wanted, metadata)?;
         self.add_wildcard_counters(&changes.added, &changes.live, &mut desired, metadata)?;
         Ok(())
     }
@@ -976,35 +977,44 @@ impl<A: PdhApi> Query<A> {
         removed: &[CounterKey],
         wanted: &BTreeSet<CounterKey>,
         metadata: &mut PendingMetadata,
-    ) {
+    ) -> Result<(), Error> {
         for key in removed {
+            self.api.check_running()?;
             let _ = self.retry_states.remove(key);
-            let counter = self.counters.remove(key).ok_or(Error::InvalidSample(
+            let mut counter = self.counters.remove(key).ok_or(Error::InvalidSample(
                 "wildcard refresh lost an existing counter",
-            ));
-            let Ok(mut counter) = counter else {
-                metadata.diagnostics.discovery_failures += 1;
-                continue;
-            };
+            ))?;
             if !wanted.contains(key) && !counter.removal_counted {
                 metadata.diagnostics.instances_removed += 1;
                 counter.removal_counted = true;
             }
             if let Err(error) = self.api.remove(&counter.handle, &counter.path) {
-                metadata.diagnostics.discovery_failures += 1;
-                metadata
-                    .failures
-                    .push(sample_failure(counter.config_index, &error));
+                if !error.is_stop() {
+                    metadata.diagnostics.discovery_failures += 1;
+                    metadata
+                        .failures
+                        .push(sample_failure(counter.config_index, &error));
+                }
+                let retry_target = wanted.contains(key).then(|| {
+                    let mut target = counter.target();
+                    target.history.restart_pdh_sampling();
+                    target
+                });
                 let _ = self.pending_removals.insert(
                     key.clone(),
-                    PendingRemoval {
+                    PendingRemoval::new(
                         counter,
-                        retry_target: None,
-                        retry_ready: false,
-                    },
+                        retry_target,
+                        Instant::now(),
+                        self.exact_retry_cap,
+                    ),
                 );
+                if error.is_stop() {
+                    return Err(error);
+                }
             }
         }
+        Ok(())
     }
 
     fn add_wildcard_counters(
@@ -1182,17 +1192,22 @@ impl<A: PdhApi> Query<A> {
             .count()
     }
 
-    fn retry_pending_removals(&mut self, now: Instant, metadata: &mut PendingMetadata) {
-        let keys = self.pending_removals.keys().cloned().collect::<Vec<_>>();
+    fn retry_pending_removals(
+        &mut self,
+        now: Instant,
+        metadata: &mut PendingMetadata,
+    ) -> Result<(), Error> {
+        let keys = self
+            .pending_removals
+            .iter()
+            .filter(|(_, removal)| now >= removal.next_attempt)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
         for key in keys {
+            self.api.check_running()?;
             let Some(mut removal) = self.pending_removals.remove(&key) else {
                 continue;
             };
-            if !removal.retry_ready {
-                removal.retry_ready = true;
-                let _ = self.pending_removals.insert(key, removal);
-                continue;
-            }
             match self
                 .api
                 .remove(&removal.counter.handle, &removal.counter.path)
@@ -1203,13 +1218,21 @@ impl<A: PdhApi> Query<A> {
                     }
                 }
                 Err(error) => {
-                    metadata
-                        .failures
-                        .push(sample_failure(removal.counter.config_index, &error));
+                    if !error.is_stop() {
+                        metadata.diagnostics.discovery_failures += 1;
+                        metadata
+                            .failures
+                            .push(sample_failure(removal.counter.config_index, &error));
+                        removal.attempts = removal.attempts.saturating_add(1);
+                        removal.next_attempt =
+                            now + retry_delay(removal.attempts, self.exact_retry_cap);
+                    }
                     let _ = self.pending_removals.insert(key, removal);
+                    return Err(error);
                 }
             }
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1233,7 +1256,9 @@ impl<A: PdhApi> Query<A> {
         {
             return Err(self.restore_collection_error(metadata, error));
         }
-        self.retry_pending_removals(now, &mut metadata);
+        if let Err(error) = self.retry_pending_removals(now, &mut metadata) {
+            return Err(self.restore_collection_error(metadata, error));
+        }
         if let Err(error) = self.retry_counters(now, &mut metadata) {
             return Err(self.restore_collection_error(metadata, error));
         }
@@ -1355,11 +1380,7 @@ impl<A: PdhApi> Query<A> {
                     .push(sample_failure(counter.config_index, &error));
                 let _ = self.pending_removals.insert(
                     key,
-                    PendingRemoval {
-                        counter,
-                        retry_target: Some(target),
-                        retry_ready: false,
-                    },
+                    PendingRemoval::new(counter, Some(target), now, self.exact_retry_cap),
                 );
                 return Err(error);
             }
@@ -1611,7 +1632,24 @@ struct CounterHandle<C> {
 struct PendingRemoval<C> {
     counter: CounterHandle<C>,
     retry_target: Option<CounterTarget>,
-    retry_ready: bool,
+    attempts: u32,
+    next_attempt: Instant,
+}
+
+impl<C> PendingRemoval<C> {
+    fn new(
+        counter: CounterHandle<C>,
+        retry_target: Option<CounterTarget>,
+        now: Instant,
+        retry_cap: Duration,
+    ) -> Self {
+        Self {
+            counter,
+            retry_target,
+            attempts: 1,
+            next_attempt: now + retry_delay(1, retry_cap),
+        }
+    }
 }
 
 impl<C> CounterHandle<C> {
