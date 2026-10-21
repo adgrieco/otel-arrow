@@ -45,25 +45,6 @@ pub(super) struct Query<A: PdhApi = NativePdh> {
 }
 
 impl Query {
-    #[cfg(test)]
-    pub(super) fn open(
-        configs: Vec<CounterConfig>,
-        exact_retry_cap: Duration,
-        wildcard_refresh_interval: Duration,
-        max_instances_per_wildcard: usize,
-        max_native_counters: usize,
-        node: String,
-    ) -> Result<Self, Error> {
-        Self::open_with_cadences(
-            NativePdh::open(node)?,
-            configs,
-            exact_retry_cap,
-            wildcard_refresh_interval,
-            max_instances_per_wildcard,
-            max_native_counters,
-        )
-    }
-
     pub(super) fn open_replacement(
         configs: Vec<CounterConfig>,
         exact_retry_cap: Duration,
@@ -74,7 +55,7 @@ impl Query {
         seed: Option<&QueryRecreationSeed>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self, Error> {
-        Self::open_with_cadences_and_seed(
+        Self::open_with_seed(
             NativePdh::open_controlled(node, Some(shutdown))?,
             configs,
             exact_retry_cap,
@@ -82,32 +63,11 @@ impl Query {
             max_instances_per_wildcard,
             max_native_counters,
             seed,
-            true,
         )
     }
 }
 
 impl<A: PdhApi> Query<A> {
-    #[cfg(test)]
-    pub(super) fn open_with(
-        api: A,
-        configs: Vec<CounterConfig>,
-        exact_retry_cap: Duration,
-        wildcard_refresh_interval: Duration,
-        max_instances_per_wildcard: usize,
-        max_native_counters: usize,
-    ) -> Result<Self, Error> {
-        Self::open_with_cadences(
-            api,
-            configs,
-            exact_retry_cap,
-            wildcard_refresh_interval,
-            max_instances_per_wildcard,
-            max_native_counters,
-        )
-    }
-
-    #[cfg(test)]
     pub(super) fn open_with_seed(
         api: A,
         configs: Vec<CounterConfig>,
@@ -117,71 +77,7 @@ impl<A: PdhApi> Query<A> {
         max_native_counters: usize,
         seed: Option<&QueryRecreationSeed>,
     ) -> Result<Self, Error> {
-        Self::open_with_cadences_and_seed(
-            api,
-            configs,
-            exact_retry_cap,
-            wildcard_refresh_interval,
-            max_instances_per_wildcard,
-            max_native_counters,
-            seed,
-            true,
-        )
-    }
-
-    #[cfg(test)]
-    pub(super) fn open_managed_with_seed(
-        api: A,
-        configs: Vec<CounterConfig>,
-        exact_retry_cap: Duration,
-        wildcard_refresh_interval: Duration,
-        max_instances_per_wildcard: usize,
-        max_native_counters: usize,
-        seed: Option<&QueryRecreationSeed>,
-    ) -> Result<Self, Error> {
-        Self::open_with_cadences_and_seed(
-            api,
-            configs,
-            exact_retry_cap,
-            wildcard_refresh_interval,
-            max_instances_per_wildcard,
-            max_native_counters,
-            seed,
-            false,
-        )
-    }
-
-    #[cfg(test)]
-    pub(super) fn open_with_cadences(
-        api: A,
-        configs: Vec<CounterConfig>,
-        exact_retry_cap: Duration,
-        wildcard_refresh_interval: Duration,
-        max_instances_per_wildcard: usize,
-        max_native_counters: usize,
-    ) -> Result<Self, Error> {
-        Self::open_with_cadences_and_seed(
-            api,
-            configs,
-            exact_retry_cap,
-            wildcard_refresh_interval,
-            max_instances_per_wildcard,
-            max_native_counters,
-            None,
-            true,
-        )
-    }
-
-    fn open_with_cadences_and_seed(
-        mut api: A,
-        configs: Vec<CounterConfig>,
-        exact_retry_cap: Duration,
-        wildcard_refresh_interval: Duration,
-        max_instances_per_wildcard: usize,
-        max_native_counters: usize,
-        seed: Option<&QueryRecreationSeed>,
-        refresh_immediately: bool,
-    ) -> Result<Self, Error> {
+        let mut api = api;
         let exact_counter_reservations = configs
             .iter()
             .filter(|config| !config.instance_config.is_wildcard())
@@ -227,10 +123,6 @@ impl<A: PdhApi> Query<A> {
             && seed.is_none_or(|seed| {
                 seed.last_wildcard_refresh.elapsed() >= wildcard_refresh_interval
             });
-        if refresh_immediately && query.wildcard_refresh_pending {
-            query.refresh_wildcards(&mut metadata)?;
-            query.wildcard_refresh_pending = false;
-        }
         query.pending.merge(metadata);
         Ok(query)
     }
@@ -280,29 +172,13 @@ impl<A: PdhApi> Query<A> {
 
     pub(super) fn recreation_seed(&self) -> QueryRecreationSeed {
         let wildcard_targets = self
-            .counters
-            .iter()
-            .filter_map(|(key, counter)| {
-                counter
+            .counter_targets()
+            .filter_map(|(key, target)| {
+                target
                     .origin
                     .is_wildcard()
-                    .then_some((key.clone(), counter.target().for_recreated_query()))
+                    .then_some((key.clone(), target.for_recreated_query()))
             })
-            .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                state
-                    .target
-                    .origin
-                    .is_wildcard()
-                    .then_some((key.clone(), state.target.clone().for_recreated_query()))
-            }))
-            .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
-                removal.retry_target.as_ref().and_then(|target| {
-                    target
-                        .origin
-                        .is_wildcard()
-                        .then_some((key.clone(), target.clone().for_recreated_query()))
-                })
-            }))
             .collect::<BTreeMap<_, _>>()
             .into_iter()
             .collect();
@@ -316,20 +192,8 @@ impl<A: PdhApi> Query<A> {
 
     pub(super) fn admitted_members(&self) -> Vec<SampleMember> {
         let mut members = self
-            .counters
-            .iter()
-            .map(|(key, counter)| (key.clone(), counter.member()))
-            .chain(
-                self.retry_states
-                    .iter()
-                    .map(|(key, state)| (key.clone(), state.target.member())),
-            )
-            .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
-                removal
-                    .retry_target
-                    .as_ref()
-                    .map(|target| (key.clone(), target.member()))
-            }))
+            .counter_targets()
+            .map(|(key, target)| (key, target.member()))
             .collect::<BTreeMap<_, _>>()
             .into_values()
             .collect::<Vec<_>>();
@@ -339,6 +203,20 @@ impl<A: PdhApi> Query<A> {
                 .then_with(|| left.path.cmp(&right.path))
         });
         members
+    }
+
+    fn counter_targets(&self) -> impl Iterator<Item = (&CounterKey, CounterTarget)> {
+        self.counters
+            .iter()
+            .map(|(key, counter)| (key, counter.target()))
+            .chain(
+                self.retry_states
+                    .iter()
+                    .map(|(key, state)| (key, state.target.clone())),
+            )
+            .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
+                removal.retry_target.clone().map(|target| (key, target))
+            }))
     }
 
     fn initialize_exact_counters(&mut self) -> Result<(), Error> {
@@ -562,56 +440,24 @@ impl<A: PdhApi> Query<A> {
         failure.diagnostic_only = true;
         metadata.failures.push(failure);
         let mut retained = self
-            .counters
-            .iter()
-            .filter_map(|(key, counter)| {
-                (counter.config_index == config_index && counter.origin.is_wildcard()).then_some((
-                    counter.admission_order.unwrap_or(u64::MAX),
-                    key,
-                    &counter.path,
-                    &counter.instance,
-                    counter.emit_instance_attribute,
-                ))
+            .counter_targets()
+            .filter(|(_, target)| {
+                target.config_index == config_index && target.origin.is_wildcard()
             })
-            .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                (state.target.config_index == config_index && state.target.origin.is_wildcard())
-                    .then_some((
-                        state.target.admission_order.unwrap_or(u64::MAX),
-                        key,
-                        &state.target.path,
-                        &state.target.instance,
-                        state.target.emit_instance_attribute,
-                    ))
-            }))
-            .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
-                removal.retry_target.as_ref().and_then(|target| {
-                    (target.config_index == config_index && target.origin.is_wildcard()).then_some(
-                        (
-                            target.admission_order.unwrap_or(u64::MAX),
-                            key,
-                            &target.path,
-                            &target.instance,
+            .filter_map(|(key, target)| {
+                target.instance.map(|instance| {
+                    (
+                        target.admission_order.unwrap_or(u64::MAX),
+                        key.clone(),
+                        DesiredCounter::new(
+                            config_index,
+                            target.path,
+                            instance,
                             target.emit_instance_attribute,
                         ),
                     )
                 })
-            }))
-            .filter_map(
-                |(admission_order, key, path, instance, emit_instance_attribute)| {
-                    instance.clone().map(|instance| {
-                        (
-                            admission_order,
-                            key.clone(),
-                            DesiredCounter::new(
-                                config_index,
-                                path.clone(),
-                                instance,
-                                emit_instance_attribute,
-                            ),
-                        )
-                    })
-                },
-            )
+            })
             .collect::<Vec<_>>();
         retained.sort_by_key(|(admission_order, _, _)| *admission_order);
         let discovered = retained.len();
@@ -738,37 +584,16 @@ impl<A: PdhApi> Query<A> {
         self.discard_unwanted_wildcard_retries(&discovered_keys, metadata);
         self.remove_wildcard_counters(&disappeared, &discovered_keys, metadata)?;
         let admitted = self
-            .counters
-            .iter()
-            .filter_map(|(key, counter)| {
-                counter.origin.is_wildcard().then_some((
+            .counter_targets()
+            .filter_map(|(key, target)| {
+                target.origin.is_wildcard().then_some((
                     key,
                     (
-                        counter.admission_order.unwrap_or(u64::MAX),
-                        counter.config_index,
+                        target.admission_order.unwrap_or(u64::MAX),
+                        target.config_index,
                     ),
                 ))
             })
-            .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                state.target.origin.is_wildcard().then_some((
-                    key,
-                    (
-                        state.target.admission_order.unwrap_or(u64::MAX),
-                        state.target.config_index,
-                    ),
-                ))
-            }))
-            .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
-                removal.retry_target.as_ref().and_then(|target| {
-                    target.origin.is_wildcard().then_some((
-                        key,
-                        (
-                            target.admission_order.unwrap_or(u64::MAX),
-                            target.config_index,
-                        ),
-                    ))
-                })
-            }))
             .collect::<BTreeMap<_, _>>();
         let mut candidates = prepared
             .iter()
@@ -926,26 +751,14 @@ impl<A: PdhApi> Query<A> {
     }
 
     fn wildcard_instance_groups(&self) -> BTreeMap<InstanceGroupKey, BTreeSet<CounterKey>> {
+        let instances = self
+            .counter_targets()
+            .filter_map(|(key, target)| target.instance.map(|instance| (key, instance)))
+            .collect::<Vec<_>>();
         instance_groups(
-            self.counters
+            instances
                 .iter()
-                .filter_map(|(key, counter)| {
-                    counter.instance.as_deref().map(|instance| (key, instance))
-                })
-                .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                    state
-                        .target
-                        .instance
-                        .as_deref()
-                        .map(|instance| (key, instance))
-                }))
-                .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
-                    removal
-                        .retry_target
-                        .as_ref()
-                        .and_then(|target| target.instance.as_deref())
-                        .map(|instance| (key, instance))
-                })),
+                .map(|(key, instance)| (*key, instance.as_ref())),
         )
     }
 
@@ -1041,7 +854,6 @@ impl<A: PdhApi> Query<A> {
             }
             if let Err(error) = self.api.remove(&counter.handle, &counter.path) {
                 if !error.is_stop() {
-                    metadata.diagnostics.discovery_failures += 1;
                     metadata
                         .failures
                         .push(sample_failure(counter.config_index, &error));
@@ -1182,17 +994,8 @@ impl<A: PdhApi> Query<A> {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(super) fn prime(&mut self) -> Result<(), Error> {
-        self.prime_internal(true)
-    }
-
-    pub(super) fn prime_managed(&mut self) -> Result<(), Error> {
-        self.prime_internal(false)
-    }
-
-    fn prime_internal(&mut self, refresh_wildcards: bool) -> Result<(), Error> {
-        let result = self.collect_internal(refresh_wildcards).map(|sample| {
+        let result = self.collect().map(|sample| {
             self.pending.merge(sample.metadata);
         });
         self.pending.diagnostics.any_query_collected = false;
@@ -1286,7 +1089,6 @@ impl<A: PdhApi> Query<A> {
                 }
                 Err(error) => {
                     if !error.is_stop() {
-                        metadata.diagnostics.discovery_failures += 1;
                         metadata
                             .failures
                             .push(sample_failure(removal.counter.config_index, &error));
@@ -1295,34 +1097,21 @@ impl<A: PdhApi> Query<A> {
                             now + retry_delay(removal.attempts, self.exact_retry_cap);
                     }
                     let _ = self.pending_removals.insert(key, removal);
-                    return Err(error);
+                    if error.is_stop() {
+                        return Err(error);
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    #[cfg(test)]
     pub(super) fn collect(&mut self) -> Result<Sample, Error> {
-        self.collect_internal(true)
-    }
-
-    pub(super) fn collect_managed(&mut self) -> Result<Sample, Error> {
-        let sample = self.collect_internal(false)?;
-        Ok(sample)
-    }
-
-    fn collect_internal(&mut self, refresh_wildcards: bool) -> Result<Sample, Error> {
         self.api.check_running()?;
+        let now = Instant::now();
+        self.refresh_all_wildcards_managed()?;
         let mut metadata = std::mem::take(&mut self.pending);
         metadata.diagnostics.any_query_collected = false;
-        let now = Instant::now();
-        if refresh_wildcards
-            && self.wildcard_refresh_due()
-            && let Err(error) = self.refresh_wildcards(&mut metadata)
-        {
-            return Err(self.restore_collection_error(metadata, error));
-        }
         if let Err(error) = self.retry_pending_removals(now, &mut metadata) {
             return Err(self.restore_collection_error(metadata, error));
         }
@@ -1449,7 +1238,10 @@ impl<A: PdhApi> Query<A> {
                     key,
                     PendingRemoval::new(counter, Some(target), now, self.exact_retry_cap),
                 );
-                return Err(error);
+                if error.is_stop() {
+                    return Err(error);
+                }
+                continue;
             }
             self.schedule_retry(key, target, now);
         }
@@ -1725,15 +1517,6 @@ impl<C> PendingRemoval<C> {
 }
 
 impl<C> CounterHandle<C> {
-    fn member(&self) -> SampleMember {
-        SampleMember {
-            counter_index: self.config_index,
-            path: Arc::clone(&self.path),
-            instance: self.instance.clone(),
-            emit_instance_attribute: self.emit_instance_attribute,
-        }
-    }
-
     fn target(&self) -> CounterTarget {
         CounterTarget {
             config_index: self.config_index,

@@ -106,7 +106,7 @@ pub(super) enum CounterKind {
     FormattedSingleSample,
     /// A PDH formula requiring successive samples (including private-clock timers).
     CalculatedTwoSample,
-    /// A PDH-provided raw difference eligible for delta Sum temporality.
+    /// A PDH-provided raw difference requiring two samples and reset readiness after errors.
     Delta,
     /// A fraction or average requiring successive samples and advancing base values.
     CalculatedTwoSampleWithBase,

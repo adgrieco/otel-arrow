@@ -597,13 +597,15 @@ async fn live_pdh_entirely_unavailable_counter_set_starts_empty() {
 }
 
 fn open_live_query(configs: Vec<CounterConfig>, node: &str) -> Query {
-    Query::open(
+    Query::open_replacement(
         configs,
         Duration::from_secs(30),
         Duration::from_secs(30),
         256,
         4_096,
         node.to_owned(),
+        None,
+        Arc::new(AtomicBool::new(false)),
     )
     .unwrap()
 }
@@ -847,7 +849,7 @@ async fn live_pdh_refreshes_process_membership_after_duplicate_renumbering() {
     wildcard.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
     };
-    let mut query = Query::open(
+    let mut query = Query::open_replacement(
         vec![
             counter(r"\Memory\Available Bytes", "windows.memory.available"),
             wildcard,
@@ -857,6 +859,8 @@ async fn live_pdh_refreshes_process_membership_after_duplicate_renumbering() {
         16,
         16,
         "membership".to_owned(),
+        None,
+        Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
 

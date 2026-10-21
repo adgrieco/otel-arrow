@@ -36,6 +36,7 @@ pub(super) struct Config {
     pub(super) max_instances_per_wildcard: usize,
     /// Receiver-wide entries reserved for exact or retained expanded native counters.
     pub(super) max_expanded_counters: usize,
+    /// Construction warnings emitted once after successful validation and construction.
     pub(super) warnings: Vec<ConfigWarning>,
 }
 

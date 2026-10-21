@@ -156,12 +156,6 @@ impl Error {
     pub(super) fn requires_immediate_query_rebuild(&self) -> bool {
         matches!(
             self,
-            Self::Pdh {
-                operation: PdhOperation::RemoveCounter,
-                ..
-            }
-        ) || matches!(
-            self,
             Self::CounterSetup {
                 cleanup_failed: true,
                 ..

@@ -502,7 +502,7 @@ fn fake_query_with_seed(
     seed: Option<&QueryRecreationSeed>,
 ) -> (Rc<RefCell<FakeState>>, Query<FakePdh>) {
     let state = fake_state(counters);
-    let query = Query::open_managed_with_seed(
+    let query = Query::open_with_seed(
         FakePdh::new(Rc::clone(&state)),
         configs,
         exact_retry_cap,

@@ -371,19 +371,13 @@ where
     if shutdown.load(Ordering::Acquire) {
         return Ok(None);
     }
-    if let Err(error) = slot.refresh(Instant::now(), query_retry_cap) {
-        if shutdown.load(Ordering::Acquire) && error.is_stop() {
-            return Ok(None);
-        }
-        return Err(error);
-    }
-    if shutdown.load(Ordering::Acquire) {
-        return Ok(None);
-    }
     if let Some(query) = slot.query.as_mut() {
-        match query.prime_managed() {
+        match query.prime() {
             Ok(()) => {}
             Err(error) => {
+                if shutdown.load(Ordering::Acquire) && error.is_stop() {
+                    return Ok(None);
+                }
                 if !error.is_collection_failure() {
                     return Err(error);
                 }
@@ -476,8 +470,6 @@ pub(super) struct QuerySlot<A: PdhApi> {
     pub(super) query: Option<Query<A>>,
     query_failure_attempts: u32,
     next_query_retry: Instant,
-    refresh_failure_attempts: u32,
-    next_refresh_retry: Instant,
     rebuild_attempts: u32,
     next_rebuild: Instant,
     rebuild_seed: Option<QueryRecreationSeed>,
@@ -528,8 +520,6 @@ impl<A: PdhApi> QuerySlot<A> {
             query: None,
             query_failure_attempts: 0,
             next_query_retry: now,
-            refresh_failure_attempts: 0,
-            next_refresh_retry: now,
             rebuild_attempts: 0,
             next_rebuild: now,
             rebuild_seed: None,
@@ -574,34 +564,6 @@ impl<A: PdhApi> QuerySlot<A> {
                         diagnostic_only: true,
                     }),
             );
-    }
-
-    fn refresh(&mut self, now: Instant, retry_cap: Duration) -> Result<(), Error> {
-        if now < self.next_refresh_retry {
-            return Ok(());
-        }
-        let Some(query) = self.query.as_mut() else {
-            return Ok(());
-        };
-        if !query.wildcard_refresh_due() {
-            return Ok(());
-        }
-        match query.refresh_all_wildcards_managed() {
-            Ok(()) => {
-                self.refresh_failure_attempts = 0;
-                self.next_refresh_retry = now;
-            }
-            Err(error) if error.is_collection_failure() => {
-                self.refresh_failure_attempts = self.refresh_failure_attempts.saturating_add(1);
-                self.next_refresh_retry =
-                    now + retry_delay(self.refresh_failure_attempts, retry_cap);
-                if error.requires_immediate_query_rebuild() {
-                    self.schedule_rebuild(self.next_refresh_retry);
-                }
-            }
-            Err(error) => return Err(error),
-        }
-        Ok(())
     }
 
     pub(super) fn collect<F>(
@@ -655,7 +617,7 @@ impl<A: PdhApi> QuerySlot<A> {
                     retry_after_ms: self.next_query_retry.duration_since(now).as_millis(),
                 })
             } else {
-                query.collect_managed()
+                query.collect()
             }
         } else if now < self.next_rebuild {
             Err(Error::QueryRecoveryPending {
@@ -692,9 +654,7 @@ impl<A: PdhApi> QuerySlot<A> {
         self.rebuild_attempts = 0;
         self.query_failure_attempts = 0;
         self.next_query_retry = now;
-        self.refresh_failure_attempts = 0;
-        self.next_refresh_retry = now;
-        let primed = rebuilt.prime_managed();
+        let primed = rebuilt.prime();
         self.last_admitted_members = rebuilt.admitted_members();
         self.query = Some(rebuilt);
         self.rebuild_seed = None;
@@ -793,7 +753,6 @@ where
     F: FnMut(Vec<CounterConfig>, usize, Option<&QueryRecreationSeed>) -> Result<Query<A>, Error>,
 {
     let now = Instant::now();
-    slot.refresh(now, retry_cap)?;
     let was_rebuilding = slot.query.is_none();
     let mut sample = match slot.collect(now, retry_cap, limit, open) {
         Ok(sample) => sample,

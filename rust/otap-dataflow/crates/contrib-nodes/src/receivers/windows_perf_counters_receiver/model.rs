@@ -163,9 +163,9 @@ pub(super) struct SampleDiagnostics {
     pub(super) counter_add_failures: u64,
     /// Number of counter read, status, calculation, or scaling failures.
     pub(super) counter_read_failures: u64,
-    /// Number of deferred counter retry attempts.
+    /// Number of deferred counter or query-collection retry attempts.
     pub(super) retry_attempts: u64,
-    /// Number of deferred counter retries that recovered.
+    /// Number of deferred counter or query-collection retries that recovered.
     pub(super) retry_recoveries: u64,
     /// Number of worker-owned query rebuilds attempted.
     pub(super) query_rebuild_attempts: u64,

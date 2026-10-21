@@ -73,7 +73,7 @@ async fn recoverable_startup_errors_become_pending_and_rebuild() {
                         }
                     });
                 }
-                Query::open_with(
+                Query::open_with_seed(
                     StartupTestPdh {
                         dropped: Arc::clone(&factory_dropped),
                     },
@@ -82,6 +82,7 @@ async fn recoverable_startup_errors_become_pending_and_rebuild() {
                     Duration::from_secs(60),
                     256,
                     limit,
+                    None,
                 )
             },
         )
@@ -513,13 +514,14 @@ fn transient_failures_retry_installed_handles_before_rebuild() {
     let factory_state = Rc::clone(&state);
     let mut open = |configs, limit, _seed: Option<&QueryRecreationSeed>| {
         opens.set(opens.get() + 1);
-        let query = Query::open_with(
+        let query = Query::open_with_seed(
             FakePdh::new(Rc::clone(&factory_state)),
             configs,
             Duration::ZERO,
             Duration::ZERO,
             256,
             limit,
+            None,
         )?;
         Ok(query)
     };
@@ -558,13 +560,14 @@ fn startup_invalid_prime_schedules_recovery() {
         Some(windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE);
     let factory_state = Rc::clone(&state);
     let mut open = |configs, limit, _seed: Option<&QueryRecreationSeed>| {
-        let query = Query::open_with(
+        let query = Query::open_with_seed(
             FakePdh::new(Rc::clone(&factory_state)),
             configs,
             Duration::ZERO,
             Duration::ZERO,
             256,
             limit,
+            None,
         )?;
         Ok(query)
     };
@@ -781,10 +784,11 @@ fn failed_rebuild_preserves_down_query_state() {
     let observed_seeds = RefCell::new(Vec::new());
     let mut fail_rebuild = |_: Vec<CounterConfig>, _: usize, seed: Option<&QueryRecreationSeed>| {
         observed_seeds.borrow_mut().push(seed.is_some());
-        Err::<Query<FakePdh>, _>(Error::Pdh {
-            operation: PdhOperation::RemoveCounter,
+        Err::<Query<FakePdh>, _>(Error::CounterSetup {
             path: concrete.to_owned(),
-            status: 1,
+            message: "injected untracked setup ownership failure".to_owned(),
+            permanent: false,
+            cleanup_failed: true,
         })
     };
     let rebuild_at = now + Duration::from_secs(1);
@@ -972,16 +976,18 @@ fn exact_reservation_reduces_same_query_expansion_capacity() {
         excluded_aggregation: None,
     };
 
-    let query = Query::open_with(
+    let mut query = Query::open_with_seed(
         FakePdh::new(Rc::clone(&state)),
         vec![counter(exact_path, "memory.available"), wildcard],
         Duration::from_secs(30),
         Duration::from_secs(30),
         256,
         2,
+        None,
     )
     .unwrap();
 
+    query.prime().unwrap();
     assert_eq!(query.active_expanded_count(), 1);
     assert_eq!(query.reserved_native_entry_count(), 2);
     assert_eq!(state.borrow().added.len(), 2);
@@ -991,7 +997,7 @@ fn exact_reservation_reduces_same_query_expansion_capacity() {
 /// Guarantees: Internal accounting corruption fails explicitly before opening native handles instead of silently exceeding the receiver limit.
 #[test]
 fn query_rejects_limit_below_exact_reservation() {
-    let result = Query::open_with(
+    let result = Query::open_with_seed(
         StartupTestPdh {
             dropped: Arc::new(AtomicBool::new(false)),
         },
@@ -1003,6 +1009,7 @@ fn query_rejects_limit_below_exact_reservation() {
         Duration::from_secs(30),
         256,
         1,
+        None,
     );
 
     assert!(matches!(
@@ -1162,7 +1169,7 @@ async fn startup_longer_than_thirty_seconds_eventually_succeeds() {
         move |configs, max_expanded_counters, _seed| {
             let _ = entered_tx.send(());
             let _ = release_rx.recv();
-            Query::open_with(
+            Query::open_with_seed(
                 StartupTestPdh {
                     dropped: Arc::clone(&factory_dropped),
                 },
@@ -1171,6 +1178,7 @@ async fn startup_longer_than_thirty_seconds_eventually_succeeds() {
                 Duration::from_secs(30),
                 256,
                 max_expanded_counters,
+                None,
             )
         },
     );
@@ -1221,7 +1229,7 @@ async fn startup_wildcard_refresh_failure_retries_after_cap() {
         retry_cap,
         4_096,
         move |configs, max_native_counters, seed| {
-            Query::open_managed_with_seed(
+            Query::open_with_seed(
                 RecoveringRefreshPdh {
                     add_calls: Arc::clone(&factory_add_calls),
                     timestamp: 100,
@@ -1240,7 +1248,13 @@ async fn startup_wildcard_refresh_failure_retries_after_cap() {
 
     let deferred = worker.collect().await.unwrap();
     assert!(deferred.points.is_empty());
-    assert_eq!(deferred.metadata.failures.len(), 2);
+    assert!(
+        deferred
+            .metadata
+            .failures
+            .iter()
+            .any(|failure| failure.reason == "counter_setup")
+    );
     assert!(
         deferred
             .metadata
@@ -1293,7 +1307,7 @@ async fn cancelling_startup_stops_between_initialization_units() {
                 let _ = entered_tx.send(());
                 let _ = release_rx.recv();
             }
-            Query::open_with(
+            Query::open_with_seed(
                 StartupTestPdh {
                     dropped: Arc::clone(&factory_dropped),
                 },
@@ -1302,6 +1316,7 @@ async fn cancelling_startup_stops_between_initialization_units() {
                 Duration::from_secs(30),
                 256,
                 max_expanded_counters,
+                None,
             )
         },
     ));
@@ -1346,7 +1361,7 @@ fn cancelling_startup_stops_between_expansion_and_priming() {
     let mut open = move |configs: Vec<CounterConfig>,
                          max_native_counters: usize,
                          seed: Option<&QueryRecreationSeed>| {
-        Query::open_managed_with_seed(
+        Query::open_with_seed(
             FakePdh::new(Rc::clone(&factory_state)),
             configs,
             Duration::from_secs(30),
@@ -1386,13 +1401,14 @@ fn cancelling_startup_stops_between_exact_native_operations() {
             fake_counter(second, Number::Integer(2)),
         ]);
         state.borrow_mut().stop_after_add = Some(Arc::new(AtomicBool::new(false)));
-        let result = Query::open_with(
+        let result = Query::open_with_seed(
             FakePdh::new(Rc::clone(&state)),
             configs,
             Duration::from_secs(30),
             Duration::from_secs(30),
             256,
             4_096,
+            None,
         );
         assert!(matches!(result, Err(Error::WorkerStopRequested)));
         let state = state.borrow();
@@ -1403,9 +1419,9 @@ fn cancelling_startup_stops_between_exact_native_operations() {
 }
 
 /// Scenario: Deferred cleanup of a departed member or still-wanted replacement fails after repeated production refresh.
-/// Guarantees: Maintenance retains failure context, seeds only wanted members without counting a scheduled collection, and cannot reopen early.
+/// Guarantees: Cleanup retains its reservation and failure context, backs off without reopening the query, and restores wanted members after removal succeeds.
 #[tokio::test]
-async fn failed_pending_cleanup_enters_bounded_seeded_rebuild() {
+async fn failed_pending_cleanup_remains_bounded_without_query_escalation() {
     let template = r"\Process(*)\Private Bytes";
     let expanded = r"\Process(worker)\Private Bytes";
     let duplicate = r"\Process(worker#1)\Private Bytes";
@@ -1432,7 +1448,7 @@ async fn failed_pending_cleanup_enters_bounded_seeded_rebuild() {
         let opens = Cell::new(0);
         let mut open = |configs, limit, seed: Option<&QueryRecreationSeed>| {
             opens.set(opens.get() + 1);
-            Query::open_managed_with_seed(
+            Query::open_with_seed(
                 FakePdh::new(Rc::clone(&state)),
                 configs,
                 Duration::from_secs(60),
@@ -1465,7 +1481,7 @@ async fn failed_pending_cleanup_enters_bounded_seeded_rebuild() {
             let _ = state.remove_errors.insert(0);
         }
         let pending = collect_query(&mut slot, Duration::from_secs(60), limit, &mut open).unwrap();
-        assert_eq!(pending.metadata.diagnostics.discovery_failures, 1);
+        assert_eq!(pending.metadata.diagnostics.discovery_failures, 0);
         assert_eq!(slot.reserved_native_entry_count(), 1);
         assert_eq!(
             state
@@ -1480,7 +1496,7 @@ async fn failed_pending_cleanup_enters_bounded_seeded_rebuild() {
         let failed = collect_query(&mut slot, Duration::from_secs(60), limit, &mut open).unwrap();
         assert!(!failed.metadata.diagnostics.any_query_collected);
         assert!(failed.metadata.diagnostics.query_pending);
-        assert_eq!(failed.metadata.diagnostics.discovery_failures, 1);
+        assert_eq!(failed.metadata.diagnostics.discovery_failures, 0);
         assert!(
             failed
                 .metadata
@@ -1488,7 +1504,7 @@ async fn failed_pending_cleanup_enters_bounded_seeded_rebuild() {
                 .iter()
                 .any(|failure| failure.reason == "PdhRemoveCounter")
         );
-        assert!(slot.query.is_none());
+        assert!(slot.query.is_some());
         assert_eq!(
             state
                 .borrow()
@@ -1498,28 +1514,17 @@ async fn failed_pending_cleanup_enters_bounded_seeded_rebuild() {
                 .count(),
             2
         );
-        assert_eq!(
-            slot.reserved_native_entry_count(),
-            usize::from(still_wanted)
-        );
-        let now = Instant::now();
-        assert!(matches!(
-            slot.collect(now, Duration::from_secs(60), limit, &mut open),
-            Err(Error::QueryRecoveryPending { .. })
-        ));
+        assert_eq!(slot.reserved_native_entry_count(), 1);
+        let backoff = collect_query(&mut slot, Duration::from_secs(60), limit, &mut open).unwrap();
+        assert_eq!(backoff.metadata.diagnostics.query_rebuild_attempts, 0);
+        assert!(!backoff.metadata.diagnostics.any_query_collected);
         assert_eq!(opens.get(), 1);
         state.borrow_mut().remove_errors.clear();
-        let rebuilt = slot
-            .collect(
-                now + Duration::from_secs(1),
-                Duration::from_secs(60),
-                limit,
-                &mut open,
-            )
-            .unwrap();
-        assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
-        assert!(!rebuilt.metadata.diagnostics.any_query_collected);
-        assert_eq!(opens.get(), 2);
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        let cleaned = collect_query(&mut slot, Duration::from_secs(60), limit, &mut open).unwrap();
+        assert_eq!(cleaned.metadata.diagnostics.query_rebuild_attempts, 0);
+        assert_eq!(cleaned.points.len(), usize::from(still_wanted));
+        assert_eq!(opens.get(), 1);
         assert_eq!(
             slot.query.as_ref().unwrap().admitted_members().len(),
             usize::from(still_wanted)
@@ -1541,7 +1546,7 @@ async fn invalid_query_rebuilds_worker_and_closes_old_handles() {
         4_096,
         move |configs, limit, _seed| {
             let _ = factory_opens.fetch_add(1, Ordering::AcqRel);
-            let query = Query::open_with(
+            let query = Query::open_with_seed(
                 PeakPdh {
                     ownership: Arc::clone(&factory_ownership),
                     owned: 0,
@@ -1554,6 +1559,7 @@ async fn invalid_query_rebuilds_worker_and_closes_old_handles() {
                 Duration::ZERO,
                 256,
                 limit,
+                None,
             )?;
             Ok(query)
         },
@@ -1637,13 +1643,14 @@ async fn shutdown_during_recovery_closes_all_handles() {
                         api.collect_gate = Some((entered, blocked));
                     }
                 }
-                Query::open_with(
+                Query::open_with_seed(
                     api,
                     configs,
                     Duration::ZERO,
                     Duration::from_secs(60),
                     256,
                     limit,
+                    None,
                 )
             },
         )
@@ -1738,7 +1745,7 @@ async fn startup_prime_query_failure_starts_and_recovers() {
         Duration::from_secs(30),
         4_096,
         move |counters, max_expanded_counters, _seed| {
-            Query::open_with(
+            Query::open_with_seed(
                 RecoveringPrimePdh {
                     collect_calls: Arc::clone(&factory_calls),
                 },
@@ -1747,6 +1754,7 @@ async fn startup_prime_query_failure_starts_and_recovers() {
                 Duration::from_secs(30),
                 256,
                 max_expanded_counters,
+                None,
             )
         },
     )
@@ -1837,7 +1845,7 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
                          _seed: Option<&QueryRecreationSeed>| {
         let open_index = factory_open_calls.get();
         factory_open_calls.set(open_index + 1);
-        Query::open_with(
+        Query::open_with_seed(
             RebuildPrimePdh {
                 fail_collect: if open_index == 0 {
                     Arc::clone(&factory_first_query_failure)
@@ -1851,6 +1859,7 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
             Duration::from_secs(30),
             256,
             max_expanded_counters,
+            None,
         )
     };
     let config = counter(path, "system.cpu.time");
@@ -2260,7 +2269,7 @@ async fn query_recovery_cap_is_independent_of_membership_refresh() {
                 .lock()
                 .unwrap()
                 .push(cadence.wildcard_refresh());
-            Query::open_with_cadences(
+            Query::open_with_seed(
                 RebuildPrimePdh {
                     fail_collect: Arc::clone(&factory_fail_collect),
                     collect_calls: 0,
@@ -2270,6 +2279,7 @@ async fn query_recovery_cap_is_independent_of_membership_refresh() {
                 cadence.wildcard_refresh(),
                 256,
                 max_native_counters,
+                None,
             )
         },
     )
