@@ -1,22 +1,19 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::config::{Aggregation, CounterConfig, InstanceConfig, MetricKind};
+use super::super::config::{CounterConfig, InstanceConfig, MetricKind};
 use super::super::model::{
-    ExpansionOverflow, InstanceIdentity, MonotonicPublication, MonotonicPublicationCandidate,
-    Number, PendingMetadata, Sample, SampleDiagnostics, SampleFailure, SampleValue,
-    merge_diagnostics, scale_integer,
+    ExpansionOverflow, InstanceIdentity, Number, PendingMetadata, Sample, SampleDiagnostics,
+    SampleFailure, SampleValue, merge_diagnostics,
 };
 use super::super::{
     TEST_PDH_LOCK,
     config::Config,
     otap_builder::{into_otap, project_sample},
 };
-use super::counter_type::*;
 use super::expansion::*;
 use super::native::NativePdh;
 use super::query::*;
-use super::timing::*;
 use super::worker::*;
 use super::*;
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
@@ -46,24 +43,10 @@ fn counter(path: &str, name: &str) -> CounterConfig {
     }
 }
 
-fn monotonic_sum(path: &str, name: &str, unit: &str) -> CounterConfig {
+fn cumulative_sum(path: &str, name: &str, unit: &str) -> CounterConfig {
     CounterConfig {
-        metric_kind: MetricKind::Sum {
-            aggregation: Aggregation::Cumulative,
-            monotonic: true,
-        },
+        metric_kind: MetricKind::Sum,
         unit: Arc::from(unit),
-        ..counter(path, name)
-    }
-}
-
-fn delta_sum(path: &str, name: &str, monotonic: bool) -> CounterConfig {
-    CounterConfig {
-        metric_kind: MetricKind::Sum {
-            aggregation: Aggregation::Delta,
-            monotonic,
-        },
-        unit: Arc::from("{operation}"),
         ..counter(path, name)
     }
 }
@@ -542,17 +525,6 @@ fn advance_fake_queries(states: &Rc<RefCell<Vec<Rc<RefCell<FakeState>>>>>) {
             }
         }
     }
-}
-
-fn collected_monotonic_publications(sample: &Sample) -> Vec<MonotonicPublication> {
-    sample
-        .points
-        .iter()
-        .filter_map(|point| match &point.monotonic_publication {
-            Some(MonotonicPublicationCandidate::Ready(publication)) => Some(publication.clone()),
-            Some(MonotonicPublicationCandidate::Pending) | None => None,
-        })
-        .collect()
 }
 
 /// Scenario: A fake PDH add receives one concrete English wildcard expansion result.

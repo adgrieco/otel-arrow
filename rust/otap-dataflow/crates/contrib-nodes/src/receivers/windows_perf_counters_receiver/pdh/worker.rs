@@ -5,8 +5,7 @@
 
 use super::super::config::CounterConfig;
 use super::super::model::{
-    MonotonicPublication, MonotonicPublicationCandidate, PendingMetadata, Sample,
-    SampleDiagnostics, SampleFailure, SampleMember,
+    PendingMetadata, Sample, SampleDiagnostics, SampleFailure, SampleMember,
 };
 use super::PdhApi;
 use super::error::Error;
@@ -950,18 +949,6 @@ impl<A: PdhApi> QuerySlot<A> {
         };
         for point in &mut sample.points {
             point.counter_index = remap(point.counter_index)?;
-            if matches!(
-                point.monotonic_publication,
-                Some(MonotonicPublicationCandidate::Pending)
-            ) {
-                point.monotonic_publication =
-                    Some(MonotonicPublicationCandidate::Ready(MonotonicPublication {
-                        counter_index: point.counter_index,
-                        path: Arc::clone(&point.path),
-                        query_generation: self.query_generation,
-                        timestamp_unix_nano: point.timestamp_unix_nano,
-                    }));
-            }
         }
         for failure in &mut sample.metadata.failures {
             failure.counter_index = remap(failure.counter_index)?;
@@ -1009,39 +996,6 @@ impl<A: PdhApi> QuerySlot<A> {
             },
             Query::reserved_native_entry_count,
         )
-    }
-
-    #[cfg(test)]
-    pub(super) fn publish_monotonic_start(&mut self, publication: &MonotonicPublication) -> bool {
-        if publication.query_generation != self.query_generation {
-            return false;
-        }
-        let Ok(config_index) = self
-            .plan
-            .global_indices
-            .binary_search(&publication.counter_index)
-        else {
-            return false;
-        };
-        self.query.as_mut().is_some_and(|query| {
-            query.publish_monotonic_start(
-                config_index,
-                &publication.path,
-                publication.timestamp_unix_nano,
-            )
-        })
-    }
-}
-
-#[cfg(test)]
-pub(super) fn publish_monotonic_starts<A: PdhApi>(
-    queries: &mut [QuerySlot<A>],
-    publications: Vec<MonotonicPublication>,
-) {
-    for publication in publications {
-        let _ = queries
-            .iter_mut()
-            .any(|query| query.publish_monotonic_start(&publication));
     }
 }
 

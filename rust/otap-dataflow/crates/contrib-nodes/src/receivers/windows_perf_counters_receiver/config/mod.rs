@@ -254,11 +254,8 @@ impl InstanceConfig {
 pub(super) enum MetricKind {
     /// A point-in-time Gauge.
     Gauge,
-    /// A Sum with configured aggregation temporality and monotonicity.
-    Sum {
-        aggregation: Aggregation,
-        monotonic: bool,
-    },
+    /// A cumulative, non-monotonic Sum.
+    Sum,
 }
 
 /// OTel Sum aggregation temporality accepted by the configuration parser.
@@ -339,10 +336,7 @@ impl MetricConfig {
                     "metrics.{name}.sum supports only cumulative, non-monotonic Sums"
                 )));
             }
-            Ok(MetricKind::Sum {
-                aggregation: sum.aggregation,
-                monotonic: sum.monotonic,
-            })
+            Ok(MetricKind::Sum)
         } else {
             Ok(MetricKind::Gauge)
         }
@@ -356,7 +350,7 @@ where
     Option::<SumConfig>::deserialize(deserializer)?
         .ok_or_else(|| {
             serde::de::Error::custom(
-                "sum must be a mapping with explicit aggregation: cumulative or delta; null Sum is invalid",
+                "sum must be a mapping with explicit aggregation: cumulative; null Sum is invalid",
             )
         })
         .map(Some)

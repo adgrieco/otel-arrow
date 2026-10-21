@@ -3,13 +3,10 @@
 
 #[cfg(test)]
 use super::config::InstanceConfig;
-use super::config::{Aggregation, CounterConfig, MetricKind};
+use super::config::{CounterConfig, MetricKind};
 #[cfg(test)]
 use super::model::SampleMember;
-use super::model::{
-    InstanceIdentity, MonotonicPublication, MonotonicPublicationCandidate, Number, Sample,
-    SamplePoint, SampleValue,
-};
+use super::model::{InstanceIdentity, Number, Sample, SamplePoint, SampleValue};
 use arrow::error::ArrowError;
 use otel_arrow_dfe_pdata::encode::record::attributes::StrKeysAttributesRecordBatchBuilder;
 use otel_arrow_dfe_pdata::encode::record::metrics::{
@@ -21,7 +18,6 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-const AGGREGATION_TEMPORALITY_DELTA: i32 = 1;
 const AGGREGATION_TEMPORALITY_CUMULATIVE: i32 = 2;
 
 fn instance_attribute_value(instance: &InstanceIdentity) -> String {
@@ -39,12 +35,6 @@ struct ProjectionBuilder {
     metric_ids: BTreeMap<Arc<str>, u16>,
 }
 
-#[derive(Debug)]
-pub(super) struct ProjectionOutcome {
-    pub(super) records: Option<OtapArrowRecords>,
-    pub(super) monotonic_publications: Vec<MonotonicPublication>,
-}
-
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub(super) struct ProjectionInvariantError(ArrowError);
@@ -54,24 +44,6 @@ struct PreparedPoint<'a> {
     point: &'a SamplePoint,
     value: Number,
     start_time_unix_nano: Option<i64>,
-}
-
-impl PreparedPoint<'_> {
-    fn monotonic_publication(
-        &self,
-    ) -> Result<Option<MonotonicPublication>, ProjectionInvariantError> {
-        match &self.point.monotonic_publication {
-            None => Ok(None),
-            Some(MonotonicPublicationCandidate::Ready(publication)) => {
-                Ok(Some(publication.clone()))
-            }
-            Some(MonotonicPublicationCandidate::Pending) => {
-                Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
-                    "pending monotonic start has no worker publication".to_owned(),
-                )))
-            }
-        }
-    }
 }
 
 impl ProjectionBuilder {
@@ -119,7 +91,7 @@ impl ProjectionBuilder {
         self.metrics.append_id(metric_id);
         self.metrics.append_metric_type(match counter.metric_kind {
             MetricKind::Gauge => MetricType::Gauge as u8,
-            MetricKind::Sum { .. } => MetricType::Sum as u8,
+            MetricKind::Sum => MetricType::Sum as u8,
         });
         self.metrics.append_name(counter.name.as_bytes());
         self.metrics
@@ -130,16 +102,10 @@ impl ProjectionBuilder {
                 self.metrics.append_aggregation_temporality(None);
                 self.metrics.append_is_monotonic(None);
             }
-            MetricKind::Sum {
-                aggregation,
-                monotonic,
-            } => {
+            MetricKind::Sum => {
                 self.metrics
-                    .append_aggregation_temporality(Some(match aggregation {
-                        Aggregation::Cumulative => AGGREGATION_TEMPORALITY_CUMULATIVE,
-                        Aggregation::Delta => AGGREGATION_TEMPORALITY_DELTA,
-                    }));
-                self.metrics.append_is_monotonic(Some(monotonic));
+                    .append_aggregation_temporality(Some(AGGREGATION_TEMPORALITY_CUMULATIVE));
+                self.metrics.append_is_monotonic(Some(false));
             }
         }
         let _ = self.metric_ids.insert(counter.name.clone(), metric_id);
@@ -247,7 +213,7 @@ fn prepare_point<'a>(
     })?;
     let start_time_unix_nano = match counter.metric_kind {
         MetricKind::Gauge => None,
-        MetricKind::Sum { .. } => {
+        MetricKind::Sum => {
             let start = point.start_time_unix_nano.ok_or_else(|| {
                 ProjectionInvariantError(ArrowError::InvalidArgumentError(format!(
                     "Sum {} ({}) has no start time",
@@ -276,9 +242,8 @@ fn prepare_point<'a>(
 fn project(
     counters: &[CounterConfig],
     sample: &Sample,
-) -> Result<ProjectionOutcome, ProjectionInvariantError> {
+) -> Result<Option<OtapArrowRecords>, ProjectionInvariantError> {
     let mut builder = ProjectionBuilder::new();
-    let mut monotonic_publications = Vec::new();
     let mut membership = BTreeSet::new();
     for member in &sample.members {
         if member.counter_index >= counters.len() {
@@ -314,23 +279,15 @@ fn project(
                 "too many counter values".to_owned(),
             ))
         })?;
-        let publication = prepared.monotonic_publication()?;
         builder.append_point(point_id, prepared)?;
-        monotonic_publications.extend(publication);
     }
     if builder.metric_ids.is_empty() {
-        return Ok(ProjectionOutcome {
-            records: None,
-            monotonic_publications,
-        });
+        return Ok(None);
     }
     // Projection supplies valid UTF-8 and keeps every builder column aligned, so a finish error
     // indicates a violated internal invariant rather than a data-dependent scrape failure.
     let records = builder.finish().map_err(ProjectionInvariantError)?;
-    Ok(ProjectionOutcome {
-        records: Some(records),
-        monotonic_publications,
-    })
+    Ok(Some(records))
 }
 
 /// Project concrete observations using their own timestamps and required Sum starts.
@@ -338,7 +295,7 @@ fn project(
 pub(super) fn project_sample(
     counters: &[CounterConfig],
     sample: &Sample,
-) -> Result<ProjectionOutcome, ProjectionInvariantError> {
+) -> Result<Option<OtapArrowRecords>, ProjectionInvariantError> {
     project(counters, sample)
 }
 
@@ -347,11 +304,7 @@ pub(super) fn into_otap(
     counters: &[CounterConfig],
     sample: Sample,
 ) -> Result<Option<OtapArrowRecords>, ArrowError> {
-    let ProjectionOutcome {
-        records,
-        monotonic_publications: _,
-    } = project_sample(counters, &sample).map_err(|error| error.0)?;
-    Ok(records)
+    project_sample(counters, &sample).map_err(|error| error.0)
 }
 
 #[cfg(test)]

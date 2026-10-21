@@ -260,13 +260,7 @@ fn defaults_sum_to_non_monotonic() {
         &*config.counters[0].description,
         "Committed private memory for each process instance."
     );
-    assert_eq!(
-        config.counters[0].metric_kind,
-        MetricKind::Sum {
-            aggregation: Aggregation::Cumulative,
-            monotonic: false
-        }
-    );
+    assert_eq!(config.counters[0].metric_kind, MetricKind::Sum);
 }
 
 /// Scenario: A cumulative additive value is configured as a monotonic Sum.
@@ -422,13 +416,7 @@ fn resolves_implicit_path_name_to_metric_definition() {
     assert_eq!(counter.name.as_ref(), r"\Memory\Available Bytes");
     assert_eq!(counter.unit.as_ref(), "By");
     assert_eq!(counter.description.as_ref(), "Available physical memory.");
-    assert_eq!(
-        counter.metric_kind,
-        MetricKind::Sum {
-            aggregation: Aggregation::Cumulative,
-            monotonic: false,
-        }
-    );
+    assert_eq!(counter.metric_kind, MetricKind::Sum);
     assert!(counter.attributes.is_empty());
 }
 

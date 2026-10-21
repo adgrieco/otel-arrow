@@ -172,7 +172,7 @@ fn handle_for_path(state: &InvalidHandleState, path: &str) -> usize {
 }
 
 /// Scenario: One wildcard delta counter's native handle becomes invalid beside a healthy calculated counter.
-/// Guarantees: Only the invalid handle retires, bounded re-add failures do not accumulate handles, localization is preserved, and replacement history starts fresh.
+/// Guarantees: Only the invalid handle retires, retries stay bounded, and replacement re-warms native sampling without changing the cumulative start.
 #[test]
 fn invalid_handle_retries_one_counter_with_fresh_history() {
     let wildcard = r"\Process(worker*)\Operations Delta";
@@ -182,7 +182,7 @@ fn invalid_handle_retries_one_counter_with_fresh_history() {
         instance_config: InstanceConfig::Wildcard {
             excluded_aggregation: Some("_Total".to_owned()),
         },
-        ..delta_sum(wildcard, "process.operations", false)
+        ..cumulative_sum(wildcard, "process.operations", "{operation}")
     };
     let (state, mut query) = invalid_handle_query(
         vec![affected, counter(healthy, "system.cpu.time")],
@@ -274,7 +274,7 @@ fn invalid_handle_retries_one_counter_with_fresh_history() {
         .iter()
         .find(|point| point.counter_index == 0)
         .unwrap();
-    assert_eq!(affected.start_time_unix_nano, Some(140));
+    assert_eq!(affected.start_time_unix_nano, Some(100));
     assert!(matches!(
         affected.value,
         SampleValue::Value(Number::Double(60.0))
@@ -319,13 +319,13 @@ fn formatted_invalid_handle_retries_exact_counter() {
     assert_eq!(state.add_attempts.len(), 2);
 }
 
-/// Scenario: A published cumulative monotonic counter is re-added after its native handle becomes invalid.
-/// Guarantees: Handle replacement re-warms native readiness without resetting the unchanged series' published start/value/time.
+/// Scenario: A cumulative counter is re-added after its native handle becomes invalid.
+/// Guarantees: Handle replacement re-warms native readiness without resetting the original query start.
 #[test]
 fn invalid_handle_readd_preserves_cumulative_sequence() {
     let path = r"\Memory\Available Bytes";
     let (state, mut query) = invalid_handle_query(
-        vec![monotonic_sum(path, "system.memory.available", "By")],
+        vec![cumulative_sum(path, "system.memory.available", "By")],
         BTreeMap::new(),
     );
     query.prime().unwrap();
@@ -335,8 +335,7 @@ fn invalid_handle_readd_preserves_cumulative_sequence() {
         state.raw_value = 20;
     }
     let first = query.collect().unwrap();
-    assert_eq!(first.points[0].start_time_unix_nano, Some(110));
-    assert!(query.publish_monotonic_start(0, &first.points[0].path, 110));
+    assert_eq!(first.points[0].start_time_unix_nano, Some(100));
 
     let old_handle = handle_for_path(&state.borrow(), path);
     {
@@ -354,8 +353,7 @@ fn invalid_handle_readd_preserves_cumulative_sequence() {
         state.raw_value = 30;
     }
     let recovered = query.collect().unwrap();
-    assert_eq!(recovered.points[0].start_time_unix_nano, Some(110));
-    assert!(recovered.points[0].monotonic_publication.is_none());
+    assert_eq!(recovered.points[0].start_time_unix_nano, Some(100));
     assert!(matches!(
         recovered.points[0].value,
         SampleValue::Value(Number::Integer(30))
@@ -368,7 +366,7 @@ fn invalid_handle_readd_preserves_cumulative_sequence() {
 fn no_observation_does_not_recover_counter_handle() {
     let path = r"\Provider\Operations Delta";
     let (state, mut query) = invalid_handle_query(
-        vec![delta_sum(path, "provider.operations", false)],
+        vec![cumulative_sum(path, "provider.operations", "{operation}")],
         BTreeMap::new(),
     );
     let _ = state.borrow_mut().no_observation.insert(path.to_owned());
@@ -395,7 +393,7 @@ fn invalid_handle_cleanup_failure_requires_query_rebuild() {
     let healthy = r"\Processor(_Total)\% Processor Time";
     let (state, mut query) = invalid_handle_query(
         vec![
-            delta_sum(path, "provider.operations", false),
+            cumulative_sum(path, "provider.operations", "{operation}"),
             counter(healthy, "system.cpu.time"),
         ],
         BTreeMap::new(),
@@ -718,7 +716,7 @@ fn startup_prime_seeds_two_sample_histories() {
     let (state, mut query) = fake_query(
         vec![
             counter(rate_path, "system.cpu.time"),
-            delta_sum(delta_path, "provider.operations", false),
+            cumulative_sum(delta_path, "provider.operations", "{operation}"),
         ],
         vec![
             FakeCounter {
@@ -769,10 +767,7 @@ fn startup_prime_seeds_two_sample_histories() {
 fn cumulative_non_monotonic_sum_uses_query_start_time() {
     let path = r"\Process(_Total)\Private Bytes";
     let config = CounterConfig {
-        metric_kind: MetricKind::Sum {
-            aggregation: Aggregation::Cumulative,
-            monotonic: false,
-        },
+        metric_kind: MetricKind::Sum,
         ..counter(path, "windows.process.private")
     };
     let (state, mut query) = fake_query(
@@ -811,10 +806,7 @@ fn later_wildcard_member_uses_admission_start_time() {
     let template = r"\Process(*)\Private Bytes";
     let expanded = r"\Process(worker)\Private Bytes";
     let mut config = CounterConfig {
-        metric_kind: MetricKind::Sum {
-            aggregation: Aggregation::Cumulative,
-            monotonic: false,
-        },
+        metric_kind: MetricKind::Sum,
         ..counter(template, "windows.process.private")
     };
     config.instance_config = InstanceConfig::Wildcard {
@@ -1136,20 +1128,20 @@ fn queued_retry_stops_after_unsupported_type() {
     assert_eq!(state.borrow().removed, [0]);
 }
 
-/// Scenario: An exact delta Sum first fails transiently, then its queued retry finds a direct native counter.
-/// Guarantees: The invalid metric mapping is reported once, cleans up its native handle, and terminates the queued retry.
+/// Scenario: An exact Sum first fails transiently, then its retry finds an unsupported native base type.
+/// Guarantees: Permanent native rejection cleans up its handle and terminates the queued retry.
 #[test]
-fn queued_retry_stops_after_invalid_mapping() {
+fn queued_retry_stops_after_unsupported_base_type() {
     let path = r"\Object\Operations";
     let (state, mut query) = fake_query_with_cadences(
-        vec![delta_sum(path, "object.operations", false)],
+        vec![cumulative_sum(path, "object.operations", "{operation}")],
         Vec::new(),
         Duration::ZERO,
         Duration::ZERO,
     );
     state.borrow_mut().counters.push(FakeCounter {
         path: path.to_owned(),
-        native_type: 0x0001_0100,
+        native_type: 0x4003_0402,
         raw: None,
         multi_count: 1,
         formatted: Some(Number::Integer(42)),
@@ -1162,10 +1154,7 @@ fn queued_retry_stops_after_invalid_mapping() {
     assert_eq!(rejected.metadata.diagnostics.retry_recoveries, 0);
     assert_eq!(rejected.metadata.diagnostics.counter_add_failures, 2);
     assert_eq!(rejected.metadata.failures.len(), 2);
-    assert_eq!(
-        rejected.metadata.failures[1].reason,
-        "invalid_metric_mapping"
-    );
+    assert_eq!(rejected.metadata.failures[1].reason, "unsupported_type");
     assert_eq!(state.borrow().removed, [0]);
 
     state.borrow_mut().timestamp = 110;
@@ -1177,13 +1166,13 @@ fn queued_retry_stops_after_invalid_mapping() {
     assert_eq!(state.borrow().removed, [0]);
 }
 
-/// Scenario: An exact delta Sum retry finds an incompatible native type whose cleanup also fails.
+/// Scenario: An exact Sum retry finds an unsupported native type whose cleanup also fails.
 /// Guarantees: The combined setup failure escapes collection as rebuild-required instead of leaving an untracked native handle.
 #[test]
 fn queued_retry_cleanup_failure_requires_query_rebuild() {
     let path = r"\Object\Operations";
     let (state, mut query) = fake_query_with_cadences(
-        vec![delta_sum(path, "object.operations", false)],
+        vec![cumulative_sum(path, "object.operations", "{operation}")],
         Vec::new(),
         Duration::ZERO,
         Duration::ZERO,
@@ -1192,7 +1181,7 @@ fn queued_retry_cleanup_failure_requires_query_rebuild() {
         let mut state = state.borrow_mut();
         state.counters.push(FakeCounter {
             path: path.to_owned(),
-            native_type: 0x0001_0100,
+            native_type: 0x4003_0401,
             raw: None,
             multi_count: 1,
             formatted: Some(Number::Integer(42)),
@@ -1211,7 +1200,7 @@ fn queued_retry_cleanup_failure_requires_query_rebuild() {
         }
     ));
     assert!(error.requires_immediate_query_rebuild());
-    assert!(error.to_string().contains("invalid metric mapping"));
+    assert!(error.to_string().contains("unsupported"));
     assert!(error.to_string().contains("PdhRemoveCounter"));
     assert_eq!(state.borrow().removed, [0]);
 }
@@ -1596,12 +1585,12 @@ fn rediscovered_pending_removal_restores_existing_handle() {
 }
 
 /// Scenario: A wildcard Delta handle remains native-active while removal is pending, then is rediscovered.
-/// Guarantees: Restoration restarts PDH sampling so the first restored point warms and the next Delta interval starts at restoration time.
+/// Guarantees: Restoration re-warms native sampling and retains the cumulative query start.
 #[test]
 fn rediscovered_pending_delta_removal_restarts_sampling() {
     let template = r"\Process(*)\Operations Delta";
     let expanded = r"\Process(worker)\Operations Delta";
-    let mut config = delta_sum(template, "process.operations", false);
+    let mut config = cumulative_sum(template, "process.operations", "{operation}");
     config.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
     };
@@ -1667,7 +1656,7 @@ fn rediscovered_pending_delta_removal_restarts_sampling() {
         state.timestamp = 140;
     }
     let recovered = query.collect().unwrap();
-    assert_eq!(recovered.points[0].start_time_unix_nano, Some(130));
+    assert_eq!(recovered.points[0].start_time_unix_nano, Some(100));
     assert_eq!(
         recovered.points[0].value,
         SampleValue::Value(Number::Double(5.0))

@@ -1329,76 +1329,13 @@ fn query_rejects_limit_below_exact_reservation() {
     ));
 }
 
-/// Scenario: A monotonic collection is discarded before delivery, and a later scrape succeeds.
-/// Guarantees: The discarded point does not consume the unknown start, so the next delivered candidate starts at its own timestamp and only its acknowledgement establishes the sequence.
-#[test]
-fn discarded_monotonic_collection_does_not_consume_start() {
-    let path = r"\TCPv4\Connection Failures";
-    let config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
-    let states = Rc::new(RefCell::new(Vec::new()));
-    let factory_states = Rc::clone(&states);
-    let mut open = move |configs: Vec<CounterConfig>,
-                         _max_native_counters: usize,
-                         _seed: Option<&QueryRecreationSeed>| {
-        let (state, query) = fake_query(
-            configs,
-            vec![FakeCounter {
-                path: path.to_owned(),
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(10)),
-                raw_error: false,
-                formatted_error: false,
-            }],
-        );
-        factory_states.borrow_mut().push(state);
-        Ok(query)
-    };
-    let mut queries = query_plans(vec![config])
-        .into_iter()
-        .map(|plan| QuerySlot::open_initial(plan, 4_096, &mut open).unwrap())
-        .collect::<Vec<_>>();
-
-    {
-        let states = states.borrow();
-        let mut state = states[0].borrow_mut();
-        state.timestamp = 110;
-        state.counters[0].formatted = Some(Number::Integer(20));
-    }
-    let discarded =
-        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
-    assert_eq!(discarded.points[0].start_time_unix_nano, Some(110));
-
-    {
-        let states = states.borrow();
-        let mut state = states[0].borrow_mut();
-        state.timestamp = 120;
-        state.counters[0].formatted = Some(Number::Integer(30));
-    }
-    let delivered =
-        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
-    assert_eq!(delivered.points[0].start_time_unix_nano, Some(120));
-    publish_monotonic_starts(&mut queries, collected_monotonic_publications(&delivered));
-
-    {
-        let states = states.borrow();
-        let mut state = states[0].borrow_mut();
-        state.timestamp = 130;
-        state.counters[0].formatted = Some(Number::Integer(40));
-    }
-    let retained =
-        collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
-    assert_eq!(retained.points[0].start_time_unix_nano, Some(120));
-}
-
 /// Scenario: A delta mapping and a recreated peer collect through separate queries with different clocks.
 /// Guarantees: Each delta interval starts exactly at that series' previous point timestamp without overlap from the later peer timestamp.
 #[test]
 fn cross_query_delta_intervals_use_their_own_timestamps() {
     let delta_path = r"\Provider\Operations Delta";
     let peer_path = r"\Memory\Available Bytes";
-    let mut delta = delta_sum(delta_path, "provider.operations", false);
+    let mut delta = cumulative_sum(delta_path, "provider.operations", "{operation}");
     delta.source_mapping_index = 0;
     let mut recreated_peer = counter(peer_path, "windows.memory.available");
     recreated_peer.recreate_query = true;
@@ -1466,10 +1403,7 @@ fn cross_query_delta_intervals_use_their_own_timestamps() {
     }
     let second = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
     assert_eq!(second.timestamp_unix_nano, 125);
-    assert_eq!(
-        second.points[0].start_time_unix_nano,
-        Some(first.points[0].timestamp_unix_nano)
-    );
+    assert_eq!(second.points[0].start_time_unix_nano, Some(100));
     assert_eq!(second.points[0].timestamp_unix_nano, 120);
 }
 
@@ -1479,7 +1413,7 @@ fn cross_query_delta_intervals_use_their_own_timestamps() {
 fn isolated_query_failure_preserves_healthy_peer_output() {
     let shared_path = r"\Memory\Available Bytes";
     let isolated_path = r"\Processor(_Total)\% Processor Time";
-    let mut shared = monotonic_sum(shared_path, "windows.memory.available", "By");
+    let mut shared = cumulative_sum(shared_path, "windows.memory.available", "By");
     shared.source_mapping_index = 0;
     let mut isolated = counter(isolated_path, "windows.processor.time");
     isolated.recreate_query = true;
@@ -1530,10 +1464,7 @@ fn isolated_query_failure_preserves_healthy_peer_output() {
 
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.points[0].counter_index, 0);
-    assert_eq!(
-        sample.points[0].start_time_unix_nano,
-        Some(sample.points[0].timestamp_unix_nano)
-    );
+    assert_eq!(sample.points[0].start_time_unix_nano, Some(100));
     assert_eq!(sample.metadata.failures.len(), 1);
     assert_eq!(sample.metadata.failures[0].counter_index, 1);
     assert_eq!(sample.metadata.failures[0].reason, "PdhCollectQueryData");
@@ -1549,7 +1480,7 @@ fn isolated_query_failure_preserves_healthy_peer_output() {
 fn recreated_query_primes_before_swap_and_preserves_old_query_on_failure() {
     let shared_path = r"\Memory\Available Bytes";
     let isolated_path = r"\Processor(_Total)\% Processor Time";
-    let mut shared = monotonic_sum(shared_path, "windows.memory.available", "By");
+    let mut shared = cumulative_sum(shared_path, "windows.memory.available", "By");
     shared.source_mapping_index = 0;
     let mut isolated = counter(isolated_path, "windows.processor.time");
     isolated.recreate_query = true;
@@ -1656,17 +1587,16 @@ fn recreated_query_primes_before_swap_and_preserves_old_query_on_failure() {
                 assert!(sample.metadata.failures.is_empty());
             }
         }
-        publish_monotonic_starts(&mut queries, collected_monotonic_publications(&sample));
     }
     assert_eq!(open_calls.get(), 6);
 }
 
-/// Scenario: A recreated monotonic direct-count query is primed after collection but before that collection's delivery acknowledgement.
-/// Guarantees: The unchanged replacement retains the pending publication identity, accepts the acknowledgement, and keeps the published start.
+/// Scenario: A recreated cumulative Sum query is primed between scheduled collections.
+/// Guarantees: The replacement seed preserves the original query start through collection and projection.
 #[test]
-fn recreated_monotonic_query_preserves_start_and_publication() {
+fn recreated_cumulative_query_preserves_start() {
     let path = r"\TCPv4\Connection Failures";
-    let mut config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
+    let mut config = cumulative_sum(path, "windows.tcp.connection_failures", "{failure}");
     config.recreate_query = true;
     let projection_config = config.clone();
     let states = Rc::new(RefCell::new(Vec::new()));
@@ -1714,12 +1644,12 @@ fn recreated_monotonic_query_preserves_start_and_publication() {
         let sample =
             collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
         assert_eq!(sample.points[0].timestamp_unix_nano, timestamp);
-        assert_eq!(sample.points[0].start_time_unix_nano, Some(110));
+        assert_eq!(sample.points[0].start_time_unix_nano, Some(100));
 
         if scrape_index == 0 {
             let projection =
                 project_sample(std::slice::from_ref(&projection_config), &sample).unwrap();
-            let records = projection.records.unwrap();
+            let records = projection.unwrap();
             let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
             let starts = points
                 .column_by_name("start_time_unix_nano")
@@ -1733,31 +1663,19 @@ fn recreated_monotonic_query_preserves_start_and_publication() {
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampNanosecondArray>()
                 .unwrap();
-            assert_eq!(starts.value(0), times.value(0));
-            assert_eq!(projection.monotonic_publications.len(), 1);
-            let publication = &projection.monotonic_publications[0];
-            assert_eq!(
-                queries[0]
-                    .query
-                    .as_ref()
-                    .unwrap()
-                    .monotonic_sequence(0, &publication.path)
-                    .unwrap()
-                    .pending_start_time_unix_nano,
-                Some(110)
-            );
-            assert!(queries[0].publish_monotonic_start(publication));
+            assert_eq!(starts.value(0), 100);
+            assert_eq!(times.value(0), 110);
         }
     }
     assert_eq!(open_calls.get(), 3);
 }
 
-/// Scenario: A monotonic cumulative Sum applies a nonzero decimal scale before OTAP delivery.
-/// Guarantees: Delivery publishes the native monotonic start without requiring an integer projected value, and the next scrape retains that start.
+/// Scenario: A cumulative Sum applies a nonzero decimal scale before OTAP delivery.
+/// Guarantees: Both scaled observations retain the fixed query start and project successfully.
 #[test]
-fn scaled_monotonic_sum_publishes_and_retains_start() {
+fn scaled_cumulative_sum_retains_start() {
     let path = r"\TCPv4\Connection Failures";
-    let mut config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
+    let mut config = cumulative_sum(path, "windows.tcp.connection_failures", "{failure}");
     config.scale_power10 = -1;
     let projection_config = config.clone();
     let states = Rc::new(RefCell::new(Vec::new()));
@@ -1790,10 +1708,9 @@ fn scaled_monotonic_sum_publishes_and_retains_start() {
         state.counters[0].formatted = Some(Number::Integer(10));
     }
     let first = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
-    assert_eq!(first.points[0].start_time_unix_nano, Some(110));
+    assert_eq!(first.points[0].start_time_unix_nano, Some(100));
     let projection = project_sample(std::slice::from_ref(&projection_config), &first).unwrap();
-    assert_eq!(projection.monotonic_publications.len(), 1);
-    publish_monotonic_starts(&mut queries, projection.monotonic_publications);
+    assert!(projection.is_some());
 
     {
         let states = states.borrow();
@@ -1802,15 +1719,15 @@ fn scaled_monotonic_sum_publishes_and_retains_start() {
         state.counters[0].formatted = Some(Number::Integer(20));
     }
     let second = collect_queries(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
-    assert_eq!(second.points[0].start_time_unix_nano, Some(110));
+    assert_eq!(second.points[0].start_time_unix_nano, Some(100));
     let projection = project_sample(std::slice::from_ref(&projection_config), &second).unwrap();
-    assert!(projection.records.is_some());
+    assert!(projection.is_some());
 }
 
-/// Scenario: A published monotonic direct-count sequence is rebuilt after repeated collection failures and primed successfully.
-/// Guarantees: Rebuild priming preserves the unchanged series' published start/value/time instead of beginning a fresh sequence.
+/// Scenario: A cumulative Sum query is rebuilt after repeated collection failures and primed successfully.
+/// Guarantees: Rebuild priming preserves the original query start through the recreation seed.
 #[test]
-fn rebuilt_monotonic_query_preserves_published_start() {
+fn rebuilt_cumulative_query_preserves_start() {
     let path = r"\TCPv4\Connection Failures";
     let states = Rc::new(RefCell::new(Vec::new()));
     let factory_states = Rc::clone(&states);
@@ -1842,7 +1759,7 @@ fn rebuilt_monotonic_query_preserves_published_start() {
         factory_states.borrow_mut().push(state);
         Ok(query)
     };
-    let config = monotonic_sum(path, "windows.tcp.connection_failures", "{failure}");
+    let config = cumulative_sum(path, "windows.tcp.connection_failures", "{failure}");
     let plan = query_plans(vec![config.clone()]).pop().unwrap();
     let mut queries = vec![QuerySlot::open_initial(plan, 4_096, &mut open).unwrap()];
     {
@@ -1852,9 +1769,9 @@ fn rebuilt_monotonic_query_preserves_published_start() {
         state.counters[0].formatted = Some(Number::Integer(20));
     }
     let first = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
-    assert_eq!(first.points[0].start_time_unix_nano, Some(110));
+    assert_eq!(first.points[0].start_time_unix_nano, Some(100));
     let projection = project_sample(std::slice::from_ref(&config), &first).unwrap();
-    publish_monotonic_starts(&mut queries, projection.monotonic_publications);
+    assert!(projection.is_some());
 
     states.borrow()[0].borrow_mut().collect_error = true;
     let now = Instant::now();
@@ -1880,7 +1797,7 @@ fn rebuilt_monotonic_query_preserves_published_start() {
         .collect(now, Duration::ZERO, 4_096, &mut open)
         .unwrap();
     assert_eq!(recovered.points[0].timestamp_unix_nano, 120);
-    assert_eq!(recovered.points[0].start_time_unix_nano, Some(110));
+    assert_eq!(recovered.points[0].start_time_unix_nano, Some(100));
     assert_eq!(open_calls.get(), 2);
 }
 

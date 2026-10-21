@@ -72,8 +72,6 @@ pub(in super::super) enum Error {
     },
     #[error(transparent)]
     UnsupportedType(#[from] UnsupportedNativeType),
-    #[error("invalid metric mapping for {path}: {message}")]
-    InvalidMetricMapping { path: String, message: String },
     #[error("counter setup for {path} failed: {message}")]
     CounterSetup {
         path: String,
@@ -128,7 +126,6 @@ impl Error {
             Self::Pdh { .. }
                 | Self::CounterData { .. }
                 | Self::UnsupportedType(_)
-                | Self::InvalidMetricMapping { .. }
                 | Self::CounterSetup { .. }
                 | Self::InvalidCounterToken { .. }
                 | Self::Calculation { .. }
@@ -200,7 +197,6 @@ impl Error {
         match self {
             Self::Pdh { operation, .. } | Self::CounterData { operation, .. } => operation.as_str(),
             Self::UnsupportedType(_) => "unsupported_type",
-            Self::InvalidMetricMapping { .. } => "invalid_metric_mapping",
             Self::CounterSetup { .. } => "counter_setup",
             Self::InvalidCounterToken { .. } => "invalid_counter_token",
             Self::InvalidSample(_) => "invalid_sample",
@@ -230,7 +226,6 @@ impl Error {
             Self::UnsupportedType(error) => {
                 format!("unsupported native type 0x{:08X}", error.native_type)
             }
-            Self::InvalidMetricMapping { message, .. } => message.clone(),
             Self::CounterSetup { message, .. } => message.clone(),
             Self::InvalidCounterToken { .. } => self.to_string(),
             Self::InvalidSample(message) => (*message).to_owned(),
@@ -244,7 +239,6 @@ impl Error {
         match self {
             Self::Pdh { path, .. }
             | Self::CounterData { path, .. }
-            | Self::InvalidMetricMapping { path, .. }
             | Self::CounterSetup { path, .. }
             | Self::InvalidCounterToken { path }
             | Self::Calculation { path, .. }
@@ -257,7 +251,6 @@ impl Error {
         matches!(
             self,
             Self::UnsupportedType(_)
-                | Self::InvalidMetricMapping { .. }
                 | Self::CounterSetup {
                     permanent: true,
                     ..

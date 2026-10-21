@@ -30,30 +30,7 @@ fn counter(path: &str, name: &str, unit: &str) -> CounterConfig {
 
 fn non_monotonic_sum(path: &str, name: &str, unit: &str) -> CounterConfig {
     CounterConfig {
-        metric_kind: MetricKind::Sum {
-            aggregation: Aggregation::Cumulative,
-            monotonic: false,
-        },
-        ..counter(path, name, unit)
-    }
-}
-
-fn monotonic_sum(path: &str, name: &str, unit: &str) -> CounterConfig {
-    CounterConfig {
-        metric_kind: MetricKind::Sum {
-            aggregation: Aggregation::Cumulative,
-            monotonic: true,
-        },
-        ..counter(path, name, unit)
-    }
-}
-
-fn delta_sum(path: &str, name: &str, unit: &str, monotonic: bool) -> CounterConfig {
-    CounterConfig {
-        metric_kind: MetricKind::Sum {
-            aggregation: Aggregation::Delta,
-            monotonic,
-        },
+        metric_kind: MetricKind::Sum,
         ..counter(path, name, unit)
     }
 }
@@ -75,7 +52,6 @@ fn point_at(
         emit_instance_attribute: false,
         timestamp_unix_nano,
         start_time_unix_nano: None,
-        monotonic_publication: None,
         value,
     }
 }
@@ -282,7 +258,6 @@ fn projects_static_attribute_spelling_verbatim() {
             emit_instance_attribute: true,
             timestamp_unix_nano: 10,
             start_time_unix_nano: None,
-            monotonic_publication: None,
             value: SampleValue::Value(Number::Integer(42 + index as i64)),
         })
         .collect();
@@ -472,15 +447,14 @@ fn projects_integer_gauges() {
     assert_eq!(time.value(0), timestamp);
 }
 
-/// Scenario: A delta point from an earlier query is merged into a sample with a later peer timestamp.
-/// Guarantees: OTAP uses the point's own interval end instead of stretching it to the merged sample timestamp.
+/// Scenario: A cumulative point has an observation time earlier than its containing sample.
+/// Guarantees: OTAP preserves the point's own start and observation timestamps.
 #[test]
-fn projects_delta_with_its_query_timestamp() {
-    let counter = delta_sum(
+fn projects_sum_with_its_observation_timestamp() {
+    let counter = non_monotonic_sum(
         r"\Provider\Operations Delta",
         "provider.operations",
         "{operation}",
-        false,
     );
     let mut point = sum_point(0, r"\Provider\Operations Delta", 100, Number::Double(2.0));
     point.timestamp_unix_nano = 110;
@@ -578,129 +552,6 @@ fn projects_integer_non_monotonic_sum() {
             .value(0),
         5
     );
-}
-
-/// Scenario: The first running-count observation is configured as a monotonic Sum.
-/// Guarantees: OTAP emits cumulative monotonic metadata with start time equal to point time.
-#[test]
-fn projects_integer_monotonic_sum() {
-    let counters = [monotonic_sum(
-        r"\Custom Provider\Operations",
-        "windows.operations",
-        "{operation}",
-    )];
-    let records = into_otap(
-        &counters,
-        Sample {
-            timestamp_unix_nano: 10,
-            members: Vec::new(),
-            points: vec![sum_point(
-                0,
-                r"\Custom Provider\Operations",
-                10,
-                Number::Integer(42),
-            )],
-            metadata: Default::default(),
-        },
-    )
-    .unwrap()
-    .unwrap();
-    let metrics = records.get(ArrowPayloadType::UnivariateMetrics).unwrap();
-    assert_eq!(
-        metrics
-            .column_by_name("metric_type")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .unwrap()
-            .value(0),
-        MetricType::Sum as u8
-    );
-    assert_eq!(
-        array_value_to_string(
-            metrics
-                .column_by_name("aggregation_temporality")
-                .unwrap()
-                .as_ref(),
-            0
-        )
-        .unwrap(),
-        AGGREGATION_TEMPORALITY_CUMULATIVE.to_string()
-    );
-    assert_eq!(
-        array_value_to_string(metrics.column_by_name("is_monotonic").unwrap().as_ref(), 0).unwrap(),
-        "true"
-    );
-    let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
-    assert_eq!(
-        points
-            .column_by_name("start_time_unix_nano")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
-            .unwrap()
-            .value(0),
-        10
-    );
-}
-
-/// Scenario: Two native delta-count mappings share one metric with different valid intervals.
-/// Guarantees: Projection emits delta Sum metadata and preserves each point's strict interval start.
-#[test]
-fn projects_delta_sum_intervals() {
-    let counters = [
-        delta_sum(
-            r"\Provider\Delta A",
-            "windows.operations",
-            "{operation}",
-            true,
-        ),
-        delta_sum(
-            r"\Provider\Delta B",
-            "windows.operations",
-            "{operation}",
-            true,
-        ),
-    ];
-    let records = into_otap(
-        &counters,
-        Sample {
-            timestamp_unix_nano: 10,
-            members: Vec::new(),
-            points: vec![
-                sum_point(0, r"\Provider\Delta A", 5, Number::Double(2.0)),
-                sum_point(1, r"\Provider\Delta B", 7, Number::Double(3.0)),
-            ],
-            metadata: Default::default(),
-        },
-    )
-    .unwrap()
-    .unwrap();
-    let metrics = records.get(ArrowPayloadType::UnivariateMetrics).unwrap();
-    assert_eq!(metrics.num_rows(), 1);
-    assert_eq!(
-        array_value_to_string(
-            metrics
-                .column_by_name("aggregation_temporality")
-                .unwrap()
-                .as_ref(),
-            0
-        )
-        .unwrap(),
-        AGGREGATION_TEMPORALITY_DELTA.to_string()
-    );
-    assert_eq!(
-        array_value_to_string(metrics.column_by_name("is_monotonic").unwrap().as_ref(), 0).unwrap(),
-        "true"
-    );
-    let points = records.get(ArrowPayloadType::NumberDataPoints).unwrap();
-    let starts = points
-        .column_by_name("start_time_unix_nano")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<arrow::array::TimestampNanosecondArray>()
-        .unwrap();
-    assert_eq!([starts.value(0), starts.value(1)], [5, 7]);
 }
 
 /// Scenario: A ready Sum point reaches projection without its required cumulative or delta interval start.
@@ -1097,7 +948,6 @@ fn projects_wildcard_instance_identity() {
                     emit_instance_attribute: true,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
-                    monotonic_publication: None,
                     value: SampleValue::Value(Number::Integer(10)),
                 },
                 SamplePoint {
@@ -1111,7 +961,6 @@ fn projects_wildcard_instance_identity() {
                     emit_instance_attribute: true,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
-                    monotonic_publication: None,
                     value: SampleValue::Value(Number::Integer(20)),
                 },
             ],
@@ -1182,7 +1031,6 @@ fn projects_aggregate_instance_selection() {
                     emit_instance_attribute: false,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
-                    monotonic_publication: None,
                     value: SampleValue::Value(Number::Integer(10)),
                 },
                 SamplePoint {
@@ -1192,7 +1040,6 @@ fn projects_aggregate_instance_selection() {
                     emit_instance_attribute: true,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
-                    monotonic_publication: None,
                     value: SampleValue::Value(Number::Integer(20)),
                 },
             ],
@@ -1261,7 +1108,6 @@ fn static_instance_override_preserves_both_native_sources() {
                     emit_instance_attribute: true,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
-                    monotonic_publication: None,
                     value: SampleValue::Value(Number::Integer(10)),
                 },
                 SamplePoint {
@@ -1275,7 +1121,6 @@ fn static_instance_override_preserves_both_native_sources() {
                     emit_instance_attribute: true,
                     timestamp_unix_nano: 1,
                     start_time_unix_nano: None,
-                    monotonic_publication: None,
                     value: SampleValue::Value(Number::Integer(20)),
                 },
             ],
@@ -1283,7 +1128,7 @@ fn static_instance_override_preserves_both_native_sources() {
         },
     )
     .unwrap();
-    let request = decode(outcome.records.unwrap());
+    let request = decode(outcome.unwrap());
     let metric = &request.resource_metrics[0].scope_metrics[0].metrics[0];
     let Some(metric::Data::Gauge(gauge)) = &metric.data else {
         panic!("expected Gauge");
@@ -1344,7 +1189,6 @@ fn overlapping_patterns_publish_each_valid_mapping() {
                 emit_instance_attribute: true,
                 timestamp_unix_nano: 1,
                 start_time_unix_nano: None,
-                monotonic_publication: None,
                 value: SampleValue::Warming,
             },
             SamplePoint {
@@ -1354,7 +1198,6 @@ fn overlapping_patterns_publish_each_valid_mapping() {
                 emit_instance_attribute: true,
                 timestamp_unix_nano: 1,
                 start_time_unix_nano: None,
-                monotonic_publication: None,
                 value: SampleValue::Value(Number::Integer(20)),
             },
         ],
@@ -1364,7 +1207,6 @@ fn overlapping_patterns_publish_each_valid_mapping() {
     let first_request = decode(
         project_sample(&[first.clone(), second.clone()], &sample)
             .unwrap()
-            .records
             .unwrap(),
     );
     let Some(metric::Data::Gauge(gauge)) =
@@ -1380,7 +1222,7 @@ fn overlapping_patterns_publish_each_valid_mapping() {
 
     sample.points[0].value = SampleValue::Value(Number::Integer(10));
     let recovered = project_sample(&[first, second], &sample).unwrap();
-    let request = decode(recovered.records.unwrap());
+    let request = decode(recovered.unwrap());
     let Some(metric::Data::Gauge(gauge)) =
         &request.resource_metrics[0].scope_metrics[0].metrics[0].data
     else {

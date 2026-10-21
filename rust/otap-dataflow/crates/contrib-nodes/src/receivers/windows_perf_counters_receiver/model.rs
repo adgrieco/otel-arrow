@@ -72,24 +72,6 @@ pub(super) struct InstanceIdentity {
     pub(super) index: u32,
 }
 
-/// One delivered monotonic cumulative point whose start can be committed by the worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct MonotonicPublication {
-    pub(super) counter_index: usize,
-    pub(super) path: Arc<str>,
-    pub(super) query_generation: u64,
-    pub(super) timestamp_unix_nano: i64,
-}
-
-/// Publication state for an unknown monotonic cumulative start.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum MonotonicPublicationCandidate {
-    /// The query identified a point whose start is not published yet.
-    Pending,
-    /// The worker attached the query identity needed to publish the start.
-    Ready(MonotonicPublication),
-}
-
 /// One exact or expanded counter point in a collection.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct SamplePoint {
@@ -101,12 +83,10 @@ pub(super) struct SamplePoint {
     pub(super) instance: Option<Arc<InstanceIdentity>>,
     /// Whether to emit the Go-compatible `instance` attribute for this point.
     pub(super) emit_instance_attribute: bool,
-    /// End of this point's observation or delta interval.
+    /// Time of this point's observation.
     pub(super) timestamp_unix_nano: i64,
-    /// Start of this point's cumulative sequence or delta interval.
+    /// Start of this point's cumulative sequence, when applicable.
     pub(super) start_time_unix_nano: Option<i64>,
-    /// Worker-owned acknowledgement state for an unknown monotonic cumulative start.
-    pub(super) monotonic_publication: Option<MonotonicPublicationCandidate>,
     /// Ready value or expected omission.
     pub(super) value: SampleValue,
 }
