@@ -901,7 +901,7 @@ async fn live_pdh_refreshes_process_membership_after_duplicate_renumbering() {
     assert_eq!(observed.ids, expected);
 }
 
-/// Scenario: Parsed configuration names duplicate live process instances using #0 and #1.
+/// Scenario: Parsed configuration names duplicate live process instances using #0 and #01.
 /// Guarantees: Configured suffix spelling reaches PDH unchanged and collects exactly the fixture process IDs.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
@@ -932,7 +932,7 @@ async fn live_pdh_collects_parsed_instance_paths() {
         },
         "perfcounters": [{
             "object": "Process",
-            "instances": [format!("{instance}#0"), format!("{instance}#1")],
+            "instances": [format!("{instance}#0"), format!("{instance}#01")],
             "counters": [{"name": "ID Process", "metric": "process.id"}]
         }]
     }))
@@ -943,7 +943,7 @@ async fn live_pdh_collects_parsed_instance_paths() {
     );
     assert_eq!(
         config.counters[1].path,
-        format!(r"\Process({instance}#1)\ID Process")
+        format!(r"\Process({instance}#01)\ID Process")
     );
     let counters = config.counters.clone();
     let mut query = open_live_query(counters.clone(), "parsed");

@@ -1886,7 +1886,7 @@ fn preserves_explicit_instance_indexes() {
 }
 
 /// Scenario: Numeric-suffix aliases appear in one list or separate object entries.
-/// Guarantees: Both duplicate checks reject zero and leading-zero aliases using the same comparison rule.
+/// Guarantees: Both duplicate checks reject aliases consistently, including mixed implicit and explicit metric names.
 #[test]
 fn rejects_instance_alias_duplicates() {
     for [first, second] in [
@@ -1910,14 +1910,26 @@ fn rejects_instance_alias_duplicates() {
             "duplicate counter path",
         );
     }
+    assert_config_error(
+        json!({
+            "metrics": {"explicit": {}},
+            "perfcounters": [
+                {"object": "Process", "instances": "app#001", "counters": [{"name": "Private Bytes"}]},
+                {"object": "process", "instances": "APP#1", "counters": [{"name": "private bytes", "metric": "explicit"}]}
+            ]
+        }),
+        "duplicate counter path",
+    );
 }
 
-/// Scenario: Instance text has padding, nonnumeric/non-ASCII suffixes or repeated hashes.
+/// Scenario: Distinct numeric indexes coexist with padded, nonnumeric/non-ASCII suffixes and repeated hashes.
 /// Guarantees: Comparison canonicalizes only one final ASCII numeric suffix without trimming or recursion.
 #[test]
 fn preserves_literal_instance_suffix_text() {
     let instances = [
         "app",
+        "app#1",
+        "app#2",
         "app#0 ",
         "app#01 ",
         " app#0",

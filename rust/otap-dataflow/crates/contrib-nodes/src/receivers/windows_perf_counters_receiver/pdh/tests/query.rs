@@ -1475,6 +1475,46 @@ fn startup_prime_preserves_counter_failures() {
     assert!(state.borrow().removed.is_empty());
 }
 
+/// Scenario: Exact configuration contains padded native components and zero or leading-zero suffixes.
+/// Guarantees: English adds and collected paths retain configured spelling without trimming or suffix rewriting.
+#[test]
+fn configured_exact_paths_reach_adapter_verbatim() {
+    let config = Config::from_json(&serde_json::json!({"perfcounters": [
+        {"object": " Process ", "instances": [" app#0 ", "app#01"],
+         "counters": [{"name": " Private Bytes "}]},
+        {"object": "Memory", "counters": [{"name": "Available Bytes "}]}
+    ]}))
+    .unwrap();
+    let paths = [
+        r"\ Process ( app#0 )\ Private Bytes ",
+        r"\ Process (app#01)\ Private Bytes ",
+        r"\Memory\Available Bytes ",
+    ];
+    let (state, mut query) = fake_query(
+        config.counters,
+        paths
+            .iter()
+            .map(|path| fake_counter(path, Number::Integer(42)))
+            .collect(),
+    );
+    assert_eq!(
+        state.borrow().attempted_adds,
+        paths
+            .iter()
+            .map(|path| ((*path).to_owned(), CounterLanguage::English))
+            .collect::<Vec<_>>()
+    );
+    let sample = query.collect().unwrap();
+    assert_eq!(
+        sample
+            .points
+            .iter()
+            .map(|point| point.path.as_ref())
+            .collect::<Vec<_>>(),
+        paths
+    );
+}
+
 /// Scenario: One exact configured path names a duplicate process instance.
 /// Guarantees: Query opening preserves parsed instance identity for non-wildcard counters.
 #[test]
