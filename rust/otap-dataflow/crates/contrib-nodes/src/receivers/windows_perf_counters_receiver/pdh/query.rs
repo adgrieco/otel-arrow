@@ -583,6 +583,19 @@ impl<A: PdhApi> Query<A> {
                         state.target.emit_instance_attribute,
                     ))
             }))
+            .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
+                removal.retry_target.as_ref().and_then(|target| {
+                    (target.config_index == config_index && target.origin.is_wildcard()).then_some(
+                        (
+                            target.admission_order.unwrap_or(u64::MAX),
+                            key,
+                            &target.path,
+                            &target.instance,
+                            target.emit_instance_attribute,
+                        ),
+                    )
+                })
+            }))
             .filter_map(
                 |(admission_order, key, path, instance, emit_instance_attribute)| {
                     instance.clone().map(|instance| {
@@ -745,6 +758,17 @@ impl<A: PdhApi> Query<A> {
                     ),
                 ))
             }))
+            .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
+                removal.retry_target.as_ref().and_then(|target| {
+                    target.origin.is_wildcard().then_some((
+                        key,
+                        (
+                            target.admission_order.unwrap_or(u64::MAX),
+                            target.config_index,
+                        ),
+                    ))
+                })
+            }))
             .collect::<BTreeMap<_, _>>();
         let mut candidates = prepared
             .iter()
@@ -849,9 +873,9 @@ impl<A: PdhApi> Query<A> {
     fn restore_rediscovered_pending_removals(&mut self, discovered: &BTreeSet<CounterKey>) {
         let restored = self
             .pending_removals
-            .keys()
-            .filter(|key| discovered.contains(*key))
-            .cloned()
+            .iter()
+            .filter(|(key, removal)| !removal.replacement_required && discovered.contains(*key))
+            .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in restored {
             let Some(mut removal) = self.pending_removals.remove(&key) else {
@@ -903,6 +927,13 @@ impl<A: PdhApi> Query<A> {
                         .target
                         .instance
                         .as_deref()
+                        .map(|instance| (key, instance))
+                }))
+                .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
+                    removal
+                        .retry_target
+                        .as_ref()
+                        .and_then(|target| target.instance.as_deref())
                         .map(|instance| (key, instance))
                 })),
         )
@@ -970,6 +1001,16 @@ impl<A: PdhApi> Query<A> {
         for key in removed_retry_instances {
             let _ = self.retry_states.remove(&key);
         }
+        for (key, removal) in &mut self.pending_removals {
+            if removal.counter.origin.is_wildcard()
+                && !wanted.contains(key)
+                && removal.retry_target.take().is_some()
+                && !removal.counter.removal_counted
+            {
+                metadata.diagnostics.instances_removed += 1;
+                removal.counter.removal_counted = true;
+            }
+        }
     }
 
     fn remove_wildcard_counters(
@@ -1026,7 +1067,11 @@ impl<A: PdhApi> Query<A> {
     ) -> Result<(), Error> {
         let now = Instant::now();
         for key in added {
-            if self.pending_removals.contains_key(key) {
+            if self
+                .pending_removals
+                .get(key)
+                .is_some_and(|removal| removal.retry_target.is_some())
+            {
                 continue;
             }
             let Some(DesiredCounter {
@@ -1052,6 +1097,10 @@ impl<A: PdhApi> Query<A> {
                 removal_counted: false,
                 history: CounterHistory::default(),
             };
+            if let Some(removal) = self.pending_removals.get_mut(key) {
+                removal.retry_target = Some(target);
+                continue;
+            }
             let was_retry = self.retry_states.contains_key(key);
             if self.try_add_target(key.clone(), target, now, metadata)?
                 && !live.contains(key)
@@ -1163,7 +1212,14 @@ impl<A: PdhApi> Query<A> {
     fn remaining_expansion_capacity(&self, allocated_expanded: usize) -> usize {
         self.max_native_counters
             .saturating_sub(self.exact_counter_reservations)
-            .saturating_sub(self.pending_wildcard_removal_count())
+            .saturating_sub(
+                self.pending_removals
+                    .values()
+                    .filter(|removal| {
+                        removal.counter.origin.is_wildcard() && removal.retry_target.is_none()
+                    })
+                    .count(),
+            )
             .saturating_sub(allocated_expanded)
     }
 
@@ -1185,6 +1241,7 @@ impl<A: PdhApi> Query<A> {
             .saturating_add(self.pending_wildcard_removal_count())
     }
 
+    #[cfg(test)]
     fn pending_wildcard_removal_count(&self) -> usize {
         self.pending_removals
             .values()
@@ -1634,6 +1691,8 @@ struct CounterHandle<C> {
 struct PendingRemoval<C> {
     counter: CounterHandle<C>,
     retry_target: Option<CounterTarget>,
+    // Rediscovery cannot cancel required retirement, even after the target disappears.
+    replacement_required: bool,
     attempts: u32,
     next_attempt: Instant,
 }
@@ -1647,6 +1706,7 @@ impl<C> PendingRemoval<C> {
     ) -> Self {
         Self {
             counter,
+            replacement_required: retry_target.is_some(),
             retry_target,
             attempts: 1,
             next_attempt: now + retry_delay(1, retry_cap),

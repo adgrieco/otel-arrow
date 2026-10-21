@@ -197,64 +197,95 @@ fn handle_for_path(state: &InvalidHandleState, path: &str) -> usize {
         .unwrap()
 }
 
-/// Scenario: An admitted wildcard handle fails reading and native retirement before discovery is due again.
-/// Guarantees: Recovery retains the member's reservation and seed, re-adds it without discovery, primes, and preserves the logical Sum start.
+/// Scenario: An admitted wildcard handle fails reading and native retirement, then recovery waits or fails opening a replacement.
+/// Guarantees: Maintenance never inherits scheduled-success evidence, while the retained seed restores membership without rediscovery and preserves the logical Sum start.
 #[test]
 fn failed_wildcard_retirement_preserves_rebuild_seed() {
     let template = r"\Process(worker*)\Operations Delta";
     let path = r"\Process(worker)\Operations Delta";
-    let state = invalid_handle_state(BTreeMap::from([(
-        template.to_owned(),
-        vec![path.to_owned()],
-    )]));
-    let mut config = cumulative_sum(template, "operations", "{operation}");
-    config.instance_config = InstanceConfig::Wildcard {
-        excluded_aggregation: None,
-    };
-    let mut open = |configs, limit, seed: Option<&QueryRecreationSeed>| {
-        // This adapter does not model query destruction; emulate release before replacement.
-        state.borrow_mut().active.clear();
-        Query::open_managed_with_seed(
-            InvalidHandlePdh(Rc::clone(&state)),
-            configs,
-            Duration::ZERO,
-            Duration::from_secs(3600),
-            256,
-            limit,
-            seed,
-        )
-    };
-    let mut slot = QuerySlot::open_initial(vec![config], 1, &mut open).unwrap();
-    let handle = handle_for_path(&state.borrow(), path);
-    {
-        let mut state = state.borrow_mut();
-        let _ = state.invalid_handles.insert(handle);
-        state.cleanup_fails = true;
-        state.timestamp = 110;
+    for fail_replacement_open in [false, true] {
+        let state = invalid_handle_state(BTreeMap::from([(
+            template.to_owned(),
+            vec![path.to_owned()],
+        )]));
+        let mut config = cumulative_sum(template, "operations", "{operation}");
+        config.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
+        let opens = Cell::new(0);
+        let mut open = |configs, limit, seed: Option<&QueryRecreationSeed>| {
+            let attempt = opens.get();
+            opens.set(attempt + 1);
+            // This adapter does not model query destruction; emulate release before replacement.
+            state.borrow_mut().active.clear();
+            if fail_replacement_open && attempt == 1 {
+                return Err(Error::Pdh {
+                    operation: PdhOperation::OpenQuery,
+                    path: "<query>".to_owned(),
+                    status: 1,
+                });
+            }
+            Query::open_managed_with_seed(
+                InvalidHandlePdh(Rc::clone(&state)),
+                configs,
+                Duration::ZERO,
+                Duration::from_secs(3600),
+                256,
+                limit,
+                seed,
+            )
+        };
+        let mut slot = QuerySlot::open_initial(vec![config], 1, &mut open).unwrap();
+        let handle = handle_for_path(&state.borrow(), path);
+        {
+            let mut state = state.borrow_mut();
+            let _ = state.invalid_handles.insert(handle);
+            state.cleanup_fails = true;
+            state.timestamp = 110;
+        }
+        let retry_cap = Duration::from_secs(60);
+        assert!(
+            collect_query(&mut slot, retry_cap, 1, &mut open)
+                .unwrap_err()
+                .requires_immediate_query_rebuild()
+        );
+        assert!(slot.query.is_none());
+        assert_eq!(slot.reserved_native_entry_count(), 1);
+        let backoff = collect_query(&mut slot, retry_cap, 1, &mut open).unwrap();
+        assert!(!backoff.metadata.diagnostics.any_query_collected);
+        assert!(backoff.points.is_empty());
+        assert!(!backoff.metadata.failures.is_empty());
+        assert_eq!(opens.get(), 1);
+        state.borrow_mut().cleanup_fails = false;
+        std::thread::sleep(Duration::from_millis(1100));
+        if fail_replacement_open {
+            let failed = collect_query(&mut slot, retry_cap, 1, &mut open).unwrap();
+            assert!(!failed.metadata.diagnostics.any_query_collected);
+            assert!(failed.points.is_empty());
+            assert!(
+                failed.metadata.failures.iter().any(|failure| {
+                    failure.reason == "PdhOpenQueryW" && failure.diagnostic_only
+                })
+            );
+            std::thread::sleep(Duration::from_millis(1100));
+        }
+        let rebuilt = collect_query(&mut slot, retry_cap, 1, &mut open).unwrap();
+        assert!(!rebuilt.metadata.diagnostics.any_query_collected);
+        assert!(rebuilt.points.is_empty());
+        assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
+        state.borrow_mut().timestamp = 120;
+        let ready = collect_query(&mut slot, retry_cap, 1, &mut open).unwrap();
+        assert_eq!(ready.points.len(), 1);
+        assert_eq!(ready.points[0].path.as_ref(), path);
+        assert_eq!(ready.points[0].start_time_unix_nano, Some(100));
+        assert!(matches!(ready.points[0].value, SampleValue::Value(_)));
+        assert_eq!(state.borrow().expand_calls, 1);
+        assert_eq!(
+            state.borrow().add_attempts,
+            [path.to_owned(), path.to_owned()]
+        );
+        assert_eq!(state.borrow().max_active, 1);
     }
-    assert!(
-        collect_query(&mut slot, Duration::ZERO, 1, &mut open)
-            .unwrap_err()
-            .requires_immediate_query_rebuild()
-    );
-    assert!(slot.query.is_none());
-    assert_eq!(slot.reserved_native_entry_count(), 1);
-    state.borrow_mut().cleanup_fails = false;
-    let rebuilt = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
-    assert!(rebuilt.points.is_empty());
-    assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
-    state.borrow_mut().timestamp = 120;
-    let ready = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
-    assert_eq!(ready.points.len(), 1);
-    assert_eq!(ready.points[0].path.as_ref(), path);
-    assert_eq!(ready.points[0].start_time_unix_nano, Some(100));
-    assert!(matches!(ready.points[0].value, SampleValue::Value(_)));
-    assert_eq!(state.borrow().expand_calls, 1);
-    assert_eq!(
-        state.borrow().add_attempts,
-        [path.to_owned(), path.to_owned()]
-    );
-    assert_eq!(state.borrow().max_active, 1);
 }
 
 /// Scenario: Replacement priming fails either before collection or after successful collection during invalid-handle cleanup.
@@ -768,7 +799,9 @@ fn wanted_pending_removal_retains_seed_and_cleanup_outcome() {
     let template = r"\Process(*)\Private Bytes";
     let wanted = r"\Process(worker)\Private Bytes";
     let departed = r"\Process(worker#1)\Private Bytes";
-    for cleanup_succeeds in [false, true] {
+    for (cleanup_succeeds, discovery_fails) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let mut config = counter(template, "private");
         config.instance_config = InstanceConfig::Wildcard {
             excluded_aggregation: None,
@@ -791,6 +824,7 @@ fn wanted_pending_removal_retains_seed_and_cleanup_outcome() {
             vec![wanted.to_owned(), departed.to_owned()],
         );
         let _ = query.collect().unwrap();
+        query.set_max_native_counters(2).unwrap();
         {
             let mut state = state.borrow_mut();
             let _ = state
@@ -819,22 +853,106 @@ fn wanted_pending_removal_retains_seed_and_cleanup_outcome() {
         assert_eq!(restored.admitted_members()[0].path.as_ref(), wanted);
         assert_eq!(restored_state.borrow().calls.expand, 0);
 
-        state.borrow_mut().remove_error = !cleanup_succeeds;
+        state.borrow_mut().expand_error = discovery_fails;
+        query.refresh_all_wildcards_managed().unwrap();
+        state.borrow_mut().expand_error = false;
+        assert_eq!(query.active_counter_count(), 0);
+        assert_eq!(query.reserved_native_entry_count(), 2);
+        assert_eq!(query.admitted_members().len(), 1);
+        assert!(query.pending.overflows.is_empty());
+        assert_eq!(state.borrow().added.len(), 2);
+        state.borrow_mut().remove_error = false;
         if cleanup_succeeds {
             let recovered = query.collect_managed().unwrap();
             assert_eq!(recovered.points.len(), 1);
             assert_eq!(recovered.points[0].path.as_ref(), wanted);
             assert_eq!(recovered.points[0].value, SampleValue::Warming);
             assert_eq!(query.reserved_native_entry_count(), 1);
-            assert_eq!(recovered.metadata.diagnostics.discovery_failures, 2);
+            assert_eq!(
+                recovered.metadata.diagnostics.discovery_failures,
+                2 + u64::from(discovery_fails)
+            );
             assert_eq!(state.borrow().added.len(), 3);
         } else {
+            let _ = state.borrow_mut().remove_errors.insert(0);
             let error = query.collect_managed().unwrap_err();
             assert!(error.requires_immediate_query_rebuild());
-            assert_eq!(query.reserved_native_entry_count(), 2);
-            assert_eq!(query.pending.diagnostics.discovery_failures, 3);
+            assert!(matches!(error, Error::Pdh { ref path, .. } if path == wanted));
+            assert_eq!(query.reserved_native_entry_count(), 1);
+            assert_eq!(
+                query.pending.diagnostics.discovery_failures,
+                3 + u64::from(discovery_fails)
+            );
             assert_eq!(query.admitted_members()[0].path.as_ref(), wanted);
         }
+    }
+}
+
+/// Scenario: A mandatory pending replacement disappears, then reappears before native cleanup succeeds.
+/// Guarantees: Departure clears the rebuild target but not required retirement or its reservation; only a fresh handle can resume publication.
+#[test]
+fn departed_pending_replacement_cannot_restore_stale_handle() {
+    let template = r"\Process(*)\Private Bytes";
+    let wanted = r"\Process(worker)\Private Bytes";
+    let departed = r"\Process(worker#1)\Private Bytes";
+    for limit in [2, 3] {
+        let mut config = counter(template, "private");
+        config.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
+        let (state, mut query) = fake_query_with_seed(
+            vec![config],
+            [wanted, departed]
+                .into_iter()
+                .map(|path| fake_counter(path, Number::Integer(1)))
+                .collect(),
+            Duration::ZERO,
+            Duration::ZERO,
+            limit,
+            None,
+        );
+        let _ = state.borrow_mut().expansions.insert(
+            template.to_owned(),
+            vec![wanted.to_owned(), departed.to_owned()],
+        );
+        query.refresh_all_wildcards_managed().unwrap();
+        let _ = query.collect_managed().unwrap();
+        {
+            let mut state = state.borrow_mut();
+            state.remove_error = true;
+            let _ = state
+                .expansions
+                .insert(template.to_owned(), vec![wanted.to_owned()]);
+        }
+        query.refresh_all_wildcards_managed().unwrap();
+        let _ = state
+            .borrow_mut()
+            .expansions
+            .insert(template.to_owned(), Vec::new());
+        query.refresh_all_wildcards_managed().unwrap();
+        assert!(query.admitted_members().is_empty());
+        assert_eq!(query.recreation_seed().reserved_native_entry_count(0), 0);
+        assert_eq!(query.pending.diagnostics.instances_removed, 2);
+        let _ = state
+            .borrow_mut()
+            .expansions
+            .insert(template.to_owned(), vec![wanted.to_owned()]);
+        query.refresh_all_wildcards_managed().unwrap();
+        assert_eq!(query.active_counter_count(), 0);
+        assert_eq!(query.reserved_native_entry_count(), 2);
+        assert_eq!(query.admitted_members().len(), usize::from(limit == 3));
+        assert_eq!(
+            query.recreation_seed().reserved_native_entry_count(0),
+            usize::from(limit == 3)
+        );
+        state.borrow_mut().remove_error = false;
+        assert_eq!(
+            query.collect_managed().unwrap().points.len(),
+            usize::from(limit == 3)
+        );
+        query.refresh_all_wildcards_managed().unwrap();
+        assert_eq!(query.collect_managed().unwrap().points.len(), 1);
+        assert_eq!(state.borrow().added.len(), 3);
     }
 }
 

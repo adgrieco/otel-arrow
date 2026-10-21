@@ -811,6 +811,7 @@ where
             slot.record_query_failure(&error);
             let mut sample = Sample::empty(slot.recovery_timestamp_unix_nano());
             slot.move_pending_metadata_to(&mut sample.metadata);
+            sample.metadata.diagnostics.any_query_collected = false;
             sample
         }
         Err(error) => return Err(error),

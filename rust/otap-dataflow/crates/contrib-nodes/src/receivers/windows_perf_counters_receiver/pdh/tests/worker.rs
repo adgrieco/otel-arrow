@@ -1402,84 +1402,129 @@ fn cancelling_startup_stops_between_exact_native_operations() {
     }
 }
 
-/// Scenario: Deferred wildcard cleanup fails after its first pending-removal deadline.
-/// Guarantees: Maintenance retains failure context, seeds a bounded rebuild without counting a scheduled collection, and cannot reopen early.
+/// Scenario: Deferred cleanup of a departed member or still-wanted replacement fails after repeated production refresh.
+/// Guarantees: Maintenance retains failure context, seeds only wanted members without counting a scheduled collection, and cannot reopen early.
 #[tokio::test]
 async fn failed_pending_cleanup_enters_bounded_seeded_rebuild() {
     let template = r"\Process(*)\Private Bytes";
     let expanded = r"\Process(worker)\Private Bytes";
-    let mut config = counter(template, "private");
-    config.instance_config = InstanceConfig::Wildcard {
-        excluded_aggregation: None,
-    };
-    let state = fake_state(vec![fake_counter(expanded, Number::Integer(1))]);
-    let _ = state
-        .borrow_mut()
-        .expansions
-        .insert(template.to_owned(), vec![expanded.to_owned()]);
-    let opens = Cell::new(0);
-    let mut open = |configs, limit, seed: Option<&QueryRecreationSeed>| {
-        opens.set(opens.get() + 1);
-        Query::open_managed_with_seed(
-            FakePdh::new(Rc::clone(&state)),
-            configs,
+    let duplicate = r"\Process(worker#1)\Private Bytes";
+    for still_wanted in [false, true] {
+        let mut config = counter(template, "private");
+        config.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
+        let paths = if still_wanted {
+            vec![expanded.to_owned(), duplicate.to_owned()]
+        } else {
+            vec![expanded.to_owned()]
+        };
+        let state = fake_state(
+            paths
+                .iter()
+                .map(|path| fake_counter(path, Number::Integer(1)))
+                .collect(),
+        );
+        let _ = state
+            .borrow_mut()
+            .expansions
+            .insert(template.to_owned(), paths);
+        let opens = Cell::new(0);
+        let mut open = |configs, limit, seed: Option<&QueryRecreationSeed>| {
+            opens.set(opens.get() + 1);
+            Query::open_managed_with_seed(
+                FakePdh::new(Rc::clone(&state)),
+                configs,
+                Duration::from_secs(60),
+                Duration::ZERO,
+                256,
+                limit,
+                seed,
+            )
+        };
+        let limit = if still_wanted { 2 } else { 1 };
+        let mut slot = open_initial_query(
+            vec![config],
             Duration::from_secs(60),
-            Duration::ZERO,
-            256,
             limit,
-            seed,
-        )
-    };
-    let mut slot = open_initial_query(
-        vec![config],
-        Duration::from_secs(60),
-        1,
-        &mut open,
-        &AtomicBool::new(false),
-    )
-    .unwrap()
-    .unwrap();
-    {
-        let mut state = state.borrow_mut();
-        let _ = state.expansions.insert(template.to_owned(), Vec::new());
-        state.remove_error = true;
-    }
-    let pending = collect_query(&mut slot, Duration::from_secs(60), 1, &mut open).unwrap();
-    assert_eq!(pending.metadata.diagnostics.discovery_failures, 1);
-    assert_eq!(slot.reserved_native_entry_count(), 1);
-    assert_eq!(state.borrow().removed, [0]);
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    let failed = collect_query(&mut slot, Duration::from_secs(60), 1, &mut open).unwrap();
-    assert!(!failed.metadata.diagnostics.any_query_collected);
-    assert!(failed.metadata.diagnostics.query_pending);
-    assert_eq!(failed.metadata.diagnostics.discovery_failures, 1);
-    assert!(
-        failed
-            .metadata
-            .failures
-            .iter()
-            .any(|failure| failure.reason == "PdhRemoveCounter")
-    );
-    assert!(slot.query.is_none());
-    assert_eq!(state.borrow().removed, [0, 0]);
-    let now = Instant::now();
-    assert!(matches!(
-        slot.collect(now, Duration::from_secs(60), 1, &mut open),
-        Err(Error::QueryRecoveryPending { .. })
-    ));
-    assert_eq!(opens.get(), 1);
-    state.borrow_mut().remove_error = false;
-    let rebuilt = slot
-        .collect(
-            now + Duration::from_secs(1),
-            Duration::from_secs(60),
-            1,
             &mut open,
+            &AtomicBool::new(false),
         )
+        .unwrap()
         .unwrap();
-    assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
-    assert!(!rebuilt.metadata.diagnostics.any_query_collected);
-    assert_eq!(opens.get(), 2);
+        {
+            let mut state = state.borrow_mut();
+            let _ = state.expansions.insert(
+                template.to_owned(),
+                if still_wanted {
+                    vec![expanded.to_owned()]
+                } else {
+                    Vec::new()
+                },
+            );
+            let _ = state.remove_errors.insert(0);
+        }
+        let pending = collect_query(&mut slot, Duration::from_secs(60), limit, &mut open).unwrap();
+        assert_eq!(pending.metadata.diagnostics.discovery_failures, 1);
+        assert_eq!(slot.reserved_native_entry_count(), 1);
+        assert_eq!(
+            state
+                .borrow()
+                .removed
+                .iter()
+                .filter(|index| **index == 0)
+                .count(),
+            1
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let failed = collect_query(&mut slot, Duration::from_secs(60), limit, &mut open).unwrap();
+        assert!(!failed.metadata.diagnostics.any_query_collected);
+        assert!(failed.metadata.diagnostics.query_pending);
+        assert_eq!(failed.metadata.diagnostics.discovery_failures, 1);
+        assert!(
+            failed
+                .metadata
+                .failures
+                .iter()
+                .any(|failure| failure.reason == "PdhRemoveCounter")
+        );
+        assert!(slot.query.is_none());
+        assert_eq!(
+            state
+                .borrow()
+                .removed
+                .iter()
+                .filter(|index| **index == 0)
+                .count(),
+            2
+        );
+        assert_eq!(
+            slot.reserved_native_entry_count(),
+            usize::from(still_wanted)
+        );
+        let now = Instant::now();
+        assert!(matches!(
+            slot.collect(now, Duration::from_secs(60), limit, &mut open),
+            Err(Error::QueryRecoveryPending { .. })
+        ));
+        assert_eq!(opens.get(), 1);
+        state.borrow_mut().remove_errors.clear();
+        let rebuilt = slot
+            .collect(
+                now + Duration::from_secs(1),
+                Duration::from_secs(60),
+                limit,
+                &mut open,
+            )
+            .unwrap();
+        assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
+        assert!(!rebuilt.metadata.diagnostics.any_query_collected);
+        assert_eq!(opens.get(), 2);
+        assert_eq!(
+            slot.query.as_ref().unwrap().admitted_members().len(),
+            usize::from(still_wanted)
+        );
+    }
 }
 
 /// Scenario: A primed worker receives PDH_INVALID_HANDLE from its first scheduled native collection.

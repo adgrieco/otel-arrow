@@ -88,6 +88,7 @@ struct FakeState {
     timestamp: i64,
     timestamp_error: bool,
     remove_error: bool,
+    remove_errors: BTreeSet<usize>,
     expand_error: bool,
     expand_errors: BTreeSet<String>,
     stop_after_expand: Option<Arc<AtomicBool>>,
@@ -193,7 +194,7 @@ impl PdhApi for FakePdh {
         let index = self.counter_index(counter, path)?;
         let mut state = self.state.borrow_mut();
         state.removed.push(index);
-        if state.remove_error {
+        if state.remove_error || state.remove_errors.contains(&index) {
             Err(Error::Pdh {
                 operation: PdhOperation::RemoveCounter,
                 path: state.counters[index].path.clone(),
@@ -477,6 +478,7 @@ fn fake_state_value(counters: Vec<FakeCounter>) -> FakeState {
         timestamp: 100,
         timestamp_error: false,
         remove_error: false,
+        remove_errors: BTreeSet::new(),
         expand_error: false,
         expand_errors: BTreeSet::new(),
         stop_after_expand: None,
