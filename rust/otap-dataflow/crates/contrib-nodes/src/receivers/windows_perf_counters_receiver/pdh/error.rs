@@ -99,8 +99,6 @@ pub(in super::super) enum Error {
     },
     #[error("PDH worker object-list {stage} failed with status 0x{status:08X}")]
     WorkerObjectRefresh { stage: &'static str, status: u32 },
-    #[error("PDH worker stopped before initialization completed")]
-    WorkerInitStopped,
     #[error("PDH worker stop was requested")]
     WorkerStopRequested,
     #[error("a performance-counter collection request is already pending")]
@@ -115,10 +113,7 @@ pub(in super::super) enum Error {
 
 impl Error {
     pub(super) fn is_stop(&self) -> bool {
-        matches!(
-            self,
-            Self::WorkerInitStopped | Self::WorkerStopRequested | Self::WorkerStopped
-        )
+        matches!(self, Self::WorkerStopRequested | Self::WorkerStopped)
     }
 
     pub(in super::super) fn is_collection_failure(&self) -> bool {
@@ -206,7 +201,6 @@ impl Error {
             Self::WorkerStart(_) => "worker_start",
             Self::WorkerLanguagePin { .. } => "worker_language_pin",
             Self::WorkerObjectRefresh { .. } => "worker_object_refresh",
-            Self::WorkerInitStopped => "worker_init_stopped",
             Self::WorkerStopRequested => "worker_stop_requested",
             Self::WorkerBusy => "worker_busy",
             Self::WorkerStopped => "worker_stopped",

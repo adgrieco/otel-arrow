@@ -103,34 +103,18 @@ fn initialize_worker_with(
         } else if size == 0 {
             Ok(())
         } else {
-            let mut buffer = vec![
-                0_u16;
-                usize::try_from(size).map_err(|_| Error::WorkerObjectRefresh {
-                    stage: "refresh size conversion",
-                    status,
-                })?
-            ];
-            size = u32::try_from(buffer.len()).map_err(|_| Error::WorkerObjectRefresh {
-                stage: "enumeration buffer size",
-                status,
-            })?;
+            let mut buffer = vec![0_u16; refresh_size(size, "refresh size conversion", status)?];
+            size = refresh_size(buffer.len(), "enumeration buffer size", status)?;
             let mut status = enumerate_objects(false, &mut size, Some(&mut buffer))?;
             enumeration_status = Some(status);
             if status == PDH_MORE_DATA {
-                let capacity =
-                    u32::try_from(buffer.len()).map_err(|_| Error::WorkerObjectRefresh {
-                        stage: "enumeration buffer size",
-                        status,
-                    })?;
+                let capacity: u32 = refresh_size(buffer.len(), "enumeration buffer size", status)?;
                 size = size.max(capacity.checked_mul(2).ok_or(Error::WorkerObjectRefresh {
                     stage: "enumeration buffer growth",
                     status,
                 })?);
                 buffer.resize(
-                    usize::try_from(size).map_err(|_| Error::WorkerObjectRefresh {
-                        stage: "enumeration size conversion",
-                        status,
-                    })?,
+                    refresh_size(size, "enumeration size conversion", status)?,
                     0,
                 );
                 status = enumerate_objects(false, &mut size, Some(&mut buffer))?;
@@ -159,6 +143,13 @@ fn initialize_worker_with(
         object_enumeration_status = ?enumeration_status
     );
     result
+}
+
+fn refresh_size<T, U>(value: T, stage: &'static str, status: u32) -> Result<U, Error>
+where
+    U: TryFrom<T>,
+{
+    U::try_from(value).map_err(|_| Error::WorkerObjectRefresh { stage, status })
 }
 
 pub(super) fn check(operation: PdhOperation, path: &str, status: u32) -> Result<(), Error> {
@@ -215,6 +206,7 @@ impl<T: Clone + Default> NativeBuffer<T> {
         self.storage.as_ptr().cast::<U>()
     }
 
+    #[cfg(test)]
     fn as_mut_ptr<U>(&mut self) -> *mut U {
         self.storage.as_mut_ptr().cast::<U>()
     }
@@ -222,6 +214,75 @@ impl<T: Clone + Default> NativeBuffer<T> {
     fn as_mut_slice(&mut self) -> &mut [T] {
         &mut self.storage
     }
+}
+
+struct FixedHeaderBufferSpec {
+    minimum_size: usize,
+    size_operation: PdhOperation,
+    fill_operation: PdhOperation,
+    size_error: &'static str,
+    capacity_error: &'static str,
+    fill_error: &'static str,
+}
+
+const COUNTER_INFO_BUFFER: FixedHeaderBufferSpec = FixedHeaderBufferSpec {
+    minimum_size: size_of::<PDH_COUNTER_INFO_W>(),
+    size_operation: PdhOperation::GetCounterInfoSize,
+    fill_operation: PdhOperation::GetCounterInfo,
+    size_error: "PdhGetCounterInfoW returned an undersized buffer",
+    capacity_error: "PdhGetCounterInfoW buffer capacity exceeds u32",
+    fill_error: "PdhGetCounterInfoW returned an invalid filled size",
+};
+
+const COUNTER_PATH_BUFFER: FixedHeaderBufferSpec = FixedHeaderBufferSpec {
+    minimum_size: size_of::<PDH_COUNTER_PATH_ELEMENTS_W>(),
+    size_operation: PdhOperation::ParseCounterPathSize,
+    fill_operation: PdhOperation::ParseCounterPath,
+    size_error: "PdhParseCounterPathW returned an undersized buffer",
+    capacity_error: "PdhParseCounterPathW buffer capacity exceeds u32",
+    fill_error: "PdhParseCounterPathW returned an invalid filled size",
+};
+
+#[derive(Clone, Copy)]
+enum BufferFillSize {
+    Reported,
+    #[cfg(test)]
+    Capacity,
+}
+
+fn fixed_header_buffer_with<T: Clone + Default>(
+    path: &str,
+    spec: &FixedHeaderBufferSpec,
+    fill_size: BufferFillSize,
+    mut read: impl FnMut(&mut u32, Option<&mut [T]>) -> Result<u32, Error>,
+) -> Result<(NativeBuffer<T>, usize), Error> {
+    let mut size = 0;
+    let status = read(&mut size, None)?;
+    if status != PDH_MORE_DATA {
+        return Err(Error::Pdh {
+            operation: spec.size_operation,
+            path: path.to_owned(),
+            status,
+        });
+    }
+    if (size as usize) < spec.minimum_size {
+        return Err(Error::InvalidSample(spec.size_error));
+    }
+    let mut buffer = NativeBuffer::with_byte_capacity(size, spec.capacity_error)?;
+    size = match fill_size {
+        BufferFillSize::Reported => size,
+        #[cfg(test)]
+        BufferFillSize::Capacity => buffer.byte_capacity_u32(spec.capacity_error)?,
+    };
+    check(
+        spec.fill_operation,
+        path,
+        read(&mut size, Some(buffer.as_mut_slice()))?,
+    )?;
+    if (size as usize) < spec.minimum_size || (size as usize) > buffer.byte_capacity() {
+        return Err(Error::InvalidSample(spec.fill_error));
+    }
+    Ok((buffer, size as usize))
 }
 
 fn is_no_observation_status(status: u32) -> bool {
@@ -367,7 +428,7 @@ impl NativePdh {
 
     #[cfg(test)]
     pub(super) fn parse_instance_path(path: &str) -> Result<InstanceIdentity, Error> {
-        NativePdh::parse_instance_identity(path)
+        Self::parse_instance_controlled(path, None)
     }
 
     #[cfg(test)]
@@ -375,38 +436,12 @@ impl NativePdh {
         path: &str,
         mut info: impl FnMut(&mut u32, Option<&mut [usize]>) -> u32,
     ) -> Result<(NativeBuffer<usize>, usize), Error> {
-        let mut size = 0;
-        let status = info(&mut size, None);
-        if status != PDH_MORE_DATA {
-            return Err(Error::Pdh {
-                operation: PdhOperation::GetCounterInfoSize,
-                path: path.to_owned(),
-                status,
-            });
-        }
-        if (size as usize) < size_of::<PDH_COUNTER_INFO_W>() {
-            return Err(Error::InvalidSample(
-                "PdhGetCounterInfoW returned an undersized buffer",
-            ));
-        }
-        let mut buffer = NativeBuffer::with_byte_capacity(
-            size,
-            "PdhGetCounterInfoW buffer capacity exceeds u32",
-        )?;
-        size = buffer.byte_capacity_u32("PdhGetCounterInfoW buffer capacity exceeds u32")?;
-        check(
-            PdhOperation::GetCounterInfo,
+        fixed_header_buffer_with(
             path,
-            info(&mut size, Some(buffer.as_mut_slice())),
-        )?;
-        if (size as usize) < size_of::<PDH_COUNTER_INFO_W>()
-            || (size as usize) > buffer.byte_capacity()
-        {
-            return Err(Error::InvalidSample(
-                "PdhGetCounterInfoW returned an invalid filled size",
-            ));
-        }
-        Ok((buffer, size as usize))
+            &COUNTER_INFO_BUFFER,
+            BufferFillSize::Capacity,
+            |size, buffer| Ok(info(size, buffer)),
+        )
     }
 
     fn wide_string(
@@ -552,11 +587,6 @@ impl NativePdh {
         }
     }
 
-    #[cfg(test)]
-    fn parse_instance_identity(path: &str) -> Result<InstanceIdentity, Error> {
-        Self::parse_instance_controlled(path, None)
-    }
-
     fn parse_instance_controlled(
         path: &str,
         shutdown: Option<&AtomicBool>,
@@ -581,42 +611,12 @@ impl NativePdh {
 
     fn parse_instance_identity_with(
         path: &str,
-        mut parse: impl FnMut(&mut u32, Option<&mut [usize]>) -> Result<u32, Error>,
+        parse: impl FnMut(&mut u32, Option<&mut [usize]>) -> Result<u32, Error>,
     ) -> Result<InstanceIdentity, Error> {
-        let mut size = 0;
-        let status = parse(&mut size, None)?;
-        if status != PDH_MORE_DATA {
-            return Err(Error::Pdh {
-                operation: PdhOperation::ParseCounterPathSize,
-                path: path.to_owned(),
-                status,
-            });
-        }
-        if (size as usize) < size_of::<PDH_COUNTER_PATH_ELEMENTS_W>() {
-            return Err(Error::InvalidSample(
-                "PdhParseCounterPathW returned an undersized buffer",
-            ));
-        }
-        let mut buffer = NativeBuffer::with_byte_capacity(
-            size,
-            "PdhParseCounterPathW buffer capacity exceeds u32",
-        )?;
-        let capacity =
-            buffer.byte_capacity_u32("PdhParseCounterPathW buffer capacity exceeds u32")?;
-        let elements = buffer.as_mut_ptr::<PDH_COUNTER_PATH_ELEMENTS_W>();
-        check(
-            PdhOperation::ParseCounterPath,
-            path,
-            parse(&mut size, Some(buffer.as_mut_slice()))?,
-        )?;
-        if (size as usize) < size_of::<PDH_COUNTER_PATH_ELEMENTS_W>() || size > capacity {
-            return Err(Error::InvalidSample(
-                "PdhParseCounterPathW returned an invalid filled size",
-            ));
-        }
+        let (buffer, filled_size) =
+            fixed_header_buffer_with(path, &COUNTER_PATH_BUFFER, BufferFillSize::Reported, parse)?;
         // SAFETY: Successful parsing initialized the fixed pointer fields.
-        let elements = unsafe { &*elements };
-        let filled_size = size as usize;
+        let elements = unsafe { &*buffer.as_ptr::<PDH_COUNTER_PATH_ELEMENTS_W>() };
         let name = Self::wide_string(elements.szInstanceName, &buffer, filled_size)?.ok_or(
             Error::InvalidSample("expanded path has no instance identity"),
         )?;
@@ -662,40 +662,12 @@ impl NativePdh {
 
     pub(super) fn counter_type_with(
         path: &str,
-        mut info: impl FnMut(&mut u32, Option<&mut [PDH_COUNTER_INFO_W]>) -> Result<u32, Error>,
+        info: impl FnMut(&mut u32, Option<&mut [PDH_COUNTER_INFO_W]>) -> Result<u32, Error>,
     ) -> Result<u32, Error> {
-        let mut size = 0;
-        let status = info(&mut size, None)?;
-        if status != PDH_MORE_DATA {
-            return Err(Error::Pdh {
-                operation: PdhOperation::GetCounterInfoSize,
-                path: path.to_owned(),
-                status,
-            });
-        }
-        if (size as usize) < size_of::<PDH_COUNTER_INFO_W>() {
-            return Err(Error::InvalidSample(
-                "PdhGetCounterInfoW returned an undersized buffer",
-            ));
-        }
         // Typed storage guarantees the header's alignment and initializes the
         // trailing buffer; PDH fills both the header and variable-sized data.
-        let mut buffer = NativeBuffer::<PDH_COUNTER_INFO_W>::with_byte_capacity(
-            size,
-            "PdhGetCounterInfoW buffer capacity exceeds u32",
-        )?;
-        check(
-            PdhOperation::GetCounterInfo,
-            path,
-            info(&mut size, Some(buffer.as_mut_slice()))?,
-        )?;
-        if (size as usize) < size_of::<PDH_COUNTER_INFO_W>()
-            || (size as usize) > buffer.byte_capacity()
-        {
-            return Err(Error::InvalidSample(
-                "PdhGetCounterInfoW returned an invalid filled size",
-            ));
-        }
+        let (mut buffer, _) =
+            fixed_header_buffer_with(path, &COUNTER_INFO_BUFFER, BufferFillSize::Reported, info)?;
         // Only a successful fill reaches classification; zero is a valid type.
         Ok(buffer.as_mut_slice()[0].dwType)
     }
@@ -1114,12 +1086,23 @@ mod tests {
             }
         }
 
+        fn fill_operation(self) -> PdhOperation {
+            match self {
+                Self::CounterInfo | Self::CounterType => PdhOperation::GetCounterInfo,
+                Self::ParseInstance => PdhOperation::ParseCounterPath,
+            }
+        }
+
         fn malformed_error(self, case: MalformedBuffer) -> Error {
             let header = self.header_size();
             let status = |size: &mut u32, filling: bool| match case {
                 MalformedBuffer::NonSizingStatus => {
                     *size = header;
                     PDH_INVALID_ARGUMENT
+                }
+                MalformedBuffer::SuccessSizingStatus => {
+                    *size = header;
+                    0
                 }
                 MalformedBuffer::UndersizedRequest => {
                     *size = header - 1;
@@ -1133,7 +1116,10 @@ mod tests {
                     *size = u32::MAX;
                     0
                 }
-                MalformedBuffer::UndersizedFill | MalformedBuffer::OversizedFill => {
+                MalformedBuffer::FailedFill if filling => PDH_MORE_DATA,
+                MalformedBuffer::UndersizedFill
+                | MalformedBuffer::OversizedFill
+                | MalformedBuffer::FailedFill => {
                     *size = header;
                     PDH_MORE_DATA
                 }
@@ -1163,9 +1149,11 @@ mod tests {
     #[derive(Clone, Copy)]
     enum MalformedBuffer {
         NonSizingStatus,
+        SuccessSizingStatus,
         UndersizedRequest,
         UndersizedFill,
         OversizedFill,
+        FailedFill,
     }
 
     fn parse_instance_fixture_error(
@@ -1287,7 +1275,7 @@ mod tests {
     }
 
     /// Scenario: Native metadata APIs return malformed sizing and filling results.
-    /// Guarantees: Counter info, counter type, and parsed instance paths all reject non-sizing status, undersized headers, and invalid filled sizes.
+    /// Guarantees: Counter info, counter type, and parsed instance paths reject non-sizing status, undersized headers, invalid filled sizes, and failed fills.
     #[test]
     fn native_metadata_buffers_reject_malformed_size_and_fill_contracts() {
         for api in [
@@ -1297,23 +1285,70 @@ mod tests {
         ] {
             for case in [
                 MalformedBuffer::NonSizingStatus,
+                MalformedBuffer::SuccessSizingStatus,
                 MalformedBuffer::UndersizedRequest,
                 MalformedBuffer::UndersizedFill,
                 MalformedBuffer::OversizedFill,
+                MalformedBuffer::FailedFill,
             ] {
                 let error = api.malformed_error(case);
-                if matches!(case, MalformedBuffer::NonSizingStatus) {
-                    assert!(matches!(
+                let expected = match case {
+                    MalformedBuffer::NonSizingStatus => {
+                        Some((api.size_operation(), PDH_INVALID_ARGUMENT))
+                    }
+                    MalformedBuffer::SuccessSizingStatus => Some((api.size_operation(), 0)),
+                    MalformedBuffer::FailedFill => Some((api.fill_operation(), PDH_MORE_DATA)),
+                    _ => None,
+                };
+                match expected {
+                    Some((expected_operation, expected_status)) => assert!(matches!(
                         error,
-                        Error::Pdh {
-                            operation,
-                            status: PDH_INVALID_ARGUMENT,
-                            ..
-                        } if operation == api.size_operation()
-                    ));
-                } else {
-                    assert!(matches!(error, Error::InvalidSample(_)));
+                        Error::Pdh { operation, status, path }
+                            if operation == expected_operation
+                                && status == expected_status
+                                && path == "fixture"
+                    )),
+                    None => assert!(matches!(error, Error::InvalidSample(_))),
                 }
+            }
+        }
+    }
+
+    /// Scenario: Metadata sizing rounds storage up, while fills report exactly the header or the full allocation.
+    /// Guarantees: The shared helper preserves reported-versus-capacity fill inputs and accepts both valid filled-size boundaries.
+    #[test]
+    fn fixed_header_buffer_preserves_fill_size_boundaries() {
+        let header = COUNTER_INFO_BUFFER.minimum_size;
+        let requested = u32::try_from(header + 1).unwrap();
+        let capacity = (requested as usize).div_ceil(size_of::<usize>()) * size_of::<usize>();
+        for fill_size in [BufferFillSize::Reported, BufferFillSize::Capacity] {
+            for filled in [header, capacity] {
+                let mut calls = 0;
+                let (buffer, filled_size) = fixed_header_buffer_with::<usize>(
+                    "fixture",
+                    &COUNTER_INFO_BUFFER,
+                    fill_size,
+                    |size, buffer| {
+                        calls += 1;
+                        let Some(buffer) = buffer else {
+                            assert_eq!(*size, 0);
+                            *size = requested;
+                            return Ok(PDH_MORE_DATA);
+                        };
+                        let expected_size = match fill_size {
+                            BufferFillSize::Reported => requested as usize,
+                            BufferFillSize::Capacity => capacity,
+                        };
+                        assert_eq!(*size as usize, expected_size);
+                        assert_eq!(size_of_val(buffer), capacity);
+                        *size = u32::try_from(filled).unwrap();
+                        Ok(0)
+                    },
+                )
+                .unwrap();
+                assert_eq!(calls, 2);
+                assert_eq!(buffer.byte_capacity(), capacity);
+                assert_eq!(filled_size, filled);
             }
         }
     }

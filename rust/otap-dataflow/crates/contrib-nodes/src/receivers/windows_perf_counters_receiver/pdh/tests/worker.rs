@@ -1899,11 +1899,11 @@ async fn query_recovery_cap_is_independent_of_membership_refresh() {
     let observed_refreshes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let factory_refreshes = Arc::clone(&observed_refreshes);
     let cadence = QueryCadence::new(Duration::from_secs(2), Duration::from_secs(60));
-    let mut worker = Worker::start_with_cadence_and(
+    let mut worker = Worker::start_with(
         vec![counter(path, "system.memory.available")],
-        cadence,
+        cadence.retry_cap(),
         4_096,
-        move |configs, max_native_counters, cadence, _seed| {
+        move |configs, max_native_counters, _seed| {
             let _ = factory_open_calls.fetch_add(1, Ordering::AcqRel);
             factory_refreshes
                 .lock()

@@ -798,7 +798,7 @@ fn startup_prime_no_data_requires_fresh_warmup() {
 }
 
 /// Scenario: A direct counter has a counter-local formatted failure during startup priming.
-/// Guarantees: Initialization continues and the priming failure is delivered with the next successful scrape.
+/// Guarantees: Initialization continues and the priming failure is reported with the next scrape without counting a lost scheduled observation.
 #[test]
 fn startup_prime_preserves_counter_failures() {
     let path = r"\Memory\Available Bytes";
@@ -821,6 +821,7 @@ fn startup_prime_preserves_counter_failures() {
     assert_eq!(sample.points.len(), 1);
     assert_eq!(sample.metadata.failures.len(), 1);
     assert_eq!(sample.metadata.failures[0].counter_index, 0);
+    assert!(sample.metadata.failures[0].diagnostic_only);
     assert!(state.borrow().removed.is_empty());
 }
 

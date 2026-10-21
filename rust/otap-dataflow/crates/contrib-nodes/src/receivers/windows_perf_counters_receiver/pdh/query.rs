@@ -331,7 +331,7 @@ impl<A: PdhApi> Query<A> {
             let instance = if self.configs[config_index].instance_config.has_instance() {
                 match self.api.parse_instance(&path) {
                     Ok(instance) => Some(Arc::new(instance)),
-                    Err(error @ Error::WorkerStopRequested) => return Err(error),
+                    Err(error) if error.is_stop() => return Err(error),
                     Err(error) => {
                         let mut failure = sample_failure(config_index, &error);
                         failure.diagnostic_only = true;
@@ -919,7 +919,7 @@ impl<A: PdhApi> Query<A> {
                             ),
                         );
                     }
-                    Err(error @ Error::WorkerStopRequested) => return Err(error),
+                    Err(error) if error.is_stop() => return Err(error),
                     Err(error) => {
                         metadata.diagnostics.counter_add_failures += 1;
                         metadata.failures.push(sample_failure(config_index, &error));
@@ -1390,7 +1390,7 @@ impl<A: PdhApi> Query<A> {
             };
             let (value, point_start_time) = match result {
                 Ok(result) => result,
-                Err(error @ Error::WorkerStopRequested) => return Err(error),
+                Err(error) if error.is_stop() => return Err(error),
                 Err(error) => {
                     metadata
                         .failures
@@ -1765,16 +1765,8 @@ impl<C> CounterHandle<C> {
         let Some(previous) = previous else {
             return Ok(Some(SampleValue::Warming));
         };
-        if self.kind == CounterKind::CalculatedTwoSampleWithBase {
-            match raw.second_value.cmp(&previous) {
-                std::cmp::Ordering::Less => {
-                    return Ok(Some(SampleValue::NoObservation));
-                }
-                std::cmp::Ordering::Equal => {
-                    return Ok(Some(SampleValue::NoObservation));
-                }
-                std::cmp::Ordering::Greater => {}
-            }
+        if self.kind == CounterKind::CalculatedTwoSampleWithBase && raw.second_value <= previous {
+            return Ok(Some(SampleValue::NoObservation));
         }
         Ok(None)
     }

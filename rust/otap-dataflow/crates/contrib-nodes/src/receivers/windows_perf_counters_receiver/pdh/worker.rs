@@ -1,7 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded worker-thread query ownership, recovery, recreation, and command lifecycle.
+//! Bounded worker-thread query ownership, failure recovery, and command lifecycle.
 
 use super::super::config::CounterConfig;
 use super::super::model::{PendingMetadata, Sample, SampleFailure, SampleMember};
@@ -61,25 +61,7 @@ pub(in super::super) struct Worker {
 }
 
 impl Worker {
-    #[cfg(test)]
-    pub(super) async fn start(
-        counters: Vec<CounterConfig>,
-        cadence: QueryCadence,
-        max_instances_per_wildcard: usize,
-        max_native_counters: usize,
-        node: String,
-    ) -> Result<Self, Error> {
-        Self::start_with_cadence(
-            counters,
-            cadence,
-            max_instances_per_wildcard,
-            max_native_counters,
-            node,
-        )
-        .await
-    }
-
-    pub(in super::super) async fn start_with_cadence(
+    pub(in super::super) async fn start(
         counters: Vec<CounterConfig>,
         cadence: QueryCadence,
         max_instances_per_wildcard: usize,
@@ -103,33 +85,6 @@ impl Worker {
             move |counters, query_limit, seed, shutdown| {
                 settings.open(counters, query_limit, seed, shutdown)
             },
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    pub(super) async fn start_with_cadence_and<A, F>(
-        counters: Vec<CounterConfig>,
-        cadence: QueryCadence,
-        max_native_counters: usize,
-        mut open: F,
-    ) -> Result<Self, Error>
-    where
-        A: PdhApi + 'static,
-        F: FnMut(
-                Vec<CounterConfig>,
-                usize,
-                QueryCadence,
-                Option<&QueryRecreationSeed>,
-            ) -> Result<Query<A>, Error>
-            + Send
-            + 'static,
-    {
-        Self::start_with(
-            counters,
-            cadence.retry_cap,
-            max_native_counters,
-            move |counters, query_limit, seed| open(counters, query_limit, cadence, seed),
         )
         .await
     }
@@ -227,7 +182,7 @@ impl Worker {
             Err(_) => {
                 cancellation.request();
                 await_worker_completion(join, completion_rx).await?;
-                Err(Error::WorkerInitStopped)
+                Err(Error::WorkerStopRequested)
             }
         }
     }

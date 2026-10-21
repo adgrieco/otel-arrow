@@ -536,7 +536,7 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
 
         let worker_start = initialize_and_signal_ready(
             async {
-                let worker = pdh::Worker::start_with_cadence(
+                let worker = pdh::Worker::start(
                     self.config.counters.clone(),
                     pdh::QueryCadence::new(
                         self.config.query_retry_cap(),
