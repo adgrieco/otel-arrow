@@ -16,7 +16,7 @@ groups:
       main:
         nodes:
           memory:
-            type: receiver:windowsperfcounters
+            type: receiver:windows_perf_counters
             config:
               metrics:
                 windows.memory.available:

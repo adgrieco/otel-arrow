@@ -4,8 +4,8 @@
 
 | Field | Value |
 | --- | --- |
-| Type | `receiver:windowsperfcounters` |
-| URN | `urn:otel:receiver:windowsperfcounters` |
+| Type | `receiver:windows_perf_counters` |
+| URN | `urn:otel:receiver:windows_perf_counters` |
 | Feature | `windows-perf-counters` |
 | Platform | Windows only |
 | Stability | Development |
@@ -32,7 +32,7 @@ host.
 ## Configuration
 
 ```yaml
-type: receiver:windowsperfcounters
+type: receiver:windows_perf_counters
 config:
   metrics:
     windows.memory.available:
@@ -81,13 +81,18 @@ config:
 | `timeout` | No | `collection_interval` | Scrape lateness warning threshold; `0s` uses the collection interval |
 | `wildcard_refresh_interval` | No | Greater of `collection_interval` and `60s` | Discovery cadence; must be at least `collection_interval` |
 | `max_instances_per_wildcard` | No | `256` | Members retained per pattern; integer from 1 through 16384, no greater than `max_expanded_counters` |
-| `max_expanded_counters` | No | `4096` | Receiver-wide exact reservations and expanded native entries; integer from 1 through 16384 |
+| `max_expanded_counters` | No | `4096` | Configured selector cap and separate runtime exact/expanded entry budget; integer from 1 through 16384 |
 
 <!-- markdownlint-enable MD013 -->
 
-Admission applies the limits at startup and on every refresh. Exact configured
-paths reserve capacity even while unavailable; pending native removals retain
-their capacity until cleanup succeeds.
+Configuration counts every generated exact or wildcard selector against
+`max_expanded_counters`, before allocating each entry; exactly the cap is
+allowed. Instance-by-counter products are generated incrementally, not
+materialized before checking the bound.
+
+Runtime admission separately applies the limits at startup and on every refresh.
+Exact configured paths reserve capacity even while unavailable; pending native
+removals retain their capacity until cleanup succeeds.
 Wildcard templates do not consume entries until they resolve to concrete
 paths. Zero or negative `initial_delay` starts collection immediately.
 Sub-second collection intervals are accepted, matching Go, but rate and other
@@ -154,10 +159,15 @@ if consumers remove the retained native provenance attributes. The receiver
 publishes each valid mapping independently; it does not sum sources, select an
 output owner or suppress collisions. Metric-less mappings do not warn because
 their configured attributes are ignored.
-Repeating a configured PDH path ignoring case is rejected, even with different
-metric names, scaling or static attributes. Distinct configured paths and
-overlapping instance patterns retain their own valid points, concrete paths
-and template attributes.
+Repeating a configured PDH path ignoring case and final numeric instance-suffix
+aliases is rejected, even with different metric names, scaling or static
+attributes. For duplicate checks only, `app` and `app#0` compare equal, as do
+`app#1` and `app#01`. Each spelling is accepted individually and preserved in
+native paths, implicit metric names and exact definition lookup. Only the final
+ASCII numeric suffix after a nonempty name is canonicalized; whitespace and
+literal nonnumeric suffixes are not trimmed or rewritten. Distinct configured
+paths and overlapping instance patterns retain their own valid points, concrete
+paths and template attributes.
 `scale_power10` defaults to zero and accepts values from `-18` through `18`.
 `recreate_query` defaults to `false`, and explicit `false` is supported.
 `recreate_query: true` is rejected. All mappings share one persistent query.
@@ -528,8 +538,8 @@ original raw path-shaped definition key and do not claim that PDH would reject
 it. Case-collision warnings list every configured spelling and are deduplicated
 once per Unicode lowercase identity group.
 
-The `receiver.windowsperfcounters.scrapes` measurement metric set attributes
-collection attempts by outcome. The `receiver.windowsperfcounters` health
+The `receiver.windows_perf_counters.scrapes` measurement metric set attributes
+collection attempts by outcome. The `receiver.windows_perf_counters` health
 metric set exports `{counter}` Gauges `configured_exact` (configured exact
 paths), `configured_wildcard` (configured pattern paths) and `active_expanded`
 (installed expanded members). It also records scrape success/failure,

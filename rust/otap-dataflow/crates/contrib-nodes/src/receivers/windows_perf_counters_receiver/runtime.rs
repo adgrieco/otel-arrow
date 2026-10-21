@@ -31,7 +31,7 @@ use tokio::time::MissedTickBehavior;
 use tokio::time::timeout;
 
 /// Factory identity for the Windows performance-counter receiver.
-pub const WINDOWSPERFCOUNTERS_RECEIVER_URN: &str = "urn:otel:receiver:windowsperfcounters";
+pub const WINDOWSPERFCOUNTERS_RECEIVER_URN: &str = "urn:otel:receiver:windows_perf_counters";
 
 const WORKER_SHUTDOWN_MAX_WAIT: Duration = Duration::from_secs(1);
 const PIPELINE_COMPLETION_RESERVE: Duration = Duration::from_millis(500);
@@ -263,7 +263,7 @@ pub static WINDOWSPERFCOUNTERS_RECEIVER: ReceiverFactory<OtapPdata> = ReceiverFa
         if pipeline.num_cores() > 1 {
             return Err(otel_arrow_dfe_config::error::Error::InvalidUserConfig {
                 error:
-                    "host-wide windowsperfcounters collection requires a one-core source pipeline"
+                    "host-wide windows_perf_counters collection requires a one-core source pipeline"
                         .to_owned(),
             });
         }
@@ -741,7 +741,7 @@ mod tests {
                 max_expanded_counters: 4_096,
                 warnings: Vec::new(),
             },
-            node: "windowsperfcounters".to_owned(),
+            node: "windows_perf_counters".to_owned(),
             metrics: Rc::new(RefCell::new(WindowsPerfCountersReceiverMetrics::register(
                 &pipeline,
             ))),
@@ -1648,15 +1648,15 @@ mod tests {
         let pipeline = controller
             .pipeline_context_with("test_group".into(), "test_pipeline".into(), 0, 2, 0)
             .with_node_context(
-                "windowsperfcounters".into(),
+                "windows_perf_counters".into(),
                 WINDOWSPERFCOUNTERS_RECEIVER_URN.into(),
                 otel_arrow_dfe_config::node::NodeKind::Receiver,
                 HashMap::new(),
             );
         let factory = OTAP_PIPELINE_FACTORY
             .get_receiver_factory_map()
-            .get(WINDOWSPERFCOUNTERS_RECEIVER_URN)
-            .expect("registered windowsperfcounters factory");
+            .get("urn:otel:receiver:windows_perf_counters")
+            .expect("registered windows_perf_counters factory");
         let result = (factory.create)(
             pipeline,
             test_node(test_runtime.config().name.clone()),
@@ -1696,14 +1696,14 @@ mod tests {
                 max_expanded_counters: 4_096,
                 warnings: Vec::new(),
             },
-            node: "windowsperfcounters".to_owned(),
+            node: "windows_perf_counters".to_owned(),
             metrics: Rc::new(RefCell::new(WindowsPerfCountersReceiverMetrics::register(
                 &pipeline,
             ))),
         };
         let receiver = ReceiverWrapper::local(
             receiver,
-            test_node("windowsperfcounters"),
+            test_node("windows_perf_counters"),
             Arc::new(NodeUserConfig::new_receiver_config(
                 WINDOWSPERFCOUNTERS_RECEIVER_URN,
             )),
@@ -1739,7 +1739,7 @@ mod tests {
         let factory = OTAP_PIPELINE_FACTORY
             .get_receiver_factory_map()
             .get(WINDOWSPERFCOUNTERS_RECEIVER_URN)
-            .expect("registered windowsperfcounters factory");
+            .expect("registered windows_perf_counters factory");
         let mut node_config = NodeUserConfig::new_receiver_config(WINDOWSPERFCOUNTERS_RECEIVER_URN);
         node_config.config = serde_json::json!({
             "metrics": {

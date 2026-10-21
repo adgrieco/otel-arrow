@@ -330,7 +330,7 @@
     "attributes": {}
   },
   {
-    "id": "urn:otel:receiver:windowsperfcounters",
+    "id": "urn:otel:receiver:windows_perf_counters",
     "category": "Receiver",
     "description": null,
     "attributes": {}

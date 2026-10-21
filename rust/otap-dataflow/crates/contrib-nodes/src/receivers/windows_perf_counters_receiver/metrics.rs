@@ -14,7 +14,7 @@ use otel_arrow_dfe_telemetry_macros::metric_set;
 
 /// PDH scrape outcomes for one Windows performance-counter receiver node.
 #[metric_set(
-    name = "receiver.windowsperfcounters.scrapes",
+    name = "receiver.windows_perf_counters.scrapes",
     measurement_attributes = OutcomeAttributes
 )]
 #[derive(Debug, Default, Clone)]
@@ -25,7 +25,7 @@ pub(super) struct WindowsPerfCountersScrapeMetrics {
 }
 
 /// Lifecycle, inventory, and collection metrics.
-#[metric_set(name = "receiver.windowsperfcounters")]
+#[metric_set(name = "receiver.windows_perf_counters")]
 #[derive(Debug, Default, Clone)]
 pub(super) struct WindowsPerfCountersMetrics {
     /// Configured exact counter paths.

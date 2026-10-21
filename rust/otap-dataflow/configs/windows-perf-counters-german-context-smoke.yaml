@@ -10,7 +10,7 @@ groups:
       main:
         nodes:
           perf:
-            type: receiver:windowsperfcounters
+            type: receiver:windows_perf_counters
             config:
               metrics:
                 smoke.memory.available: { unit: By, gauge: {} }

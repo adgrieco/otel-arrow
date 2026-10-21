@@ -5,7 +5,7 @@
 
 otel_arrow_dfe_telemetry::otel_component_scope!(
     urn = runtime::WINDOWSPERFCOUNTERS_RECEIVER_URN,
-    target = "otel.receiver.windowsperfcounters",
+    target = "otel.receiver.windows_perf_counters",
 );
 
 mod config;

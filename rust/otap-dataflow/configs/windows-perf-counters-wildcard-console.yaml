@@ -18,7 +18,7 @@ groups:
       main:
         nodes:
           wildcard:
-            type: receiver:windowsperfcounters
+            type: receiver:windows_perf_counters
             config:
               metrics:
                 windows.memory.available:

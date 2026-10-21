@@ -1,0 +1,37 @@
+# platform: windows-only
+# A-PERF acceptance configuration; the test session owns the 35-minute run.
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation: { type: core_count, count: 1 }
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          perf:
+            type: receiver:windows_perf_counters
+            config:
+              metrics:
+                perf.missing.value: { unit: "1", gauge: {} }
+                perf.process.id: { unit: "1", gauge: {} }
+                perf.process.private: { unit: By, gauge: {} }
+                perf.memory.available: { unit: By, gauge: {} }
+              perfcounters:
+                - object: AldoTel Perf Missing
+                  counters: [{ name: Missing Counter, metric: perf.missing.value }]
+                - object: Process
+                  instances: ["*"]
+                  counters:
+                    - { name: ID Process, metric: perf.process.id }
+                    - { name: Private Bytes, metric: perf.process.private }
+                - object: Memory
+                  counters: [{ name: Available Bytes, metric: perf.memory.available }]
+              collection_interval: 1s
+              wildcard_refresh_interval: 60s
+          console:
+            type: exporter:console
+            config: { format: pretty, unicode: false, color: false }
+        connections:
+          - { from: perf, to: console }

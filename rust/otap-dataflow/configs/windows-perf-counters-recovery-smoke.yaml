@@ -1,0 +1,34 @@
+# platform: windows-only
+# Provider-install acceptance configuration; execution belongs to the test session.
+version: otel_dataflow/v1
+engine: {}
+policies:
+  resources:
+    core_allocation: { type: core_count, count: 1 }
+groups:
+  default:
+    pipelines:
+      main:
+        nodes:
+          perf:
+            type: receiver:windows_perf_counters
+            config:
+              metrics:
+                recovery.exact.value: { unit: "1", gauge: {} }
+                recovery.wildcard.value: { unit: "1", gauge: {} }
+                recovery.memory.available: { unit: By, gauge: {} }
+              perfcounters:
+                - object: AldoTel Recovery Exact
+                  counters: [{ name: Value, metric: recovery.exact.value }]
+                - object: AldoTel Recovery Wildcard
+                  instances: ["*"]
+                  counters: [{ name: Value, metric: recovery.wildcard.value }]
+                - object: Memory
+                  counters: [{ name: Available Bytes, metric: recovery.memory.available }]
+              collection_interval: 10s
+              wildcard_refresh_interval: 60s
+          console:
+            type: exporter:console
+            config: { format: pretty, unicode: false, color: false }
+        connections:
+          - { from: perf, to: console }
