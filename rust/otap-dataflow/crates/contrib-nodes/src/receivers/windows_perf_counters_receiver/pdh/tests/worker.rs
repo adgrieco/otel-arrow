@@ -3,6 +3,46 @@
 
 use super::*;
 
+/// Scenario: Every exact mapping is permanently unsupported rather than temporarily unavailable.
+/// Guarantees: Startup fails contextually, releases rejected handles, and does not advertise pending readiness without recovery work.
+#[test]
+fn permanently_rejected_exact_startup_is_fatal() {
+    let path = r"\Provider\Unsupported";
+    let state = fake_state(vec![FakeCounter {
+        native_type: 0x4003_0401,
+        ..fake_counter(path, Number::Integer(1))
+    }]);
+    let opens = Cell::new(0);
+    let mut open = |configs, limit, seed: Option<&QueryRecreationSeed>| {
+        opens.set(opens.get() + 1);
+        Query::open_with_seed(
+            FakePdh::new(Rc::clone(&state)),
+            configs,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            256,
+            limit,
+            seed,
+        )
+    };
+    let result = open_initial_query(
+        vec![counter(path, "unsupported")],
+        Duration::ZERO,
+        1,
+        &mut open,
+        &AtomicBool::new(false),
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("permanent rejection reported readiness"),
+    };
+    assert!(matches!(error, Error::NoUsableCounters { .. }));
+    assert!(error.to_string().contains("unsupported_type"));
+    assert_eq!(opens.get(), 1);
+    assert_eq!(state.borrow().removed, [0]);
+    assert_eq!(state.borrow().calls.collect, 0);
+}
+
 /// Scenario: Initial open or setup cleanup fails recoverably before a later successful open.
 /// Guarantees: Readiness exposes pending state, bounded backoff does not reopen early, and rebuild primes before publication.
 #[tokio::test(flavor = "current_thread")]

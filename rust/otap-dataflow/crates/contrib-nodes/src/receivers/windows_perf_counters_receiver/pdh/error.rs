@@ -83,6 +83,8 @@ pub(in super::super) enum Error {
     InvalidCounterToken { path: String },
     #[error("invalid performance-counter sample: {0}")]
     InvalidSample(&'static str),
+    #[error("no usable performance counters or recoverable availability work: {detail}")]
+    NoUsableCounters { detail: String },
     #[error("counter calculation for {path} failed: {message}")]
     Calculation { path: String, message: String },
     #[error("counter scaling for {path} failed: {source}")]
@@ -196,6 +198,7 @@ impl Error {
             Self::CounterSetup { .. } => "counter_setup",
             Self::InvalidCounterToken { .. } => "invalid_counter_token",
             Self::InvalidSample(_) => "invalid_sample",
+            Self::NoUsableCounters { .. } => "no_usable_counters",
             Self::Calculation { .. } => "calculation",
             Self::Scale { .. } => "scale",
             Self::WorkerStart(_) => "worker_start",

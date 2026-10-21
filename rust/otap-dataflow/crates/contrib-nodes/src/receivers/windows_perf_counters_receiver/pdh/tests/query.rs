@@ -18,6 +18,9 @@ struct InvalidHandleState {
     raw_value: i64,
     no_observation: BTreeSet<String>,
     expansions: BTreeMap<String, Vec<String>>,
+    expand_calls: usize,
+    collect_status: Option<u32>,
+    invalidate_on_collect: bool,
 }
 
 struct InvalidHandlePdh(Rc<RefCell<InvalidHandleState>>);
@@ -69,6 +72,19 @@ impl PdhApi for InvalidHandlePdh {
     }
 
     fn collect(&mut self) -> Result<bool, Error> {
+        let mut state = self.0.borrow_mut();
+        if let Some(status) = state.collect_status {
+            return Err(Error::Pdh {
+                operation: PdhOperation::CollectQueryData,
+                path: "<query>".to_owned(),
+                status,
+            });
+        }
+        if state.invalidate_on_collect {
+            let handles = state.active.clone();
+            state.invalid_handles.extend(handles);
+            state.invalidate_on_collect = false;
+        }
         Ok(true)
     }
 
@@ -118,6 +134,7 @@ impl PdhApi for InvalidHandlePdh {
     }
 
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
+        self.0.borrow_mut().expand_calls += 1;
         Ok(self
             .0
             .borrow()
@@ -136,7 +153,23 @@ fn invalid_handle_query(
     configs: Vec<CounterConfig>,
     expansions: BTreeMap<String, Vec<String>>,
 ) -> (Rc<RefCell<InvalidHandleState>>, Query<InvalidHandlePdh>) {
-    let state = Rc::new(RefCell::new(InvalidHandleState {
+    let state = invalid_handle_state(expansions);
+    let query = Query::open_with(
+        InvalidHandlePdh(Rc::clone(&state)),
+        configs,
+        Duration::ZERO,
+        Duration::ZERO,
+        256,
+        4_096,
+    )
+    .unwrap();
+    (state, query)
+}
+
+fn invalid_handle_state(
+    expansions: BTreeMap<String, Vec<String>>,
+) -> Rc<RefCell<InvalidHandleState>> {
+    Rc::new(RefCell::new(InvalidHandleState {
         next_handle: 0,
         paths: BTreeMap::new(),
         active: BTreeSet::new(),
@@ -150,17 +183,10 @@ fn invalid_handle_query(
         raw_value: 10,
         no_observation: BTreeSet::new(),
         expansions,
-    }));
-    let query = Query::open_with(
-        InvalidHandlePdh(Rc::clone(&state)),
-        configs,
-        Duration::ZERO,
-        Duration::ZERO,
-        256,
-        4_096,
-    )
-    .unwrap();
-    (state, query)
+        expand_calls: 0,
+        collect_status: None,
+        invalidate_on_collect: false,
+    }))
 }
 
 fn handle_for_path(state: &InvalidHandleState, path: &str) -> usize {
@@ -169,6 +195,226 @@ fn handle_for_path(state: &InvalidHandleState, path: &str) -> usize {
         .iter()
         .find_map(|(handle, candidate)| (candidate == path).then_some(*handle))
         .unwrap()
+}
+
+/// Scenario: An admitted wildcard handle fails reading and native retirement before discovery is due again.
+/// Guarantees: Recovery retains the member's reservation and seed, re-adds it without discovery, primes, and preserves the logical Sum start.
+#[test]
+fn failed_wildcard_retirement_preserves_rebuild_seed() {
+    let template = r"\Process(worker*)\Operations Delta";
+    let path = r"\Process(worker)\Operations Delta";
+    let state = invalid_handle_state(BTreeMap::from([(
+        template.to_owned(),
+        vec![path.to_owned()],
+    )]));
+    let mut config = cumulative_sum(template, "operations", "{operation}");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let mut open = |configs, limit, seed: Option<&QueryRecreationSeed>| {
+        // This adapter does not model query destruction; emulate release before replacement.
+        state.borrow_mut().active.clear();
+        Query::open_managed_with_seed(
+            InvalidHandlePdh(Rc::clone(&state)),
+            configs,
+            Duration::ZERO,
+            Duration::from_secs(3600),
+            256,
+            limit,
+            seed,
+        )
+    };
+    let mut slot = QuerySlot::open_initial(vec![config], 1, &mut open).unwrap();
+    let handle = handle_for_path(&state.borrow(), path);
+    {
+        let mut state = state.borrow_mut();
+        let _ = state.invalid_handles.insert(handle);
+        state.cleanup_fails = true;
+        state.timestamp = 110;
+    }
+    assert!(
+        collect_query(&mut slot, Duration::ZERO, 1, &mut open)
+            .unwrap_err()
+            .requires_immediate_query_rebuild()
+    );
+    assert!(slot.query.is_none());
+    assert_eq!(slot.reserved_native_entry_count(), 1);
+    state.borrow_mut().cleanup_fails = false;
+    let rebuilt = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
+    assert!(rebuilt.points.is_empty());
+    assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
+    state.borrow_mut().timestamp = 120;
+    let ready = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
+    assert_eq!(ready.points.len(), 1);
+    assert_eq!(ready.points[0].path.as_ref(), path);
+    assert_eq!(ready.points[0].start_time_unix_nano, Some(100));
+    assert!(matches!(ready.points[0].value, SampleValue::Value(_)));
+    assert_eq!(state.borrow().expand_calls, 1);
+    assert_eq!(
+        state.borrow().add_attempts,
+        [path.to_owned(), path.to_owned()]
+    );
+    assert_eq!(state.borrow().max_active, 1);
+}
+
+/// Scenario: Replacement priming fails either before collection or after successful collection during invalid-handle cleanup.
+/// Guarantees: Both failures produce diagnostic-only maintenance, no points or scheduled success, and no duplicated failures on the following request.
+#[test]
+fn failed_rebuild_prime_is_diagnostic_only() {
+    let path = r"\Memory\Available Bytes";
+    for fail_after_collection in [false, true] {
+        let state = invalid_handle_state(BTreeMap::new());
+        let opens = Cell::new(0);
+        let mut open = |configs, limit, seed: Option<&QueryRecreationSeed>| {
+            let attempt = opens.get();
+            opens.set(attempt + 1);
+            {
+                let mut state = state.borrow_mut();
+                state.active.clear();
+                state.collect_status = (attempt == 1 && !fail_after_collection).then_some(1);
+                state.invalidate_on_collect = attempt == 1 && fail_after_collection;
+                state.cleanup_fails = attempt == 1 && fail_after_collection;
+            }
+            Query::open_managed_with_seed(
+                InvalidHandlePdh(Rc::clone(&state)),
+                configs,
+                Duration::ZERO,
+                Duration::from_secs(3600),
+                256,
+                limit,
+                seed,
+            )
+        };
+        let mut slot =
+            QuerySlot::open_initial(vec![counter(path, "memory")], 1, &mut open).unwrap();
+        state.borrow_mut().collect_status = Some(PDH_INVALID_HANDLE);
+        assert!(
+            collect_query(&mut slot, Duration::ZERO, 1, &mut open)
+                .unwrap_err()
+                .is_invalid_query()
+        );
+        let failed_prime = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
+        assert!(failed_prime.points.is_empty());
+        assert!(!failed_prime.metadata.diagnostics.any_query_collected);
+        assert!(failed_prime.metadata.diagnostics.query_pending);
+        assert!(!failed_prime.metadata.failures.is_empty());
+        assert!(
+            failed_prime
+                .metadata
+                .failures
+                .iter()
+                .all(|failure| failure.diagnostic_only)
+        );
+        state.borrow_mut().collect_status = None;
+        if fail_after_collection {
+            let rebuilt = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
+            assert!(!rebuilt.metadata.diagnostics.any_query_collected);
+            assert!(rebuilt.metadata.failures.is_empty());
+        }
+        state.borrow_mut().timestamp = 120;
+        let ready = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
+        assert!(ready.metadata.diagnostics.any_query_collected);
+        assert!(ready.metadata.failures.is_empty());
+        assert_eq!(ready.points.len(), 1);
+    }
+}
+
+/// Scenario: One configured mapping expands multiple patterns whose list order conflicts with concrete-key order.
+/// Guarantees: Global admission compares concrete keys across that mapping's patterns and is independent of the pattern list order.
+#[test]
+fn same_mapping_patterns_share_concrete_key_admission_order() {
+    let alpha = r"\Process(alpha)\Private Bytes";
+    let zeta = r"\Process(zeta)\Private Bytes";
+    for patterns in [vec!["z*", "a*"], vec!["a*", "z*"]] {
+        let config = Config::from_json(&serde_json::json!({
+            "metrics": { "private": { "gauge": {} } },
+            "perfcounters": [{ "object": "Process", "instances": patterns,
+                "counters": [{ "name": "Private Bytes", "metric": "private" }] }]
+        }))
+        .unwrap();
+        assert_eq!(
+            config.counters[0].source_mapping_index,
+            config.counters[1].source_mapping_index
+        );
+        let (state, mut query) = fake_query_with_seed(
+            config.counters,
+            [alpha, zeta]
+                .into_iter()
+                .map(|path| fake_counter(path, Number::Integer(1)))
+                .collect(),
+            Duration::ZERO,
+            Duration::ZERO,
+            1,
+            None,
+        );
+        {
+            let mut state = state.borrow_mut();
+            let _ = state.expansions.insert(
+                r"\Process(a*)\Private Bytes".to_owned(),
+                vec![alpha.to_owned()],
+            );
+            let _ = state.expansions.insert(
+                r"\Process(z*)\Private Bytes".to_owned(),
+                vec![zeta.to_owned()],
+            );
+        }
+        query.refresh_all_wildcards_managed().unwrap();
+        let sample = query.collect_managed().unwrap();
+        assert_eq!(sample.points.len(), 1);
+        assert_eq!(sample.points[0].path.as_ref(), alpha);
+    }
+}
+
+/// Scenario: A retained member is rediscovered by an overlapping pattern from its source mapping.
+/// Guarantees: The original pattern retains ownership when still matching, so deduplication cannot move its quota charge and exceed a per-pattern limit.
+#[test]
+fn overlapping_patterns_preserve_retained_quota_ownership() {
+    let alpha = r"\Process(alpha)\Private Bytes";
+    let zeta = r"\Process(zeta)\Private Bytes";
+    let config = Config::from_json(&serde_json::json!({
+        "perfcounters": [{ "object": "Process", "instances": ["z*", "*a"],
+            "counters": [{ "name": "Private Bytes" }] }]
+    }))
+    .unwrap();
+    let state = fake_state(
+        [alpha, zeta]
+            .into_iter()
+            .map(|path| fake_counter(path, Number::Integer(1)))
+            .collect(),
+    );
+    let _ = state.borrow_mut().expansions.insert(
+        r"\Process(*a)\Private Bytes".to_owned(),
+        vec![zeta.to_owned()],
+    );
+    let mut query = Query::open_managed_with_seed(
+        FakePdh::new(Rc::clone(&state)),
+        config.counters,
+        Duration::ZERO,
+        Duration::ZERO,
+        1,
+        2,
+        None,
+    )
+    .unwrap();
+    query.refresh_all_wildcards_managed().unwrap();
+    {
+        let mut state = state.borrow_mut();
+        let _ = state.expansions.insert(
+            r"\Process(z*)\Private Bytes".to_owned(),
+            vec![zeta.to_owned()],
+        );
+        let _ = state.expansions.insert(
+            r"\Process(*a)\Private Bytes".to_owned(),
+            vec![alpha.to_owned(), zeta.to_owned()],
+        );
+    }
+    query.refresh_all_wildcards_managed().unwrap();
+    let sample = query.collect_managed().unwrap();
+    assert_eq!(sample.points.len(), 1);
+    assert_eq!(sample.points[0].counter_index, 1);
+    assert_eq!(sample.points[0].path.as_ref(), zeta);
+    assert_eq!(state.borrow().added, [zeta.to_owned()]);
+    assert_eq!(sample.metadata.diagnostics.instances_omitted_over_limit, 1);
 }
 
 /// Scenario: One wildcard delta counter's native handle becomes invalid beside a healthy calculated counter.
@@ -1024,20 +1270,25 @@ fn queued_retry_stops_after_unsupported_type() {
         formatted_error: false,
     });
 
-    let rejected = query.collect().unwrap();
-    assert_eq!(rejected.metadata.diagnostics.retry_attempts, 1);
-    assert_eq!(rejected.metadata.diagnostics.retry_recoveries, 0);
-    assert_eq!(rejected.metadata.diagnostics.counter_add_failures, 2);
-    assert_eq!(rejected.metadata.failures.len(), 2);
-    assert_eq!(rejected.metadata.failures[1].reason, "unsupported_type");
+    assert!(matches!(
+        query.collect(),
+        Err(Error::NoUsableCounters { .. })
+    ));
+    let rejected = std::mem::take(&mut query.pending);
+    assert_eq!(rejected.diagnostics.retry_attempts, 1);
+    assert_eq!(rejected.diagnostics.retry_recoveries, 0);
+    assert_eq!(rejected.diagnostics.counter_add_failures, 2);
+    assert_eq!(rejected.failures.len(), 2);
+    assert_eq!(rejected.failures[1].reason, "unsupported_type");
     assert_eq!(state.borrow().removed, [0]);
 
     state.borrow_mut().timestamp = 110;
-    let settled = query.collect().unwrap();
-    assert_eq!(settled.metadata.diagnostics.retry_attempts, 0);
-    assert_eq!(settled.metadata.diagnostics.retry_recoveries, 0);
-    assert_eq!(settled.metadata.diagnostics.counter_add_failures, 0);
-    assert!(settled.metadata.failures.is_empty());
+    assert!(matches!(
+        query.collect(),
+        Err(Error::NoUsableCounters { .. })
+    ));
+    assert_eq!(query.pending.diagnostics.retry_attempts, 0);
+    assert!(query.pending.failures.is_empty());
     assert_eq!(state.borrow().removed, [0]);
 }
 
@@ -1062,20 +1313,25 @@ fn queued_retry_stops_after_unsupported_base_type() {
         formatted_error: false,
     });
 
-    let rejected = query.collect().unwrap();
-    assert_eq!(rejected.metadata.diagnostics.retry_attempts, 1);
-    assert_eq!(rejected.metadata.diagnostics.retry_recoveries, 0);
-    assert_eq!(rejected.metadata.diagnostics.counter_add_failures, 2);
-    assert_eq!(rejected.metadata.failures.len(), 2);
-    assert_eq!(rejected.metadata.failures[1].reason, "unsupported_type");
+    assert!(matches!(
+        query.collect(),
+        Err(Error::NoUsableCounters { .. })
+    ));
+    let rejected = std::mem::take(&mut query.pending);
+    assert_eq!(rejected.diagnostics.retry_attempts, 1);
+    assert_eq!(rejected.diagnostics.retry_recoveries, 0);
+    assert_eq!(rejected.diagnostics.counter_add_failures, 2);
+    assert_eq!(rejected.failures.len(), 2);
+    assert_eq!(rejected.failures[1].reason, "unsupported_type");
     assert_eq!(state.borrow().removed, [0]);
 
     state.borrow_mut().timestamp = 110;
-    let settled = query.collect().unwrap();
-    assert_eq!(settled.metadata.diagnostics.retry_attempts, 0);
-    assert_eq!(settled.metadata.diagnostics.retry_recoveries, 0);
-    assert_eq!(settled.metadata.diagnostics.counter_add_failures, 0);
-    assert!(settled.metadata.failures.is_empty());
+    assert!(matches!(
+        query.collect(),
+        Err(Error::NoUsableCounters { .. })
+    ));
+    assert_eq!(query.pending.diagnostics.retry_attempts, 0);
+    assert!(query.pending.failures.is_empty());
     assert_eq!(state.borrow().removed, [0]);
 }
 

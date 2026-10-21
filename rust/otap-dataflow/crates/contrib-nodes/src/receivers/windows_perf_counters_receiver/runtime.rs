@@ -157,6 +157,28 @@ impl FailureLogState {
         receiver: &WindowsPerfCountersReceiver,
         sample: &Sample,
     ) -> Result<(), usize> {
+        let retained = sample
+            .members
+            .iter()
+            .map(|member| (member.counter_index, member.path.as_ref()))
+            .chain(
+                sample
+                    .metadata
+                    .failures
+                    .iter()
+                    .filter(|failure| failure.reason == "PdhRemoveCounter")
+                    .map(|failure| (failure.counter_index, failure.path.as_ref())),
+            )
+            .collect::<BTreeSet<_>>();
+        self.active_counter_failures
+            .retain(|(counter_index, path, _)| {
+                retained.contains(&(*counter_index, path.as_ref()))
+                    || receiver
+                        .config
+                        .counters
+                        .get(*counter_index)
+                        .is_some_and(|counter| path.as_ref() == counter.path.as_str())
+            });
         for point in &sample.points {
             if !matches!(point.value, SampleValue::Value(_)) {
                 continue;
@@ -656,7 +678,7 @@ mod tests {
         CounterConfig, InstanceConfig, MetricKind,
     };
     use crate::receivers::windows_perf_counters_receiver::model::{
-        Number, PendingMetadata, SampleDiagnostics, SamplePoint, SampleValue,
+        Number, PendingMetadata, SampleDiagnostics, SampleMember, SamplePoint, SampleValue,
     };
     use arrow::array::TimestampNanosecondArray;
     use otel_arrow_dfe_config::node::NodeUserConfig;
@@ -873,6 +895,64 @@ mod tests {
         assert_eq!(metrics.health.counter_add_failures.get(), 1);
         assert_eq!(metrics.health.query_pending.get(), 1);
         assert_eq!(metrics.health.counter_read_failures.get(), 0);
+    }
+
+    /// Scenario: Unique wildcard members fail and disappear repeatedly under a one-member admission limit.
+    /// Guarantees: Warning suppression retains current/retrying identities, drops departed identities, and re-arms when a removed identity returns.
+    #[test]
+    fn wildcard_warning_state_is_bounded_by_current_membership() {
+        let mut config = test_counter(BTreeMap::new());
+        config.path = r"\Process(*)\Private Bytes".to_owned();
+        config.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
+        let receiver = test_receiver(vec![config]);
+        let mut state = FailureLogState::default();
+        for index in 0..100 {
+            let path: Arc<str> = Arc::from(format!(r"\Process(worker{index})\Private Bytes"));
+            let mut failed = Sample::empty(100);
+            failed.members.push(SampleMember {
+                counter_index: 0,
+                path: Arc::clone(&path),
+                instance: None,
+                emit_instance_attribute: false,
+            });
+            failed.metadata.failures.push(SampleFailure {
+                counter_index: 0,
+                path,
+                reason: "counter CStatus",
+                error: "invalid data".to_owned(),
+                diagnostic_only: false,
+            });
+            state.log_counter_failures(&receiver, &failed).unwrap();
+            assert_eq!(state.active_counter_failures.len(), 1);
+            failed.metadata.failures.clear();
+            state.log_counter_failures(&receiver, &failed).unwrap();
+            assert_eq!(state.active_counter_failures.len(), 1);
+            state
+                .log_counter_failures(&receiver, &Sample::empty(110))
+                .unwrap();
+            assert!(state.active_counter_failures.is_empty());
+        }
+        let path: Arc<str> = Arc::from(r"\Process(worker0)\Private Bytes");
+        let mut removed = Sample::empty(120);
+        removed.metadata.failures.push(SampleFailure {
+            counter_index: 0,
+            path: Arc::clone(&path),
+            reason: "PdhRemoveCounter",
+            error: "cleanup pending".to_owned(),
+            diagnostic_only: true,
+        });
+        state.log_counter_failures(&receiver, &removed).unwrap();
+        state.log_counter_failures(&receiver, &removed).unwrap();
+        assert_eq!(state.active_counter_failures.len(), 1);
+        state
+            .log_counter_failures(&receiver, &Sample::empty(130))
+            .unwrap();
+        assert!(state.active_counter_failures.is_empty());
+        removed.metadata.failures[0].reason = "counter CStatus";
+        state.log_counter_failures(&receiver, &removed).unwrap();
+        assert_eq!(state.active_counter_failures.len(), 1);
     }
 
     /// Scenario: A concrete counter fails, is absent and omitted on later scrapes, then produces a valid value before failing again.

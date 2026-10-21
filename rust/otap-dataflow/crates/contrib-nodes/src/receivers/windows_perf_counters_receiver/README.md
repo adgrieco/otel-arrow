@@ -315,7 +315,9 @@ healthy counters. Exact unsupported mappings do not enter add retry; wildcard
 members are reconsidered on later discovery. A missing or inaccessible exact
 counter
 is diagnosed and retried with bounded backoff. An entirely unavailable set
-starts pending and retries availability rather than failing startup.
+starts pending when retry or discovery work can restore availability.
+An exact-only set with no usable counters and no remaining recovery work fails
+explicitly instead of advertising unrecoverable pending readiness.
 Diagnostics include the native type.
 
 ## Scaling

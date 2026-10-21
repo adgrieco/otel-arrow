@@ -218,6 +218,7 @@ impl<A: PdhApi> Query<A> {
             initial_wildcard_refresh: seed.is_none(),
         };
         query.initialize_exact_counters()?;
+        query.ensure_available_or_recoverable(&query.pending)?;
         let mut metadata = PendingMetadata::default();
         if let Some(seed) = seed {
             query.initialize_seeded_wildcards(seed, &mut metadata)?;
@@ -238,6 +239,26 @@ impl<A: PdhApi> Query<A> {
         self.configs
             .iter()
             .any(|config| config.instance_config.is_wildcard())
+    }
+
+    fn ensure_available_or_recoverable(&self, metadata: &PendingMetadata) -> Result<(), Error> {
+        if self.counters.is_empty()
+            && self.retry_states.is_empty()
+            && self.pending_removals.is_empty()
+            && !self.has_wildcard_configs()
+        {
+            let detail = metadata.failures.last().map_or_else(
+                || "no installed counters, retries or wildcard discovery".to_owned(),
+                |failure| {
+                    format!("{} for {}: {}", failure.reason, failure.path, failure.error)
+                        .chars()
+                        .take(512)
+                        .collect()
+                },
+            );
+            return Err(Error::NoUsableCounters { detail });
+        }
+        Ok(())
     }
 
     fn initialize_seeded_wildcards(
@@ -837,33 +858,46 @@ impl<A: PdhApi> Query<A> {
             .counters
             .iter()
             .filter_map(|(key, counter)| {
-                counter
-                    .origin
-                    .is_wildcard()
-                    .then_some((key, counter.admission_order.unwrap_or(u64::MAX)))
+                counter.origin.is_wildcard().then_some((
+                    key,
+                    (
+                        counter.admission_order.unwrap_or(u64::MAX),
+                        counter.config_index,
+                    ),
+                ))
             })
             .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                state
-                    .target
-                    .origin
-                    .is_wildcard()
-                    .then_some((key, state.target.admission_order.unwrap_or(u64::MAX)))
+                state.target.origin.is_wildcard().then_some((
+                    key,
+                    (
+                        state.target.admission_order.unwrap_or(u64::MAX),
+                        state.target.config_index,
+                    ),
+                ))
             }))
             .collect::<BTreeMap<_, _>>();
         let mut candidates = prepared
             .iter()
             .enumerate()
-            .flat_map(|(discovery_index, (_, _, _, paths))| {
+            .flat_map(|(discovery_index, (config_index, _, _, paths))| {
                 let admitted = &admitted;
-                paths.iter().enumerate().map(move |(path_index, (key, _))| {
-                    let order = admitted.get(key).copied();
-                    (
-                        order.is_none(),
-                        order.unwrap_or(0),
-                        discovery_index,
-                        path_index,
-                    )
-                })
+                let mapping_index = self.configs[*config_index].source_mapping_index;
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(move |(path_index, (key, path))| {
+                        let admission = admitted.get(key).copied();
+                        (
+                            admission.is_none(),
+                            admission.map_or(0, |(order, _)| order),
+                            mapping_index,
+                            admission.is_some_and(|(_, owner)| owner != *config_index),
+                            key,
+                            path,
+                            discovery_index,
+                            path_index,
+                        )
+                    })
             })
             .collect::<Vec<_>>();
         candidates.sort_unstable();
@@ -871,7 +905,7 @@ impl<A: PdhApi> Query<A> {
         let mut duplicates = vec![0; prepared.len()];
         let mut remaining = self.remaining_expansion_capacity(expanded_total);
         let mut owned = desired.keys().cloned().collect::<BTreeSet<_>>();
-        for (_, _, discovery_index, path_index) in candidates {
+        for (_, _, _, _, _, _, discovery_index, path_index) in candidates {
             let key = &prepared[discovery_index].3[path_index].0;
             if owned.contains(key) {
                 duplicates[discovery_index] += 1;
@@ -962,6 +996,22 @@ impl<A: PdhApi> Query<A> {
         known_groups: &BTreeMap<InstanceGroupKey, BTreeSet<CounterKey>>,
         metadata: &mut PendingMetadata,
     ) -> Result<(), Error> {
+        for (key, target) in &desired {
+            if let Some(counter) = self.counters.get_mut(key)
+                && counter.origin.is_wildcard()
+            {
+                counter.config_index = target.config_index;
+                counter.instance = Some(Arc::clone(&target.instance));
+                counter.emit_instance_attribute = target.emit_instance_attribute;
+            }
+            if let Some(state) = self.retry_states.get_mut(key)
+                && state.target.origin.is_wildcard()
+            {
+                state.target.config_index = target.config_index;
+                state.target.instance = Some(Arc::clone(&target.instance));
+                state.target.emit_instance_attribute = target.emit_instance_attribute;
+            }
+        }
         let changes = self.plan_wildcard_reconciliation(&desired, known_groups);
         self.discard_unwanted_wildcard_retries(&changes.wanted, metadata);
         self.remove_wildcard_counters(&changes.removed, &changes.wanted, metadata);
@@ -1194,23 +1244,22 @@ impl<A: PdhApi> Query<A> {
 
     #[cfg(test)]
     pub(super) fn prime(&mut self) -> Result<(), Error> {
-        let mut sample = self.collect_internal(true)?;
-        sample.metadata.diagnostics.any_query_collected = false;
-        for failure in &mut sample.metadata.failures {
-            failure.diagnostic_only = true;
-        }
-        self.pending.merge(sample.metadata);
-        Ok(())
+        self.prime_internal(true)
     }
 
     pub(super) fn prime_managed(&mut self) -> Result<(), Error> {
-        let mut sample = self.collect_internal(false)?;
-        sample.metadata.diagnostics.any_query_collected = false;
-        for failure in &mut sample.metadata.failures {
+        self.prime_internal(false)
+    }
+
+    fn prime_internal(&mut self, refresh_wildcards: bool) -> Result<(), Error> {
+        let result = self.collect_internal(refresh_wildcards).map(|sample| {
+            self.pending.merge(sample.metadata);
+        });
+        self.pending.diagnostics.any_query_collected = false;
+        for failure in &mut self.pending.failures {
             failure.diagnostic_only = true;
         }
-        self.pending.merge(sample.metadata);
-        Ok(())
+        result
     }
 
     pub(super) fn record_prime_failure(&mut self, error: &Error) {
@@ -1318,6 +1367,9 @@ impl<A: PdhApi> Query<A> {
             return Err(self.restore_collection_error(metadata, error));
         }
         if self.counters.is_empty() {
+            if let Err(error) = self.ensure_available_or_recoverable(&metadata) {
+                return Err(self.restore_collection_error(metadata, error));
+            }
             let timestamp_unix_nano = match self.api.timestamp().and_then(positive_timestamp) {
                 Ok(timestamp) => timestamp,
                 Err(error) => {
@@ -1430,6 +1482,14 @@ impl<A: PdhApi> Query<A> {
                 metadata
                     .failures
                     .push(sample_failure(counter.config_index, &error));
+                let _ = self.pending_removals.insert(
+                    key,
+                    PendingRemoval {
+                        counter,
+                        retry_target: Some(target),
+                        retry_ready: false,
+                    },
+                );
                 return Err(error);
             }
             self.schedule_retry(key, target, now);
