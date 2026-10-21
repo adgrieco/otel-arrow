@@ -425,93 +425,6 @@ fn invalid_handle_cleanup_failure_requires_query_rebuild() {
     assert_eq!(state.add_attempts.len(), 2);
 }
 
-/// Scenario: Startup membership contains a healthy exact counter, one wildcard member, and an unavailable exact peer.
-/// Guarantees: Later discovery and failed-add retries are disabled; transient collection failure retains installed handles and membership.
-#[test]
-fn frozen_membership_collects_only_installed_handles() {
-    let template = r"\Process(*)\Private Bytes";
-    let path = r"\Process(worker)\Private Bytes";
-    let healthy = r"\Memory\Available Bytes";
-    let mut wildcard = counter(template, "process");
-    wildcard.instance_config = InstanceConfig::Wildcard {
-        excluded_aggregation: None,
-    };
-    wildcard.source_mapping_index = 1;
-    let state = fake_state(vec![
-        fake_counter(healthy, Number::Integer(42)),
-        fake_counter(path, Number::Integer(1)),
-    ]);
-    let _ = state
-        .borrow_mut()
-        .expansions
-        .insert(template.to_owned(), vec![path.to_owned()]);
-    let mut query = Query::open_with(
-        FakePdh::new(Rc::clone(&state)),
-        vec![
-            counter(healthy, "memory"),
-            wildcard,
-            counter(r"\Missing\Value", "missing"),
-        ],
-        Duration::ZERO,
-        Duration::ZERO,
-        256,
-        4096,
-    )
-    .unwrap();
-    query.freeze_membership().unwrap();
-    let installed = state.borrow().added.clone();
-    let adds = state.borrow().calls.add;
-    let expansions = state.borrow().calls.expand;
-    let _ = state
-        .borrow_mut()
-        .expansions
-        .insert(template.to_owned(), Vec::new());
-    for _ in 0..4 {
-        state.borrow_mut().collect_error = true;
-        assert!(query.collect_managed().is_err());
-    }
-    state.borrow_mut().collect_error = false;
-    let sample = query.collect_managed().unwrap();
-    assert_eq!(sample.points.len(), 2);
-    assert_eq!(state.borrow().added, installed);
-    assert_eq!(state.borrow().calls.expand, expansions);
-    assert!(state.borrow().removed.is_empty());
-    assert_eq!(sample.metadata.diagnostics.retry_attempts, 0);
-    assert_eq!(state.borrow().calls.add, adds);
-}
-
-/// Scenario: Startup discovers no usable counters, or only a healthy counter beside an empty pattern.
-/// Guarantees: An all-empty set fails explicitly, but a partial set reports the empty pattern without a fabricated point.
-#[test]
-fn frozen_membership_rejects_empty_startup_and_diagnoses_partial_empty_pattern() {
-    let mut wildcard = counter(r"\Process(no-such-*)\Private Bytes", "process");
-    wildcard.instance_config = InstanceConfig::Wildcard {
-        excluded_aggregation: None,
-    };
-    let (_, mut empty) = fake_query(vec![wildcard.clone()], Vec::new());
-    assert!(matches!(
-        empty.freeze_membership(),
-        Err(Error::NoUsableCounters { .. })
-    ));
-    let path = r"\Memory\Available Bytes";
-    let (_, mut partial) = fake_query(
-        vec![counter(path, "memory"), wildcard],
-        vec![fake_counter(path, Number::Integer(42))],
-    );
-    partial.freeze_membership().unwrap();
-    let sample = partial.collect_managed().unwrap();
-    assert_eq!(sample.points.len(), 1);
-    assert!(
-        sample
-            .metadata
-            .failures
-            .iter()
-            .any(|failure| failure.counter_index == 1
-                && failure.reason == "empty_expansion"
-                && failure.diagnostic_only)
-    );
-}
-
 /// Scenario: Shutdown arrives during the first native aggregate-filter parse in startup expansion.
 /// Guarantees: Setup stops before another parse, counter add or prime instead of walking the remaining expansion.
 #[test]
@@ -596,7 +509,7 @@ fn startup_admission_enforces_fixed_pattern_and_total_bounds() {
         };
         configs.push(config);
     }
-    let mut query = Query::open_with(
+    let query = Query::open_with(
         FakePdh::new(Rc::clone(&state)),
         configs,
         Duration::from_secs(30),
@@ -605,7 +518,6 @@ fn startup_admission_enforces_fixed_pattern_and_total_bounds() {
         4096,
     )
     .unwrap();
-    query.freeze_membership().unwrap();
     let members = query.admitted_members();
     assert_eq!(members.len(), 4096);
     for mapping in 0..17 {
@@ -800,9 +712,9 @@ fn cumulative_non_monotonic_sum_uses_query_start_time() {
 }
 
 /// Scenario: A non-monotonic cumulative wildcard member is admitted after the query has already collected.
-/// Guarantees: The new concrete series starts at its admission observation boundary rather than the older query-open time.
+/// Guarantees: Newly admitted concrete series retain the logical query start independently of their sampling admission boundary.
 #[test]
-fn later_wildcard_member_uses_admission_start_time() {
+fn later_wildcard_member_uses_logical_query_start_time() {
     let template = r"\Process(*)\Private Bytes";
     let expanded = r"\Process(worker)\Private Bytes";
     let mut config = CounterConfig {
@@ -838,7 +750,7 @@ fn later_wildcard_member_uses_admission_start_time() {
     }
     let admitted = query.collect().unwrap();
     assert_eq!(admitted.points.len(), 1);
-    assert_eq!(admitted.points[0].start_time_unix_nano, Some(110));
+    assert_eq!(admitted.points[0].start_time_unix_nano, Some(100));
     assert!(matches!(
         admitted.points[0].value,
         SampleValue::Value(Number::Integer(42))
@@ -1291,8 +1203,15 @@ fn wildcard_refresh_retries_permanently_rejected_instance() {
         assert_eq!(rejected.metadata.diagnostics.retry_attempts, 0);
         assert_eq!(rejected.metadata.diagnostics.retry_recoveries, 0);
         assert_eq!(rejected.metadata.diagnostics.counter_add_failures, 1);
-        assert_eq!(rejected.metadata.failures.len(), 1);
-        assert_eq!(rejected.metadata.failures[0].reason, "unsupported_type");
+        assert_eq!(
+            rejected
+                .metadata
+                .failures
+                .iter()
+                .filter(|failure| failure.reason == "unsupported_type")
+                .count(),
+            1
+        );
         let state = state.borrow();
         assert_eq!(state.added.len(), expected_attempts);
         assert_eq!(state.removed.len(), expected_attempts);
@@ -1803,6 +1722,170 @@ fn non_ascii_case_collisions_share_one_budgeted_key() {
     assert!(paths.iter().any(|(_, path)| path == &upper));
     assert!(!paths.iter().any(|(_, path)| path == &lower));
     assert!(paths.iter().any(|(_, path)| path == &other));
+}
+
+/// Scenario: A later mapping retains or replaces its member while an earlier mapping discovers a new member at a one-entry limit.
+/// Guarantees: Retained members win globally; when capacity is released, new members are admitted in configuration rather than native-name order.
+#[test]
+fn refresh_retains_globally_then_admits_in_config_order() {
+    let first_template = r"\ZFirst(*)\Value";
+    let later_template = r"\ASecond(*)\Value";
+    let first_new = r"\ZFirst(new)\Value";
+    let later_old = r"\ASecond(old)\Value";
+    let later_new = r"\ASecond(new)\Value";
+    for retain_later in [false, true] {
+        let configs = [first_template, later_template]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut config = counter(path, "value");
+                config.source_mapping_index = index;
+                config.instance_config = InstanceConfig::Wildcard {
+                    excluded_aggregation: None,
+                };
+                config
+            })
+            .collect();
+        let (state, mut query) = fake_query_with_seed(
+            configs,
+            [first_new, later_old, later_new]
+                .into_iter()
+                .map(|path| fake_counter(path, Number::Integer(1)))
+                .collect(),
+            Duration::ZERO,
+            Duration::ZERO,
+            1,
+            None,
+        );
+        let _ = state
+            .borrow_mut()
+            .expansions
+            .insert(later_template.to_owned(), vec![later_old.to_owned()]);
+        query.refresh_all_wildcards_managed().unwrap();
+        {
+            let mut state = state.borrow_mut();
+            let _ = state
+                .expansions
+                .insert(first_template.to_owned(), vec![first_new.to_owned()]);
+            let _ = state.expansions.insert(
+                later_template.to_owned(),
+                vec![if retain_later { later_old } else { later_new }.to_owned()],
+            );
+        }
+        query.refresh_all_wildcards_managed().unwrap();
+        let sample = query.collect_managed().unwrap();
+        assert_eq!(sample.points.len(), 1);
+        assert_eq!(
+            sample.points[0].path.as_ref(),
+            if retain_later { later_old } else { first_new }
+        );
+        assert_eq!(query.active_counter_count(), 1);
+    }
+}
+
+/// Scenario: A disappeared member in a later mapping cannot be removed while an earlier mapping discovers a replacement.
+/// Guarantees: Failed cleanup retains the native-entry reservation and prevents new acquisition until cleanup succeeds.
+#[test]
+fn global_refresh_preserves_failed_removal_reservation() {
+    let first_template = r"\First(*)\Value";
+    let later_template = r"\Later(*)\Value";
+    let first_new = r"\First(new)\Value";
+    let later_old = r"\Later(old)\Value";
+    let configs = [first_template, later_template]
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let mut config = counter(path, "value");
+            config.source_mapping_index = index;
+            config.instance_config = InstanceConfig::Wildcard {
+                excluded_aggregation: None,
+            };
+            config
+        })
+        .collect();
+    let (state, mut query) = fake_query_with_seed(
+        configs,
+        [first_new, later_old]
+            .into_iter()
+            .map(|path| fake_counter(path, Number::Integer(1)))
+            .collect(),
+        Duration::ZERO,
+        Duration::ZERO,
+        1,
+        None,
+    );
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(later_template.to_owned(), vec![later_old.to_owned()]);
+    query.refresh_all_wildcards_managed().unwrap();
+    let _ = query.collect_managed().unwrap();
+    {
+        let mut state = state.borrow_mut();
+        let _ = state
+            .expansions
+            .insert(first_template.to_owned(), vec![first_new.to_owned()]);
+        let _ = state
+            .expansions
+            .insert(later_template.to_owned(), Vec::new());
+        state.remove_error = true;
+    }
+    query.refresh_all_wildcards_managed().unwrap();
+    let blocked = query.collect_managed().unwrap();
+    assert!(blocked.points.is_empty());
+    assert_eq!(query.reserved_native_entry_count(), 1);
+    assert_eq!(state.borrow().added, [later_old.to_owned()]);
+    assert_eq!(blocked.metadata.diagnostics.instances_omitted_over_limit, 1);
+    state.borrow_mut().remove_error = false;
+    let _ = query.collect_managed().unwrap();
+    assert_eq!(query.reserved_native_entry_count(), 0);
+    query.refresh_all_wildcards_managed().unwrap();
+    let admitted = query.collect_managed().unwrap();
+    assert_eq!(admitted.points[0].path.as_ref(), first_new);
+    assert_eq!(query.reserved_native_entry_count(), 1);
+    assert_eq!(
+        state.borrow().added,
+        [later_old.to_owned(), first_new.to_owned()]
+    );
+}
+
+/// Scenario: A wildcard remains empty through startup and later discovery passes.
+/// Guarantees: Startup diagnoses the configured mapping once without inventing a concrete observation or repeated empty-expansion warnings.
+#[test]
+fn empty_startup_expansion_is_diagnosed_once() {
+    let template = r"\Process(*)\Private Bytes";
+    let mut config = counter(template, "process.private");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let (_, mut query) =
+        fake_query_with_cadences(vec![config], Vec::new(), Duration::ZERO, Duration::ZERO);
+    let startup = query.collect().unwrap();
+    assert_eq!(
+        startup
+            .metadata
+            .failures
+            .iter()
+            .filter(|failure| failure.reason == "empty_expansion")
+            .count(),
+        1
+    );
+    assert!(
+        startup
+            .metadata
+            .failures
+            .iter()
+            .all(|failure| failure.diagnostic_only)
+    );
+    let later = query.collect().unwrap();
+    assert!(
+        !later
+            .metadata
+            .failures
+            .iter()
+            .any(|failure| failure.reason == "empty_expansion")
+    );
+    assert!(!later.metadata.diagnostics.any_query_collected);
 }
 
 /// Scenario: A refresh reorders retained instances while adding one and removing another.

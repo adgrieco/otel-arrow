@@ -45,69 +45,6 @@ async fn live_pdh_persistent_worker_reuses_and_closes_query() {
     assert_eq!(after.1 - before.1, 1);
 }
 
-/// Scenario: An internal caller requests query recreation despite the public configuration rejection.
-/// Guarantees: The production worker freezes every installed query and never replaces it at runtime.
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
-async fn live_pdh_recreates_and_primes_opted_in_query() {
-    let _serial = TEST_PDH_LOCK.lock().await;
-    let before = query_counts();
-    let shared_first = counter(r"\Memory\Available Bytes", "windows.memory.available");
-    let mut recreated = counter(
-        r"\Processor(_Total)\% Processor Time",
-        "windows.processor.time",
-    );
-    recreated.recreate_query = true;
-    recreated.source_mapping_index = 1;
-    let mut shared_second = counter(r"\Memory\Committed Bytes", "windows.memory.committed");
-    shared_second.source_mapping_index = 2;
-    let mut worker = Worker::start(
-        vec![shared_first, recreated, shared_second],
-        QueryCadence::uniform(Duration::from_secs(30)),
-        256,
-        4_096,
-        "test".to_owned(),
-    )
-    .await
-    .unwrap();
-
-    for _ in 0..2 {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let sample = worker.collect().await.unwrap();
-        assert_eq!(sample.points.len(), 3);
-        assert!(matches!(
-            sample.points[0].value,
-            SampleValue::Value(Number::Integer(value)) if value >= 0
-        ));
-        assert!(
-            matches!(sample.points[1].value, SampleValue::Value(Number::Double(value)) if value.is_finite())
-        );
-        assert!(matches!(
-            sample.points[2].value,
-            SampleValue::Value(Number::Integer(value)) if value >= 0
-        ));
-        assert_eq!(
-            sample
-                .points
-                .iter()
-                .map(|point| point.counter_index)
-                .collect::<Vec<_>>(),
-            [0, 1, 2]
-        );
-        assert_eq!(sample.metadata.diagnostics.query_recreation_attempts, 0);
-        assert_eq!(sample.metadata.diagnostics.query_recreation_failures, 0);
-    }
-    assert!(
-        worker
-            .shutdown(Instant::now() + Duration::from_secs(2))
-            .await
-            .unwrap()
-    );
-    let after = query_counts();
-    assert_eq!(after.0 - before.0, 2);
-    assert_eq!(after.1 - before.1, 2);
-}
-
 /// Scenario: Two independently configured receiver workers collect in one process.
 /// Guarantees: Each receiver owns a distinct query and both can collect and shut down cleanly.
 #[tokio::test(flavor = "current_thread")]
@@ -625,13 +562,13 @@ async fn live_pdh_collects_backslashed_paging_file_instance() {
 }
 
 /// Scenario: Every configured exact counter is unavailable when the worker starts.
-/// Guarantees: Startup fails explicitly and worker-owned cleanup closes the empty query.
+/// Guarantees: Startup exposes pending availability, collection remains empty, and shutdown closes the retryable query.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_entirely_unavailable_counter_set_starts_empty() {
     let _serial = TEST_PDH_LOCK.lock().await;
     let before = query_counts();
-    let result = Worker::start(
+    let mut worker = Worker::start(
         vec![counter(
             r"\Missing Object\Missing Counter",
             "windows.missing.counter",
@@ -641,8 +578,19 @@ async fn live_pdh_entirely_unavailable_counter_set_starts_empty() {
         4_096,
         "test".to_owned(),
     )
-    .await;
-    assert!(matches!(result, Err(Error::NoUsableCounters { .. })));
+    .await
+    .unwrap();
+    assert!(worker.startup.pending);
+    let sample = worker.collect().await.unwrap();
+    assert!(sample.metadata.diagnostics.query_pending);
+    assert!(!sample.metadata.diagnostics.any_query_collected);
+    assert!(sample.points.is_empty());
+    assert!(
+        worker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap()
+    );
     let after = query_counts();
     assert_eq!(after.0 - before.0, 1);
     assert_eq!(after.1 - before.1, 1);

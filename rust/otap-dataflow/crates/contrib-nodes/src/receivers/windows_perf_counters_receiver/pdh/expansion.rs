@@ -67,6 +67,7 @@ pub(super) fn keyed_expanded_paths(
     keyed
 }
 
+#[cfg(test)]
 pub(super) fn limit_expanded_paths<T>(
     paths: &mut Vec<T>,
     per_wildcard_limit: usize,

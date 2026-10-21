@@ -5,7 +5,7 @@
 
 use super::config::Config;
 use super::metrics::WindowsPerfCountersReceiverMetrics;
-use super::model::{Sample, SampleFailure, SampleValue};
+use super::model::{ExpansionOverflow, Sample, SampleFailure, SampleValue};
 use super::otap_builder::{ProjectionInvariantError, project_sample};
 use super::pdh;
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ use otel_arrow_dfe_otap::OTAP_RECEIVER_FACTORIES;
 use otel_arrow_dfe_otap::pdata::{Context, OtapPdata};
 use otel_arrow_dfe_telemetry::common_attributes::Outcome;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -58,6 +58,24 @@ fn next_future_collection_tick(
         periods -= u128::from(step);
     }
     Some(next)
+}
+
+fn overflow_summaries(overflows: &[ExpansionOverflow]) -> BTreeMap<usize, ExpansionOverflow> {
+    let mut summaries = BTreeMap::<usize, ExpansionOverflow>::new();
+    for overflow in overflows {
+        let _ = summaries
+            .entry(overflow.counter_index)
+            .and_modify(|summary| {
+                if summary.reason != overflow.reason {
+                    summary.reason = "multiple_limits";
+                }
+                summary.discovered = summary.discovered.max(overflow.discovered);
+                summary.retained = summary.retained.min(overflow.retained);
+                summary.omitted = summary.omitted.saturating_add(overflow.omitted);
+            })
+            .or_insert_with(|| overflow.clone());
+    }
+    summaries
 }
 
 fn failed_counter_value_count(failures: &[SampleFailure]) -> u64 {
@@ -307,7 +325,7 @@ impl WindowsPerfCountersReceiver {
     }
 
     fn log_sample_events(&self, sample: &Sample) {
-        for overflow in &sample.metadata.overflows {
+        for overflow in overflow_summaries(&sample.metadata.overflows).values() {
             let path_template = &self.config.counters[overflow.counter_index].path;
             otel_arrow_dfe_telemetry::otel_warn!(
                 "windows_perf_counters_receiver.instance_limit.exceeded",
@@ -328,7 +346,8 @@ impl WindowsPerfCountersReceiver {
                 node = self.node.as_str(),
                 added = sample.metadata.diagnostics.instances_added,
                 removed = sample.metadata.diagnostics.instances_removed,
-                active = sample.metadata.diagnostics.active_expanded_counters as u64
+                active = sample.metadata.diagnostics.active_expanded_counters as u64,
+                timestamp_unix_nano = sample.timestamp_unix_nano
             );
         }
     }
@@ -450,15 +469,6 @@ impl WindowsPerfCountersReceiver {
                     self.metrics.borrow_mut().health.worker_busy.inc();
                     continue;
                 }
-                Err(err) if err.is_invalid_query() => {
-                    self.record_completed_scrape(collection_duration, false);
-                    otel_arrow_dfe_telemetry::otel_error!(
-                        "windows_perf_counters_receiver.query.invalid",
-                        node = self.node.as_str(),
-                        error = %err
-                    );
-                    return Err(CollectionLoopError::Native(err));
-                }
                 Err(err) if err.is_collection_failure() => {
                     self.record_completed_scrape(collection_duration, false);
                     failure_logs.log_scrape_failure(&self.node, &err);
@@ -525,16 +535,37 @@ impl local::Receiver<OtapPdata> for WindowsPerfCountersReceiver {
         }
 
         let worker_start = initialize_and_signal_ready(
-            pdh::Worker::start_with_cadence(
-                self.config.counters.clone(),
-                pdh::QueryCadence::new(
-                    self.config.query_retry_cap(),
-                    self.config.wildcard_refresh_interval(),
-                ),
-                self.config.max_instances_per_wildcard,
-                self.config.max_expanded_counters,
-                self.node.clone(),
-            ),
+            async {
+                let worker = pdh::Worker::start_with_cadence(
+                    self.config.counters.clone(),
+                    pdh::QueryCadence::new(
+                        self.config.query_retry_cap(),
+                        self.config.wildcard_refresh_interval(),
+                    ),
+                    self.config.max_instances_per_wildcard,
+                    self.config.max_expanded_counters,
+                    self.node.clone(),
+                )
+                .await?;
+                {
+                    let mut metrics = self.metrics.borrow_mut();
+                    metrics
+                        .health
+                        .query_pending
+                        .set(u64::from(worker.startup.pending));
+                    metrics
+                        .health
+                        .active_expanded
+                        .set(worker.startup.active_expanded as u64);
+                }
+                otel_arrow_dfe_telemetry::otel_info!(
+                    "windows_perf_counters_receiver.ready",
+                    node = self.node.as_str(),
+                    query_pending = worker.startup.pending,
+                    active_expanded = worker.startup.active_expanded as u64
+                );
+                Ok::<_, pdh::Error>(worker)
+            },
             || effect_handler.signal_ready(),
         );
         tokio::pin!(worker_start);
@@ -654,7 +685,6 @@ mod tests {
             attributes: Arc::new(attributes),
             instance_config: InstanceConfig::None,
             scale_power10: 0,
-            recreate_query: false,
             source_mapping_index: 0,
         }
     }
@@ -729,10 +759,39 @@ mod tests {
         assert_eq!(failed_counter_value_count(&failures), 1);
     }
 
-    /// Scenario: One partial sample contains a failed query open and the next sample is empty only because that query remains in recovery.
-    /// Guarantees: The partial sample succeeds, recovery-only counts as an attempt failure, and only the failed open increments query-failure health.
+    /// Scenario: One wildcard reaches both its per-pattern and receiver-wide limit during the same refresh.
+    /// Guarantees: Reporting produces one summary for the pattern while retaining the total number of omitted members.
+    #[test]
+    fn compound_overflow_has_one_pattern_summary() {
+        let summaries = overflow_summaries(&[
+            ExpansionOverflow {
+                counter_index: 0,
+                reason: "per_wildcard",
+                discovered: 10,
+                retained: 4,
+                omitted: 6,
+            },
+            ExpansionOverflow {
+                counter_index: 0,
+                reason: "receiver_total",
+                discovered: 4,
+                retained: 2,
+                omitted: 2,
+            },
+        ]);
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[&0];
+        assert_eq!(
+            (summary.discovered, summary.retained, summary.omitted),
+            (10, 2, 8)
+        );
+        assert_eq!(summary.reason, "multiple_limits");
+    }
+
+    /// Scenario: A sample contains a failed counter add beside a healthy value, then a recovery-only sample follows.
+    /// Guarantees: Healthy collection succeeds, recovery-only does not count as a failed native collection, and pending recovery is observable.
     #[tokio::test]
-    async fn failed_open_and_recovery_only_sample_have_distinct_accounting() {
+    async fn healthy_collection_and_recovery_only_have_distinct_accounting() {
         let mut unavailable = test_counter(BTreeMap::new());
         unavailable.path = r"\Unavailable\Value".to_owned();
         unavailable.name = Arc::from("windows.unavailable");
@@ -747,15 +806,15 @@ mod tests {
             metadata: PendingMetadata {
                 diagnostics: SampleDiagnostics {
                     any_query_collected: true,
-                    scrape_failures: 1,
+                    counter_add_failures: 1,
                     ..Default::default()
                 },
                 failures: vec![SampleFailure {
                     counter_index: 1,
                     path: Arc::from(r"\Unavailable\Value"),
-                    reason: "PdhOpenQueryW",
+                    reason: "PdhAddEnglishCounterW",
                     error: "PDH status 0x00000001".to_owned(),
-                    diagnostic_only: false,
+                    diagnostic_only: true,
                 }],
                 overflows: Vec::new(),
             },
@@ -780,6 +839,10 @@ mod tests {
             members: Vec::new(),
             points: Vec::new(),
             metadata: PendingMetadata {
+                diagnostics: SampleDiagnostics {
+                    query_pending: true,
+                    ..Default::default()
+                },
                 failures: vec![SampleFailure {
                     counter_index: 1,
                     path: Arc::from(r"\Unavailable\Value"),
@@ -806,7 +869,9 @@ mod tests {
         assert_eq!(metrics.scrape_attempts(Outcome::Success), 1);
         assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
         assert_eq!(metrics.health.scrapes.get(), 1);
-        assert_eq!(metrics.health.scrape_failures.get(), 1);
+        assert_eq!(metrics.health.scrape_failures.get(), 0);
+        assert_eq!(metrics.health.counter_add_failures.get(), 1);
+        assert_eq!(metrics.health.query_pending.get(), 1);
         assert_eq!(metrics.health.counter_read_failures.get(), 0);
     }
 
@@ -1138,16 +1203,20 @@ mod tests {
     }
 
     /// Scenario: A scheduled native collection reports an invalid query handle.
-    /// Guarantees: Exactly one failed scrape is counted and the typed error terminates before any later collect or send.
+    /// Guarantees: The failed native attempt is counted once and runtime requests another scheduled collection instead of terminating on invalidation.
     #[tokio::test(start_paused = true)]
-    async fn invalid_query_is_terminal_and_counted_once() {
+    async fn invalid_query_is_retryable_and_counted_once() {
         let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
         let calls = std::cell::Cell::new(0);
         let result = receiver
             .collect_and_send_with(
                 || {
                     calls.set(calls.get() + 1);
-                    async {
+                    let call = calls.get();
+                    async move {
+                        if call > 1 {
+                            return Err(pdh::Error::WorkerStopped);
+                        }
                         Err(pdh::Error::Pdh {
                             operation: pdh::PdhOperation::CollectQueryData,
                             path: "<query>".to_owned(),
@@ -1158,12 +1227,13 @@ mod tests {
                 |_| async { panic!("invalid query must never publish") },
             )
             .await;
-        assert!(
-            matches!(result, Err(CollectionLoopError::Native(error)) if error.is_invalid_query())
-        );
-        assert_eq!(calls.get(), 1);
+        assert!(matches!(
+            result,
+            Err(CollectionLoopError::Native(pdh::Error::WorkerStopped))
+        ));
+        assert_eq!(calls.get(), 2);
         let metrics = receiver.metrics.borrow();
-        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
+        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 2);
         assert_eq!(metrics.health.scrape_failures.get(), 1);
         assert_eq!(metrics.health.scrapes.get(), 0);
         assert_eq!(metrics.health.counter_read_failures.get(), 0);
@@ -1461,7 +1531,6 @@ mod tests {
                     attributes: Arc::new(BTreeMap::new()),
                     instance_config: InstanceConfig::None,
                     scale_power10: 0,
-                    recreate_query: false,
                     source_mapping_index: 0,
                 }],
                 collection_interval: Duration::from_secs(1),

@@ -2,6 +2,69 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+
+/// Scenario: Discovery limits or refresh cadence cross their supported boundaries.
+/// Guarantees: Invalid options fail pure configuration validation with the relevant field context.
+#[test]
+fn validates_discovery_option_boundaries() {
+    let base = json!({
+        "collection_interval": "5s",
+        "perfcounters": [{"object": "Memory", "counters": [{"name": "Available Bytes"}]}]
+    });
+    for (key, value, expected) in [
+        (
+            "wildcard_refresh_interval",
+            json!("0s"),
+            "at least collection_interval",
+        ),
+        (
+            "wildcard_refresh_interval",
+            json!("4s"),
+            "at least collection_interval",
+        ),
+        (
+            "max_instances_per_wildcard",
+            json!(0),
+            "between 1 and 16384",
+        ),
+        (
+            "max_instances_per_wildcard",
+            json!(16385),
+            "between 1 and 16384",
+        ),
+        ("max_instances_per_wildcard", json!(null), "invalid type"),
+        ("max_expanded_counters", json!(0), "between 1 and 16384"),
+        ("max_expanded_counters", json!(16385), "between 1 and 16384"),
+        ("max_expanded_counters", json!(null), "invalid type"),
+    ] {
+        let mut value_with_option = base.clone();
+        value_with_option[key] = value;
+        assert_config_error(value_with_option, expected);
+    }
+    let mut inverted = base;
+    inverted["max_instances_per_wildcard"] = json!(3);
+    inverted["max_expanded_counters"] = json!(2);
+    assert_config_error(
+        inverted,
+        "max_instances_per_wildcard must not exceed max_expanded_counters",
+    );
+}
+
+/// Scenario: Explicit discovery options select minimum and maximum valid limits.
+/// Guarantees: Normalization preserves configured limits and a refresh cadence equal to collection is accepted.
+#[test]
+fn accepts_explicit_discovery_limits() {
+    for limit in [1, 256, 4096, 16384] {
+        let config = Config::from_json(&json!({
+            "collection_interval": "5s", "wildcard_refresh_interval": "5s",
+            "max_instances_per_wildcard": limit, "max_expanded_counters": limit,
+            "perfcounters": [{"object": "Process", "instances": "*", "counters": [{"name": "Private Bytes"}]}]
+        })).unwrap();
+        assert_eq!(config.max_instances_per_wildcard, limit);
+        assert_eq!(config.max_expanded_counters, limit);
+        assert_eq!(config.wildcard_refresh_interval(), Duration::from_secs(5));
+    }
+}
 use serde_json::json;
 
 fn metric() -> serde_json::Value {
@@ -168,7 +231,7 @@ fn accepts_go_timing_range() {
             "collection_interval": "2s",
             "wildcard_refresh_interval": "1s"
         }),
-        "wildcard_refresh_interval is not supported",
+        "wildcard_refresh_interval must be at least collection_interval",
     );
 }
 
@@ -203,13 +266,18 @@ fn defaults_refresh_independently_of_query_retry() {
     assert_eq!(long.wildcard_refresh_interval(), Duration::from_secs(120));
     assert_eq!(long.query_retry_cap(), Duration::from_secs(120));
 
-    assert!(config("5s", Some("90s")).is_err());
+    assert_eq!(
+        config("5s", Some("90s"))
+            .unwrap()
+            .wildcard_refresh_interval(),
+        Duration::from_secs(90)
+    );
 }
 
-/// Scenario: Deferred options are explicitly requested, including their default values or null.
-/// Guarantees: Presence is rejected before startup, while absent defaults keep fixed bounds and indexed recreation errors.
+/// Scenario: Discovery options are set explicitly, while per-scrape recreation is requested separately.
+/// Guarantees: Valid refresh/limit options are accepted and recreation remains rejected with indexed context.
 #[test]
-fn rejects_explicit_deferred_capabilities() {
+fn accepts_discovery_options_and_rejects_recreation() {
     let base = json!({
         "perfcounters": [
             {"object": "Memory", "counters": [{"name": "Available Bytes"}]},
@@ -218,15 +286,12 @@ fn rejects_explicit_deferred_capabilities() {
     });
     for (key, value) in [
         ("wildcard_refresh_interval", json!("60s")),
-        ("wildcard_refresh_interval", json!(null)),
         ("max_instances_per_wildcard", json!(256)),
-        ("max_instances_per_wildcard", json!(null)),
         ("max_expanded_counters", json!(4096)),
-        ("max_expanded_counters", json!(null)),
     ] {
         let mut value_with_option = base.clone();
         value_with_option[key] = value;
-        assert_config_error(value_with_option, &format!("{key} is not supported"));
+        assert!(Config::from_json(&value_with_option).is_ok(), "{key}");
     }
     let config = Config::from_json(&base).unwrap();
     assert_eq!(config.max_instances_per_wildcard, 256);
@@ -552,7 +617,7 @@ fn accepts_null_metrics_as_empty_definitions() {
 /// Scenario: Mappings explicitly disable or enable query recreation across expanded paths.
 /// Guarantees: Explicit false remains supported, while true fails with indexed context.
 #[test]
-fn retains_query_recreation_by_source_mapping() {
+fn accepts_disabled_recreation_and_rejects_enabled_recreation() {
     let config = |recreate_query| {
         json!({
             "perfcounters": [{
@@ -570,7 +635,7 @@ fn retains_query_recreation_by_source_mapping() {
     };
 
     let disabled = Config::from_json(&config(false)).unwrap();
-    assert!(!disabled.counters[0].recreate_query);
+    assert_eq!(disabled.counters.len(), 4);
     assert_eq!(disabled.counters[0].source_mapping_index, 0);
     assert_eq!(disabled.counters[1].source_mapping_index, 0);
 

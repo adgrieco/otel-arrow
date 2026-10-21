@@ -16,7 +16,6 @@ use super::native::NativePdh;
 use super::query::*;
 use super::worker::*;
 use super::*;
-use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
@@ -38,7 +37,6 @@ fn counter(path: &str, name: &str) -> CounterConfig {
         attributes: Arc::new(BTreeMap::new()),
         instance_config: InstanceConfig::None,
         scale_power10: 0,
-        recreate_query: false,
         source_mapping_index: 0,
     }
 }
@@ -513,18 +511,6 @@ fn fake_query_with_seed(
     )
     .unwrap();
     (state, query)
-}
-
-fn advance_fake_queries(states: &Rc<RefCell<Vec<Rc<RefCell<FakeState>>>>>) {
-    for state in states.borrow().iter() {
-        let mut state = state.borrow_mut();
-        state.timestamp += 10;
-        for counter in &mut state.counters {
-            if let Some(raw) = &mut counter.raw {
-                *raw += 10;
-            }
-        }
-    }
 }
 
 /// Scenario: A fake PDH add receives one concrete English wildcard expansion result.

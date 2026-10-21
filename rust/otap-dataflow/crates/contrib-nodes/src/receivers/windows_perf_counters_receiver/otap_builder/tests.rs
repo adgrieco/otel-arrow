@@ -23,7 +23,6 @@ fn counter(path: &str, name: &str, unit: &str) -> CounterConfig {
         attributes: Arc::new(BTreeMap::new()),
         instance_config: InstanceConfig::None,
         scale_power10: 0,
-        recreate_query: false,
         source_mapping_index: 0,
     }
 }

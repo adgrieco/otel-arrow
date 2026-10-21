@@ -4,13 +4,10 @@
 //! Bounded worker-thread query ownership, recovery, recreation, and command lifecycle.
 
 use super::super::config::CounterConfig;
-use super::super::model::{
-    PendingMetadata, Sample, SampleDiagnostics, SampleFailure, SampleMember,
-};
+use super::super::model::{PendingMetadata, Sample, SampleFailure, SampleMember};
 use super::PdhApi;
 use super::error::Error;
 use super::query::{Query, QueryRecreationSeed, retry_delay};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -60,6 +57,7 @@ pub(in super::super) struct Worker {
     pub(super) shutdown_requested: Arc<AtomicBool>,
     pub(super) join: Option<JoinHandle<()>>,
     pub(super) completion: Option<oneshot::Receiver<()>>,
+    pub(in super::super) startup: StartupState,
 }
 
 impl Worker {
@@ -179,7 +177,6 @@ impl Worker {
             + Send
             + 'static,
     {
-        let plans = query_plans(counters);
         let (tx, rx) = mpsc::sync_channel(1);
         let (init_tx, init_rx) = oneshot::channel();
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -195,7 +192,7 @@ impl Worker {
                     open(configs, limit, seed, Arc::clone(&factory_shutdown))
                 };
                 run_worker_thread(
-                    plans,
+                    counters,
                     query_retry_cap,
                     max_native_counters,
                     &mut open,
@@ -211,7 +208,7 @@ impl Worker {
         let mut cancellation =
             StartupCancellation::new(tx.clone(), Arc::clone(&shutdown_requested));
         match init_rx.await {
-            Ok(Ok(())) => {
+            Ok(Ok(startup)) => {
                 cancellation.disarm();
                 Ok(Self {
                     tx,
@@ -219,6 +216,7 @@ impl Worker {
                     shutdown_requested,
                     join: Some(join),
                     completion: Some(completion_rx),
+                    startup,
                 })
             }
             Ok(Err(error)) => {
@@ -344,14 +342,20 @@ impl Drop for CompletionSignal {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(in super::super) struct StartupState {
+    pub(in super::super) pending: bool,
+    pub(in super::super) active_expanded: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_worker_thread<A, F>(
-    plans: Vec<QueryPlan>,
+    configs: Vec<CounterConfig>,
     query_retry_cap: Duration,
     max_native_counters: usize,
     open: &mut F,
     rx: mpsc::Receiver<Command>,
-    init_tx: oneshot::Sender<Result<(), Error>>,
+    init_tx: oneshot::Sender<Result<StartupState, Error>>,
     completion_tx: oneshot::Sender<()>,
     accepted: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
@@ -360,103 +364,85 @@ fn run_worker_thread<A, F>(
     F: FnMut(Vec<CounterConfig>, usize, Option<&QueryRecreationSeed>) -> Result<Query<A>, Error>,
 {
     let _completion = CompletionSignal(Some(completion_tx));
-    let mut queries = match open_initial_queries(
-        plans,
+    let mut slot = match open_initial_query(
+        configs,
         query_retry_cap,
         max_native_counters,
         open,
         &shutdown_requested,
     ) {
-        Ok(Some(queries)) => queries,
+        Ok(Some(slot)) => slot,
         Ok(None) => return,
         Err(error) => {
             let _ = init_tx.send(Err(error));
             return;
         }
     };
-    if shutdown_requested.load(Ordering::Acquire) || init_tx.send(Ok(())).is_err() {
+    let startup = StartupState {
+        pending: slot.is_pending(),
+        active_expanded: slot.active_expanded_count(),
+    };
+    if shutdown_requested.load(Ordering::Acquire) || init_tx.send(Ok(startup)).is_err() {
         return;
     }
-    run_command_loop(
-        &mut queries,
-        query_retry_cap,
-        max_native_counters,
-        open,
-        &rx,
-        &accepted,
-        &shutdown_requested,
-    );
-}
-
-pub(super) fn open_initial_queries<A, F>(
-    plans: Vec<QueryPlan>,
-    query_retry_cap: Duration,
-    max_native_counters: usize,
-    open: &mut F,
-    shutdown_requested: &AtomicBool,
-) -> Result<Option<Vec<QuerySlot<A>>>, Error>
-where
-    A: PdhApi,
-    F: FnMut(Vec<CounterConfig>, usize, Option<&QueryRecreationSeed>) -> Result<Query<A>, Error>,
-{
-    let mut queries = Vec::with_capacity(plans.len());
-    let mut unopened_exact_reservations = plans
-        .iter()
-        .map(QueryPlan::exact_counter_reservations)
-        .fold(0usize, usize::saturating_add);
-    for plan in plans {
-        if shutdown_requested.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        unopened_exact_reservations =
-            unopened_exact_reservations.saturating_sub(plan.exact_counter_reservations());
-        let query_limit = remaining_native_capacity(
-            max_native_counters,
-            queries
-                .iter()
-                .map(QuerySlot::reserved_native_entry_count)
-                .chain(std::iter::once(unopened_exact_reservations)),
-        );
-        queries.push(QuerySlot::open_initial_unprepared(plan, query_limit, open)?);
-    }
-    if !prepare_initial_queries(
-        &mut queries,
-        query_retry_cap,
-        max_native_counters,
-        shutdown_requested,
-    )? {
-        return Ok(None);
-    }
-    Ok(Some(queries))
-}
-
-fn run_command_loop<A, F>(
-    queries: &mut [QuerySlot<A>],
-    query_retry_cap: Duration,
-    max_native_counters: usize,
-    open: &mut F,
-    rx: &mpsc::Receiver<Command>,
-    accepted: &Arc<AtomicBool>,
-    shutdown_requested: &Arc<AtomicBool>,
-) where
-    A: PdhApi,
-    F: FnMut(Vec<CounterConfig>, usize, Option<&QueryRecreationSeed>) -> Result<Query<A>, Error>,
-{
     while !shutdown_requested.load(Ordering::Acquire) {
         match rx.recv() {
             Ok(Command::Collect(response)) => {
-                let accepted = AcceptedCollectGuard::new(Arc::clone(accepted));
-                let result = collect_queries(queries, query_retry_cap, max_native_counters, open);
-                let terminal = result.as_ref().is_err_and(Error::is_invalid_query);
+                let accepted = AcceptedCollectGuard::new(Arc::clone(&accepted));
+                let result = collect_query(&mut slot, query_retry_cap, max_native_counters, open);
                 drop(accepted);
                 let _ = response.send(result);
-                if terminal {
-                    break;
-                }
             }
             Ok(Command::Shutdown) | Err(_) => break,
         }
     }
+}
+
+pub(super) fn open_initial_query<A, F>(
+    configs: Vec<CounterConfig>,
+    query_retry_cap: Duration,
+    max_native_counters: usize,
+    open: &mut F,
+    shutdown: &AtomicBool,
+) -> Result<Option<QuerySlot<A>>, Error>
+where
+    A: PdhApi,
+    F: FnMut(Vec<CounterConfig>, usize, Option<&QueryRecreationSeed>) -> Result<Query<A>, Error>,
+{
+    if shutdown.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let mut slot = QuerySlot::open_unprepared(configs, query_retry_cap, max_native_counters, open)?;
+    if shutdown.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    if let Err(error) = slot.refresh(Instant::now(), query_retry_cap) {
+        if shutdown.load(Ordering::Acquire) && error.is_stop() {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    if shutdown.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    if let Some(query) = slot.query.as_mut() {
+        match query.prime_managed() {
+            Ok(()) => {}
+            Err(error) => {
+                if !error.is_collection_failure() {
+                    return Err(error);
+                }
+                query.record_prime_failure(&error);
+                let retry_installed =
+                    error.is_query_collection_failure() && !error.is_invalid_query();
+                slot.update_recovery_state(Instant::now(), query_retry_cap, false, &Err(error));
+                if retry_installed {
+                    slot.next_query_retry = Instant::now();
+                }
+            }
+        }
+    }
+    Ok(Some(slot))
 }
 
 impl Drop for Worker {
@@ -487,8 +473,7 @@ impl Drop for AcceptedCollectGuard {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct QuerySettings {
+struct QuerySettings {
     cadence: QueryCadence,
     max_instances_per_wildcard: usize,
     node: String,
@@ -499,7 +484,7 @@ pub(super) struct QuerySettings {
 impl QuerySettings {
     fn open(
         &mut self,
-        counters: Vec<CounterConfig>,
+        configs: Vec<CounterConfig>,
         max_native_counters: usize,
         seed: Option<&QueryRecreationSeed>,
         shutdown: Arc<AtomicBool>,
@@ -507,8 +492,8 @@ impl QuerySettings {
         initialize_once(&mut self.initialized, || {
             super::native::initialize_worker(&self.node, self.has_wildcards, &shutdown)
         })?;
-        let mut query = Query::open_replacement(
-            counters,
+        Query::open_replacement(
+            configs,
             self.cadence.retry_cap,
             self.cadence.wildcard_refresh,
             self.max_instances_per_wildcard,
@@ -516,9 +501,7 @@ impl QuerySettings {
             self.node.clone(),
             seed,
             shutdown,
-        )?;
-        query.freeze_membership()?;
-        Ok(query)
+        )
     }
 }
 
@@ -526,64 +509,16 @@ pub(super) fn initialize_once(
     initialized: &mut bool,
     initialize: impl FnOnce() -> Result<(), Error>,
 ) -> Result<(), Error> {
-    if *initialized {
-        return Ok(());
+    if !*initialized {
+        initialize()?;
+        *initialized = true;
     }
-    initialize()?;
-    *initialized = true;
     Ok(())
 }
 
-pub(super) struct QueryPlan {
-    pub(super) configs: Vec<CounterConfig>,
-    pub(super) global_indices: Vec<usize>,
-    pub(super) recreate_query: bool,
-}
-
-impl QueryPlan {
-    fn exact_counter_reservations(&self) -> usize {
-        self.configs
-            .iter()
-            .filter(|config| !config.instance_config.is_wildcard())
-            .count()
-    }
-}
-
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-enum QueryPlanKey {
-    Shared,
-    Recreated(usize),
-}
-
-pub(super) fn query_plans(counters: Vec<CounterConfig>) -> Vec<QueryPlan> {
-    let mut plans = Vec::<QueryPlan>::new();
-    let mut plan_indices = HashMap::<QueryPlanKey, usize>::new();
-    for (global_index, counter) in counters.into_iter().enumerate() {
-        let key = if counter.recreate_query {
-            QueryPlanKey::Recreated(counter.source_mapping_index)
-        } else {
-            QueryPlanKey::Shared
-        };
-        if let Some(&plan_index) = plan_indices.get(&key) {
-            let plan = &mut plans[plan_index];
-            plan.configs.push(counter);
-            plan.global_indices.push(global_index);
-            continue;
-        }
-        let _ = plan_indices.insert(key, plans.len());
-        plans.push(QueryPlan {
-            recreate_query: counter.recreate_query,
-            configs: vec![counter],
-            global_indices: vec![global_index],
-        });
-    }
-    plans
-}
-
 pub(super) struct QuerySlot<A: PdhApi> {
-    pub(super) plan: QueryPlan,
+    configs: Vec<CounterConfig>,
     pub(super) query: Option<Query<A>>,
-    query_generation: u64,
     query_failure_attempts: u32,
     next_query_retry: Instant,
     refresh_failure_attempts: u32,
@@ -591,7 +526,6 @@ pub(super) struct QuerySlot<A: PdhApi> {
     rebuild_attempts: u32,
     next_rebuild: Instant,
     rebuild_seed: Option<QueryRecreationSeed>,
-    last_active_expanded_count: usize,
     last_admitted_members: Vec<SampleMember>,
     pending: PendingMetadata,
 }
@@ -599,7 +533,7 @@ pub(super) struct QuerySlot<A: PdhApi> {
 impl<A: PdhApi> QuerySlot<A> {
     #[cfg(test)]
     pub(super) fn open_initial<F>(
-        plan: QueryPlan,
+        configs: Vec<CounterConfig>,
         max_native_counters: usize,
         open: &mut F,
     ) -> Result<Self, Error>
@@ -610,28 +544,20 @@ impl<A: PdhApi> QuerySlot<A> {
             Option<&QueryRecreationSeed>,
         ) -> Result<Query<A>, Error>,
     {
-        let mut slot = Self::open_initial_unprepared(plan, max_native_counters, open)?;
-        if let Some(query) = slot.query.as_mut() {
-            query.refresh_all_wildcards_managed()?;
-            let prime_error = query.prime_managed().err();
-            if prime_error.as_ref().is_some_and(Error::is_invalid_query) {
-                return Err(prime_error.expect("invalid-query prime error is present"));
-            }
-            if let Some(error) = &prime_error {
-                query.record_prime_failure(error);
-            }
-            slot.query_failure_attempts = u32::from(
-                prime_error
-                    .as_ref()
-                    .is_some_and(Error::is_query_collection_failure),
-            );
-        }
-        Ok(slot)
+        open_initial_query(
+            configs,
+            Duration::ZERO,
+            max_native_counters,
+            open,
+            &AtomicBool::new(false),
+        )?
+        .ok_or(Error::WorkerStopRequested)
     }
 
-    fn open_initial_unprepared<F>(
-        plan: QueryPlan,
-        max_native_counters: usize,
+    fn open_unprepared<F>(
+        configs: Vec<CounterConfig>,
+        retry_cap: Duration,
+        limit: usize,
         open: &mut F,
     ) -> Result<Self, Error>
     where
@@ -642,13 +568,9 @@ impl<A: PdhApi> QuerySlot<A> {
         ) -> Result<Query<A>, Error>,
     {
         let now = Instant::now();
-        let query = open(plan.configs.clone(), max_native_counters, None)?;
-        let last_active_expanded_count = query.active_expanded_count();
-        let last_admitted_members = query.admitted_members();
-        Ok(Self {
-            plan,
-            query: Some(query),
-            query_generation: 0,
+        let mut slot = Self {
+            configs,
+            query: None,
             query_failure_attempts: 0,
             next_query_retry: now,
             refresh_failure_attempts: 0,
@@ -656,22 +578,82 @@ impl<A: PdhApi> QuerySlot<A> {
             rebuild_attempts: 0,
             next_rebuild: now,
             rebuild_seed: None,
-            last_active_expanded_count,
-            last_admitted_members,
+            last_admitted_members: Vec::new(),
             pending: PendingMetadata::default(),
-        })
+        };
+        match open(slot.configs.clone(), limit, None) {
+            Ok(query) => {
+                slot.last_admitted_members = query.admitted_members();
+                slot.query = Some(query);
+            }
+            Err(error) if error.is_recoverable_query_open_failure() => {
+                slot.record_query_failure(&error);
+                slot.rebuild_attempts = 1;
+                slot.next_rebuild = now + retry_delay(1, retry_cap);
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(slot)
     }
 
-    fn is_recoverable_collection_error(&self, error: &Error) -> bool {
-        !error.is_invalid_query()
-            && (error.is_collection_failure() || error.is_recoverable_query_open_failure())
+    fn is_pending(&self) -> bool {
+        self.query_failure_attempts > 0
+            || self
+                .query
+                .as_ref()
+                .is_none_or(|query| query.active_counter_count() == 0)
+    }
+
+    fn record_query_failure(&mut self, error: &Error) {
+        self.pending
+            .failures
+            .extend(
+                self.configs
+                    .iter()
+                    .enumerate()
+                    .map(|(counter_index, config)| SampleFailure {
+                        counter_index,
+                        path: Arc::from(config.path.as_str()),
+                        reason: error.reason(),
+                        error: error.bounded_detail(),
+                        diagnostic_only: true,
+                    }),
+            );
+    }
+
+    fn refresh(&mut self, now: Instant, retry_cap: Duration) -> Result<(), Error> {
+        if now < self.next_refresh_retry {
+            return Ok(());
+        }
+        let Some(query) = self.query.as_mut() else {
+            return Ok(());
+        };
+        if !query.wildcard_refresh_due() {
+            return Ok(());
+        }
+        match query.refresh_all_wildcards_managed() {
+            Ok(()) => {
+                self.refresh_failure_attempts = 0;
+                self.next_refresh_retry = now;
+            }
+            Err(error) if error.is_collection_failure() => {
+                self.refresh_failure_attempts = self.refresh_failure_attempts.saturating_add(1);
+                self.next_refresh_retry =
+                    now + retry_delay(self.refresh_failure_attempts, retry_cap);
+                if error.requires_immediate_query_rebuild() {
+                    self.schedule_rebuild(self.next_refresh_retry);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
     }
 
     pub(super) fn collect<F>(
         &mut self,
         now: Instant,
-        query_retry_cap: Duration,
-        max_native_counters: usize,
+        retry_cap: Duration,
+        limit: usize,
         open: &mut F,
     ) -> Result<Sample, Error>
     where
@@ -681,25 +663,19 @@ impl<A: PdhApi> QuerySlot<A> {
             Option<&QueryRecreationSeed>,
         ) -> Result<Query<A>, Error>,
     {
-        if let Some(query) = self.query.as_mut()
-            && query.membership_is_frozen()
-        {
-            return query.collect_managed();
-        }
-        let was_query_retry =
+        let was_retry =
             self.query.is_some() && self.query_failure_attempts > 0 && now >= self.next_query_retry;
-        if was_query_retry {
+        if was_retry {
             self.pending.diagnostics.retry_attempts += 1;
         }
-        let mut result = self.collect_or_rebuild(now, max_native_counters, query_retry_cap, open);
-        if result.as_ref().is_err_and(Error::is_invalid_query) {
-            return result;
-        }
-        self.update_recovery_state(now, query_retry_cap, was_query_retry, &result);
+        let mut result = self.collect_or_rebuild(now, limit, retry_cap, open);
+        self.update_recovery_state(now, retry_cap, was_retry, &result);
         if let Ok(sample) = &mut result {
+            let collected = sample.metadata.diagnostics.any_query_collected;
             sample
                 .metadata
                 .merge_older(std::mem::take(&mut self.pending));
+            sample.metadata.diagnostics.any_query_collected = collected;
         }
         result
     }
@@ -707,8 +683,8 @@ impl<A: PdhApi> QuerySlot<A> {
     fn collect_or_rebuild<F>(
         &mut self,
         now: Instant,
-        max_native_counters: usize,
-        query_retry_cap: Duration,
+        limit: usize,
+        retry_cap: Duration,
         open: &mut F,
     ) -> Result<Sample, Error>
     where
@@ -718,29 +694,28 @@ impl<A: PdhApi> QuerySlot<A> {
             Option<&QueryRecreationSeed>,
         ) -> Result<Query<A>, Error>,
     {
-        if let Some(active_query) = self.query.as_mut() {
-            active_query.set_max_native_counters(max_native_counters)?;
+        if let Some(query) = self.query.as_mut() {
             if now < self.next_query_retry {
                 Err(Error::QueryRecoveryPending {
                     retry_after_ms: self.next_query_retry.duration_since(now).as_millis(),
                 })
             } else {
-                active_query.collect_managed()
+                query.collect_managed()
             }
         } else if now < self.next_rebuild {
             Err(Error::QueryRecoveryPending {
                 retry_after_ms: self.next_rebuild.duration_since(now).as_millis(),
             })
         } else {
-            self.rebuild(now, max_native_counters, query_retry_cap, open)
+            self.rebuild(now, limit, retry_cap, open)
         }
     }
 
     fn rebuild<F>(
         &mut self,
         now: Instant,
-        max_native_counters: usize,
-        query_retry_cap: Duration,
+        limit: usize,
+        retry_cap: Duration,
         open: &mut F,
     ) -> Result<Sample, Error>
     where
@@ -751,15 +726,11 @@ impl<A: PdhApi> QuerySlot<A> {
         ) -> Result<Query<A>, Error>,
     {
         self.pending.diagnostics.query_rebuild_attempts += 1;
-        let mut rebuilt = match open(
-            self.plan.configs.clone(),
-            max_native_counters,
-            self.rebuild_seed.as_ref(),
-        ) {
-            Ok(rebuilt) => rebuilt,
+        let mut rebuilt = match open(self.configs.clone(), limit, self.rebuild_seed.as_ref()) {
+            Ok(query) => query,
             Err(error) => {
                 self.rebuild_attempts = self.rebuild_attempts.saturating_add(1);
-                self.next_rebuild = now + retry_delay(self.rebuild_attempts, query_retry_cap);
+                self.next_rebuild = now + retry_delay(self.rebuild_attempts, retry_cap);
                 return Err(error);
             }
         };
@@ -768,20 +739,57 @@ impl<A: PdhApi> QuerySlot<A> {
         self.next_query_retry = now;
         self.refresh_failure_attempts = 0;
         self.next_refresh_retry = now;
-        if let Err(error) = rebuilt.prime_managed() {
-            self.query_generation = self.query_generation.wrapping_add(1);
-            self.rebuild_seed = None;
-            self.query = Some(rebuilt);
-            return Err(error);
-        }
-        self.pending.diagnostics.query_rebuild_recoveries += 1;
-        let mut sample = Sample::empty(rebuilt.previous_timestamp_unix_nano);
-        rebuilt.move_pending_metadata_to(&mut sample.metadata);
+        let primed = rebuilt.prime_managed();
         self.last_admitted_members = rebuilt.admitted_members();
-        self.query_generation = self.query_generation.wrapping_add(1);
-        self.rebuild_seed = None;
         self.query = Some(rebuilt);
+        self.rebuild_seed = None;
+        primed?;
+        self.pending.diagnostics.query_rebuild_recoveries += 1;
+        let mut sample = Sample::empty(self.recovery_timestamp_unix_nano());
+        self.move_pending_metadata_to(&mut sample.metadata);
+        sample.metadata.diagnostics.any_query_collected = false;
         Ok(sample)
+    }
+
+    fn update_recovery_state(
+        &mut self,
+        now: Instant,
+        retry_cap: Duration,
+        was_retry: bool,
+        result: &Result<Sample, Error>,
+    ) {
+        if result.as_ref().is_err_and(|error| {
+            error.is_invalid_query() || error.requires_immediate_query_rebuild()
+        }) {
+            self.schedule_rebuild(now + retry_delay(1, retry_cap));
+        } else if result
+            .as_ref()
+            .is_err_and(Error::is_query_collection_failure)
+        {
+            self.query_failure_attempts = self.query_failure_attempts.saturating_add(1);
+            self.next_query_retry = now + retry_delay(self.query_failure_attempts, retry_cap);
+            if should_rebuild_query(self.query_failure_attempts) {
+                self.schedule_rebuild(self.next_query_retry);
+            }
+        } else if result.is_ok() {
+            if was_retry {
+                self.pending.diagnostics.retry_recoveries += 1;
+            }
+            self.query_failure_attempts = 0;
+            self.next_query_retry = now;
+        }
+    }
+
+    fn schedule_rebuild(&mut self, next_rebuild: Instant) {
+        let Some(query) = self.query.as_mut() else {
+            return;
+        };
+        self.last_admitted_members = query.admitted_members();
+        query.move_pending_metadata_to(&mut self.pending);
+        self.rebuild_seed = Some(query.recreation_seed());
+        self.query = None;
+        self.rebuild_attempts = 0;
+        self.next_rebuild = next_rebuild;
     }
 
     fn recovery_timestamp_unix_nano(&self) -> i64 {
@@ -797,243 +805,32 @@ impl<A: PdhApi> QuerySlot<A> {
         target.merge(std::mem::take(&mut self.pending));
     }
 
-    fn update_recovery_state(
-        &mut self,
-        now: Instant,
-        query_retry_cap: Duration,
-        was_query_retry: bool,
-        result: &Result<Sample, Error>,
-    ) {
-        if result
-            .as_ref()
-            .is_err_and(Error::is_query_collection_failure)
-        {
-            self.query_failure_attempts = self.query_failure_attempts.saturating_add(1);
-            self.next_query_retry = now + retry_delay(self.query_failure_attempts, query_retry_cap);
-            if should_rebuild_query(self.query_failure_attempts) {
-                self.schedule_rebuild(self.next_query_retry);
-            }
-        } else if result
-            .as_ref()
-            .is_err_and(Error::requires_immediate_query_rebuild)
-        {
-            self.schedule_rebuild(now + retry_delay(1, query_retry_cap));
-        } else if result.is_ok() {
-            if was_query_retry {
-                self.pending.diagnostics.retry_recoveries += 1;
-            }
-            self.query_failure_attempts = 0;
-            self.next_query_retry = now;
-        }
-    }
-
-    fn update_refresh_recovery_state(
-        &mut self,
-        now: Instant,
-        query_retry_cap: Duration,
-        error: &Error,
-    ) {
-        self.refresh_failure_attempts = self.refresh_failure_attempts.saturating_add(1);
-        self.next_refresh_retry = now + retry_delay(self.refresh_failure_attempts, query_retry_cap);
-        if error.requires_immediate_query_rebuild() {
-            self.schedule_rebuild(self.next_refresh_retry);
-            return;
-        }
-        if should_rebuild_query(self.refresh_failure_attempts) {
-            self.schedule_rebuild(self.next_refresh_retry);
-        }
-    }
-
-    fn record_refresh_success(&mut self, now: Instant) {
-        self.refresh_failure_attempts = 0;
-        self.next_refresh_retry = now;
-    }
-
-    fn move_query_metadata_to_pending(&mut self) {
-        if let Some(active_query) = self.query.as_mut() {
-            active_query.move_pending_metadata_to(&mut self.pending);
-        }
-    }
-
-    fn schedule_rebuild(&mut self, next_rebuild: Instant) {
-        if self.query.is_none() {
-            return;
-        }
-        self.last_active_expanded_count = self.query.as_ref().map_or(
-            self.last_active_expanded_count,
-            Query::active_expanded_count,
-        );
-        if let Some(query) = self.query.as_ref() {
-            self.last_admitted_members = query.admitted_members();
-        }
-        self.move_query_metadata_to_pending();
-        self.rebuild_seed = self.query.as_ref().map(Query::recreation_seed);
-        self.query = None;
-        self.rebuild_attempts = 0;
-        self.next_rebuild = next_rebuild;
-    }
-
-    fn recreate<F>(
-        &mut self,
-        now: Instant,
-        max_native_counters: usize,
-        open: &mut F,
-        metadata: &mut PendingMetadata,
-    ) where
-        F: FnMut(
-            Vec<CounterConfig>,
-            usize,
-            Option<&QueryRecreationSeed>,
-        ) -> Result<Query<A>, Error>,
-    {
-        if !self.plan.recreate_query {
-            return;
-        }
-        if self.query.as_ref().is_some_and(Query::membership_is_frozen) {
-            return;
-        }
-        metadata.diagnostics.query_recreation_attempts += 1;
-        let reserved = self.reserved_native_entry_count();
-        let replacement = if max_native_counters < reserved {
-            Err(Error::QueryRecreationCapacity {
-                available: max_native_counters,
-                reserved,
-            })
-        } else {
-            let seed = self.query.as_ref().map(Query::recreation_seed);
-            open(
-                self.plan.configs.clone(),
-                max_native_counters,
-                seed.as_ref(),
-            )
-            .and_then(|mut query| {
-                query.prime_managed()?;
-                Ok(query)
-            })
-        };
-        match replacement {
-            Ok(query) => {
-                self.last_admitted_members = query.admitted_members();
-                self.query = Some(query);
-                self.query_failure_attempts = 0;
-                self.next_query_retry = now;
-                self.rebuild_attempts = 0;
-                self.next_rebuild = now;
-            }
-            Err(error) => {
-                metadata.diagnostics.query_recreation_failures += 1;
-                metadata.failures.extend(
-                    self.plan.global_indices.iter().zip(&self.plan.configs).map(
-                        |(&counter_index, config)| SampleFailure {
-                            counter_index,
-                            path: Arc::from(config.path.as_str()),
-                            reason: error.reason(),
-                            error: error.bounded_detail(),
-                            diagnostic_only: true,
-                        },
-                    ),
-                );
-            }
-        }
-    }
-
-    pub(super) fn remap_sample(&self, mut sample: Sample) -> Result<Sample, Error> {
-        let remap = |local_index: usize| {
-            self.plan
-                .global_indices
-                .get(local_index)
-                .copied()
-                .ok_or(Error::InvalidSample(
-                    "query returned an unknown local counter index",
-                ))
-        };
-        for point in &mut sample.points {
-            point.counter_index = remap(point.counter_index)?;
-        }
-        for failure in &mut sample.metadata.failures {
-            failure.counter_index = remap(failure.counter_index)?;
-        }
-        for overflow in &mut sample.metadata.overflows {
-            overflow.counter_index = remap(overflow.counter_index)?;
-        }
-        Ok(sample)
-    }
-
-    fn admitted_members(&self) -> Result<Vec<SampleMember>, Error> {
-        let mut members = self.query.as_ref().map_or_else(
-            || self.last_admitted_members.clone(),
-            Query::admitted_members,
-        );
-        for member in &mut members {
-            member.counter_index = self
-                .plan
-                .global_indices
-                .get(member.counter_index)
-                .copied()
-                .ok_or(Error::InvalidSample(
-                    "query membership references an unknown local counter index",
-                ))?;
-        }
-        Ok(members)
-    }
-
     pub(super) fn active_expanded_count(&self) -> usize {
-        self.query.as_ref().map_or(
-            self.last_active_expanded_count,
-            Query::active_expanded_count,
-        )
+        self.query.as_ref().map_or(0, Query::active_expanded_count)
     }
 
+    #[cfg(test)]
     pub(super) fn reserved_native_entry_count(&self) -> usize {
-        let exact_counter_reservations = self.plan.exact_counter_reservations();
+        let exact = self
+            .configs
+            .iter()
+            .filter(|config| !config.instance_config.is_wildcard())
+            .count();
         self.query.as_ref().map_or_else(
             || {
                 self.rebuild_seed
                     .as_ref()
-                    .map_or(exact_counter_reservations, |seed| {
-                        seed.reserved_native_entry_count(exact_counter_reservations)
-                    })
+                    .map_or(exact, |seed| seed.reserved_native_entry_count(exact))
             },
             Query::reserved_native_entry_count,
         )
     }
 }
 
-pub(super) fn merge_query_samples(samples: Vec<Sample>) -> Result<Sample, Error> {
-    let mut merged = None::<Sample>;
-    for sample in samples {
-        if let Some(target) = &mut merged {
-            target.timestamp_unix_nano = target.timestamp_unix_nano.max(sample.timestamp_unix_nano);
-            target.metadata.diagnostics.active_expanded_counters +=
-                sample.metadata.diagnostics.active_expanded_counters;
-            target.metadata.merge(sample.metadata);
-            target.members.extend(sample.members);
-            target.points.extend(sample.points);
-        } else {
-            merged = Some(sample);
-        }
-    }
-    let mut merged = merged.ok_or(Error::InvalidSample(
-        "worker has no performance-counter query",
-    ))?;
-    merged.points.sort_by(|left, right| {
-        (left.counter_index, &left.path).cmp(&(right.counter_index, &right.path))
-    });
-    merged
-        .metadata
-        .failures
-        .sort_by_key(|failure| (failure.counter_index, failure.reason));
-    merged
-        .metadata
-        .overflows
-        .sort_by_key(|overflow| (overflow.counter_index, overflow.reason));
-    Ok(merged)
-}
-
-pub(super) fn collect_queries<A, F>(
-    queries: &mut [QuerySlot<A>],
-    query_retry_cap: Duration,
-    max_native_counters: usize,
+pub(super) fn collect_query<A, F>(
+    slot: &mut QuerySlot<A>,
+    retry_cap: Duration,
+    limit: usize,
     open: &mut F,
 ) -> Result<Sample, Error>
 where
@@ -1041,277 +838,32 @@ where
     F: FnMut(Vec<CounterConfig>, usize, Option<&QueryRecreationSeed>) -> Result<Query<A>, Error>,
 {
     let now = Instant::now();
-    let (mut refresh_errors, _) =
-        refresh_wildcards_in_config_order(queries, max_native_counters, None);
-    let mut samples = Vec::with_capacity(queries.len());
-    let mut recreation_eligible = vec![false; queries.len()];
-    let mut first_collection_error = None;
-    let mut query_failures = Vec::new();
-    let mut scrape_failure_observed = false;
-    let mut any_query_collected = false;
-    for query_index in 0..queries.len() {
-        let refresh_failed = refresh_errors[query_index].is_some();
-        if let Some(error) = refresh_errors[query_index].take() {
-            let query = &mut queries[query_index];
-            let recoverable = query.is_recoverable_collection_error(&error)
-                || error.requires_immediate_query_rebuild();
-            if recoverable {
-                query.update_refresh_recovery_state(now, query_retry_cap, &error);
-            } else {
+    slot.refresh(now, retry_cap)?;
+    let was_rebuilding = slot.query.is_none();
+    let mut sample = match slot.collect(now, retry_cap, limit, open) {
+        Ok(sample) => sample,
+        Err(error)
+            if error.is_collection_failure() || error.is_recoverable_query_open_failure() =>
+        {
+            if !was_rebuilding && !matches!(error, Error::QueryRecoveryPending { .. }) {
                 return Err(error);
             }
+            slot.record_query_failure(&error);
+            let mut sample = Sample::empty(slot.recovery_timestamp_unix_nano());
+            slot.move_pending_metadata_to(&mut sample.metadata);
+            sample
         }
-        let query_limit = query_native_limit(queries, query_index, max_native_counters);
-        let query = &mut queries[query_index];
-        let generation_before_collection = query.query_generation;
-        match query.collect(now, query_retry_cap, query_limit, open) {
-            Ok(sample) => {
-                any_query_collected |= sample.metadata.diagnostics.any_query_collected;
-                recreation_eligible[query_index] =
-                    !refresh_failed && query.query_generation == generation_before_collection;
-                samples.push(query.remap_sample(sample)?);
-            }
-            Err(error) if query.is_recoverable_collection_error(&error) => {
-                let recovery_only = matches!(&error, Error::QueryRecoveryPending { .. })
-                    || query.query_generation != generation_before_collection;
-                if !recovery_only {
-                    scrape_failure_observed = true;
-                }
-                append_query_failures(&mut query_failures, &query.plan, &error, recovery_only);
-                if recovery_only {
-                    let mut sample = Sample::empty(query.recovery_timestamp_unix_nano());
-                    sample.metadata.diagnostics.active_expanded_counters =
-                        query.active_expanded_count();
-                    query.move_pending_metadata_to(&mut sample.metadata);
-                    samples.push(sample);
-                } else if first_collection_error.is_none() {
-                    first_collection_error = Some(error);
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    if samples.is_empty() {
-        return Err(first_collection_error.unwrap_or(Error::InvalidSample(
-            "worker has no successful performance-counter query",
-        )));
-    }
-    let mut sample = merge_query_samples(samples)?;
-    sample.metadata.diagnostics.any_query_collected = any_query_collected;
-    if !query_failures.is_empty() {
-        sample.metadata.merge(PendingMetadata {
-            diagnostics: SampleDiagnostics {
-                scrape_failures: u64::from(scrape_failure_observed),
-                ..Default::default()
-            },
-            failures: query_failures,
-            overflows: Vec::new(),
-        });
-    }
-    recreate_successful_queries(
-        queries,
-        &recreation_eligible,
-        now,
-        max_native_counters,
-        open,
-        &mut sample,
+        Err(error) => return Err(error),
+    };
+    sample.members = slot.query.as_ref().map_or_else(
+        || slot.last_admitted_members.clone(),
+        Query::admitted_members,
     );
-    sample.members = queries
-        .iter()
-        .map(QuerySlot::admitted_members)
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-    sample.members.sort_by(|left, right| {
-        (left.counter_index, &left.path).cmp(&(right.counter_index, &right.path))
-    });
+    sample.metadata.diagnostics.active_expanded_counters = slot.active_expanded_count();
+    sample.metadata.diagnostics.query_pending = slot.is_pending();
     sample
         .metadata
         .failures
         .sort_by_key(|failure| (failure.counter_index, failure.reason));
     Ok(sample)
-}
-
-fn prepare_initial_queries<A: PdhApi>(
-    queries: &mut [QuerySlot<A>],
-    query_retry_cap: Duration,
-    max_native_counters: usize,
-    shutdown_requested: &AtomicBool,
-) -> Result<bool, Error> {
-    let now = Instant::now();
-    let (mut refresh_errors, stopped) =
-        refresh_wildcards_in_config_order(queries, max_native_counters, Some(shutdown_requested));
-    if stopped {
-        return Ok(false);
-    }
-    for (query_index, error) in refresh_errors.iter_mut().enumerate() {
-        let Some(error) = error.take() else {
-            continue;
-        };
-        let slot = &mut queries[query_index];
-        if !slot.is_recoverable_collection_error(&error)
-            && !error.requires_immediate_query_rebuild()
-        {
-            return Err(error);
-        }
-        slot.update_refresh_recovery_state(now, query_retry_cap, &error);
-    }
-    for slot in queries {
-        if shutdown_requested.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        let Some(query) = slot.query.as_mut() else {
-            continue;
-        };
-        let prime_error = query.prime_managed().err();
-        if prime_error.as_ref().is_some_and(Error::is_invalid_query) {
-            return Err(prime_error.expect("invalid-query prime error is present"));
-        }
-        if let Some(error) = &prime_error {
-            query.record_prime_failure(error);
-        }
-        if slot.query_failure_attempts == 0
-            && prime_error
-                .as_ref()
-                .is_some_and(Error::is_query_collection_failure)
-        {
-            slot.query_failure_attempts = 1;
-            slot.next_query_retry = now;
-        }
-    }
-    Ok(true)
-}
-
-fn refresh_wildcards_in_config_order<A: PdhApi>(
-    queries: &mut [QuerySlot<A>],
-    max_native_counters: usize,
-    shutdown_requested: Option<&AtomicBool>,
-) -> (Vec<Option<Error>>, bool) {
-    let now = Instant::now();
-    let due = queries
-        .iter()
-        .map(|slot| {
-            now >= slot.next_refresh_retry
-                && slot.query.as_ref().is_some_and(Query::wildcard_refresh_due)
-        })
-        .collect::<Vec<_>>();
-    let mut tasks = queries
-        .iter()
-        .enumerate()
-        .filter(|(query_index, _)| due[*query_index])
-        .flat_map(|(query_index, slot)| {
-            slot.plan
-                .configs
-                .iter()
-                .enumerate()
-                .filter(|(_, config)| config.instance_config.is_wildcard())
-                .map(move |(config_index, _)| {
-                    (
-                        slot.plan.global_indices[config_index],
-                        query_index,
-                        config_index,
-                    )
-                })
-        })
-        .collect::<Vec<_>>();
-    tasks.sort_by_key(|(global_index, _, _)| *global_index);
-
-    let mut errors = std::iter::repeat_with(|| None)
-        .take(queries.len())
-        .collect::<Vec<_>>();
-    for (_, query_index, config_index) in tasks {
-        if shutdown_requested.is_some_and(|stop| stop.load(Ordering::Acquire)) {
-            return (errors, true);
-        }
-        if errors[query_index].is_some() {
-            continue;
-        }
-        let query_limit = query_native_limit(queries, query_index, max_native_counters);
-        let query = queries[query_index]
-            .query
-            .as_mut()
-            .expect("wildcard refresh task requires an active query");
-        let result = query
-            .set_max_native_counters(query_limit)
-            .and_then(|()| query.refresh_wildcard_config_managed(config_index));
-        if let Err(error) = result {
-            errors[query_index] = Some(error);
-        }
-    }
-    for (query_index, is_due) in due.into_iter().enumerate() {
-        if is_due && errors[query_index].is_none() {
-            let slot = &mut queries[query_index];
-            if let Some(query) = slot.query.as_mut() {
-                query.finish_managed_wildcard_refresh();
-                slot.record_refresh_success(now);
-            }
-        }
-    }
-    (errors, false)
-}
-
-fn query_native_limit<A: PdhApi>(
-    queries: &[QuerySlot<A>],
-    query_index: usize,
-    max_native_counters: usize,
-) -> usize {
-    remaining_native_capacity(
-        max_native_counters,
-        queries
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != query_index)
-            .map(|(_, query)| query.reserved_native_entry_count()),
-    )
-}
-
-pub(super) fn remaining_native_capacity(
-    max_native_counters: usize,
-    reserved_counts: impl Iterator<Item = usize>,
-) -> usize {
-    max_native_counters
-        .saturating_sub(reserved_counts.fold(0usize, |total, count| total.saturating_add(count)))
-}
-
-fn append_query_failures(
-    failures: &mut Vec<SampleFailure>,
-    plan: &QueryPlan,
-    error: &Error,
-    diagnostic_only: bool,
-) {
-    let reason = error.reason();
-    let detail = error.bounded_detail();
-    failures.extend(plan.global_indices.iter().zip(&plan.configs).map(
-        |(&counter_index, config)| SampleFailure {
-            counter_index,
-            path: Arc::from(config.path.as_str()),
-            reason,
-            error: detail.clone(),
-            diagnostic_only,
-        },
-    ));
-}
-
-fn recreate_successful_queries<A, F>(
-    queries: &mut [QuerySlot<A>],
-    collection_succeeded: &[bool],
-    now: Instant,
-    max_native_counters: usize,
-    open: &mut F,
-    sample: &mut Sample,
-) where
-    A: PdhApi,
-    F: FnMut(Vec<CounterConfig>, usize, Option<&QueryRecreationSeed>) -> Result<Query<A>, Error>,
-{
-    for query_index in 0..queries.len() {
-        if !collection_succeeded[query_index] {
-            continue;
-        }
-        let query_limit = remaining_native_capacity(
-            max_native_counters,
-            queries.iter().map(QuerySlot::reserved_native_entry_count),
-        );
-        queries[query_index].recreate(now, query_limit, open, &mut sample.metadata);
-    }
 }

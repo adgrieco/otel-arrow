@@ -99,10 +99,6 @@ pub(in super::super) enum Error {
     },
     #[error("PDH worker object-list {stage} failed with status 0x{status:08X}")]
     WorkerObjectRefresh { stage: &'static str, status: u32 },
-    #[error("no usable performance counters were installed at startup for {paths:?}")]
-    NoUsableCounters { paths: Vec<String> },
-    #[error("failed to open the startup PDH query: {0}")]
-    StartupQuery(#[source] Box<Error>),
     #[error("PDH worker stopped before initialization completed")]
     WorkerInitStopped,
     #[error("PDH worker stop was requested")]
@@ -115,11 +111,16 @@ pub(in super::super) enum Error {
     WorkerPanicked,
     #[error("PDH query recovery is deferred for another {retry_after_ms} ms")]
     QueryRecoveryPending { retry_after_ms: u128 },
-    #[error("replacement query capacity {available} is below its current reservation {reserved}")]
-    QueryRecreationCapacity { available: usize, reserved: usize },
 }
 
 impl Error {
+    pub(super) fn is_stop(&self) -> bool {
+        matches!(
+            self,
+            Self::WorkerInitStopped | Self::WorkerStopRequested | Self::WorkerStopped
+        )
+    }
+
     pub(in super::super) fn is_collection_failure(&self) -> bool {
         matches!(
             self,
@@ -205,15 +206,12 @@ impl Error {
             Self::WorkerStart(_) => "worker_start",
             Self::WorkerLanguagePin { .. } => "worker_language_pin",
             Self::WorkerObjectRefresh { .. } => "worker_object_refresh",
-            Self::NoUsableCounters { .. } => "no_usable_counters",
-            Self::StartupQuery(_) => "startup_query",
             Self::WorkerInitStopped => "worker_init_stopped",
             Self::WorkerStopRequested => "worker_stop_requested",
             Self::WorkerBusy => "worker_busy",
             Self::WorkerStopped => "worker_stopped",
             Self::WorkerPanicked => "worker_panicked",
             Self::QueryRecoveryPending { .. } => "query_recovery_pending",
-            Self::QueryRecreationCapacity { .. } => "query_recreation_capacity",
         }
     }
 

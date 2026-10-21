@@ -37,6 +37,9 @@ pub(super) struct WindowsPerfCountersMetrics {
     /// Currently active expanded wildcard counters.
     #[metric(unit = "{counter}")]
     pub active_expanded: Gauge<u64>,
+    /// Whether query recovery or initial counter availability is pending.
+    #[metric(unit = "{query}")]
+    pub query_pending: Gauge<u64>,
     /// Successful collections.
     #[metric(unit = "{scrape}")]
     pub scrapes: Counter<u64>,
@@ -55,15 +58,64 @@ pub(super) struct WindowsPerfCountersMetrics {
     /// Counter observations lost to read, status, calculation, or scaling failures.
     #[metric(unit = "{failure}")]
     pub counter_read_failures: Counter<u64>,
+    /// Wildcard discovery refreshes attempted.
+    #[metric(unit = "{refresh}")]
+    pub discovery_refreshes: Counter<u64>,
+    /// Wildcard discovery refreshes that failed.
+    #[metric(unit = "{refresh}")]
+    pub discovery_failures: Counter<u64>,
+    /// Expanded instances added.
+    #[metric(unit = "{instance}")]
+    pub instances_added: Counter<u64>,
+    /// Expanded instances removed.
+    #[metric(unit = "{instance}")]
+    pub instances_removed: Counter<u64>,
+    /// Expanded instances omitted by configured limits.
+    #[metric(unit = "{instance}")]
+    pub instances_omitted_over_limit: Counter<u64>,
+    /// Counter add attempts that failed.
+    #[metric(unit = "{failure}")]
+    pub counter_add_failures: Counter<u64>,
+    /// Deferred counter or collection retry attempts.
+    #[metric(unit = "{attempt}")]
+    pub retry_attempts: Counter<u64>,
+    /// Deferred counter or collection retries that recovered.
+    #[metric(unit = "{recovery}")]
+    pub retry_recoveries: Counter<u64>,
+    /// Worker-owned query rebuild attempts.
+    #[metric(unit = "{attempt}")]
+    pub query_rebuild_attempts: Counter<u64>,
+    /// Worker-owned query rebuilds that recovered.
+    #[metric(unit = "{recovery}")]
+    pub query_rebuild_recoveries: Counter<u64>,
+    /// Points omitted while independently warming.
+    #[metric(unit = "{metric}")]
+    pub warmup_omissions: Counter<u64>,
 }
 
 impl WindowsPerfCountersMetrics {
     pub(super) fn apply(&mut self, diagnostics: &SampleDiagnostics) {
         self.active_expanded
             .set(diagnostics.active_expanded_counters as u64);
+        self.query_pending.set(u64::from(diagnostics.query_pending));
+        self.discovery_refreshes
+            .add(diagnostics.discovery_refreshes);
+        self.discovery_failures.add(diagnostics.discovery_failures);
+        self.instances_added.add(diagnostics.instances_added);
+        self.instances_removed.add(diagnostics.instances_removed);
+        self.instances_omitted_over_limit
+            .add(diagnostics.instances_omitted_over_limit);
+        self.counter_add_failures
+            .add(diagnostics.counter_add_failures);
+        self.retry_attempts.add(diagnostics.retry_attempts);
+        self.retry_recoveries.add(diagnostics.retry_recoveries);
+        self.query_rebuild_attempts
+            .add(diagnostics.query_rebuild_attempts);
+        self.query_rebuild_recoveries
+            .add(diagnostics.query_rebuild_recoveries);
+        self.warmup_omissions.add(diagnostics.warmup_omissions);
         self.counter_read_failures
             .add(diagnostics.counter_read_failures);
-        self.scrape_failures.add(diagnostics.scrape_failures);
     }
 }
 

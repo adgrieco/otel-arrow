@@ -22,9 +22,10 @@ include their configured path template. The resource includes
 `os.type=windows`.
 
 The receiver constructs PDH paths from configured performance objects,
-instances, and counters, and expands instance patterns once at startup.
-Instances appearing later require a receiver restart; there is no periodic
-refresh, failed-add retry, query recreation, or recovery loop.
+instances, and counters, and periodically refreshes instance membership.
+New members are admitted within configured bounds and disappeared members are
+removed. Missing counters retry with bounded backoff; failed queries rebuild
+on their owning worker.
 Configured objects and counters must be installed and enabled on the target
 host.
 
@@ -78,12 +79,15 @@ config:
 | `initial_delay` | No | `1s` | Delay before the first collection request; non-positive means immediate |
 | `collection_interval` | No | `1m` | Any positive collection interval |
 | `timeout` | No | `collection_interval` | Scrape lateness warning threshold; `0s` uses the collection interval |
+| `wildcard_refresh_interval` | No | Greater of `collection_interval` and `60s` | Discovery cadence; must be at least `collection_interval` |
+| `max_instances_per_wildcard` | No | `256` | Members retained per pattern; integer from 1 through 16384, no greater than `max_expanded_counters` |
+| `max_expanded_counters` | No | `4096` | Receiver-wide exact reservations and expanded native entries; integer from 1 through 16384 |
 
 <!-- markdownlint-enable MD013 -->
 
-Explicit `wildcard_refresh_interval`, `max_instances_per_wildcard`, and
-`max_expanded_counters` are rejected. Startup admission uses fixed limits of
-256 members per pattern and 4096 exact plus expanded native entries.
+Admission applies the limits at startup and on every refresh. Exact configured
+paths reserve capacity even while unavailable; pending native removals retain
+their capacity until cleanup succeeds.
 Wildcard templates do not consume entries until they resolve to concrete
 paths. Zero or negative `initial_delay` starts collection immediately.
 Sub-second collection intervals are accepted, matching Go, but rate and other
@@ -96,7 +100,6 @@ Each `metrics` key is an OTel metric name. `description` defaults to empty and
 `unit` defaults to `"1"`. Definitions may be unused. A definition may select
 one `gauge: {}` or `sum:` object; omitting both defaults to Gauge. A Sum
 requires `aggregation: cumulative`; `monotonic` defaults to `false`.
-Delta and monotonic definitions are rejected, including unused definitions.
 Empty and null Sum configurations are rejected. Metrics
 that configure both Gauge and Sum are also rejected. Gauge may use YAML
 shorthand such as `gauge:`. Metric definition names preserve their exact
@@ -279,11 +282,11 @@ timestamps and non-monotonic value decreases alone do not reset it. Projection
 requires `0 < start <= time`; missing or invalid starts are invariant errors.
 This start is an observation boundary, not provider creation time.
 
-An invalid query handle terminates the receiver with a typed native error and
-one failed scheduled collection. No later points are published and the invalid
-query is not rebuilt or retried. Restart the receiver to resume collection;
-this does not promise an automatic engine restart. Cleanup remains owned by
-the worker when its current native call returns.
+An invalid query handle fails that scheduled collection, then triggers a
+bounded worker-owned rebuild. Rebuild priming publishes no points; collection
+resumes on a subsequent scheduled scrape. The seed preserves the logical query
+start and rollback context, including for members admitted after startup.
+Cleanup remains owned by the worker when its current native call returns.
 
 Native setup observes shutdown between operations and before priming. A blocked
 PDH call is not cancelled; the worker closes its owned query after that call
@@ -307,11 +310,12 @@ sample readiness and guard the native `MultiCount` used by multi-timers.
 Geneva-specific Full or Factored event formats are transport and schema choices
 outside this receiver's OTAP metric contract.
 
-Unsupported exact or expanded counter types are omitted and diagnosed without
-suppressing healthy counters. They are not retried because their native type
-cannot change while the handle exists. A missing or inaccessible exact counter
-is diagnosed and omitted without retrying its addition. Zero usable installed
-counters fails startup; installed counters awaiting warm-up are not empty.
+Unsupported counter types are omitted and diagnosed without suppressing
+healthy counters. Exact unsupported mappings do not enter add retry; wildcard
+members are reconsidered on later discovery. A missing or inaccessible exact
+counter
+is diagnosed and retried with bounded backoff. An entirely unavailable set
+starts pending and retries availability rather than failing startup.
 Diagnostics include the native type.
 
 ## Scaling
@@ -330,29 +334,26 @@ For example, `\Memory\Available Bytes` remains an exact byte count with unit
 
 ## Collection behavior
 
-The receiver opens its PDH query on the worker and performs one startup
-collection without emitting points. This prime seeds valid native and
-receiver-side sample history before `initial_delay` and the first scheduled
-scrape. A transient priming collection failure is retained as bounded
-diagnostics; the next tick collects the same installed handles. No-data or
-counter-local failures retain their normal omission and diagnostic behavior
-without fabricating readiness.
-The initial pass has no fixed timeout. Drain or shutdown remains responsive and
-requests worker cleanup, but a native call already in progress must return
-before its query resources can be released. Setup checks for shutdown between
-native calls, including aggregate filtering. Failed query open, zero usable
-counters, thread-start, configuration, and invariant failures reject startup
-explicitly. An empty wildcard is diagnosed and omitted beside healthy peers;
-it never fabricates a zero-valued point.
+The worker opens and primes one query before scheduled collection. Recoverable
+open or setup failures instead create one pending slot with bounded retries.
+Readiness means the initial pass has finished, not that every provider is
+available: the `ready` event and `query_pending` gauge expose pending recovery
+or an empty installed set. Configuration, invariant, worker-language and
+startup object-refresh failures remain fatal. There is no fixed startup
+deadline or promise of partial publication during a blocked native call.
 
-- Wildcards are expanded only at startup. Concrete paths are joined by
-  configured counter
-  and full case-insensitive path, including PDH's `#n` duplicate index.
+- Wildcards refresh at the configured cadence, on scheduled collections.
+  Each cycle discovers all patterns, releases disappeared handles, then keeps
+  still-present admitted members globally before admitting new paths in
+  configuration order. Failed removals retain their capacity. Concrete identity
+  includes the configured mapping and
+  Unicode-lowercase native path, including PDH's `#n` duplicate index.
 - One-sample counters can emit immediately. A valid startup prime normally
   makes two-sample counters eligible on the first scheduled scrape. Insufficient
   elapsed time or an invalid/missing prime still requires fresh warm-up.
-- New instances require a receiver restart. Disappeared instances retain their
-  installed handles and ordinary native no-data/read-failure handling.
+- Disappeared members are removed. Failed removals remain worker-owned and
+  capacity-accounted until local cleanup succeeds. Ordinary discovery failures
+  retain healthy membership and retry discovery at its cadence.
 - When a sample-fraction or average base does not advance, no relevant
   operation occurred; that value is omitted rather than replaced with zero. A
   decreasing base also omits the point and resets its baseline. This differs
@@ -368,17 +369,19 @@ it never fabricates a zero-valued point.
 - The native worker validates timestamps, Sum intervals, and finite values
   before projection. Broken sample/configuration identity and Arrow schema
   errors remain fatal receiver invariants.
-- Failed additions are not retried. Counter read failures omit only the affected
-  point and retain the existing handle for the next scheduled collection.
-- A configuration with no usable installed counters fails startup.
+- Missing counters and recoverable add failures retry with capped exponential
+  backoff. Invalid counter handles retire and re-add locally; failed cleanup
+  triggers query recovery. Permanent unsupported types remain diagnosed.
 - Query-level `PDH_NO_DATA` and the other transient no-observation statuses
   emit no batch and do not count as failures. They clear saved PDH base history,
   and restart two-sample warm-up while preserving cumulative Sum starts.
   Other query-level collection failures
   and post-collection timestamp failures apply the same reset before returning
-  an error. Transient failures retry the same installed handles on the next
-  tick, without rebuild or backoff. An invalid query is terminal and requires
-  a receiver restart.
+  an error. Collection failures retry the same query with bounded backoff;
+  three consecutive query collection failures schedule a seeded rebuild.
+  An invalid query schedules a rebuild immediately, subject to bounded retry
+  delay. Rebuild and priming are maintenance, not successful scheduled
+  collections, and never publish a maintenance-only batch.
 - The receiver waits for every accepted scrape and delivers late results with
   their original point timestamps. Crossing the lateness threshold immediately
   records an overrun and emits a warning without cancelling the scrape. A
@@ -386,9 +389,15 @@ it never fabricates a zero-valued point.
   `collection_interval`; omitting it or setting `0s` uses the next scheduled
   collection tick. The warning re-arms only after an on-time scrape. No
   concurrent request is queued while the native call remains in flight.
-- Wildcard expansion is sorted before applying the fixed limits. Excess
+- Wildcard expansion is sorted before applying configured limits. Excess
   instances are omitted and reported explicitly, never presented as a complete
-  expansion. Membership is not reconsidered until receiver restart.
+  expansion. Each affected pattern emits at most one bounded limit summary
+  per refresh, including when both limits apply.
+
+Drain and shutdown stay responsive between native operations, including
+aggregate filtering and before priming. An in-progress PDH call cannot be
+cancelled; worker-owned cleanup completes when it returns. Scrape duration
+ends at native-result receipt, excluding projection and downstream delivery.
 
 Each emitted point retains its own collection timestamp. Cumulative
 non-monotonic Sum points use the fixed query-start rule described above.
@@ -413,7 +422,7 @@ example demonstrates rates, fractions, and averages.
 The focused
 [`windows-perf-counters-wildcard-console.yaml`](../../../../../configs/windows-perf-counters-wildcard-console.yaml)
 example combines an exact Memory counter with
-`\Process(*)\Private Bytes` with fixed startup discovery. It
+`\Process(*)\Private Bytes` with periodic discovery. It
 uses only built-in Windows performance counters and demonstrates bounded
 per-process expansion without requiring a separate test executable.
 
@@ -441,7 +450,7 @@ not by `--validate-and-exit`.
 - The source pipeline must allocate one core.
 - Multiple receiver nodes may use independent intervals. Each node owns one
   worker and one PDH query. Avoid unintentionally configuring duplicate collection.
-- Use narrow wildcard patterns where possible. The fixed per-path and
+- Use narrow wildcard patterns where possible. The configurable per-path and
   receiver-wide limits bound active handles and emitted cardinality.
 - One scrape can be in flight. Missed ticks are skipped rather than queued.
 - Downstream backpressure delays later scrapes instead of creating an
@@ -465,7 +474,7 @@ and low-cardinality reason. Other runtime events are:
 - `windows_perf_counters_receiver.worker.startup`
 - `windows_perf_counters_receiver.worker.language.warn`
 - `windows_perf_counters_receiver.startup.fail`
-- `windows_perf_counters_receiver.query.invalid`
+- `windows_perf_counters_receiver.ready`
 
 Repeated scrape and counter warnings are suppressed until the affected
 condition recovers. Configuration events are:
@@ -488,8 +497,13 @@ paths), `configured_wildcard` (configured pattern paths) and `active_expanded`
 overruns and duration, worker-busy collection rejections, and concrete lost
 observations in `counter_read_failures`. Multiple diagnostics for one lost
 observation count once; maintenance, priming, warm-up and expected no-data
-count zero. Query failures are counted separately. No `failed_counter_values`
-metric or recovery inventory is exported.
+count zero. Query failures are counted separately. The `{query}` gauge
+`query_pending` is one during availability/recovery pending and zero when
+serving normally. Recovery counters include `discovery_refreshes`,
+`discovery_failures`, `instances_added`, `instances_removed`,
+`instances_omitted_over_limit`, `counter_add_failures`, `retry_attempts`,
+`retry_recoveries`, `query_rebuild_attempts`, `query_rebuild_recoveries` and
+`warmup_omissions`. No `failed_counter_values` metric is exported.
 
 ## Related documentation
 

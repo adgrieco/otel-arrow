@@ -139,6 +139,8 @@ pub(super) struct ExpansionOverflow {
 pub(super) struct SampleDiagnostics {
     /// Whether at least one scheduled query reached native collection for this scrape.
     pub(super) any_query_collected: bool,
+    /// Whether the query is awaiting recovery or has no installed counters yet.
+    pub(super) query_pending: bool,
     /// Number of currently active expanded wildcard counters.
     pub(super) active_expanded_counters: usize,
     /// Number of wildcard discovery refreshes attempted.
@@ -153,10 +155,8 @@ pub(super) struct SampleDiagnostics {
     pub(super) instances_omitted_over_limit: u64,
     /// Number of counter-add attempts that failed.
     pub(super) counter_add_failures: u64,
-    /// Number of counter read, status, or projection failures.
+    /// Number of counter read, status, calculation, or scaling failures.
     pub(super) counter_read_failures: u64,
-    /// Number of query-level collection failures preserved outside a requested scrape.
-    pub(super) scrape_failures: u64,
     /// Number of deferred counter retry attempts.
     pub(super) retry_attempts: u64,
     /// Number of deferred counter retries that recovered.
@@ -165,10 +165,6 @@ pub(super) struct SampleDiagnostics {
     pub(super) query_rebuild_attempts: u64,
     /// Number of worker-owned query rebuilds that recovered.
     pub(super) query_rebuild_recoveries: u64,
-    /// Number of configured post-scrape query recreations attempted.
-    pub(super) query_recreation_attempts: u64,
-    /// Number of configured post-scrape query recreations that failed.
-    pub(super) query_recreation_failures: u64,
     /// Number of independently warming points omitted.
     pub(super) warmup_omissions: u64,
 }
@@ -428,13 +424,10 @@ pub(super) fn merge_diagnostics(target: &mut SampleDiagnostics, delta: SampleDia
     target.instances_omitted_over_limit += delta.instances_omitted_over_limit;
     target.counter_add_failures += delta.counter_add_failures;
     target.counter_read_failures += delta.counter_read_failures;
-    target.scrape_failures += delta.scrape_failures;
     target.retry_attempts += delta.retry_attempts;
     target.retry_recoveries += delta.retry_recoveries;
     target.query_rebuild_attempts += delta.query_rebuild_attempts;
     target.query_rebuild_recoveries += delta.query_rebuild_recoveries;
-    target.query_recreation_attempts += delta.query_recreation_attempts;
-    target.query_recreation_failures += delta.query_recreation_failures;
     target.warmup_omissions += delta.warmup_omissions;
 }
 

@@ -42,17 +42,6 @@ pub(super) struct Config {
 impl Config {
     /// Parse, validate, and normalize the public configuration contract.
     pub(super) fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
-        for option in [
-            "wildcard_refresh_interval",
-            "max_instances_per_wildcard",
-            "max_expanded_counters",
-        ] {
-            if value.get(option).is_some() {
-                return Err(invalid(format!(
-                    "{option} is not supported: membership is fixed at startup with limits of 256 per pattern and 4096 total entries"
-                )));
-            }
-        }
         let user: UserConfig =
             serde_json::from_value(value.clone()).map_err(|err| invalid(err.to_string()))?;
         for (object_index, object) in user.perfcounters.iter().enumerate() {
@@ -203,8 +192,6 @@ pub(super) struct CounterConfig {
     pub(super) instance_config: InstanceConfig,
     /// Base-10 scaling applied after PDH calculates the native value.
     pub(super) scale_power10: i32,
-    /// Whether this configured mapping receives a fresh, primed query after each scrape.
-    pub(super) recreate_query: bool,
     /// Identity shared by normalized paths expanded from one configured mapping.
     pub(super) source_mapping_index: usize,
 }
@@ -749,7 +736,6 @@ impl ObjectNormalizer<'_> {
                 attributes: metric.attributes,
                 instance_config: expanded.instance_config,
                 scale_power10: mapping.scale_power10,
-                recreate_query: mapping.recreate_query,
                 source_mapping_index,
             });
         }
