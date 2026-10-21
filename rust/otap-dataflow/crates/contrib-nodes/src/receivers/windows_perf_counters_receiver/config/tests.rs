@@ -1529,11 +1529,13 @@ fn bounds_exact_paths_by_native_counter_budget() {
     );
     assert_config_error(
         config(json!([object(257, 16)])),
-        "normalize to 4097 exact counter paths, exceeding max_expanded_counters 4096",
+        "normalize to 4097 counter selectors, exceeding max_expanded_counters 4096",
     );
+    let mut second_object = object(1, 2048);
+    second_object["object"] = json!("Other Process");
     assert_config_error(
-        config(json!([object(1, 2049), object(1, 2048)])),
-        "normalize to 4097 exact counter paths, exceeding max_expanded_counters 4096",
+        config(json!([object(1, 2049), second_object])),
+        "normalize to 4097 counter selectors, exceeding max_expanded_counters 4096",
     );
 }
 
@@ -1561,10 +1563,10 @@ fn allows_exact_paths_beyond_removed_template_cap() {
     );
 }
 
-/// Scenario: Exact paths exhaust the native budget while an additional wildcard template is configured.
-/// Guarantees: Templates remain configurable without pre-consuming entries, while their concrete expansions cannot exceed the runtime budget.
+/// Scenario: Exact paths and one wildcard selector reach the configured selector bound together.
+/// Guarantees: Wildcard selectors count toward config cardinality independently of runtime expansion.
 #[test]
-fn wildcard_templates_do_not_consume_exact_counter_budget() {
+fn accepts_exact_and_wildcard_selectors_at_configured_bound() {
     let counters = |prefix: &str, count: usize| {
         (0..count)
             .map(|index| json!({"name": format!("{prefix} {index}")}))
@@ -1591,6 +1593,7 @@ fn wildcard_templates_do_not_consume_exact_counter_budget() {
     });
 
     let config = Config::from_json(&json!({
+        "max_expanded_counters": 257,
         "perfcounters": [omitted, empty, selected, wildcard]
     }))
     .unwrap();
@@ -1602,6 +1605,63 @@ fn wildcard_templates_do_not_consume_exact_counter_budget() {
             .unwrap()
             .instance_config
             .is_wildcard()
+    );
+}
+
+/// Scenario: Exact, wildcard and mixed selectors reach or exceed default and explicit limits.
+/// Guarantees: Every normalized selector counts once; exactly the cap succeeds and the next rejects.
+#[test]
+fn bounds_all_configured_selectors() {
+    for cap in [1, 16, 4096, 16384] {
+        for kind in ["exact", "wildcard", "mixed"] {
+            for excess in [0, 1] {
+                let instances = (0..cap + excess)
+                    .map(|index| {
+                        if kind == "wildcard" || (kind == "mixed" && index % 2 == 0) {
+                            format!("worker{index}*")
+                        } else {
+                            format!("worker{index}")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut value = json!({
+                    "max_instances_per_wildcard": 1,
+                    "perfcounters": [{
+                        "object": "Process",
+                        "instances": instances,
+                        "counters": [{"name": "ID Process"}]
+                    }]
+                });
+                if cap != DEFAULT_MAX_EXPANDED_COUNTERS {
+                    value["max_expanded_counters"] = json!(cap);
+                }
+                if excess == 0 {
+                    assert_eq!(Config::from_json(&value).unwrap().counters.len(), cap);
+                } else {
+                    assert_config_error(
+                        value,
+                        &format!(
+                            "normalize to {} counter selectors, exceeding max_expanded_counters {cap}",
+                            cap + 1
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Scenario: Many wildcard patterns and counter mappings would generate 65,536 selectors.
+/// Guarantees: Normalization rejects at the default 4097th selector instead of materializing the product.
+#[test]
+fn rejects_large_wildcard_selector_product() {
+    assert_config_error(
+        json!({"perfcounters": [{
+            "object": "Process",
+            "instances": (0..256).map(|i| format!("worker{i}*")).collect::<Vec<_>>(),
+            "counters": (0..256).map(|i| json!({"name": format!("Counter {i}")})).collect::<Vec<_>>()
+        }]}),
+        "normalize to 4097 counter selectors, exceeding max_expanded_counters 4096",
     );
 }
 
@@ -1776,38 +1836,123 @@ fn rejects_duplicate_paths_across_output_mappings() {
     );
 }
 
-/// Scenario: Explicit instances and the aggregation name contain zero or leading-zero numeric suffixes.
-/// Guarantees: Every configured suffix remains distinct and reaches the native path or wildcard filter unchanged.
+/// Scenario: Individual exact instances and an aggregation name use omitted, zero or leading-zero suffixes.
+/// Guarantees: Native paths, implicit names and exact lookup preserve spelling; aggregate filtering stays unchanged.
 #[test]
 fn preserves_explicit_instance_indexes() {
-    let config = Config::from_json(&json!({
-        "metrics": {"test": metric()},
-        "perfcounters": [{
-            "object": "Process",
-            "instances": ["app", "app#0", "app#1", "app#01", "worker*"],
-            "aggregation_name": "_Total#00",
-            "counters": [{"name": "Private Bytes", "metric": "test"}]
-        }]
-    }))
+    for (instance, unit) in [
+        ("app", "By"),
+        ("app#0", "KiBy"),
+        ("app#00", "MiBy"),
+        ("app#1", "GiBy"),
+        ("app#01", "TiBy"),
+        ("app#001", "PiBy"),
+    ] {
+        let config = Config::from_json(&json!({
+            "metrics": {
+                r"\Process(app)\Private Bytes": {"unit": "By"},
+                r"\Process(app#0)\Private Bytes": {"unit": "KiBy"},
+                r"\Process(app#00)\Private Bytes": {"unit": "MiBy"},
+                r"\Process(app#1)\Private Bytes": {"unit": "GiBy"},
+                r"\Process(app#01)\Private Bytes": {"unit": "TiBy"},
+                r"\Process(app#001)\Private Bytes": {"unit": "PiBy"}
+            },
+            "perfcounters": [{
+                "object": "Process",
+                "instances": instance,
+                "counters": [{"name": "Private Bytes"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(config.counters.len(), 1);
+        assert_eq!(
+            config.counters[0].path,
+            format!(r"\Process({instance})\Private Bytes")
+        );
+        assert_eq!(config.counters[0].name.as_ref(), config.counters[0].path);
+        assert_eq!(config.counters[0].unit.as_ref(), unit);
+    }
+    let wildcard = Config::from_json(&json!({"perfcounters": [{
+        "object": "Process",
+        "instances": "worker*",
+        "aggregation_name": "_Total#00",
+        "counters": [{"name": "Private Bytes"}]
+    }]}))
     .unwrap();
     assert_eq!(
-        config
-            .counters
-            .iter()
-            .map(|counter| counter.path.as_str())
-            .collect::<Vec<_>>(),
-        [
-            r"\Process(app)\Private Bytes",
-            r"\Process(app#0)\Private Bytes",
-            r"\Process(app#1)\Private Bytes",
-            r"\Process(app#01)\Private Bytes",
-            r"\Process(worker*)\Private Bytes",
-        ]
-    );
-    assert_eq!(
-        config.counters[4].instance_config.excluded_aggregation(),
+        wildcard.counters[0].instance_config.excluded_aggregation(),
         Some("_Total#00")
     );
+}
+
+/// Scenario: Numeric-suffix aliases appear in one list or separate object entries.
+/// Guarantees: Both duplicate checks reject zero and leading-zero aliases using the same comparison rule.
+#[test]
+fn rejects_instance_alias_duplicates() {
+    for [first, second] in [
+        ["app", "app#0"],
+        ["app#1", "app#01"],
+        ["App", "app#00"],
+        ["\u{00c4}pp#1", "\u{00e4}pp#001"],
+    ] {
+        assert_config_error(
+            json!({"perfcounters": [{
+                "object": "Process", "instances": [first, second],
+                "counters": [{"name": "Private Bytes"}]
+            }]}),
+            "instances contains duplicate",
+        );
+        assert_config_error(
+            json!({"perfcounters": [
+                {"object": "Process", "instances": first, "counters": [{"name": "Private Bytes"}]},
+                {"object": "process", "instances": second, "counters": [{"name": "private bytes"}]}
+            ]}),
+            "duplicate counter path",
+        );
+    }
+}
+
+/// Scenario: Instance text has padding, nonnumeric/non-ASCII suffixes, empty prefixes or repeated hashes.
+/// Guarantees: Comparison canonicalizes only one final ASCII numeric suffix without trimming or recursion.
+#[test]
+fn preserves_literal_instance_suffix_text() {
+    let instances = [
+        "app",
+        "app#0 ",
+        "app#01 ",
+        " app#0",
+        "app#1x",
+        "app#01x",
+        "app#\u{0660}",
+        "app#0#0",
+        "#0",
+        "#00",
+        "app#",
+    ];
+    for separate_entries in [false, true] {
+        let perfcounters = if separate_entries {
+            instances
+                .iter()
+                .map(|instance| {
+                    json!({
+                        "object": "Process", "instances": instance,
+                        "counters": [{"name": "Private Bytes"}]
+                    })
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![json!({
+                "object": "Process", "instances": instances,
+                "counters": [{"name": "Private Bytes"}]
+            })]
+        };
+        let config = Config::from_json(&json!({"perfcounters": perfcounters})).unwrap();
+        assert_eq!(config.counters.len(), instances.len());
+        for (counter, instance) in config.counters.iter().zip(instances) {
+            assert_eq!(counter.path, format!(r"\Process({instance})\Private Bytes"));
+            assert_eq!(counter.name.as_ref(), counter.path);
+        }
+    }
 }
 
 /// Scenario: An instance name starts with `#` and otherwise resembles a PDH duplicate suffix.

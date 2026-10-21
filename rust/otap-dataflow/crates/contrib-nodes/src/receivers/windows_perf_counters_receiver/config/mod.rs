@@ -34,7 +34,7 @@ pub(super) struct Config {
     pub(super) wildcard_refresh_interval: Option<Duration>,
     /// Maximum expanded instances retained for one wildcard path.
     pub(super) max_instances_per_wildcard: usize,
-    /// Receiver-wide entries reserved for exact or retained expanded native counters.
+    /// Maximum configured selectors, and separately exact or expanded native entries.
     pub(super) max_expanded_counters: usize,
     /// Construction warnings emitted once after successful validation and construction.
     pub(super) warnings: Vec<ConfigWarning>,
@@ -527,8 +527,8 @@ enum InstanceSegment {
     Wildcard(String),
 }
 
-struct ExpandedPath {
-    native: String,
+struct ExpandedPath<'a> {
+    instance: Option<&'a str>,
     instance_config: InstanceConfig,
 }
 
@@ -616,19 +616,19 @@ fn unused_path_metric_definitions<'a>(
 fn normalize_counters(
     objects: Vec<ObjectConfig>,
     metrics: &BTreeMap<Arc<str>, NormalizedMetric>,
-    max_native_counters: usize,
+    max_configured_counters: usize,
     warnings: &mut Vec<ConfigWarning>,
 ) -> Result<Vec<CounterConfig>, Error> {
     let mut counters = Vec::new();
     let mut source_mapping_index = 0;
-    let mut exact_counter_count = 0;
+    let mut paths = HashSet::new();
     for (object_index, object) in objects.into_iter().enumerate() {
         normalize_object(
             object_index,
             object,
             metrics,
-            max_native_counters,
-            &mut exact_counter_count,
+            max_configured_counters,
+            &mut paths,
             &mut counters,
             &mut source_mapping_index,
             warnings,
@@ -641,8 +641,8 @@ fn normalize_object(
     object_index: usize,
     object: ObjectConfig,
     metrics: &BTreeMap<Arc<str>, NormalizedMetric>,
-    max_native_counters: usize,
-    exact_counter_count: &mut usize,
+    max_configured_counters: usize,
+    paths: &mut HashSet<String>,
     output: &mut Vec<CounterConfig>,
     source_mapping_index: &mut usize,
     warnings: &mut Vec<ConfigWarning>,
@@ -669,8 +669,8 @@ fn normalize_object(
             counter_index,
             mapping,
             *source_mapping_index,
-            max_native_counters,
-            exact_counter_count,
+            max_configured_counters,
+            paths,
             output,
             warnings,
         )?;
@@ -696,8 +696,8 @@ impl ObjectNormalizer<'_> {
         counter_index: usize,
         mapping: CounterMapping,
         source_mapping_index: usize,
-        max_native_counters: usize,
-        exact_counter_count: &mut usize,
+        max_configured_counters: usize,
+        paths: &mut HashSet<String>,
         output: &mut Vec<CounterConfig>,
         warnings: &mut Vec<ConfigWarning>,
     ) -> Result<(), Error> {
@@ -715,21 +715,27 @@ impl ObjectNormalizer<'_> {
             &mapping.attributes,
             warnings,
         )?;
-        for expanded in self
-            .instances
-            .expand(self.object_name, counter_name, self.aggregation_name)
-        {
-            let metric = self.resolve_metric(&expanded.native, explicit_metric.as_ref());
-            if !expanded.instance_config.is_wildcard() {
-                *exact_counter_count = exact_counter_count.saturating_add(1);
-                if *exact_counter_count > max_native_counters {
-                    return Err(invalid(format!(
-                        "perfcounters normalize to {exact_counter_count} exact counter paths, exceeding max_expanded_counters {max_native_counters}"
-                    )));
-                }
+        for expanded in self.instances.expand(self.aggregation_name) {
+            if output.len() >= max_configured_counters {
+                return Err(invalid(format!(
+                    "perfcounters normalize to {} counter selectors, exceeding max_expanded_counters {max_configured_counters}",
+                    output.len() + 1
+                )));
             }
+            let path = counter_path(self.object_name, expanded.instance, counter_name);
+            let comparison_instance = expanded.instance.map(instance_comparison_key);
+            let comparison_path = counter_path(
+                self.object_name,
+                comparison_instance.as_deref(),
+                counter_name,
+            )
+            .to_lowercase();
+            if !paths.insert(comparison_path) {
+                return Err(invalid(format!("duplicate counter path {path}")));
+            }
+            let metric = self.resolve_metric(&path, explicit_metric.as_ref());
             output.push(CounterConfig {
-                path: expanded.native,
+                path,
                 name: metric.name,
                 unit: metric.unit,
                 description: metric.description,
@@ -839,7 +845,7 @@ impl NormalizedInstances {
         let mut segments = Vec::with_capacity(configured.len());
         for configured in configured {
             let segment = InstanceSegment::from_config(&field, configured)?;
-            if !identities.insert(segment.value().to_lowercase()) {
+            if !identities.insert(instance_comparison_key(segment.value())) {
                 return Err(invalid(format!(
                     "{object_field}.instances contains duplicate {:?}",
                     segment.value()
@@ -867,37 +873,41 @@ impl NormalizedInstances {
         }
     }
 
-    fn expand(&self, object: &str, counter: &str, aggregation_name: &str) -> Vec<ExpandedPath> {
-        match self {
-            Self::None => vec![ExpandedPath {
-                native: counter_path(object, None, counter),
+    fn expand<'a>(&'a self, aggregation_name: &'a str) -> impl Iterator<Item = ExpandedPath<'a>> {
+        let single = match self {
+            Self::None => Some(ExpandedPath {
+                instance: None,
                 instance_config: InstanceConfig::None,
-            }],
+            }),
             Self::All {
                 include_aggregation,
-            } => vec![ExpandedPath {
-                native: counter_path(object, Some("*"), counter),
+            } => Some(ExpandedPath {
+                instance: Some("*"),
                 instance_config: InstanceConfig::Wildcard {
                     excluded_aggregation: (!include_aggregation)
                         .then(|| aggregation_name.to_owned()),
                 },
-            }],
-            Self::Selected(segments) => segments
-                .iter()
-                .map(|segment| ExpandedPath {
-                    native: counter_path(object, Some(segment.value()), counter),
-                    instance_config: if segment.is_wildcard() {
-                        InstanceConfig::Wildcard {
-                            excluded_aggregation: Some(aggregation_name.to_owned()),
-                        }
-                    } else {
-                        InstanceConfig::Exact {
-                            emit_attribute: !segment.is_exact(aggregation_name),
-                        }
-                    },
-                })
-                .collect(),
-        }
+            }),
+            Self::Selected(_) => None,
+        };
+        let segments = match self {
+            Self::Selected(segments) => segments.as_slice(),
+            _ => &[],
+        };
+        single
+            .into_iter()
+            .chain(segments.iter().map(move |segment| ExpandedPath {
+                instance: Some(segment.value()),
+                instance_config: if segment.is_wildcard() {
+                    InstanceConfig::Wildcard {
+                        excluded_aggregation: Some(aggregation_name.to_owned()),
+                    }
+                } else {
+                    InstanceConfig::Exact {
+                        emit_attribute: !segment.is_exact(aggregation_name),
+                    }
+                },
+            }))
     }
 }
 
@@ -939,20 +949,27 @@ fn counter_path(object: &str, instance: Option<&str>, counter: &str) -> String {
     }
 }
 
-fn validate_counter_outputs(counters: &[CounterConfig]) -> Result<(), Error> {
-    let lowercase_paths = counters
-        .iter()
-        .map(|counter| counter.path.to_lowercase())
-        .collect::<Vec<_>>();
-    let mut output_identities = HashSet::with_capacity(counters.len());
-    for (counter, lowercase_path) in counters.iter().zip(&lowercase_paths) {
-        validate_counter(counter)?;
-        if !output_identities.insert(lowercase_path) {
-            return Err(invalid(format!(
-                "duplicate counter path {} for metric {}",
-                counter.path, counter.name
-            )));
+/// Comparison only; preserve configured spelling in paths, metric names and lookup.
+fn instance_comparison_key(value: &str) -> String {
+    let lowercase = value.to_lowercase();
+    match lowercase.rsplit_once('#') {
+        Some((name, index))
+            if !name.is_empty()
+                && !index.is_empty()
+                && index.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            match index.trim_start_matches('0') {
+                "" => name.to_owned(),
+                index => format!("{name}#{index}"),
+            }
         }
+        _ => lowercase,
+    }
+}
+
+fn validate_counter_outputs(counters: &[CounterConfig]) -> Result<(), Error> {
+    for counter in counters {
+        validate_counter(counter)?;
     }
     Ok(())
 }
