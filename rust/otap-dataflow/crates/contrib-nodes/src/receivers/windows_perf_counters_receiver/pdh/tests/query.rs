@@ -956,6 +956,121 @@ fn departed_pending_replacement_cannot_restore_stale_handle() {
     }
 }
 
+/// Scenario: A mandatory pending replacement changes pattern owner before its previous owner's discovery fails at full quota.
+/// Guarantees: Admission, recreation seed and cleaned-up output use the selected owner without evicting its previous owner's healthy members or exceeding the native budget.
+#[test]
+fn pending_replacement_handoff_preserves_owner_and_pattern_quota() {
+    let first = r"\Process(worker?)\Private Bytes";
+    let second = r"\Process(*)\Private Bytes";
+    let wanted = r"\Process(worker0)\Private Bytes";
+    let duplicate = r"\Process(worker0#1)\Private Bytes";
+    let healthy = [
+        r"\Process(bravo)\Private Bytes",
+        r"\Process(charlie)\Private Bytes",
+    ];
+    let configs = [first, second]
+        .into_iter()
+        .enumerate()
+        .map(|(index, template)| {
+            let mut config = counter(template, &format!("private.{index}"));
+            config.instance_config = InstanceConfig::Wildcard {
+                excluded_aggregation: None,
+            };
+            config
+        })
+        .collect::<Vec<_>>();
+    let counters = || {
+        [wanted, duplicate, healthy[0], healthy[1]]
+            .into_iter()
+            .map(|path| FakeCounter {
+                native_type: 0x0040_0500,
+                raw: Some(10),
+                ..fake_counter(path, Number::Double(1.0))
+            })
+            .collect::<Vec<_>>()
+    };
+    let state = fake_state(counters());
+    let _ = state.borrow_mut().expansions.insert(
+        second.to_owned(),
+        vec![wanted.to_owned(), duplicate.to_owned()],
+    );
+    let mut query = Query::open_managed_with_seed(
+        FakePdh::new(Rc::clone(&state)),
+        configs.clone(),
+        Duration::ZERO,
+        Duration::ZERO,
+        2,
+        3,
+        None,
+    )
+    .unwrap();
+    query.refresh_all_wildcards_managed().unwrap();
+    let _ = query.collect_managed().unwrap();
+    {
+        let mut state = state.borrow_mut();
+        let _ = state
+            .expansions
+            .insert(second.to_owned(), vec![wanted.to_owned()]);
+        let _ = state.remove_errors.insert(0);
+    }
+    query.refresh_all_wildcards_managed().unwrap();
+    assert_eq!(query.admitted_members()[0].counter_index, 1);
+    {
+        let mut state = state.borrow_mut();
+        let _ = state
+            .expansions
+            .insert(first.to_owned(), vec![wanted.to_owned()]);
+        let _ = state.expansions.insert(
+            second.to_owned(),
+            healthy.iter().map(|path| (*path).to_owned()).collect(),
+        );
+    }
+    query.refresh_all_wildcards_managed().unwrap();
+    let expected = vec![
+        (0, wanted.to_owned()),
+        (1, healthy[0].to_owned()),
+        (1, healthy[1].to_owned()),
+    ];
+    let members = |query: &Query<FakePdh>| {
+        query
+            .admitted_members()
+            .into_iter()
+            .map(|member| (member.counter_index, member.path.to_string()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(members(&query), expected);
+    assert_eq!(query.active_counter_count(), 2);
+    assert_eq!(query.reserved_native_entry_count(), 3);
+    let seed = query.recreation_seed();
+    let restored = Query::open_managed_with_seed(
+        FakePdh::new(fake_state(counters())),
+        configs,
+        Duration::ZERO,
+        Duration::from_secs(3600),
+        2,
+        3,
+        Some(&seed),
+    )
+    .unwrap();
+    assert_eq!(members(&restored), expected);
+    let _ = state.borrow_mut().expand_errors.insert(second.to_owned());
+    query.refresh_all_wildcards_managed().unwrap();
+    assert_eq!(members(&query), expected);
+    assert_eq!(query.reserved_native_entry_count(), 3);
+    assert!(query.pending.overflows.is_empty());
+    state.borrow_mut().remove_errors.clear();
+    let cleaned = query.collect_managed().unwrap();
+    assert_eq!(cleaned.points.len(), 3);
+    let replacement = cleaned
+        .points
+        .iter()
+        .find(|point| point.path.as_ref() == wanted)
+        .unwrap();
+    assert_eq!(replacement.counter_index, 0);
+    assert_eq!(replacement.value, SampleValue::Warming);
+    assert_eq!(query.reserved_native_entry_count(), 3);
+}
+
 /// Scenario: A departed member's first removal fails and more collections arrive before the cleanup retry deadline.
 /// Guarantees: Pending ownership retains capacity without another native removal or repeated failure record on each intervening collection.
 #[test]

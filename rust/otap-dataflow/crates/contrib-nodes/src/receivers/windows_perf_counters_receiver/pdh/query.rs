@@ -907,6 +907,16 @@ impl<A: PdhApi> Query<A> {
                 state.target.instance = Some(Arc::clone(&target.instance));
                 state.target.emit_instance_attribute = target.emit_instance_attribute;
             }
+            if let Some(pending_target) = self
+                .pending_removals
+                .get_mut(key)
+                .and_then(|removal| removal.retry_target.as_mut())
+                && pending_target.origin.is_wildcard()
+            {
+                pending_target.config_index = target.config_index;
+                pending_target.instance = Some(Arc::clone(&target.instance));
+                pending_target.emit_instance_attribute = target.emit_instance_attribute;
+            }
         }
         let changes = self.plan_wildcard_reconciliation(&desired, known_groups);
         self.discard_unwanted_wildcard_retries(&changes.wanted, metadata);
