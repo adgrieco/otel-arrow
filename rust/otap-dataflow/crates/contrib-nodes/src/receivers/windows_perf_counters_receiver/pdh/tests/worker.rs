@@ -156,6 +156,9 @@ struct PeakOwnership {
     current: std::sync::atomic::AtomicUsize,
     peak: std::sync::atomic::AtomicUsize,
     expansions: std::sync::atomic::AtomicUsize,
+    collect_calls: std::sync::atomic::AtomicUsize,
+    collect_status: std::sync::atomic::AtomicU32,
+    closed_queries: std::sync::atomic::AtomicUsize,
 }
 
 struct PeakPdh {
@@ -170,6 +173,7 @@ impl Drop for PeakPdh {
             .ownership
             .current
             .fetch_sub(self.owned, Ordering::AcqRel);
+        let _ = self.ownership.closed_queries.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -194,6 +198,15 @@ impl PdhApi for PeakPdh {
     }
 
     fn collect(&mut self) -> Result<bool, Error> {
+        let _ = self.ownership.collect_calls.fetch_add(1, Ordering::AcqRel);
+        let status = self.ownership.collect_status.load(Ordering::Acquire);
+        if status != 0 {
+            return Err(Error::Pdh {
+                operation: PdhOperation::CollectQueryData,
+                path: "<query>".to_owned(),
+                status,
+            });
+        }
         Ok(true)
     }
 
@@ -623,7 +636,7 @@ fn recovery_only_sample_reports_no_query_collected() {
     assert!(recovery_only.metadata.failures[0].diagnostic_only);
 }
 
-/// Scenario: One isolated query is unavailable at startup and later rebuilds into a permanent mapping error beside a healthy query.
+/// Scenario: One initially healthy isolated query goes down and its deferred rebuild encounters a permanent mapping error beside a healthy query.
 /// Guarantees: The query-local fatal mapping error is diagnosed without discarding the healthy peer's collected value.
 #[test]
 fn isolated_query_mapping_error_preserves_healthy_peer_output() {
@@ -636,43 +649,33 @@ fn isolated_query_mapping_error_preserves_healthy_peer_output() {
 
     let failing_open_calls = Rc::new(Cell::new(0_usize));
     let factory_failing_open_calls = Rc::clone(&failing_open_calls);
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
     let mut open = move |configs: Vec<CounterConfig>,
                          max_native_counters: usize,
                          seed: Option<&QueryRecreationSeed>| {
         if configs[0].path == failing_path {
             let call = factory_failing_open_calls.get();
             factory_failing_open_calls.set(call + 1);
-            return if call == 0 {
-                Err(Error::Pdh {
-                    operation: PdhOperation::OpenQuery,
-                    path: "<query>".to_owned(),
-                    status: 1,
-                })
-            } else {
-                Err(Error::CounterSetup {
+            if call != 0 {
+                return Err(Error::CounterSetup {
                     path: failing_path.to_owned(),
                     message: "injected permanent mapping error".to_owned(),
                     permanent: true,
                     cleanup_failed: false,
-                })
-            };
+                });
+            }
         }
-        let (_, query) = fake_query_with_seed(
+        let installed = fake_counter(&configs[0].path, Number::Integer(42));
+        let (state, query) = fake_query_with_seed(
             configs,
-            vec![FakeCounter {
-                path: healthy_path.to_owned(),
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(42)),
-                raw_error: false,
-                formatted_error: false,
-            }],
+            vec![installed],
             Duration::ZERO,
             Duration::from_secs(30),
             max_native_counters,
             seed,
         );
+        factory_states.borrow_mut().push(state);
         Ok(query)
     };
     let mut queries = open_initial_queries(
@@ -684,6 +687,10 @@ fn isolated_query_mapping_error_preserves_healthy_peer_output() {
     )
     .unwrap()
     .unwrap();
+    states.borrow()[1].borrow_mut().collect_error = true;
+    for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
+        let _ = collect_queries(&mut queries, Duration::ZERO, 2, &mut open).unwrap();
+    }
 
     let sample = collect_queries(&mut queries, Duration::from_secs(30), 2, &mut open).unwrap();
 
@@ -698,7 +705,7 @@ fn isolated_query_mapping_error_preserves_healthy_peer_output() {
     let deferred = collect_queries(&mut queries, Duration::from_secs(30), 2, &mut open).unwrap();
     assert_eq!(deferred.points.len(), 1);
     assert_eq!(deferred.metadata.diagnostics.scrape_failures, 0);
-    assert_eq!(deferred.metadata.failures.len(), 2);
+    assert_eq!(deferred.metadata.failures.len(), 1);
     assert!(
         deferred
             .metadata
@@ -974,29 +981,32 @@ fn recreation_peak_includes_old_query_ownership() {
     );
 }
 
-/// Scenario: An exact-only query is temporarily unavailable while a later query opens.
-/// Guarantees: The absent slot keeps its exact reservation so recovery cannot overcommit capacity already given to healthy peers.
+/// Scenario: Opening an initial exact-only query returns a native OpenQuery failure.
+/// Guarantees: The error propagates without creating a pending slot or attempting a rebuild.
 #[test]
-fn unavailable_query_reserves_exact_native_entry() {
+fn initial_query_open_error_is_fatal() {
     let unavailable = QueryPlan {
         configs: vec![counter(r"\Unavailable\Value", "windows.unavailable")],
         global_indices: vec![0],
         recreate_query: false,
     };
+    let opens = Cell::new(0);
     let mut open = |_: Vec<CounterConfig>, _: usize, _: Option<&QueryRecreationSeed>| {
+        opens.set(opens.get() + 1);
         Err::<Query<FakePdh>, _>(Error::Pdh {
             operation: PdhOperation::OpenQuery,
             path: "<query>".to_owned(),
             status: 1,
         })
     };
-    let slot = QuerySlot::open_initial(unavailable, 2, &mut open).unwrap();
-
-    assert_eq!(slot.reserved_native_entry_count(), 1);
-    assert_eq!(
-        remaining_native_capacity(2, std::iter::once(slot.reserved_native_entry_count())),
-        1
-    );
+    assert!(matches!(
+        QuerySlot::open_initial(unavailable, 2, &mut open),
+        Err(Error::Pdh {
+            operation: PdhOperation::OpenQuery,
+            ..
+        })
+    ));
+    assert_eq!(opens.get(), 1);
 }
 
 /// Scenario: A wildcard query reaches the rebuild threshold while its admitted member has not disappeared.
@@ -2129,29 +2139,40 @@ fn cancelling_startup_stops_between_exact_native_operations() {
     assert_eq!(state.calls.collect, 0);
 }
 
-/// Scenario: Initial query opens fail transiently for every slot or beside one healthy isolated slot.
-/// Guarantees: Empty and partial initial state become ready, preserve bounded evidence, and recover without restarting the receiver.
+/// Scenario: Initial OpenQuery or cleanup-failed setup fails, with or without an already opened healthy query.
+/// Guarantees: Startup returns the original typed error after one failed open, joins the worker, and closes earlier queries without rebuilding.
 #[tokio::test(flavor = "current_thread")]
-async fn startup_retains_recoverable_empty_and_partial_slots() {
-    for include_healthy in [false, true] {
+async fn startup_open_and_setup_errors_are_terminal() {
+    for (include_healthy, cleanup_failed) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let failed_path = r"\Unavailable\Value";
-        let mut counters = vec![counter(failed_path, "windows.unavailable")];
+        let mut counters = Vec::new();
         if include_healthy {
             let mut healthy = counter(r"\Memory\Available Bytes", "windows.memory.available");
             healthy.recreate_query = true;
-            healthy.source_mapping_index = 1;
             counters.push(healthy);
         }
-        let failed_once = Arc::new(AtomicBool::new(false));
-        let factory_failed_once = Arc::clone(&failed_once);
-        let mut worker = Worker::start_with(
+        counters.push(counter(failed_path, "windows.unavailable"));
+        let failed_opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_failed_opens = Arc::clone(&failed_opens);
+        let healthy_dropped = Arc::new(AtomicBool::new(false));
+        let factory_healthy_dropped = Arc::clone(&healthy_dropped);
+        let result = Worker::start_with(
             counters,
             Duration::ZERO,
             4_096,
             move |configs, max_expanded_counters, _seed| {
-                if configs[0].path == failed_path
-                    && !factory_failed_once.swap(true, Ordering::AcqRel)
-                {
+                if configs[0].path == failed_path {
+                    let _ = factory_failed_opens.fetch_add(1, Ordering::AcqRel);
+                    if cleanup_failed {
+                        return Err(Error::CounterSetup {
+                            path: failed_path.to_owned(),
+                            message: "injected cleanup failure".to_owned(),
+                            permanent: false,
+                            cleanup_failed: true,
+                        });
+                    }
                     return Err(Error::Pdh {
                         operation: PdhOperation::OpenQuery,
                         path: "<query>".to_owned(),
@@ -2160,7 +2181,7 @@ async fn startup_retains_recoverable_empty_and_partial_slots() {
                 }
                 Query::open_with(
                     StartupTestPdh {
-                        dropped: Arc::new(AtomicBool::new(false)),
+                        dropped: Arc::clone(&factory_healthy_dropped),
                     },
                     configs,
                     Duration::from_secs(30),
@@ -2170,35 +2191,91 @@ async fn startup_retains_recoverable_empty_and_partial_slots() {
                 )
             },
         )
-        .await
-        .unwrap();
-
-        let first = worker.collect().await.unwrap();
-        assert_eq!(
-            first
-                .points
-                .iter()
-                .map(|point| point.counter_index)
-                .collect::<Vec<_>>(),
-            if include_healthy { vec![1] } else { Vec::new() }
-        );
-        assert_eq!(first.metadata.failures.len(), 1);
-        assert_eq!(first.metadata.failures[0].counter_index, 0);
-        assert_eq!(first.metadata.failures[0].reason, "PdhOpenQueryW");
-        assert!(first.metadata.failures[0].diagnostic_only);
-        assert_eq!(first.metadata.diagnostics.scrape_failures, 0);
-        assert_eq!(first.metadata.diagnostics.query_rebuild_attempts, 1);
-        assert_eq!(first.metadata.diagnostics.query_rebuild_recoveries, 1);
-
-        let recovered = worker.collect().await.unwrap();
-        assert_eq!(recovered.points.len(), usize::from(include_healthy) + 1);
-        assert!(
-            worker
-                .shutdown(Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap()
-        );
+        .await;
+        let Err(error) = result else {
+            panic!("initial query failure unexpectedly became ready");
+        };
+        if cleanup_failed {
+            assert!(matches!(
+                error,
+                Error::CounterSetup {
+                    cleanup_failed: true,
+                    ..
+                }
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                Error::Pdh {
+                    operation: PdhOperation::OpenQuery,
+                    status: 1,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(failed_opens.load(Ordering::Acquire), 1);
+        assert_eq!(healthy_dropped.load(Ordering::Acquire), include_healthy);
     }
+}
+
+/// Scenario: A primed worker receives PDH_INVALID_HANDLE from its first scheduled native collection.
+/// Guarantees: That typed failure terminates the worker; the next request reports WorkerStopped, all query-owned handles close, and no reopen occurs.
+#[tokio::test(flavor = "current_thread")]
+async fn invalid_query_stops_worker_and_closes_handles() {
+    let ownership = Arc::new(PeakOwnership::default());
+    let factory_ownership = Arc::clone(&ownership);
+    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factory_opens = Arc::clone(&opens);
+    let mut worker = Worker::start_with(
+        vec![counter(r"\Memory\Available Bytes", "memory")],
+        Duration::ZERO,
+        4_096,
+        move |configs, limit, _seed| {
+            let _ = factory_opens.fetch_add(1, Ordering::AcqRel);
+            let mut query = Query::open_with(
+                PeakPdh {
+                    ownership: Arc::clone(&factory_ownership),
+                    owned: 0,
+                    expansions: BTreeMap::new(),
+                },
+                configs,
+                Duration::ZERO,
+                Duration::ZERO,
+                256,
+                limit,
+            )?;
+            query.freeze_membership()?;
+            Ok(query)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ownership.current.load(Ordering::Acquire), 1);
+    assert_eq!(ownership.collect_calls.load(Ordering::Acquire), 1);
+    ownership.collect_status.store(
+        windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE,
+        Ordering::Release,
+    );
+
+    assert!(matches!(
+        worker.collect().await,
+        Err(Error::Pdh {
+            operation: PdhOperation::CollectQueryData,
+            status: windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE,
+            ..
+        })
+    ));
+    assert!(matches!(worker.collect().await, Err(Error::WorkerStopped)));
+    assert!(
+        worker
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap()
+    );
+    assert_eq!(ownership.current.load(Ordering::Acquire), 0);
+    assert_eq!(ownership.closed_queries.load(Ordering::Acquire), 1);
+    assert_eq!(ownership.collect_calls.load(Ordering::Acquire), 2);
+    assert_eq!(opens.load(Ordering::Acquire), 1);
 }
 
 /// Scenario: Initial query construction returns a non-availability invariant error.
@@ -2277,26 +2354,20 @@ async fn startup_prime_query_failure_starts_and_recovers() {
     );
 }
 
-/// Scenario: The only query is unavailable at startup and successfully rebuilds during the first requested scrape.
+/// Scenario: An initially healthy deferred-recovery query goes down and successfully rebuilds during the next requested scrape.
 /// Guarantees: Rebuild and priming maintenance produce an empty sample marked as no query collection, so runtime accounting treats the attempt as failed.
 #[test]
 fn rebuild_only_sample_reports_no_query_collected() {
     let path = r"\Unavailable\Value";
     let open_calls = Rc::new(Cell::new(0_usize));
     let factory_open_calls = Rc::clone(&open_calls);
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let factory_states = Rc::clone(&states);
     let mut open = move |configs: Vec<CounterConfig>,
                          max_native_counters: usize,
                          seed: Option<&QueryRecreationSeed>| {
-        let call = factory_open_calls.get();
-        factory_open_calls.set(call + 1);
-        if call == 0 {
-            return Err(Error::Pdh {
-                operation: PdhOperation::OpenQuery,
-                path: "<query>".to_owned(),
-                status: 1,
-            });
-        }
-        let (_, query) = fake_query_with_seed(
+        factory_open_calls.set(factory_open_calls.get() + 1);
+        let (state, query) = fake_query_with_seed(
             configs,
             vec![fake_counter(path, Number::Integer(42))],
             Duration::ZERO,
@@ -2304,6 +2375,7 @@ fn rebuild_only_sample_reports_no_query_collected() {
             max_native_counters,
             seed,
         );
+        factory_states.borrow_mut().push(state);
         Ok(query)
     };
     let mut queries = open_initial_queries(
@@ -2315,6 +2387,10 @@ fn rebuild_only_sample_reports_no_query_collected() {
     )
     .unwrap()
     .unwrap();
+    states.borrow()[0].borrow_mut().collect_error = true;
+    for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
+        assert!(collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).is_err());
+    }
 
     let rebuilt = collect_queries(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
 

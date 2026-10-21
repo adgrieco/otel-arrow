@@ -418,12 +418,7 @@ where
                 .map(QuerySlot::reserved_native_entry_count)
                 .chain(std::iter::once(unopened_exact_reservations)),
         );
-        queries.push(QuerySlot::open_initial_unprepared(
-            plan,
-            query_retry_cap,
-            query_limit,
-            open,
-        )?);
+        queries.push(QuerySlot::open_initial_unprepared(plan, query_limit, open)?);
     }
     if !prepare_initial_queries(
         &mut queries,
@@ -616,25 +611,7 @@ impl<A: PdhApi> QuerySlot<A> {
             Option<&QueryRecreationSeed>,
         ) -> Result<Query<A>, Error>,
     {
-        Self::open_initial_with_retry_cap(plan, Duration::ZERO, max_native_counters, open)
-    }
-
-    #[cfg(test)]
-    fn open_initial_with_retry_cap<F>(
-        plan: QueryPlan,
-        query_retry_cap: Duration,
-        max_native_counters: usize,
-        open: &mut F,
-    ) -> Result<Self, Error>
-    where
-        F: FnMut(
-            Vec<CounterConfig>,
-            usize,
-            Option<&QueryRecreationSeed>,
-        ) -> Result<Query<A>, Error>,
-    {
-        let mut slot =
-            Self::open_initial_unprepared(plan, query_retry_cap, max_native_counters, open)?;
+        let mut slot = Self::open_initial_unprepared(plan, max_native_counters, open)?;
         if let Some(query) = slot.query.as_mut() {
             query.refresh_all_wildcards_managed()?;
             let prime_error = query.prime_managed().err();
@@ -655,7 +632,6 @@ impl<A: PdhApi> QuerySlot<A> {
 
     fn open_initial_unprepared<F>(
         plan: QueryPlan,
-        query_retry_cap: Duration,
         max_native_counters: usize,
         open: &mut F,
     ) -> Result<Self, Error>
@@ -667,43 +643,7 @@ impl<A: PdhApi> QuerySlot<A> {
         ) -> Result<Query<A>, Error>,
     {
         let now = Instant::now();
-        let query = match open(plan.configs.clone(), max_native_counters, None) {
-            Ok(query) => query,
-            Err(error) if error.is_recoverable_query_open_failure() => {
-                let reason = error.reason();
-                let detail = error.bounded_detail();
-                return Ok(Self {
-                    pending: PendingMetadata {
-                        failures: plan
-                            .configs
-                            .iter()
-                            .enumerate()
-                            .map(|(counter_index, config)| SampleFailure {
-                                counter_index,
-                                path: Arc::from(config.path.as_str()),
-                                reason,
-                                error: detail.clone(),
-                                diagnostic_only: true,
-                            })
-                            .collect(),
-                        ..Default::default()
-                    },
-                    plan,
-                    query: None,
-                    query_generation: 0,
-                    query_failure_attempts: 0,
-                    next_query_retry: now,
-                    refresh_failure_attempts: 0,
-                    next_refresh_retry: now,
-                    rebuild_attempts: 1,
-                    next_rebuild: now + retry_delay(1, query_retry_cap),
-                    rebuild_seed: None,
-                    last_active_expanded_count: 0,
-                    last_admitted_members: Vec::new(),
-                });
-            }
-            Err(error) => return Err(error),
-        };
+        let query = open(plan.configs.clone(), max_native_counters, None)?;
         let last_active_expanded_count = query.active_expanded_count();
         let last_admitted_members = query.admitted_members();
         Ok(Self {

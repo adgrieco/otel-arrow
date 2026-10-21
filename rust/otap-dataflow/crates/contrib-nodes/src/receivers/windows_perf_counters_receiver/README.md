@@ -170,6 +170,10 @@ because providers may use them as part of valid native identity. An invalid or
 unavailable constructed path is diagnosed for that counter without rejecting
 unrelated mappings.
 
+Validated on English hosts; counter names are configured in English and
+resolved independently of the display language. No non-English receiver run
+is claimed.
+
 Configure performance object and counter names in English. Every worker pins
 and verifies native UI language `0x0409` before its first PDH call. With any
 wildcard configured, a failed or ineffective pin or failed startup object-list
@@ -478,7 +482,9 @@ once per Unicode lowercase identity group.
 
 The `receiver.windowsperfcounters.scrapes` measurement metric set attributes
 collection attempts by outcome. The `receiver.windowsperfcounters` health
-metric set records configured and active counters, scrape success/failure,
+metric set exports `{counter}` Gauges `configured_exact` (configured exact
+paths), `configured_wildcard` (configured pattern paths) and `active_expanded`
+(installed expanded members). It also records scrape success/failure,
 overruns and duration, worker-busy collection rejections, and concrete lost
 observations in `counter_read_failures`. Multiple diagnostics for one lost
 observation count once; maintenance, priming, warm-up and expected no-data
