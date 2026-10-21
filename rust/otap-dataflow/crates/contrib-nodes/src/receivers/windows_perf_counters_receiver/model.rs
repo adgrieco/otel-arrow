@@ -132,6 +132,8 @@ pub(super) struct ExpansionOverflow {
     pub(super) retained: usize,
     /// Number of concrete paths omitted by this limit.
     pub(super) omitted: usize,
+    /// Up to three concrete paths omitted by this admission limit.
+    pub(super) examples: Vec<Arc<str>>,
 }
 
 /// Bounded operational changes observed while producing one sample.

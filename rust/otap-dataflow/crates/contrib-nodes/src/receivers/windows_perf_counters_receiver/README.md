@@ -394,7 +394,8 @@ deadline or promise of partial publication during a blocked native call.
 - Limits apply after retained-first, configuration-order admission. Excess
   instances are omitted and reported explicitly, never presented as a complete
   expansion. Each affected pattern emits at most one bounded limit summary
-  per refresh, including when both limits apply.
+  per refresh, including when both limits apply, with exact admission counts
+  and at most three omitted concrete example paths.
 
 Drain and shutdown stay responsive between native operations, including
 aggregate filtering and before priming. An in-progress PDH call cannot be

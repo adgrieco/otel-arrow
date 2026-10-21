@@ -1903,15 +1903,11 @@ fn pending_wildcard_removal_consumes_one_budget_entry() {
             .insert(first_template.to_owned(), Vec::new());
         state.remove_error = true;
     }
-    query.refresh_wildcard_config_managed(0).unwrap();
+    query.refresh_all_wildcards_managed().unwrap();
     assert_eq!(query.active_expanded_count(), 1);
     assert_eq!(query.reserved_native_entry_count(), 2);
-
-    state.borrow_mut().remove_error = false;
-    query.refresh_wildcard_config_managed(1).unwrap();
-
-    assert_eq!(query.active_expanded_count(), 1);
-    assert_eq!(query.reserved_native_entry_count(), 2);
+    assert_eq!(query.admitted_members().len(), 1);
+    assert_eq!(query.admitted_members()[0].path.as_ref(), second_expanded);
     assert!(query.pending.overflows.is_empty());
 }
 
@@ -2232,11 +2228,10 @@ fn failed_discovery_retention_reserves_global_capacity_first() {
         .enumerate()
         .map(|(index, path)| fake_counter(path, Number::Integer(i64::try_from(index + 1).unwrap())))
         .collect();
+    let mut second = wildcard(second_template, "thread.context_switches");
+    second.source_mapping_index = 1;
     let (state, mut query) = fake_query_with_seed(
-        vec![
-            wildcard(first_template, "process.private"),
-            wildcard(second_template, "thread.context_switches"),
-        ],
+        vec![wildcard(first_template, "process.private"), second],
         counters,
         Duration::ZERO,
         Duration::from_secs(30),
@@ -2248,7 +2243,7 @@ fn failed_discovery_retention_reserves_global_capacity_first() {
         second_template.to_owned(),
         second_paths.iter().map(|path| (*path).to_owned()).collect(),
     );
-    query.refresh_wildcard_config_managed(1).unwrap();
+    query.refresh_all_wildcards_managed().unwrap();
     assert_eq!(query.active_expanded_count(), 3);
 
     {
@@ -2259,9 +2254,8 @@ fn failed_discovery_retention_reserves_global_capacity_first() {
             first_paths.iter().map(|path| (*path).to_owned()).collect(),
         );
     }
-    query.refresh_wildcard_config_managed(1).unwrap();
-    query.refresh_wildcard_config_managed(0).unwrap();
-    query.finish_managed_wildcard_refresh();
+    query.last_wildcard_refresh = Instant::now() - Duration::from_secs(31);
+    query.refresh_all_wildcards_managed().unwrap();
 
     let sample = query.collect().unwrap();
     assert_eq!(sample.points.len(), 4);
@@ -2293,10 +2287,67 @@ fn failed_discovery_retention_reserves_global_capacity_first() {
         sample.metadata.overflows,
         [ExpansionOverflow {
             counter_index: 0,
-            reason: "receiver_total",
+            reason: "admission_limit",
             discovered: 3,
             retained: 1,
             omitted: 2,
+            examples: first_paths[1..]
+                .iter()
+                .map(|path| Arc::from(*path))
+                .collect(),
+        }]
+    );
+}
+
+/// Scenario: A production refresh exceeds both the per-pattern and receiver-wide limits.
+/// Guarantees: One exact admission summary counts every omission and carries only the first three deterministically ordered omitted paths.
+#[test]
+fn wildcard_overflow_is_one_bounded_admission_record() {
+    let template = r"\Process(*)\Private Bytes";
+    let paths = (0..8)
+        .map(|index| format!(r"\Process(worker{index})\Private Bytes"))
+        .collect::<Vec<_>>();
+    let mut config = counter(template, "process.private");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let state = fake_state(
+        paths
+            .iter()
+            .map(|path| fake_counter(path, Number::Integer(1)))
+            .collect(),
+    );
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(template.to_owned(), paths.iter().rev().cloned().collect());
+    let mut query = Query::open_managed_with_seed(
+        FakePdh::new(Rc::clone(&state)),
+        vec![config],
+        Duration::ZERO,
+        Duration::from_secs(60),
+        2,
+        1,
+        None,
+    )
+    .unwrap();
+    query.refresh_all_wildcards_managed().unwrap();
+    let sample = query.collect_managed().unwrap();
+    assert_eq!(sample.points.len(), 1);
+    assert_eq!(sample.points[0].path.as_ref(), paths[0]);
+    assert_eq!(sample.metadata.diagnostics.instances_omitted_over_limit, 7);
+    assert_eq!(
+        sample.metadata.overflows,
+        [ExpansionOverflow {
+            counter_index: 0,
+            reason: "admission_limit",
+            discovered: 8,
+            retained: 1,
+            omitted: 7,
+            examples: paths[1..4]
+                .iter()
+                .map(|path| Arc::from(path.as_str()))
+                .collect(),
         }]
     );
 }

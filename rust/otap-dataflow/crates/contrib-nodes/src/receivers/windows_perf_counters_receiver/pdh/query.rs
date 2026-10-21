@@ -538,34 +538,6 @@ impl<A: PdhApi> Query<A> {
                 && self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval)
     }
 
-    #[cfg(test)]
-    pub(super) fn refresh_wildcard_config_managed(
-        &mut self,
-        config_index: usize,
-    ) -> Result<(), Error> {
-        if !self
-            .configs
-            .get(config_index)
-            .is_some_and(|config| config.instance_config.is_wildcard())
-        {
-            return Err(Error::InvalidSample(
-                "managed wildcard refresh selected a non-wildcard counter",
-            ));
-        }
-        let mut metadata = PendingMetadata::default();
-        let result = self.refresh_wildcard_config(config_index, &mut metadata);
-        self.pending.merge(metadata);
-        result
-    }
-
-    #[cfg(test)]
-    pub(super) fn finish_managed_wildcard_refresh(&mut self) {
-        self.pending.diagnostics.discovery_refreshes += 1;
-        self.last_wildcard_refresh = Instant::now();
-        self.wildcard_refresh_pending = false;
-        self.initial_wildcard_refresh = false;
-    }
-
     pub(super) fn refresh_all_wildcards_managed(&mut self) -> Result<(), Error> {
         if !self.wildcard_refresh_due() {
             return Ok(());
@@ -574,117 +546,6 @@ impl<A: PdhApi> Query<A> {
         let result = self.refresh_wildcards(&mut metadata);
         self.pending.merge(metadata);
         result
-    }
-
-    #[cfg(test)]
-    fn refresh_wildcard_config(
-        &mut self,
-        config_index: usize,
-        metadata: &mut PendingMetadata,
-    ) -> Result<(), Error> {
-        self.api.check_running()?;
-        let mut desired = self.desired_wildcards_excluding(config_index);
-        let expanded_total = self.reserved_wildcards_excluding(config_index);
-        let paths = match self.api.expand(&self.configs[config_index].path) {
-            Ok(paths) => paths,
-            Err(error) if error.is_stop() => return Err(error),
-            Err(error) => {
-                self.reserve_failed_discovery(
-                    config_index,
-                    &mut desired,
-                    expanded_total,
-                    metadata,
-                    &error,
-                );
-                return self.reconcile_wildcards(desired, metadata);
-            }
-        };
-        self.prepare_successful_discoveries(
-            vec![WildcardDiscovery {
-                config_index,
-                paths: Ok(paths),
-            }],
-            &mut desired,
-            expanded_total,
-            metadata,
-        )?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn desired_wildcards_excluding(&self, config_index: usize) -> DesiredCounters {
-        self.counters
-            .iter()
-            .filter_map(|(key, counter)| {
-                (counter.config_index != config_index && counter.origin.is_wildcard())
-                    .then(|| {
-                        counter.instance.clone().map(|instance| {
-                            (
-                                key.clone(),
-                                DesiredCounter::new(
-                                    counter.config_index,
-                                    counter.path.clone(),
-                                    instance,
-                                    counter.emit_instance_attribute,
-                                ),
-                            )
-                        })
-                    })
-                    .flatten()
-            })
-            .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                (state.target.config_index != config_index && state.target.origin.is_wildcard())
-                    .then(|| {
-                        state.target.instance.clone().map(|instance| {
-                            (
-                                key.clone(),
-                                DesiredCounter::new(
-                                    state.target.config_index,
-                                    state.target.path.clone(),
-                                    instance,
-                                    state.target.emit_instance_attribute,
-                                ),
-                            )
-                        })
-                    })
-                    .flatten()
-            }))
-            .chain(self.pending_removals.iter().filter_map(|(key, removal)| {
-                (removal.counter.config_index != config_index)
-                    .then(|| {
-                        removal.retry_target.as_ref().and_then(|target| {
-                            target.instance.clone().map(|instance| {
-                                (
-                                    key.clone(),
-                                    DesiredCounter::new(
-                                        target.config_index,
-                                        target.path.clone(),
-                                        instance,
-                                        target.emit_instance_attribute,
-                                    ),
-                                )
-                            })
-                        })
-                    })
-                    .flatten()
-            }))
-            .collect()
-    }
-
-    #[cfg(test)]
-    fn reserved_wildcards_excluding(&self, config_index: usize) -> usize {
-        self.counters
-            .iter()
-            .filter_map(|(key, counter)| {
-                (counter.config_index != config_index && counter.origin.is_wildcard())
-                    .then_some(key.clone())
-            })
-            .chain(self.retry_states.iter().filter_map(|(key, state)| {
-                (state.target.config_index != config_index && state.target.origin.is_wildcard())
-                    .then_some(key.clone())
-            }))
-            .collect::<BTreeSet<_>>()
-            .len()
     }
 
     fn reserve_failed_discovery(
@@ -745,7 +606,15 @@ impl<A: PdhApi> Query<A> {
             self.max_instances_per_wildcard,
             self.remaining_expansion_capacity(expanded_total),
         );
-        metadata.record_expansion_overflows(config_index, discovered, allocation);
+        metadata.record_expansion_overflows(
+            config_index,
+            discovered,
+            allocation,
+            retained
+                .iter()
+                .skip(allocation.retained)
+                .map(|(_, _, counter)| Arc::clone(&counter.path)),
+        );
         for (_, key, counter) in retained.into_iter().take(allocation.retained) {
             let _ = desired.insert(key, counter);
         }
@@ -903,6 +772,7 @@ impl<A: PdhApi> Query<A> {
         candidates.sort_unstable();
         let mut selected = vec![BTreeSet::new(); prepared.len()];
         let mut duplicates = vec![0; prepared.len()];
+        let mut omitted_examples = vec![Vec::new(); prepared.len()];
         let mut remaining = self.remaining_expansion_capacity(expanded_total);
         let mut owned = desired.keys().cloned().collect::<BTreeSet<_>>();
         for (_, _, _, _, _, _, discovery_index, path_index) in candidates {
@@ -917,10 +787,20 @@ impl<A: PdhApi> Query<A> {
             {
                 let _ = selected[discovery_index].insert(path_index);
                 remaining -= 1;
+            } else if omitted_examples[discovery_index].len() < 3 {
+                omitted_examples[discovery_index].push(Arc::from(
+                    prepared[discovery_index].3[path_index].1.as_str(),
+                ));
             }
         }
-        for (((config_index, aggregation_only, discovered, paths), selected), duplicates) in
-            prepared.into_iter().zip(selected).zip(duplicates)
+        for (
+            (((config_index, aggregation_only, discovered, paths), selected), duplicates),
+            examples,
+        ) in prepared
+            .into_iter()
+            .zip(selected)
+            .zip(duplicates)
+            .zip(omitted_examples)
         {
             let discovered = discovered - duplicates;
             let per_wildcard_retained = discovered.min(self.max_instances_per_wildcard);
@@ -932,6 +812,7 @@ impl<A: PdhApi> Query<A> {
                     per_wildcard_omitted: discovered - per_wildcard_retained,
                     total_omitted: per_wildcard_retained.saturating_sub(selected.len()),
                 },
+                examples,
             );
             for (path_index, (key, path)) in paths.into_iter().enumerate() {
                 if !selected.contains(&path_index) {
@@ -978,16 +859,6 @@ impl<A: PdhApi> Query<A> {
             removal.counter.reset_readiness();
             let _ = self.counters.insert(key, removal.counter);
         }
-    }
-
-    #[cfg(test)]
-    fn reconcile_wildcards(
-        &mut self,
-        desired: DesiredCounters,
-        metadata: &mut PendingMetadata,
-    ) -> Result<(), Error> {
-        let groups = self.wildcard_instance_groups();
-        self.reconcile_wildcards_with_groups(desired, &groups, metadata)
     }
 
     fn reconcile_wildcards_with_groups(
@@ -1671,31 +1542,22 @@ impl PendingMetadata {
         counter_index: usize,
         discovered: usize,
         allocation: ExpansionAllocation,
+        examples: impl IntoIterator<Item = Arc<str>>,
     ) {
-        if allocation.per_wildcard_omitted > 0 {
+        let omitted = allocation
+            .per_wildcard_omitted
+            .saturating_add(allocation.total_omitted);
+        if omitted > 0 {
             self.overflows.push(ExpansionOverflow {
                 counter_index,
-                reason: "per_wildcard",
+                reason: "admission_limit",
                 discovered,
-                retained: discovered - allocation.per_wildcard_omitted,
-                omitted: allocation.per_wildcard_omitted,
-            });
-        }
-        if allocation.total_omitted > 0 {
-            self.overflows.push(ExpansionOverflow {
-                counter_index,
-                reason: "receiver_total",
-                discovered: discovered - allocation.per_wildcard_omitted,
                 retained: allocation.retained,
-                omitted: allocation.total_omitted,
+                omitted,
+                examples: examples.into_iter().take(3).collect(),
             });
         }
-        self.diagnostics.instances_omitted_over_limit += u64::try_from(
-            allocation
-                .per_wildcard_omitted
-                .saturating_add(allocation.total_omitted),
-        )
-        .unwrap_or(u64::MAX);
+        self.diagnostics.instances_omitted_over_limit += u64::try_from(omitted).unwrap_or(u64::MAX);
     }
 }
 

@@ -1785,10 +1785,11 @@ fn sample_metadata_merge_preserves_pending_evidence() {
         }],
         overflows: vec![ExpansionOverflow {
             counter_index: 0,
-            reason: "per_wildcard",
+            reason: "admission_limit",
             discovered: 3,
             retained: 2,
             omitted: 1,
+            examples: vec![Arc::from(r"\Initial\Omitted")],
         }],
     };
 
@@ -1806,10 +1807,11 @@ fn sample_metadata_merge_preserves_pending_evidence() {
         }],
         overflows: vec![ExpansionOverflow {
             counter_index: 1,
-            reason: "receiver_total",
+            reason: "admission_limit",
             discovered: 4,
             retained: 3,
             omitted: 1,
+            examples: vec![Arc::from(r"\Recovery\Omitted")],
         }],
     });
 
@@ -1819,8 +1821,16 @@ fn sample_metadata_merge_preserves_pending_evidence() {
     assert_eq!(metadata.failures[0].reason, "initial");
     assert_eq!(metadata.failures[1].reason, "recovery");
     assert_eq!(metadata.overflows.len(), 2);
-    assert_eq!(metadata.overflows[0].reason, "per_wildcard");
-    assert_eq!(metadata.overflows[1].reason, "receiver_total");
+    assert_eq!(metadata.overflows[0].counter_index, 0);
+    assert_eq!(metadata.overflows[1].counter_index, 1);
+    assert_eq!(
+        metadata.overflows[0].examples[0].as_ref(),
+        r"\Initial\Omitted"
+    );
+    assert_eq!(
+        metadata.overflows[1].examples[0].as_ref(),
+        r"\Recovery\Omitted"
+    );
 
     metadata.merge(PendingMetadata {
         diagnostics: SampleDiagnostics::default(),
@@ -1833,10 +1843,11 @@ fn sample_metadata_merge_preserves_pending_evidence() {
         }],
         overflows: vec![ExpansionOverflow {
             counter_index: 0,
-            reason: "per_wildcard",
+            reason: "admission_limit",
             discovered: 5,
             retained: 2,
             omitted: 3,
+            examples: vec![Arc::from(r"\Initial\Latest")],
         }],
     });
 
@@ -1844,6 +1855,10 @@ fn sample_metadata_merge_preserves_pending_evidence() {
     assert_eq!(metadata.failures[0].error, "latest failure");
     assert_eq!(metadata.overflows.len(), 2);
     assert_eq!(metadata.overflows[0].discovered, 5);
+    assert_eq!(
+        metadata.overflows[0].examples[0].as_ref(),
+        r"\Initial\Latest"
+    );
 }
 
 /// Scenario: Older slot metadata and the current scrape report the same counter failure identity.
@@ -1864,10 +1879,11 @@ fn slot_metadata_merge_keeps_newer_failure() {
         }],
         overflows: vec![ExpansionOverflow {
             counter_index: 0,
-            reason: "per_wildcard",
+            reason: "admission_limit",
             discovered: 3,
             retained: 2,
             omitted: 1,
+            examples: vec![Arc::from(r"\Counter\Older")],
         }],
     };
     let mut sample = Sample {
@@ -1884,10 +1900,11 @@ fn slot_metadata_merge_keeps_newer_failure() {
             }],
             overflows: vec![ExpansionOverflow {
                 counter_index: 1,
-                reason: "receiver_total",
+                reason: "admission_limit",
                 discovered: 4,
                 retained: 3,
                 omitted: 1,
+                examples: vec![Arc::from(r"\Counter\Current")],
             }],
             diagnostics: SampleDiagnostics {
                 active_expanded_counters: 2,
@@ -1904,8 +1921,16 @@ fn slot_metadata_merge_keeps_newer_failure() {
     assert_eq!(sample.metadata.diagnostics.retry_recoveries, 1);
     assert_eq!(sample.metadata.failures.len(), 1);
     assert_eq!(sample.metadata.failures[0].error, "current failure");
-    assert_eq!(sample.metadata.overflows[0].reason, "receiver_total");
-    assert_eq!(sample.metadata.overflows[1].reason, "per_wildcard");
+    assert_eq!(sample.metadata.overflows[0].counter_index, 1);
+    assert_eq!(sample.metadata.overflows[1].counter_index, 0);
+    assert_eq!(
+        sample.metadata.overflows[0].examples[0].as_ref(),
+        r"\Counter\Current"
+    );
+    assert_eq!(
+        sample.metadata.overflows[1].examples[0].as_ref(),
+        r"\Counter\Older"
+    );
     assert_eq!(pending.failures.len(), 0);
     assert_eq!(pending.overflows.len(), 0);
 }
