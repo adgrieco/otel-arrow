@@ -29,21 +29,6 @@ impl QueryCadence {
             wildcard_refresh,
         }
     }
-
-    #[cfg(test)]
-    pub(super) fn uniform(cadence: Duration) -> Self {
-        Self::new(cadence, cadence)
-    }
-
-    #[cfg(test)]
-    pub(super) fn retry_cap(self) -> Duration {
-        self.retry_cap
-    }
-
-    #[cfg(test)]
-    pub(super) fn wildcard_refresh(self) -> Duration {
-        self.wildcard_refresh
-    }
 }
 
 pub(super) fn should_rebuild_query(consecutive_failures: u32) -> bool {
@@ -85,33 +70,7 @@ impl Worker {
         .await
     }
 
-    #[cfg(test)]
-    pub(super) async fn start_with<A, F>(
-        counters: Vec<CounterConfig>,
-        query_retry_cap: Duration,
-        max_native_counters: usize,
-        mut open: F,
-    ) -> Result<Self, Error>
-    where
-        A: PdhApi + 'static,
-        F: FnMut(
-                Vec<CounterConfig>,
-                usize,
-                Option<&QueryRecreationSeed>,
-            ) -> Result<Query<A>, Error>
-            + Send
-            + 'static,
-    {
-        Self::start_controlled(
-            counters,
-            query_retry_cap,
-            max_native_counters,
-            move |configs, limit, seed, _shutdown| open(configs, limit, seed),
-        )
-        .await
-    }
-
-    async fn start_controlled<A, F>(
+    pub(super) async fn start_controlled<A, F>(
         counters: Vec<CounterConfig>,
         query_retry_cap: Duration,
         max_native_counters: usize,
@@ -208,18 +167,14 @@ impl Worker {
 
     /// Request shutdown and return `false` if the worker outlives the deadline.
     pub(in super::super) async fn shutdown(&mut self, deadline: Instant) -> Result<bool, Error> {
-        self.shutdown_requested.store(true, Ordering::Release);
-        match self.tx.try_send(Command::Shutdown) {
-            Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-            Err(mpsc::TrySendError::Disconnected(_)) => {}
-        }
+        request_stop(&self.tx, &self.shutdown_requested);
         let Some(join) = self.join.take() else {
             return Ok(true);
         };
-        let Some(completion) = self.completion.as_mut() else {
-            self.join = Some(join);
-            return Err(Error::WorkerStopped);
-        };
+        let completion = self
+            .completion
+            .as_mut()
+            .expect("an owned join has a completion signal");
         match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), completion).await {
             Ok(_) => {
                 self.completion = None;
@@ -250,8 +205,7 @@ impl StartupCancellation {
     }
 
     fn request(&self) {
-        self.shutdown_requested.store(true, Ordering::Release);
-        let _ = self.tx.try_send(Command::Shutdown);
+        request_stop(&self.tx, &self.shutdown_requested);
     }
 
     fn disarm(&mut self) {
@@ -340,7 +294,13 @@ fn run_worker_thread<A, F>(
         match rx.recv() {
             Ok(Command::Collect(response)) => {
                 let accepted = AcceptedCollectGuard::new(Arc::clone(&accepted));
-                let result = collect_query(&mut slot, query_retry_cap, max_native_counters, open);
+                let result = collect_query(
+                    &mut slot,
+                    query_retry_cap,
+                    max_native_counters,
+                    open,
+                    Instant::now(),
+                );
                 drop(accepted);
                 let _ = response.send(result);
             }
@@ -392,8 +352,16 @@ where
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.shutdown_requested.store(true, Ordering::Release);
-        let _ = self.tx.try_send(Command::Shutdown);
+        request_stop(&self.tx, &self.shutdown_requested);
+    }
+}
+
+fn request_stop(tx: &mpsc::SyncSender<Command>, stop: &AtomicBool) {
+    if stop
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let _ = tx.try_send(Command::Shutdown);
     }
 }
 
@@ -473,29 +441,6 @@ pub(super) struct QuerySlot<A: PdhApi> {
 }
 
 impl<A: PdhApi> QuerySlot<A> {
-    #[cfg(test)]
-    pub(super) fn open_initial<F>(
-        configs: Vec<CounterConfig>,
-        max_native_counters: usize,
-        open: &mut F,
-    ) -> Result<Self, Error>
-    where
-        F: FnMut(
-            Vec<CounterConfig>,
-            usize,
-            Option<&QueryRecreationSeed>,
-        ) -> Result<Query<A>, Error>,
-    {
-        open_initial_query(
-            configs,
-            Duration::ZERO,
-            max_native_counters,
-            open,
-            &AtomicBool::new(false),
-        )?
-        .ok_or(Error::WorkerStopRequested)
-    }
-
     fn open_unprepared<F>(
         configs: Vec<CounterConfig>,
         retry_cap: Duration,
@@ -612,7 +557,7 @@ impl<A: PdhApi> QuerySlot<A> {
                     retry_after_ms: self.next_query_retry.duration_since(now).as_millis(),
                 })
             } else {
-                query.collect()
+                query.collect_at(now)
             }
         } else if now < self.next_rebuild {
             Err(Error::QueryRecoveryPending {
@@ -718,23 +663,6 @@ impl<A: PdhApi> QuerySlot<A> {
     pub(super) fn active_expanded_count(&self) -> usize {
         self.query.as_ref().map_or(0, Query::active_expanded_count)
     }
-
-    #[cfg(test)]
-    pub(super) fn reserved_native_entry_count(&self) -> usize {
-        let exact = self
-            .configs
-            .iter()
-            .filter(|config| !config.instance_config.is_wildcard())
-            .count();
-        self.query.as_ref().map_or_else(
-            || {
-                self.rebuild_seed
-                    .as_ref()
-                    .map_or(exact, |seed| seed.reserved_native_entry_count(exact))
-            },
-            Query::reserved_native_entry_count,
-        )
-    }
 }
 
 pub(super) fn collect_query<A, F>(
@@ -742,12 +670,12 @@ pub(super) fn collect_query<A, F>(
     retry_cap: Duration,
     limit: usize,
     open: &mut F,
+    now: Instant,
 ) -> Result<Sample, Error>
 where
     A: PdhApi,
     F: FnMut(Vec<CounterConfig>, usize, Option<&QueryRecreationSeed>) -> Result<Query<A>, Error>,
 {
-    let now = Instant::now();
     let was_rebuilding = slot.query.is_none();
     let mut sample = match slot.collect(now, retry_cap, limit, open) {
         Ok(sample) => sample,
@@ -782,3 +710,7 @@ where
         .sort_by_key(|failure| (failure.counter_index, failure.reason));
     Ok(sample)
 }
+
+#[cfg(test)]
+#[path = "tests/worker_support.rs"]
+mod test_support;

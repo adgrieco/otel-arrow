@@ -43,8 +43,7 @@ pub(super) struct Config {
 impl Config {
     /// Parse, validate, and normalize the public configuration contract.
     pub(super) fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
-        let user: UserConfig =
-            serde_json::from_value(value.clone()).map_err(|err| invalid(err.to_string()))?;
+        let user = UserConfig::deserialize(value).map_err(|err| invalid(err.to_string()))?;
         for (object_index, object) in user.perfcounters.iter().enumerate() {
             for (counter_index, counter) in object.counters.iter().enumerate() {
                 if counter.recreate_query {
@@ -70,7 +69,6 @@ impl Config {
             user.max_expanded_counters,
             &mut warnings,
         )?;
-        validate_counter_outputs(&counters)?;
         warnings.extend(
             unused_path_metric_definitions(
                 metrics
@@ -686,8 +684,8 @@ fn normalize_aggregation_name(
     let configured = configured
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| DEFAULT_AGGREGATION_NAME.to_owned());
-    validate_native_component(&format!("{object_field}.aggregation_name"), &configured)
-        .map(str::to_owned)
+    let _ = validate_native_component(&format!("{object_field}.aggregation_name"), &configured)?;
+    Ok(configured)
 }
 
 impl ObjectNormalizer<'_> {
@@ -707,12 +705,17 @@ impl ObjectNormalizer<'_> {
         );
         let counter_name =
             validate_native_component(&format!("{counter_field}.name"), &mapping.name)?;
+        if !(MIN_SCALE_POWER10..=MAX_SCALE_POWER10).contains(&mapping.scale_power10) {
+            return Err(invalid(format!(
+                "{counter_field}.scale_power10 must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}"
+            )));
+        }
         let metric_name = normalize_metric_reference(&counter_field, &mapping.metric)?;
         let explicit_metric = self.normalize_explicit_metric(
             counter_index,
             &counter_field,
             metric_name,
-            &mapping.attributes,
+            mapping.attributes,
             warnings,
         )?;
         for expanded in self.instances.expand(self.aggregation_name) {
@@ -723,6 +726,7 @@ impl ObjectNormalizer<'_> {
                 )));
             }
             let path = counter_path(self.object_name, expanded.instance, counter_name);
+            validate_path_length("counter path", &path)?;
             let comparison_instance = expanded.instance.map(instance_comparison_key);
             let comparison_path = counter_path(
                 self.object_name,
@@ -731,7 +735,7 @@ impl ObjectNormalizer<'_> {
             )
             .to_lowercase();
             if !paths.insert(comparison_path) {
-                return Err(invalid(format!("duplicate counter path {path}")));
+                return Err(invalid(format!("duplicate counter path: {path}")));
             }
             let metric = self.resolve_metric(&path, explicit_metric.as_ref());
             output.push(CounterConfig {
@@ -781,7 +785,7 @@ impl ObjectNormalizer<'_> {
         counter_index: usize,
         counter_field: &str,
         metric_name: Option<&str>,
-        configured_attributes: &BTreeMap<String, String>,
+        configured_attributes: BTreeMap<String, String>,
         warnings: &mut Vec<ConfigWarning>,
     ) -> Result<Option<ResolvedMetric>, Error> {
         let Some(name) = metric_name else {
@@ -792,9 +796,11 @@ impl ObjectNormalizer<'_> {
                 "{counter_field}.metric references undefined metric {name:?}"
             ))
         })?;
-        validate_attribute_keys(counter_field, configured_attributes)?;
-        let attributes = configured_attributes.clone();
-        if should_warn_instance_override(self.instances.has_multiple_or_wildcard(), &attributes) {
+        validate_attribute_keys(counter_field, &configured_attributes)?;
+        if should_warn_instance_override(
+            self.instances.has_multiple_or_wildcard(),
+            &configured_attributes,
+        ) {
             warnings.push(ConfigWarning::InstanceOverride {
                 object_index: self.object_index,
                 counter_index,
@@ -805,7 +811,7 @@ impl ObjectNormalizer<'_> {
             unit: Arc::clone(&metric.unit),
             description: Arc::clone(&metric.description),
             kind: metric.kind,
-            attributes: Arc::new(attributes),
+            attributes: Arc::new(configured_attributes),
         }))
     }
 }
@@ -874,25 +880,27 @@ impl NormalizedInstances {
     }
 
     fn expand<'a>(&'a self, aggregation_name: &'a str) -> impl Iterator<Item = ExpandedPath<'a>> {
-        let single = match self {
-            Self::None => Some(ExpandedPath {
-                instance: None,
-                instance_config: InstanceConfig::None,
-            }),
+        let (single, segments) = match self {
+            Self::None => (
+                Some(ExpandedPath {
+                    instance: None,
+                    instance_config: InstanceConfig::None,
+                }),
+                &[][..],
+            ),
             Self::All {
                 include_aggregation,
-            } => Some(ExpandedPath {
-                instance: Some("*"),
-                instance_config: InstanceConfig::Wildcard {
-                    excluded_aggregation: (!include_aggregation)
-                        .then(|| aggregation_name.to_owned()),
-                },
-            }),
-            Self::Selected(_) => None,
-        };
-        let segments = match self {
-            Self::Selected(segments) => segments.as_slice(),
-            _ => &[],
+            } => (
+                Some(ExpandedPath {
+                    instance: Some("*"),
+                    instance_config: InstanceConfig::Wildcard {
+                        excluded_aggregation: (!include_aggregation)
+                            .then(|| aggregation_name.to_owned()),
+                    },
+                }),
+                &[][..],
+            ),
+            Self::Selected(segments) => (None, segments.as_slice()),
         };
         single
             .into_iter()
@@ -913,12 +921,10 @@ impl NormalizedInstances {
 
 impl InstanceSegment {
     fn from_config(field: &str, configured: String) -> Result<Self, Error> {
+        let _ = validate_native_component(field, &configured)?;
         if configured.contains(['*', '?']) {
-            Ok(Self::Wildcard(
-                validate_native_component(field, &configured)?.to_owned(),
-            ))
+            Ok(Self::Wildcard(configured))
         } else {
-            let configured = validate_native_component(field, &configured)?.to_owned();
             if configured.strip_prefix('#').is_some_and(|index| {
                 !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
             }) {
@@ -974,28 +980,10 @@ fn instance_comparison_key(value: &str) -> String {
     }
 }
 
-fn validate_counter_outputs(counters: &[CounterConfig]) -> Result<(), Error> {
-    for counter in counters {
-        validate_counter(counter)?;
-    }
-    Ok(())
-}
-
 fn validate_path_length(field: &str, path: &str) -> Result<(), Error> {
     if path.encode_utf16().count() > MAX_COUNTER_PATH_LEN {
         return Err(invalid(format!(
             "{field} {path:?} must contain at most {MAX_COUNTER_PATH_LEN} UTF-16 code units"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_counter(counter: &CounterConfig) -> Result<(), Error> {
-    validate_path_length("counter path", &counter.path)?;
-    if !(MIN_SCALE_POWER10..=MAX_SCALE_POWER10).contains(&counter.scale_power10) {
-        return Err(invalid(format!(
-            "counter path {:?} scale_power10 must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}",
-            counter.path
         )));
     }
     Ok(())

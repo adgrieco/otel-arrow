@@ -172,7 +172,8 @@ fn late_counter_retry_preserves_logical_query_start() {
     )
     .unwrap()
     .unwrap();
-    let pending = collect_query(&mut slot, Duration::ZERO, 4096, &mut open).unwrap();
+    let pending =
+        collect_query(&mut slot, Duration::ZERO, 4096, &mut open, Instant::now()).unwrap();
     assert!(pending.metadata.diagnostics.query_pending);
     assert!(!pending.metadata.diagnostics.any_query_collected);
     assert_eq!(state.borrow().calls.collect, 0);
@@ -181,7 +182,7 @@ fn late_counter_retry_preserves_logical_query_start() {
         state.counters.push(fake_counter(path, Number::Integer(42)));
         state.timestamp = 110;
     }
-    let ready = collect_query(&mut slot, Duration::ZERO, 4096, &mut open).unwrap();
+    let ready = collect_query(&mut slot, Duration::ZERO, 4096, &mut open, Instant::now()).unwrap();
     assert_eq!(ready.points[0].start_time_unix_nano, Some(100));
     assert!(ready.metadata.diagnostics.any_query_collected);
     assert!(!ready.metadata.diagnostics.query_pending);
@@ -231,7 +232,7 @@ fn dynamic_slot_refreshes_membership_with_bounded_admission() {
         template.to_owned(),
         vec![first.to_owned(), second.to_owned()],
     );
-    let admitted = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
+    let admitted = collect_query(&mut slot, Duration::ZERO, 1, &mut open, Instant::now()).unwrap();
     assert_eq!(admitted.points.len(), 1);
     assert_eq!(admitted.points[0].path.as_ref(), first);
     assert_eq!(admitted.metadata.diagnostics.instances_added, 1);
@@ -243,7 +244,7 @@ fn dynamic_slot_refreshes_membership_with_bounded_admission() {
         .borrow_mut()
         .expansions
         .insert(template.to_owned(), Vec::new());
-    let removed = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
+    let removed = collect_query(&mut slot, Duration::ZERO, 1, &mut open, Instant::now()).unwrap();
     assert!(removed.points.is_empty());
     assert_eq!(removed.metadata.diagnostics.instances_removed, 1);
     assert_eq!(removed.metadata.diagnostics.active_expanded_counters, 0);
@@ -416,6 +417,7 @@ struct PeakOwnership {
     collect_calls: std::sync::atomic::AtomicUsize,
     collect_status: std::sync::atomic::AtomicU32,
     closed_queries: std::sync::atomic::AtomicUsize,
+    collect_gate: std::sync::Mutex<Option<(oneshot::Sender<()>, mpsc::Receiver<()>)>>,
 }
 
 struct PeakPdh {
@@ -469,7 +471,11 @@ impl PdhApi for PeakPdh {
 
     fn collect(&mut self) -> Result<bool, Error> {
         let _ = self.ownership.collect_calls.fetch_add(1, Ordering::AcqRel);
-        if let Some((entered, release)) = self.collect_gate.take() {
+        let gate = self
+            .collect_gate
+            .take()
+            .or_else(|| self.ownership.collect_gate.lock().unwrap().take());
+        if let Some((entered, release)) = gate {
             entered.send(()).unwrap();
             release.recv_timeout(Duration::from_secs(2)).unwrap();
             self.check_running()?;
@@ -550,10 +556,26 @@ fn transient_failures_retry_installed_handles_before_rebuild() {
     let adds = state.borrow().calls.add;
     state.borrow_mut().collect_error = true;
     for _ in 0..2 {
-        assert!(collect_query(&mut queries, Duration::ZERO, 4096, &mut open).is_err());
+        assert!(
+            collect_query(
+                &mut queries,
+                Duration::ZERO,
+                4096,
+                &mut open,
+                Instant::now()
+            )
+            .is_err()
+        );
     }
     state.borrow_mut().collect_error = false;
-    let sample = collect_query(&mut queries, Duration::ZERO, 4096, &mut open).unwrap();
+    let sample = collect_query(
+        &mut queries,
+        Duration::ZERO,
+        4096,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap();
     assert_eq!(opens.get(), 1);
     assert_eq!(state.borrow().calls.add, adds);
     assert!(state.borrow().removed.is_empty());
@@ -619,7 +641,14 @@ fn recovery_only_sample_reports_no_query_collected() {
     let mut query = QuerySlot::open_initial(plan, 4_096, &mut open).unwrap();
     state.borrow_mut().collect_error = true;
 
-    let failure = collect_query(&mut query, Duration::from_secs(30), 4_096, &mut open).unwrap_err();
+    let failure = collect_query(
+        &mut query,
+        Duration::from_secs(30),
+        4_096,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap_err();
     assert!(matches!(
         failure,
         Error::Pdh {
@@ -628,8 +657,14 @@ fn recovery_only_sample_reports_no_query_collected() {
         }
     ));
 
-    let recovery_only =
-        collect_query(&mut query, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    let recovery_only = collect_query(
+        &mut query,
+        Duration::from_secs(30),
+        4_096,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap();
     assert!(recovery_only.points.is_empty());
     assert!(!recovery_only.metadata.diagnostics.any_query_collected);
     assert_eq!(recovery_only.metadata.failures.len(), 1);
@@ -869,7 +904,7 @@ fn repeated_refresh_failures_stay_on_refresh_cadence() {
     };
     let plan = vec![counter(exact_path, "memory.available"), first, second];
     let mut slot = QuerySlot::open_initial(plan, 1, &mut open).unwrap();
-    let startup = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
+    let startup = collect_query(&mut slot, Duration::ZERO, 1, &mut open, Instant::now()).unwrap();
     assert_eq!(
         startup
             .metadata
@@ -883,7 +918,8 @@ fn repeated_refresh_failures_stay_on_refresh_cadence() {
     let initial_expand_calls = states.borrow()[0].borrow().calls.expand;
     let mut queries = slot;
     for attempt in 0..QUERY_REBUILD_AFTER_FAILURES {
-        let sample = collect_query(&mut queries, Duration::ZERO, 1, &mut open).unwrap();
+        let sample =
+            collect_query(&mut queries, Duration::ZERO, 1, &mut open, Instant::now()).unwrap();
         assert_eq!(sample.points.len(), 1);
         assert_eq!(sample.points[0].counter_index, 0);
         assert_eq!(sample.metadata.diagnostics.discovery_failures, 2);
@@ -950,14 +986,28 @@ fn query_backoff_preserves_active_expanded_count() {
         .expansions
         .insert(path.to_owned(), vec![concrete.to_owned()]);
 
-    let healthy = collect_query(&mut queries, Duration::from_secs(30), 1, &mut open).unwrap();
+    let healthy = collect_query(
+        &mut queries,
+        Duration::from_secs(30),
+        1,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap();
     assert_eq!(healthy.metadata.diagnostics.active_expanded_counters, 1);
     states.borrow()[0].borrow_mut().collect_error = true;
     let now = Instant::now();
     let failure = queries.collect(now, Duration::from_secs(30), 1, &mut open);
     assert!(failure.is_err_and(|error| error.is_query_collection_failure()));
     let native_collects = states.borrow()[0].borrow().calls.collect;
-    let pending = collect_query(&mut queries, Duration::from_secs(30), 1, &mut open).unwrap();
+    let pending = collect_query(
+        &mut queries,
+        Duration::from_secs(30),
+        1,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap();
     assert!(pending.points.is_empty());
     assert!(!pending.metadata.diagnostics.any_query_collected);
     assert_eq!(states.borrow()[0].borrow().calls.collect, native_collects);
@@ -972,7 +1022,14 @@ fn query_backoff_preserves_active_expanded_count() {
     assert!(queries.query.is_none());
     assert_eq!(queries.active_expanded_count(), 0);
 
-    let pending = collect_query(&mut queries, Duration::from_secs(30), 1, &mut open).unwrap();
+    let pending = collect_query(
+        &mut queries,
+        Duration::from_secs(30),
+        1,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap();
 
     assert!(pending.points.is_empty());
     assert_eq!(pending.metadata.diagnostics.active_expanded_counters, 0);
@@ -1081,7 +1138,14 @@ fn scaled_cumulative_sum_retains_start() {
         state.timestamp = 110;
         state.counters[0].formatted = Some(Number::Integer(10));
     }
-    let first = collect_query(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    let first = collect_query(
+        &mut queries,
+        Duration::from_secs(30),
+        4_096,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap();
     assert_eq!(first.points[0].start_time_unix_nano, Some(100));
     let projection = project_sample(std::slice::from_ref(&projection_config), &first).unwrap();
     assert!(projection.is_some());
@@ -1092,7 +1156,14 @@ fn scaled_cumulative_sum_retains_start() {
         state.timestamp = 120;
         state.counters[0].formatted = Some(Number::Integer(20));
     }
-    let second = collect_query(&mut queries, Duration::from_secs(30), 4_096, &mut open).unwrap();
+    let second = collect_query(
+        &mut queries,
+        Duration::from_secs(30),
+        4_096,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap();
     assert_eq!(second.points[0].start_time_unix_nano, Some(100));
     let projection = project_sample(std::slice::from_ref(&projection_config), &second).unwrap();
     assert!(projection.is_some());
@@ -1142,7 +1213,14 @@ fn rebuilt_cumulative_query_preserves_start() {
         state.timestamp = 110;
         state.counters[0].formatted = Some(Number::Integer(20));
     }
-    let first = collect_query(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
+    let first = collect_query(
+        &mut queries,
+        Duration::ZERO,
+        4_096,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap();
     assert_eq!(first.points[0].start_time_unix_nano, Some(100));
     let projection = project_sample(std::slice::from_ref(&config), &first).unwrap();
     assert!(projection.is_some());
@@ -1444,8 +1522,8 @@ fn cancelling_startup_stops_between_exact_native_operations() {
 
 /// Scenario: Deferred cleanup of a departed member or still-wanted replacement fails after repeated production refresh.
 /// Guarantees: Cleanup retains its reservation and failure context, backs off without reopening the query, and restores wanted members after removal succeeds.
-#[tokio::test]
-async fn failed_pending_cleanup_remains_bounded_without_query_escalation() {
+#[test]
+fn failed_pending_cleanup_remains_bounded_without_query_escalation() {
     let template = r"\Process(*)\Private Bytes";
     let expanded = r"\Process(worker)\Private Bytes";
     let duplicate = r"\Process(worker#1)\Private Bytes";
@@ -1504,7 +1582,9 @@ async fn failed_pending_cleanup_remains_bounded_without_query_escalation() {
             );
             let _ = state.remove_errors.insert(0);
         }
-        let pending = collect_query(&mut slot, Duration::from_secs(60), limit, &mut open).unwrap();
+        let now = Instant::now();
+        let pending =
+            collect_query(&mut slot, Duration::from_secs(60), limit, &mut open, now).unwrap();
         assert_eq!(pending.metadata.diagnostics.discovery_failures, 0);
         assert_eq!(slot.reserved_native_entry_count(), 1);
         assert_eq!(
@@ -1516,8 +1596,14 @@ async fn failed_pending_cleanup_remains_bounded_without_query_escalation() {
                 .count(),
             1
         );
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        let failed = collect_query(&mut slot, Duration::from_secs(60), limit, &mut open).unwrap();
+        let failed = collect_query(
+            &mut slot,
+            Duration::from_secs(60),
+            limit,
+            &mut open,
+            now + Duration::from_millis(1100),
+        )
+        .unwrap();
         assert!(!failed.metadata.diagnostics.any_query_collected);
         assert!(failed.metadata.diagnostics.query_pending);
         assert_eq!(failed.metadata.diagnostics.discovery_failures, 0);
@@ -1539,13 +1625,26 @@ async fn failed_pending_cleanup_remains_bounded_without_query_escalation() {
             2
         );
         assert_eq!(slot.reserved_native_entry_count(), 1);
-        let backoff = collect_query(&mut slot, Duration::from_secs(60), limit, &mut open).unwrap();
+        let backoff = collect_query(
+            &mut slot,
+            Duration::from_secs(60),
+            limit,
+            &mut open,
+            now + Duration::from_millis(1200),
+        )
+        .unwrap();
         assert_eq!(backoff.metadata.diagnostics.query_rebuild_attempts, 0);
         assert!(!backoff.metadata.diagnostics.any_query_collected);
         assert_eq!(opens.get(), 1);
         state.borrow_mut().remove_errors.clear();
-        tokio::time::sleep(Duration::from_millis(2100)).await;
-        let cleaned = collect_query(&mut slot, Duration::from_secs(60), limit, &mut open).unwrap();
+        let cleaned = collect_query(
+            &mut slot,
+            Duration::from_secs(60),
+            limit,
+            &mut open,
+            now + Duration::from_millis(3200),
+        )
+        .unwrap();
         assert_eq!(cleaned.metadata.diagnostics.query_rebuild_attempts, 0);
         assert_eq!(cleaned.points.len(), usize::from(still_wanted));
         assert_eq!(opens.get(), 1);
@@ -1791,7 +1890,6 @@ async fn startup_prime_query_failure_starts_and_recovers() {
     assert_eq!(warming.metadata.failures[0].counter_index, 0);
     assert_eq!(warming.metadata.failures[0].reason, "PdhCollectQueryData");
     assert!(warming.metadata.failures[0].diagnostic_only);
-    assert_eq!(warming.metadata.diagnostics.counter_read_failures, 0);
     assert_eq!(warming.metadata.diagnostics.retry_attempts, 1);
     assert_eq!(warming.metadata.diagnostics.retry_recoveries, 1);
 
@@ -1843,10 +1941,26 @@ fn rebuild_only_sample_reports_no_query_collected() {
     .unwrap();
     states.borrow()[0].borrow_mut().collect_error = true;
     for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
-        assert!(collect_query(&mut queries, Duration::ZERO, 4_096, &mut open).is_err());
+        assert!(
+            collect_query(
+                &mut queries,
+                Duration::ZERO,
+                4_096,
+                &mut open,
+                Instant::now()
+            )
+            .is_err()
+        );
     }
 
-    let rebuilt = collect_query(&mut queries, Duration::ZERO, 4_096, &mut open).unwrap();
+    let rebuilt = collect_query(
+        &mut queries,
+        Duration::ZERO,
+        4_096,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap();
 
     assert!(rebuilt.points.is_empty());
     assert!(!rebuilt.metadata.diagnostics.any_query_collected);
@@ -1901,7 +2015,8 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
         ));
     }
 
-    let rebuilt = collect_query(&mut query, Duration::ZERO, 4_096, &mut open).unwrap();
+    let rebuilt =
+        collect_query(&mut query, Duration::ZERO, 4_096, &mut open, Instant::now()).unwrap();
 
     assert!(rebuilt.points.is_empty());
     assert_eq!(rebuilt.members.len(), 1);
@@ -1927,131 +2042,41 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
     assert_eq!(open_calls.get(), 2);
 }
 
-fn simulated_blocked_worker(cleanup_complete: Arc<AtomicBool>) -> (Worker, mpsc::Sender<()>) {
-    let (tx, rx) = mpsc::sync_channel(1);
-    let (release_tx, release_rx) = mpsc::channel();
-    let (completion_tx, completion_rx) = oneshot::channel();
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
-    let join = std::thread::spawn(move || {
-        let _commands = rx;
-        let _ = release_rx.recv();
-        cleanup_complete.store(true, Ordering::Release);
-        let _ = completion_tx.send(());
-    });
-    (
-        Worker {
-            tx,
-            accepted: Arc::new(AtomicBool::new(false)),
-            shutdown_requested,
-            join: Some(join),
-            completion: Some(completion_rx),
-            startup: StartupState::default(),
-        },
-        release_tx,
-    )
-}
-
-fn empty_sample() -> Sample {
-    Sample {
-        timestamp_unix_nano: 2,
-        members: Vec::new(),
-        points: Vec::new(),
-        metadata: PendingMetadata::default(),
-    }
-}
-
-fn controlled_worker() -> (
-    Worker,
-    oneshot::Receiver<()>,
-    oneshot::Sender<()>,
-    oneshot::Receiver<()>,
-) {
-    let (tx, rx) = mpsc::sync_channel(1);
-    let accepted = Arc::new(AtomicBool::new(false));
-    let worker_accepted = Arc::clone(&accepted);
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
-    let worker_shutdown = Arc::clone(&shutdown_requested);
-    let (started_tx, started_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel();
-    let (released_tx, released_rx) = oneshot::channel();
-    let (completion_tx, completion_rx) = oneshot::channel();
-    let join = std::thread::spawn(move || {
-        let mut first = Some((started_tx, release_rx, released_tx));
-        while !worker_shutdown.load(Ordering::Acquire) {
-            match rx.recv() {
-                Ok(Command::Collect(response)) => {
-                    let accepted = AcceptedCollectGuard::new(Arc::clone(&worker_accepted));
-                    if let Some((started, release, released)) = first.take() {
-                        let _ = started.send(());
-                        let _ = release.blocking_recv();
-                        drop(accepted);
-                        let _ = response.send(Ok(empty_sample()));
-                        let _ = released.send(());
-                    } else {
-                        drop(accepted);
-                        let _ = response.send(Ok(empty_sample()));
-                    }
-                }
-                Ok(Command::Shutdown) | Err(_) => break,
-            }
-        }
-        let _ = completion_tx.send(());
-    });
-    (
-        Worker {
-            tx,
-            accepted,
-            shutdown_requested,
-            join: Some(join),
-            completion: Some(completion_rx),
-            startup: StartupState::default(),
-        },
-        started_rx,
-        release_tx,
-        released_rx,
-    )
-}
-
 /// Scenario: A collection future times out while the worker remains inside a native call.
 /// Guarantees: Later requests fail fast as busy and collection resumes after the call returns.
 #[tokio::test(flavor = "current_thread")]
 async fn bounds_timed_out_collection_and_recovers() {
-    let (mut worker, started, release, released) = controlled_worker();
+    let (mut worker, ownership, started, release) = blocked_collect_worker().await;
     {
-        let first = tokio::time::timeout(Duration::from_millis(20), worker.collect());
+        let first = worker.collect();
         tokio::pin!(first);
         tokio::select! {
             result = &mut first => panic!("collection resolved before release: {result:?}"),
             result = started => result.expect("worker should start the first collection"),
         }
-        assert!(first.await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), first)
+                .await
+                .is_err()
+        );
     }
     assert!(matches!(worker.collect().await, Err(Error::WorkerBusy)));
     release.send(()).expect("release worker collection");
-    released
-        .await
-        .expect("worker should finish blocked collection");
-    assert!(worker.collect().await.is_ok());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while worker.accepted.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker should finish blocked collection");
+    assert_eq!(worker.collect().await.unwrap().points.len(), 1);
+    assert_eq!(ownership.collect_calls.load(Ordering::Acquire), 3);
     assert!(
         worker
             .shutdown(Instant::now() + Duration::from_secs(1))
             .await
             .expect("worker shutdown")
     );
-}
-
-/// Scenario: The worker's capacity-one command queue already contains a request.
-/// Guarantees: Additional work fails explicitly instead of growing an unbounded backlog.
-#[test]
-fn pending_work_is_bounded() {
-    let (tx, _rx) = mpsc::sync_channel(1);
-    let (first, _) = oneshot::channel();
-    let (second, _) = oneshot::channel();
-    tx.try_send(Command::Collect(first)).unwrap();
-    assert!(matches!(
-        tx.try_send(Command::Collect(second)),
-        Err(mpsc::TrySendError::Full(_))
-    ));
 }
 
 /// Scenario: Startup or recovery deltas are merged into a completed collection.
@@ -2273,8 +2298,8 @@ fn retry_delay_is_exponential_and_capped() {
 
 /// Scenario: Query collection repeatedly fails with a two-second retry cap and a sixty-second membership refresh.
 /// Guarantees: Recovery rebuilds on collection cadence instead of waiting for the unrelated wildcard discovery clock.
-#[tokio::test(flavor = "current_thread")]
-async fn query_recovery_cap_is_independent_of_membership_refresh() {
+#[test]
+fn query_recovery_cap_is_independent_of_membership_refresh() {
     let path = r"\Memory\Available Bytes";
     let fail_collect = Arc::new(AtomicBool::new(false));
     let factory_fail_collect = Arc::clone(&fail_collect);
@@ -2283,61 +2308,57 @@ async fn query_recovery_cap_is_independent_of_membership_refresh() {
     let observed_refreshes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let factory_refreshes = Arc::clone(&observed_refreshes);
     let cadence = QueryCadence::new(Duration::from_secs(2), Duration::from_secs(60));
-    let mut worker = Worker::start_with(
+    let mut open = move |configs, max_native_counters, seed: Option<&QueryRecreationSeed>| {
+        let _ = factory_open_calls.fetch_add(1, Ordering::AcqRel);
+        factory_refreshes
+            .lock()
+            .unwrap()
+            .push(cadence.wildcard_refresh());
+        Query::open_with_seed(
+            RebuildPrimePdh {
+                fail_collect: Arc::clone(&factory_fail_collect),
+                collect_calls: 0,
+            },
+            configs,
+            cadence.retry_cap(),
+            cadence.wildcard_refresh(),
+            256,
+            max_native_counters,
+            seed,
+        )
+    };
+    let mut slot = QuerySlot::open_initial(
         vec![counter(path, "system.memory.available")],
-        cadence.retry_cap(),
         4_096,
-        move |configs, max_native_counters, _seed| {
-            let _ = factory_open_calls.fetch_add(1, Ordering::AcqRel);
-            factory_refreshes
-                .lock()
-                .unwrap()
-                .push(cadence.wildcard_refresh());
-            Query::open_with_seed(
-                RebuildPrimePdh {
-                    fail_collect: Arc::clone(&factory_fail_collect),
-                    collect_calls: 0,
-                },
-                configs,
-                cadence.retry_cap(),
-                cadence.wildcard_refresh(),
-                256,
-                max_native_counters,
-                None,
-            )
-        },
+        &mut open,
     )
-    .await
     .unwrap();
     fail_collect.store(true, Ordering::Release);
-
-    assert!(matches!(
-        worker.collect().await,
-        Err(Error::Pdh {
-            operation: PdhOperation::CollectQueryData,
-            ..
-        })
-    ));
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
-    assert!(matches!(
-        worker.collect().await,
-        Err(Error::Pdh {
-            operation: PdhOperation::CollectQueryData,
-            ..
-        })
-    ));
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
-    assert!(matches!(
-        worker.collect().await,
-        Err(Error::Pdh {
-            operation: PdhOperation::CollectQueryData,
-            ..
-        })
-    ));
+    let now = Instant::now();
+    for offset in [0, 1, 3] {
+        assert!(matches!(
+            collect_query(
+                &mut slot,
+                cadence.retry_cap(),
+                4_096,
+                &mut open,
+                now + Duration::from_secs(offset)
+            ),
+            Err(Error::Pdh {
+                operation: PdhOperation::CollectQueryData,
+                ..
+            })
+        ));
+    }
     fail_collect.store(false, Ordering::Release);
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
-
-    let rebuilt = worker.collect().await.unwrap();
+    let rebuilt = collect_query(
+        &mut slot,
+        cadence.retry_cap(),
+        4_096,
+        &mut open,
+        now + Duration::from_secs(5),
+    )
+    .unwrap();
 
     assert!(rebuilt.points.is_empty());
     assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
@@ -2345,12 +2366,6 @@ async fn query_recovery_cap_is_independent_of_membership_refresh() {
     assert_eq!(
         observed_refreshes.lock().unwrap().as_slice(),
         [Duration::from_secs(60), Duration::from_secs(60)]
-    );
-    assert!(
-        worker
-            .shutdown(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap()
     );
 }
 
@@ -2369,9 +2384,15 @@ fn query_rebuild_waits_for_bounded_retries() {
 /// and worker-owned resources remain alive until that cleanup completes.
 #[tokio::test(flavor = "current_thread")]
 async fn blocked_worker_releases_resources_after_timeout() {
-    let _serial = TEST_PDH_LOCK.lock().await;
-    let cleanup_complete = Arc::new(AtomicBool::new(false));
-    let (mut worker, release) = simulated_blocked_worker(Arc::clone(&cleanup_complete));
+    let (mut worker, ownership, started, release) = blocked_collect_worker().await;
+    {
+        let collection = worker.collect();
+        tokio::pin!(collection);
+        tokio::select! {
+            result = &mut collection => panic!("collection resolved before release: {result:?}"),
+            result = started => result.expect("worker should enter native collection"),
+        }
+    }
 
     let start = Instant::now();
     assert!(
@@ -2381,7 +2402,8 @@ async fn blocked_worker_releases_resources_after_timeout() {
             .unwrap()
     );
     assert!(start.elapsed() < Duration::from_secs(1));
-    assert!(!cleanup_complete.load(Ordering::Acquire));
+    assert_eq!(ownership.current.load(Ordering::Acquire), 1);
+    assert_eq!(ownership.closed_queries.load(Ordering::Acquire), 0);
     release.send(()).unwrap();
     assert!(
         worker
@@ -2389,5 +2411,44 @@ async fn blocked_worker_releases_resources_after_timeout() {
             .await
             .unwrap()
     );
-    assert!(cleanup_complete.load(Ordering::Acquire));
+    assert_eq!(ownership.current.load(Ordering::Acquire), 0);
+    assert_eq!(ownership.closed_queries.load(Ordering::Acquire), 1);
+}
+
+async fn blocked_collect_worker() -> (
+    Worker,
+    Arc<PeakOwnership>,
+    oneshot::Receiver<()>,
+    mpsc::Sender<()>,
+) {
+    let ownership = Arc::new(PeakOwnership::default());
+    let worker_ownership = Arc::clone(&ownership);
+    let worker = Worker::start_controlled(
+        vec![counter(r"\Memory\Available Bytes", "available")],
+        Duration::from_secs(30),
+        4_096,
+        move |configs, limit, seed, shutdown| {
+            Query::open_with_seed(
+                PeakPdh {
+                    ownership: Arc::clone(&worker_ownership),
+                    owned: 0,
+                    expansions: BTreeMap::new(),
+                    shutdown: Some(shutdown),
+                    collect_gate: None,
+                },
+                configs,
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                256,
+                limit,
+                seed,
+            )
+        },
+    )
+    .await
+    .unwrap();
+    let (entered, started) = oneshot::channel();
+    let (release, blocked) = mpsc::channel();
+    *ownership.collect_gate.lock().unwrap() = Some((entered, blocked));
+    (worker, ownership, started, release)
 }

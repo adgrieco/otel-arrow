@@ -7,11 +7,10 @@ use super::config::{MAX_SCALE_POWER10, MIN_SCALE_POWER10};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-// F6-sized measurements put the metadata-index crossover above 128x128 comparisons.
+// F6-sized measurements put the metadata-index crossover above 32,768 comparisons.
 const METADATA_INDEX_WORK_THRESHOLD: usize = 32_768;
-const MAX_METADATA_INDEX_SPARSITY: usize = 4;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
 struct MetadataKey {
     counter_index: usize,
     reason: &'static str,
@@ -161,8 +160,6 @@ pub(super) struct SampleDiagnostics {
     pub(super) instances_omitted_over_limit: u64,
     /// Number of counter-add attempts that failed.
     pub(super) counter_add_failures: u64,
-    /// Number of counter read, status, calculation, or scaling failures.
-    pub(super) counter_read_failures: u64,
     /// Number of deferred counter or query-collection retry attempts.
     pub(super) retry_attempts: u64,
     /// Number of deferred counter or query-collection retries that recovered.
@@ -185,7 +182,13 @@ pub(super) struct PendingMetadata {
 impl PendingMetadata {
     pub(super) fn merge(&mut self, delta: Self) {
         merge_diagnostics(&mut self.diagnostics, delta.diagnostics);
-        merge_latest_failures(&mut self.failures, delta.failures);
+        merge_latest_by_key(&mut self.failures, delta.failures, |failure| {
+            (
+                failure.counter_index,
+                failure.reason,
+                Arc::clone(&failure.path),
+            )
+        });
         merge_latest_by_key(&mut self.overflows, delta.overflows, |overflow| {
             MetadataKey::new(overflow.counter_index, overflow.reason)
         });
@@ -193,86 +196,24 @@ impl PendingMetadata {
 
     pub(super) fn merge_older(&mut self, older: Self) {
         merge_diagnostics(&mut self.diagnostics, older.diagnostics);
-        merge_older_failures(&mut self.failures, older.failures);
+        merge_older_by_key(&mut self.failures, older.failures, |failure| {
+            (
+                failure.counter_index,
+                failure.reason,
+                Arc::clone(&failure.path),
+            )
+        });
         merge_older_by_key(&mut self.overflows, older.overflows, |overflow| {
             MetadataKey::new(overflow.counter_index, overflow.reason)
         });
     }
 }
 
-fn merge_latest_failures(current: &mut Vec<SampleFailure>, latest: Vec<SampleFailure>) {
-    if current.len().saturating_mul(latest.len()) <= METADATA_INDEX_WORK_THRESHOLD {
-        for item in latest {
-            if let Some(existing) = current.iter_mut().find(|existing| {
-                existing.counter_index == item.counter_index
-                    && existing.reason == item.reason
-                    && existing.path == item.path
-            }) {
-                *existing = item;
-            } else {
-                current.push(item);
-            }
-        }
-        return;
-    }
-    let mut indices = current
-        .iter()
-        .enumerate()
-        .map(|(index, failure)| {
-            (
-                (
-                    failure.counter_index,
-                    failure.reason,
-                    Arc::clone(&failure.path),
-                ),
-                index,
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    for item in latest {
-        let key = (item.counter_index, item.reason, Arc::clone(&item.path));
-        if let Some(index) = indices.get(&key).copied() {
-            current[index] = item;
-        } else {
-            let index = current.len();
-            current.push(item);
-            let _ = indices.insert(key, index);
-        }
-    }
-}
-
-fn merge_older_failures(current: &mut Vec<SampleFailure>, older: Vec<SampleFailure>) {
-    if current.len().saturating_mul(older.len()) <= METADATA_INDEX_WORK_THRESHOLD {
-        for item in older {
-            if !current.iter().any(|existing| {
-                existing.counter_index == item.counter_index
-                    && existing.reason == item.reason
-                    && existing.path == item.path
-            }) {
-                current.push(item);
-            }
-        }
-        return;
-    }
-    let mut keys = current
-        .iter()
-        .map(|failure| {
-            (
-                failure.counter_index,
-                failure.reason,
-                Arc::clone(&failure.path),
-            )
-        })
-        .collect::<std::collections::HashSet<_>>();
-    for item in older {
-        let key = (item.counter_index, item.reason, Arc::clone(&item.path));
-        if keys.insert(key) {
-            current.push(item);
-        }
-    }
-}
-
-fn merge_latest_by_key<T>(current: &mut Vec<T>, latest: Vec<T>, key: impl Fn(&T) -> MetadataKey) {
+fn merge_latest_by_key<T, K: Eq + std::hash::Hash>(
+    current: &mut Vec<T>,
+    latest: Vec<T>,
+    key: impl Fn(&T) -> K,
+) {
     if latest.is_empty() {
         return;
     }
@@ -280,23 +221,24 @@ fn merge_latest_by_key<T>(current: &mut Vec<T>, latest: Vec<T>, key: impl Fn(&T)
         merge_latest_linearly(current, latest, key);
         return;
     }
-    let Some(mut indices) = dense_metadata_indices(current, &latest, &key) else {
-        merge_latest_linearly(current, latest, key);
-        return;
-    };
+    let mut indices = metadata_indices(current, &key);
     for item in latest {
         let item_key = key(&item);
-        if let Some(index) = indices.get(item_key) {
+        if let Some(index) = indices.get(&item_key).copied() {
             current[index] = item;
         } else {
             let index = current.len();
             current.push(item);
-            indices.insert(item_key, index);
+            let _ = indices.insert(item_key, index);
         }
     }
 }
 
-fn merge_older_by_key<T>(current: &mut Vec<T>, older: Vec<T>, key: impl Fn(&T) -> MetadataKey) {
+fn merge_older_by_key<T, K: Eq + std::hash::Hash>(
+    current: &mut Vec<T>,
+    older: Vec<T>,
+    key: impl Fn(&T) -> K,
+) {
     if older.is_empty() {
         return;
     }
@@ -304,79 +246,29 @@ fn merge_older_by_key<T>(current: &mut Vec<T>, older: Vec<T>, key: impl Fn(&T) -
         merge_older_linearly(current, older, key);
         return;
     }
-    let Some(mut indices) = dense_metadata_indices(current, &older, &key) else {
-        merge_older_linearly(current, older, key);
-        return;
-    };
+    let mut indices = metadata_indices(current, &key);
     for item in older {
         let item_key = key(&item);
-        if indices.get(item_key).is_none() {
+        if let std::collections::hash_map::Entry::Vacant(entry) = indices.entry(item_key) {
             let index = current.len();
             current.push(item);
-            indices.insert(item_key, index);
+            let _ = entry.insert(index);
         }
     }
 }
 
-struct DenseMetadataIndices {
-    reasons: Vec<&'static str>,
-    indices: Vec<Option<usize>>,
-}
-
-impl DenseMetadataIndices {
-    fn slot(&self, key: MetadataKey) -> usize {
-        let reason_index = self
-            .reasons
-            .iter()
-            .position(|reason| *reason == key.reason)
-            .expect("metadata reason was indexed");
-        key.counter_index * self.reasons.len() + reason_index
-    }
-
-    fn get(&self, key: MetadataKey) -> Option<usize> {
-        self.indices[self.slot(key)]
-    }
-
-    fn insert(&mut self, key: MetadataKey, index: usize) {
-        let slot = self.slot(key);
-        self.indices[slot] = Some(index);
-    }
-}
-
-fn dense_metadata_indices<T>(
+fn metadata_indices<T, K: Eq + std::hash::Hash>(
     current: &[T],
-    incoming: &[T],
-    key: &impl Fn(&T) -> MetadataKey,
-) -> Option<DenseMetadataIndices> {
-    let entry_count = current.len().saturating_add(incoming.len());
-    let mut reasons = Vec::new();
-    let mut max_counter_index = None::<usize>;
-    for item in current.iter().chain(incoming) {
-        let item_key = key(item);
-        max_counter_index = max_counter_index.max(Some(item_key.counter_index));
-        if !reasons.contains(&item_key.reason) {
-            reasons.push(item_key.reason);
-        }
-    }
-    let counter_slots = max_counter_index?.checked_add(1)?;
-    let slot_count = counter_slots.checked_mul(reasons.len())?;
-    if slot_count > entry_count.saturating_mul(MAX_METADATA_INDEX_SPARSITY) {
-        return None;
-    }
-    let mut dense = DenseMetadataIndices {
-        reasons,
-        indices: vec![None; slot_count],
-    };
-    for (index, item) in current.iter().enumerate() {
-        let item_key = key(item);
-        if dense.get(item_key).is_none() {
-            dense.insert(item_key, index);
-        }
-    }
-    Some(dense)
+    key: &impl Fn(&T) -> K,
+) -> HashMap<K, usize> {
+    current
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (key(item), index))
+        .collect()
 }
 
-fn merge_latest_linearly<T>(current: &mut Vec<T>, latest: Vec<T>, key: impl Fn(&T) -> MetadataKey) {
+fn merge_latest_linearly<T, K: Eq>(current: &mut Vec<T>, latest: Vec<T>, key: impl Fn(&T) -> K) {
     for item in latest {
         if let Some(existing) = current
             .iter_mut()
@@ -389,7 +281,7 @@ fn merge_latest_linearly<T>(current: &mut Vec<T>, latest: Vec<T>, key: impl Fn(&
     }
 }
 
-fn merge_older_linearly<T>(current: &mut Vec<T>, older: Vec<T>, key: impl Fn(&T) -> MetadataKey) {
+fn merge_older_linearly<T, K: Eq>(current: &mut Vec<T>, older: Vec<T>, key: impl Fn(&T) -> K) {
     for item in older {
         if !current.iter().any(|existing| key(existing) == key(&item)) {
             current.push(item);
@@ -429,7 +321,6 @@ pub(super) fn merge_diagnostics(target: &mut SampleDiagnostics, delta: SampleDia
     target.instances_removed += delta.instances_removed;
     target.instances_omitted_over_limit += delta.instances_omitted_over_limit;
     target.counter_add_failures += delta.counter_add_failures;
-    target.counter_read_failures += delta.counter_read_failures;
     target.retry_attempts += delta.retry_attempts;
     target.retry_recoveries += delta.retry_recoveries;
     target.query_rebuild_attempts += delta.query_rebuild_attempts;
@@ -605,15 +496,17 @@ mod tests {
     /// Guarantees: Index storage remains proportional to evidence count rather than the largest configured-counter index.
     #[test]
     fn metadata_index_bounds_sparse_storage() {
-        let current = vec![failure(usize::MAX, "current")];
-        let incoming = vec![failure(0, "incoming")];
-
-        assert!(
-            dense_metadata_indices(&current, &incoming, &|failure| {
-                MetadataKey::new(failure.counter_index, failure.reason)
-            })
-            .is_none()
-        );
+        let mut current = (0..256)
+            .map(|index| failure(index, "current"))
+            .collect::<Vec<_>>();
+        current[0].counter_index = usize::MAX;
+        let incoming = (0..256).map(|index| failure(index, "incoming")).collect();
+        merge_older_by_key(&mut current, incoming, |failure| {
+            MetadataKey::new(failure.counter_index, failure.reason)
+        });
+        assert_eq!(current.len(), 257);
+        assert_eq!(current[0].counter_index, usize::MAX);
+        assert_eq!(current[256].error, "incoming");
     }
 
     /// Scenario: Every configured index has two failure reasons while older evidence partially overlaps and partially extends current metadata.

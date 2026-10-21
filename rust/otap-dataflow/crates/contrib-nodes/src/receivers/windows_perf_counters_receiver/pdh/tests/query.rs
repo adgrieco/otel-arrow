@@ -266,20 +266,21 @@ fn failed_wildcard_retirement_preserves_rebuild_seed() {
             state.timestamp = 110;
         }
         let retry_cap = Duration::from_secs(60);
-        let failed_cleanup = collect_query(&mut slot, retry_cap, 2, &mut open).unwrap();
+        let failed_cleanup =
+            collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now()).unwrap();
         assert_eq!(failed_cleanup.points.len(), 1);
         assert_eq!(failed_cleanup.points[0].path.as_ref(), healthy);
         assert!(slot.query.is_some());
         state.borrow_mut().collect_status = Some(PDH_INVALID_HANDLE);
         assert!(
-            collect_query(&mut slot, retry_cap, 2, &mut open)
+            collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now())
                 .unwrap_err()
                 .is_invalid_query()
         );
         state.borrow_mut().collect_status = None;
         assert!(slot.query.is_none());
         assert_eq!(slot.reserved_native_entry_count(), 2);
-        let backoff = collect_query(&mut slot, retry_cap, 2, &mut open).unwrap();
+        let backoff = collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now()).unwrap();
         assert!(!backoff.metadata.diagnostics.any_query_collected);
         assert!(backoff.points.is_empty());
         assert!(!backoff.metadata.failures.is_empty());
@@ -287,7 +288,7 @@ fn failed_wildcard_retirement_preserves_rebuild_seed() {
         state.borrow_mut().cleanup_fails = false;
         std::thread::sleep(Duration::from_millis(1100));
         if fail_replacement_open {
-            let failed = collect_query(&mut slot, retry_cap, 2, &mut open).unwrap();
+            let failed = collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now()).unwrap();
             assert!(!failed.metadata.diagnostics.any_query_collected);
             assert!(failed.points.is_empty());
             assert!(
@@ -297,12 +298,12 @@ fn failed_wildcard_retirement_preserves_rebuild_seed() {
             );
             std::thread::sleep(Duration::from_millis(1100));
         }
-        let rebuilt = collect_query(&mut slot, retry_cap, 2, &mut open).unwrap();
+        let rebuilt = collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now()).unwrap();
         assert!(!rebuilt.metadata.diagnostics.any_query_collected);
         assert!(rebuilt.points.is_empty());
         assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
         state.borrow_mut().timestamp = 120;
-        let ready = collect_query(&mut slot, retry_cap, 2, &mut open).unwrap();
+        let ready = collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now()).unwrap();
         assert_eq!(ready.points.len(), 2);
         assert_eq!(ready.points[0].path.as_ref(), path);
         assert_eq!(ready.points[0].start_time_unix_nano, Some(100));
@@ -353,11 +354,12 @@ fn failed_rebuild_prime_is_diagnostic_only() {
             QuerySlot::open_initial(vec![counter(path, "memory")], 1, &mut open).unwrap();
         state.borrow_mut().collect_status = Some(PDH_INVALID_HANDLE);
         assert!(
-            collect_query(&mut slot, Duration::ZERO, 1, &mut open)
+            collect_query(&mut slot, Duration::ZERO, 1, &mut open, Instant::now())
                 .unwrap_err()
                 .is_invalid_query()
         );
-        let failed_prime = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
+        let failed_prime =
+            collect_query(&mut slot, Duration::ZERO, 1, &mut open, Instant::now()).unwrap();
         assert!(failed_prime.points.is_empty());
         assert!(!failed_prime.metadata.diagnostics.any_query_collected);
         assert!(failed_prime.metadata.diagnostics.query_pending);
@@ -373,7 +375,7 @@ fn failed_rebuild_prime_is_diagnostic_only() {
         state.borrow_mut().invalidate_on_collect = false;
         state.borrow_mut().cleanup_fails = false;
         state.borrow_mut().timestamp = 120;
-        let ready = collect_query(&mut slot, Duration::ZERO, 1, &mut open).unwrap();
+        let ready = collect_query(&mut slot, Duration::ZERO, 1, &mut open, Instant::now()).unwrap();
         assert!(ready.metadata.diagnostics.any_query_collected);
         assert!(ready.metadata.failures.is_empty());
         assert_eq!(ready.points.len(), 1);
@@ -682,7 +684,6 @@ fn no_observation_does_not_recover_counter_handle() {
         state.borrow_mut().timestamp = timestamp;
         let sample = query.collect().unwrap();
         assert!(matches!(sample.points[0].value, SampleValue::NoObservation));
-        assert_eq!(sample.metadata.diagnostics.counter_read_failures, 0);
         assert_eq!(sample.metadata.diagnostics.retry_attempts, 0);
     }
 
@@ -1206,18 +1207,7 @@ fn same_path_mappings_use_independent_query_entries() {
     let mut second = counter(path, "windows.memory.available_copy");
     second.source_mapping_index = 1;
     let configs = vec![first, second];
-    let (state, mut query) = fake_query(
-        configs,
-        vec![FakeCounter {
-            path: path.to_owned(),
-            native_type: 0x0001_0100,
-            raw: None,
-            multi_count: 1,
-            formatted: Some(Number::Integer(42)),
-            raw_error: false,
-            formatted_error: false,
-        }],
-    );
+    let (state, mut query) = fake_query(configs, vec![fake_counter(path, Number::Integer(42))]);
 
     assert_eq!(state.borrow().added, [path.to_owned(), path.to_owned()]);
     let sample = query.collect().unwrap();
@@ -1390,15 +1380,7 @@ fn later_wildcard_member_uses_logical_query_start_time() {
     };
     let (state, mut query) = fake_query_with_cadences(
         vec![config],
-        vec![FakeCounter {
-            path: expanded.to_owned(),
-            native_type: 0x0001_0100,
-            raw: None,
-            multi_count: 1,
-            formatted: Some(Number::Integer(42)),
-            raw_error: false,
-            formatted_error: false,
-        }],
+        vec![fake_counter(expanded, Number::Integer(42))],
         Duration::from_secs(30),
         Duration::ZERO,
     );
@@ -1538,18 +1520,7 @@ fn exact_instance_path_preserves_identity() {
     config.instance_config = InstanceConfig::Exact {
         emit_attribute: true,
     };
-    let (_, mut query) = fake_query(
-        vec![config],
-        vec![FakeCounter {
-            path: path.to_owned(),
-            native_type: 0x0001_0100,
-            raw: None,
-            multi_count: 1,
-            formatted: Some(Number::Integer(42)),
-            raw_error: false,
-            formatted_error: false,
-        }],
-    );
+    let (_, mut query) = fake_query(vec![config], vec![fake_counter(path, Number::Integer(42))]);
 
     let sample = query.collect().unwrap();
     assert_eq!(
@@ -1571,18 +1542,7 @@ fn exact_instance_parse_failure_preserves_value() {
     config.instance_config = InstanceConfig::Exact {
         emit_attribute: true,
     };
-    let (_, mut query) = fake_query(
-        vec![config],
-        vec![FakeCounter {
-            path: path.to_owned(),
-            native_type: 0x0001_0100,
-            raw: None,
-            multi_count: 1,
-            formatted: Some(Number::Integer(42)),
-            raw_error: false,
-            formatted_error: false,
-        }],
-    );
+    let (_, mut query) = fake_query(vec![config], vec![fake_counter(path, Number::Integer(42))]);
 
     let sample = query.collect().unwrap();
     assert_eq!(sample.points.len(), 1);
@@ -2220,15 +2180,7 @@ fn queued_transient_retry_still_recovers() {
     {
         let mut state = state.borrow_mut();
         state.timestamp = 110;
-        state.counters.push(FakeCounter {
-            path: path.to_owned(),
-            native_type: 0x0001_0100,
-            raw: None,
-            multi_count: 1,
-            formatted: Some(Number::Integer(42)),
-            raw_error: false,
-            formatted_error: false,
-        });
+        state.counters.push(fake_counter(path, Number::Integer(42)));
     }
     let recovered = query.collect().unwrap();
     assert_eq!(recovered.metadata.diagnostics.retry_attempts, 1);
@@ -2312,15 +2264,7 @@ fn wildcard_remove_failure_stays_owned_until_local_retry() {
     };
     let (state, mut query) = fake_query_with_cadences(
         vec![config],
-        vec![FakeCounter {
-            path: expanded.to_owned(),
-            native_type: 0x0001_0100,
-            raw: None,
-            multi_count: 1,
-            formatted: Some(Number::Integer(42)),
-            raw_error: false,
-            formatted_error: false,
-        }],
+        vec![fake_counter(expanded, Number::Integer(42))],
         Duration::ZERO,
         Duration::ZERO,
     );
@@ -2374,24 +2318,8 @@ fn expansion_limit_prioritizes_admitted_wildcard_member() {
     let (state, mut query) = fake_query_with_seed(
         vec![config],
         vec![
-            FakeCounter {
-                path: admitted.to_owned(),
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(42)),
-                raw_error: false,
-                formatted_error: false,
-            },
-            FakeCounter {
-                path: newcomer.to_owned(),
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(7)),
-                raw_error: false,
-                formatted_error: false,
-            },
+            fake_counter(admitted, Number::Integer(42)),
+            fake_counter(newcomer, Number::Integer(7)),
         ],
         Duration::ZERO,
         Duration::ZERO,
@@ -2522,15 +2450,7 @@ fn rediscovered_pending_removal_restores_existing_handle() {
     };
     let (state, mut query) = fake_query_with_seed(
         vec![config],
-        vec![FakeCounter {
-            path: expanded.to_owned(),
-            native_type: 0x0001_0100,
-            raw: None,
-            multi_count: 1,
-            formatted: Some(Number::Integer(42)),
-            raw_error: false,
-            formatted_error: false,
-        }],
+        vec![fake_counter(expanded, Number::Integer(42))],
         Duration::ZERO,
         Duration::ZERO,
         1,
@@ -2685,24 +2605,8 @@ fn pending_wildcard_removal_consumes_one_budget_entry() {
     let (state, mut query) = fake_query_with_seed(
         vec![first, second],
         vec![
-            FakeCounter {
-                path: first_expanded.to_owned(),
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(42)),
-                raw_error: false,
-                formatted_error: false,
-            },
-            FakeCounter {
-                path: second_expanded.to_owned(),
-                native_type: 0x0001_0100,
-                raw: None,
-                multi_count: 1,
-                formatted: Some(Number::Integer(7)),
-                raw_error: false,
-                formatted_error: false,
-            },
+            fake_counter(first_expanded, Number::Integer(42)),
+            fake_counter(second_expanded, Number::Integer(7)),
         ],
         Duration::ZERO,
         Duration::ZERO,
@@ -2993,33 +2897,6 @@ fn empty_startup_expansion_is_diagnosed_once() {
     assert_eq!(admitted.points[0].path.as_ref(), expanded);
 }
 
-/// Scenario: A refresh reorders retained instances while adding one and removing another.
-/// Guarantees: Only stable-key set differences change handles, so retained history cannot move positionally.
-#[test]
-fn refresh_delta_preserves_retained_instance_keys() {
-    let retained = CounterKey::new(0, r"\Process(worker#1)\Private Bytes");
-    let removed = CounterKey::new(0, r"\Process(old)\Private Bytes");
-    let added = CounterKey::new(0, r"\Process(new)\Private Bytes");
-    let existing = [removed.clone(), retained.clone()]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let wanted = [added.clone(), retained.clone()]
-        .into_iter()
-        .rev()
-        .collect::<BTreeSet<_>>();
-    let (actual_removed, actual_added) = refresh_changes_with_group_resets(
-        &existing,
-        &BTreeSet::new(),
-        &wanted,
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-    );
-    assert_eq!(actual_removed, vec![removed]);
-    assert_eq!(actual_added, vec![added]);
-    assert!(existing.contains(&retained));
-    assert!(wanted.contains(&retained));
-}
-
 /// Scenario: Discovery returns more sorted paths than either configured expansion bound allows.
 /// Guarantees: The retained prefix is deterministic and every omitted instance is counted explicitly.
 #[test]
@@ -3208,200 +3085,120 @@ fn wildcard_overflow_is_one_bounded_admission_record() {
     );
 }
 
-/// Scenario: Refresh returns the same duplicate-name membership in a different order.
-/// Guarantees: Stable membership does not recreate handles or reset calculated history.
+/// Scenario: Refresh changes concrete membership with stable, retrying, or departing duplicate-instance groups.
+/// Guarantees: Set differences and duplicate-group churn recreate only identities whose history is unsafe.
 #[test]
-fn unchanged_duplicate_group_preserves_handles() {
-    let worker = CounterKey::new(0, r"\Process(worker)\% Processor Time");
-    let worker_duplicate = CounterKey::new(0, r"\Process(worker#1)\% Processor Time");
-    let instance = InstanceIdentity {
-        name: "worker".to_owned(),
+fn refresh_group_changes_preserve_stable_histories() {
+    let members = [
+        ("worker", 0),
+        ("worker", 1),
+        ("other", 0),
+        ("old", 0),
+        ("new", 0),
+    ];
+    let identities = members.map(|(name, index)| InstanceIdentity {
+        name: name.to_owned(),
         parent: None,
-        index: 0,
-    };
-    let duplicate_instance = InstanceIdentity {
-        name: "worker".to_owned(),
-        parent: None,
-        index: 1,
-    };
-    let existing = [worker.clone(), worker_duplicate.clone()]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let wanted = [worker_duplicate.clone(), worker.clone()]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let existing_groups = instance_groups(
-        [
-            (&worker, &instance),
-            (&worker_duplicate, &duplicate_instance),
-        ]
-        .into_iter(),
-    );
-    let wanted_groups = instance_groups(
-        [
-            (&worker_duplicate, &duplicate_instance),
-            (&worker, &instance),
-        ]
-        .into_iter(),
-    );
-
-    let (removed, added) = refresh_changes_with_group_resets(
-        &existing,
-        &BTreeSet::new(),
-        &wanted,
-        &existing_groups,
-        &wanted_groups,
-    );
-
-    assert!(removed.is_empty());
-    assert!(added.is_empty());
-}
-
-/// Scenario: One member of a duplicate-name group has a live handle while its peer waits in retry state and discovery still returns both.
-/// Guarantees: Logical membership remains unchanged, so the healthy live handle is not recreated and the retry keeps its backoff.
-#[test]
-fn retrying_duplicate_does_not_reset_healthy_peer() {
-    let live_worker = CounterKey::new(0, r"\Process(worker)\% Processor Time");
-    let retrying_worker = CounterKey::new(0, r"\Process(worker#1)\% Processor Time");
-    let live_instance = InstanceIdentity {
-        name: "worker".to_owned(),
-        parent: None,
-        index: 0,
-    };
-    let retrying_instance = InstanceIdentity {
-        name: "worker".to_owned(),
-        parent: None,
-        index: 1,
-    };
-    let live = [live_worker.clone()].into_iter().collect::<BTreeSet<_>>();
-    let retrying = [retrying_worker.clone()]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let wanted = [live_worker.clone(), retrying_worker.clone()]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let known_groups = instance_groups(
-        [
-            (&live_worker, &live_instance),
-            (&retrying_worker, &retrying_instance),
-        ]
-        .into_iter(),
-    );
-    let wanted_groups = instance_groups(
-        [
-            (&retrying_worker, &retrying_instance),
-            (&live_worker, &live_instance),
-        ]
-        .into_iter(),
-    );
-
-    let (removed, added) =
-        refresh_changes_with_group_resets(&live, &retrying, &wanted, &known_groups, &wanted_groups);
-
-    assert!(removed.is_empty());
-    assert!(added.is_empty());
-}
-
-/// Scenario: A retrying duplicate-name sibling disappears while its peer still has a live handle.
-/// Guarantees: The live peer is recreated so calculated history cannot cross a possible PDH renumbering.
-#[test]
-fn disappearing_retrying_duplicate_resets_healthy_peer() {
-    let live_worker = CounterKey::new(0, r"\Process(worker)\% Processor Time");
-    let retrying_worker = CounterKey::new(0, r"\Process(worker#1)\% Processor Time");
-    let live_instance = InstanceIdentity {
-        name: "worker".to_owned(),
-        parent: None,
-        index: 0,
-    };
-    let retrying_instance = InstanceIdentity {
-        name: "worker".to_owned(),
-        parent: None,
-        index: 1,
-    };
-    let live = [live_worker.clone()].into_iter().collect::<BTreeSet<_>>();
-    let retrying = [retrying_worker.clone()]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let wanted = [live_worker.clone()].into_iter().collect::<BTreeSet<_>>();
-    let known_groups = instance_groups(
-        [
-            (&live_worker, &live_instance),
-            (&retrying_worker, &retrying_instance),
-        ]
-        .into_iter(),
-    );
-    let wanted_groups = instance_groups([(&live_worker, &live_instance)].into_iter());
-
-    let (removed, added) =
-        refresh_changes_with_group_resets(&live, &retrying, &wanted, &known_groups, &wanted_groups);
-
-    assert_eq!(removed.as_slice(), std::slice::from_ref(&live_worker));
-    assert_eq!(added.as_slice(), std::slice::from_ref(&live_worker));
-    assert!(!removed.contains(&retrying_worker));
-    assert!(!added.contains(&retrying_worker));
-}
-
-/// Scenario: One of two duplicate-name processes exits and PDH renumbers the survivor.
-/// Guarantees: Every handle in that duplicate group is recreated so no native or receiver history crosses process identities.
-#[test]
-fn duplicate_group_churn_recreates_retained_paths() {
-    let worker = CounterKey::new(0, r"\Process(worker)\% Processor Time");
-    let worker_duplicate = CounterKey::new(0, r"\Process(worker#1)\% Processor Time");
-    let unrelated = CounterKey::new(0, r"\Process(other)\% Processor Time");
-    let worker_instance = InstanceIdentity {
-        name: "worker".to_owned(),
-        parent: None,
-        index: 0,
-    };
-    let worker_duplicate_instance = InstanceIdentity {
-        name: "worker".to_owned(),
-        parent: None,
-        index: 1,
-    };
-    let unrelated_instance = InstanceIdentity {
-        name: "other".to_owned(),
-        parent: None,
-        index: 0,
-    };
-    let existing = [worker.clone(), worker_duplicate.clone(), unrelated.clone()]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let wanted = [worker.clone(), unrelated.clone()]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let existing_groups = instance_groups(
-        [
-            (&worker, &worker_instance),
-            (&worker_duplicate, &worker_duplicate_instance),
-            (&unrelated, &unrelated_instance),
-        ]
-        .into_iter(),
-    );
-    let wanted_groups = instance_groups(
-        [
-            (&worker, &worker_instance),
-            (&unrelated, &unrelated_instance),
-        ]
-        .into_iter(),
-    );
-
-    let (removed, added) = refresh_changes_with_group_resets(
-        &existing,
-        &BTreeSet::new(),
-        &wanted,
-        &existing_groups,
-        &wanted_groups,
-    );
-
-    assert_eq!(
-        removed.iter().cloned().collect::<BTreeSet<_>>(),
-        [worker.clone(), worker_duplicate]
-            .into_iter()
+        index,
+    });
+    let keys = members.map(|(name, index)| {
+        let instance = if index == 0 {
+            name.to_owned()
+        } else {
+            format!("{name}#{index}")
+        };
+        CounterKey::new(0, &format!(r"\Process({instance})\% Processor Time"))
+    });
+    let cases = [
+        (
+            "set_difference",
+            &[0, 3][..],
+            &[][..],
+            &[4, 0][..],
+            false,
+            &[3][..],
+            &[4][..],
+        ),
+        (
+            "unchanged_duplicates",
+            &[0, 1][..],
+            &[][..],
+            &[1, 0][..],
+            true,
+            &[][..],
+            &[][..],
+        ),
+        (
+            "retrying_duplicate",
+            &[0][..],
+            &[1][..],
+            &[1, 0][..],
+            true,
+            &[][..],
+            &[][..],
+        ),
+        (
+            "departed_retry",
+            &[0][..],
+            &[1][..],
+            &[0][..],
+            true,
+            &[0][..],
+            &[0][..],
+        ),
+        (
+            "duplicate_churn",
+            &[0, 1, 2][..],
+            &[][..],
+            &[0, 2][..],
+            true,
+            &[0, 1][..],
+            &[0][..],
+        ),
+    ];
+    let key_set = |indices: &[usize]| {
+        indices
+            .iter()
+            .map(|index| keys[*index].clone())
             .collect::<BTreeSet<_>>()
-    );
-    assert_eq!(added, vec![worker]);
-    assert!(!removed.contains(&unrelated));
-    assert!(!added.contains(&unrelated));
+    };
+    for (name, live, retrying, wanted, groups, removed, added) in cases {
+        let known_groups = if groups {
+            instance_groups(
+                live.iter()
+                    .chain(retrying)
+                    .map(|index| (&keys[*index], &identities[*index])),
+            )
+        } else {
+            BTreeMap::new()
+        };
+        let wanted_groups = if groups {
+            instance_groups(
+                wanted
+                    .iter()
+                    .map(|index| (&keys[*index], &identities[*index])),
+            )
+        } else {
+            BTreeMap::new()
+        };
+        let actual = refresh_changes_with_group_resets(
+            &key_set(live),
+            &key_set(retrying),
+            &key_set(wanted),
+            &known_groups,
+            &wanted_groups,
+        );
+        assert_eq!(
+            actual.0,
+            key_set(removed).into_iter().collect::<Vec<_>>(),
+            "{name}"
+        );
+        assert_eq!(
+            actual.1,
+            key_set(added).into_iter().collect::<Vec<_>>(),
+            "{name}"
+        );
+    }
 }
 
 /// Scenario: A wildcard expansion contains exact-case, case-distinct, and concrete instances.
@@ -3463,15 +3260,7 @@ fn retains_wildcard_only_aggregation_without_instance_label() {
     };
     let (state, mut query) = fake_query(
         vec![config],
-        vec![FakeCounter {
-            path: aggregate.to_owned(),
-            native_type: 0x0001_0100,
-            raw: None,
-            multi_count: 1,
-            formatted: Some(Number::Integer(42)),
-            raw_error: false,
-            formatted_error: false,
-        }],
+        vec![fake_counter(aggregate, Number::Integer(42))],
     );
     let _ = state
         .borrow_mut()

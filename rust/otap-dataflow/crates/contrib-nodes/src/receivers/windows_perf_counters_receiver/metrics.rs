@@ -24,6 +24,10 @@ pub(super) struct WindowsPerfCountersScrapeMetrics {
     pub attempts: Counter<u64>,
 }
 
+#[cfg(test)]
+#[path = "metrics_tests.rs"]
+mod tests;
+
 /// Lifecycle, inventory, and collection metrics.
 #[metric_set(name = "receiver.windows_perf_counters")]
 #[derive(Debug, Default, Clone)]
@@ -114,8 +118,6 @@ impl WindowsPerfCountersMetrics {
         self.query_rebuild_recoveries
             .add(diagnostics.query_rebuild_recoveries);
         self.warmup_omissions.add(diagnostics.warmup_omissions);
-        self.counter_read_failures
-            .add(diagnostics.counter_read_failures);
     }
 }
 
@@ -149,13 +151,5 @@ impl WindowsPerfCountersReceiverMetrics {
         let mut snapshots = self.scrapes.terminal_snapshots();
         snapshots.extend(self.health.terminal_snapshots());
         snapshots
-    }
-
-    #[cfg(test)]
-    pub(super) fn scrape_attempts(&self, outcome: Outcome) -> u64 {
-        self.scrapes
-            .get(OutcomeAttributes { outcome })
-            .attempts
-            .get()
     }
 }

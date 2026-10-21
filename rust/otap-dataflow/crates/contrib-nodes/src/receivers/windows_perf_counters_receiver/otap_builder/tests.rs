@@ -1,8 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::config::Config;
-use super::super::model::{InstanceIdentity, PendingMetadata, SampleFailure};
+use super::super::config::{Config, InstanceConfig};
+use super::super::model::{InstanceIdentity, PendingMetadata, SampleFailure, SampleMember};
 use super::*;
 use arrow::array::{Array, Int64Array, UInt8Array};
 use arrow::util::display::array_value_to_string;
@@ -12,6 +12,13 @@ use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric;
 use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryIntoWithOptions};
 use otel_arrow_dfe_pdata_codec::OtapPayload;
 use prost::Message;
+
+pub(in super::super) fn into_otap(
+    counters: &[CounterConfig],
+    sample: Sample,
+) -> Result<Option<OtapArrowRecords>, ArrowError> {
+    project_sample(counters, &sample).map_err(|error| error.0)
+}
 
 fn counter(path: &str, name: &str, unit: &str) -> CounterConfig {
     CounterConfig {
@@ -624,17 +631,19 @@ fn gauge_ignores_irrelevant_start_time() {
         "windows.memory.available",
         "By",
     )];
+    let mut observation = point(
+        0,
+        r"\Memory\Available Bytes",
+        SampleValue::Value(Number::Integer(42)),
+    );
+    observation.start_time_unix_nano = Some(2);
     assert!(
         into_otap(
             &counters,
             Sample {
                 timestamp_unix_nano: 1,
                 members: Vec::new(),
-                points: vec![point(
-                    0,
-                    r"\Memory\Available Bytes",
-                    SampleValue::Value(Number::Integer(42)),
-                )],
+                points: vec![observation],
                 metadata: Default::default(),
             }
         )

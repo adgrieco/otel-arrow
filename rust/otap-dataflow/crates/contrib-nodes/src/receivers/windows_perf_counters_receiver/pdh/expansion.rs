@@ -3,15 +3,10 @@
 
 use super::super::model::InstanceIdentity;
 use super::error::Error;
-#[cfg(test)]
-use super::native::NativePdh;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Parses a counter path through handle-independent native PDH path processing.
 #[cfg(test)]
-pub(super) fn parse_instance(path: &str) -> Result<InstanceIdentity, Error> {
-    NativePdh::parse_instance_path(path)
-}
+pub(super) use test_support::{is_aggregation_instance, limit_expanded_paths, parse_instance};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct CounterKey {
@@ -67,17 +62,6 @@ pub(super) fn keyed_expanded_paths(
     keyed
 }
 
-#[cfg(test)]
-pub(super) fn limit_expanded_paths<T>(
-    paths: &mut Vec<T>,
-    per_wildcard_limit: usize,
-    total_remaining: usize,
-) -> ExpansionAllocation {
-    let allocation = expansion_allocation(paths.len(), per_wildcard_limit, total_remaining);
-    paths.truncate(allocation.retained);
-    allocation
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ExpansionAllocation {
     pub(super) retained: usize,
@@ -101,11 +85,6 @@ pub(super) fn expansion_allocation(
     }
 }
 
-#[cfg(test)]
-pub(super) fn is_aggregation_instance(path: &str, aggregation_name: &str) -> bool {
-    parse_instance(path).is_ok_and(|instance| matches_aggregation(instance, aggregation_name))
-}
-
 fn matches_aggregation(instance: InstanceIdentity, aggregation_name: &str) -> bool {
     let name = if instance.index == 0 {
         instance.name
@@ -116,6 +95,10 @@ fn matches_aggregation(instance: InstanceIdentity, aggregation_name: &str) -> bo
         format!("{parent}/{name}") == aggregation_name
     })
 }
+
+#[cfg(test)]
+#[path = "tests/expansion_support.rs"]
+mod test_support;
 
 pub(super) fn cleanup_aggregation_instances(
     paths: &mut Vec<String>,

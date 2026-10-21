@@ -1,11 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(test)]
-use super::config::InstanceConfig;
 use super::config::{CounterConfig, MetricKind};
-#[cfg(test)]
-use super::model::SampleMember;
 use super::model::{InstanceIdentity, Number, Sample, SamplePoint, SampleValue};
 use arrow::error::ArrowError;
 use otel_arrow_dfe_pdata::encode::record::attributes::StrKeysAttributesRecordBatchBuilder;
@@ -300,12 +296,7 @@ pub(super) fn project_sample(
 }
 
 #[cfg(test)]
-pub(super) fn into_otap(
-    counters: &[CounterConfig],
-    sample: Sample,
-) -> Result<Option<OtapArrowRecords>, ArrowError> {
-    project_sample(counters, &sample).map_err(|error| error.0)
-}
+pub(super) use tests::into_otap;
 
 #[cfg(test)]
 mod tests;

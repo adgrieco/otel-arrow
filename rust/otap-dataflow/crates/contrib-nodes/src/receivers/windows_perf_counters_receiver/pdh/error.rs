@@ -253,15 +253,9 @@ impl Error {
         )
     }
 
-    pub(super) fn with_cleanup_failure(path: &str, primary: Option<Self>, cleanup: Self) -> Self {
-        let permanent = primary
-            .as_ref()
-            .is_some_and(Self::is_permanent_counter_error);
-        let cleanup = cleanup.to_string();
-        let message = primary.map_or_else(
-            || cleanup.clone(),
-            |primary| format!("{primary}; {cleanup}"),
-        );
+    pub(super) fn with_cleanup_failure(path: &str, primary: Self, cleanup: Self) -> Self {
+        let permanent = primary.is_permanent_counter_error();
+        let message = format!("{primary}; {cleanup}");
         Self::CounterSetup {
             path: path.to_owned(),
             message,

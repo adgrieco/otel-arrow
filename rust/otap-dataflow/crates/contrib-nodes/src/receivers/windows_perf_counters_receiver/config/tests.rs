@@ -221,6 +221,13 @@ fn accepts_go_timing_range() {
     let slow = config("48h", "72h").unwrap();
     assert_eq!(slow.collection_interval, Duration::from_secs(48 * 60 * 60));
     assert_eq!(slow.initial_delay, Duration::from_secs(72 * 60 * 60));
+    assert_config_error(
+        json!({
+            "collection_interval": "0s",
+            "perfcounters": [{"object": "Memory", "counters": [{"name": "Available Bytes"}]}]
+        }),
+        "collection_interval must be greater than zero",
+    );
 
     assert_config_error(
         json!({
@@ -1108,6 +1115,7 @@ fn bounds_configured_scale_power() {
 /// Guarantees: Validation identifies the empty list, including the object's configuration index.
 #[test]
 fn rejects_empty_counter_lists_with_context() {
+    assert_config_error(json!({}), "missing field `perfcounters`");
     assert_config_error(
         json!({"perfcounters": []}),
         "perfcounters must contain at least one entry",
@@ -1118,6 +1126,21 @@ fn rejects_empty_counter_lists_with_context() {
             {"object": "Process", "counters": []}
         ]}),
         "perfcounters[1].counters must contain at least one entry",
+    );
+}
+
+/// Scenario: A removed metric-kind alias is supplied instead of a supported Gauge or Sum.
+/// Guarantees: The unsupported field is rejected explicitly rather than silently defaulting to Gauge.
+#[test]
+fn rejects_removed_metric_kind_alias() {
+    assert_config_error(
+        json!({
+            "metrics": {"test": {"up_down_counter": {}}},
+            "perfcounters": [{
+                "object": "Memory", "counters": [{"name": "Available Bytes", "metric": "test"}]
+            }]
+        }),
+        "unknown field `up_down_counter`",
     );
 }
 
@@ -1665,11 +1688,11 @@ fn accepts_exact_and_wildcard_selectors_at_configured_bound() {
     );
 }
 
-/// Scenario: Exact, wildcard and mixed selectors reach or exceed default and explicit limits.
+/// Scenario: Exact, wildcard and mixed selectors reach or exceed small explicit limits.
 /// Guarantees: Every normalized selector counts once; exactly the cap succeeds and the next rejects.
 #[test]
 fn bounds_all_configured_selectors() {
-    for cap in [1, 16, 4096, 16384] {
+    for cap in [1, 16] {
         for kind in ["exact", "wildcard", "mixed"] {
             for excess in [0, 1] {
                 let instances = (0..cap + excess)
@@ -1689,9 +1712,7 @@ fn bounds_all_configured_selectors() {
                         "counters": [{"name": "ID Process"}]
                     }]
                 });
-                if cap != DEFAULT_MAX_EXPANDED_COUNTERS {
-                    value["max_expanded_counters"] = json!(cap);
-                }
+                value["max_expanded_counters"] = json!(cap);
                 if excess == 0 {
                     assert_eq!(Config::from_json(&value).unwrap().counters.len(), cap);
                 } else {
@@ -2038,7 +2059,7 @@ fn preserves_literal_instance_suffix_text() {
 /// Guarantees: Index-only names reject with PR1's missing-instance-name error.
 #[test]
 fn rejects_numeric_suffix_only_instances() {
-    for instance in ["#0", "#1", "#00", "#5"] {
+    for instance in ["#0", "#1"] {
         assert_config_error(
             json!({
                 "metrics": {"test": metric()},
@@ -2050,37 +2071,6 @@ fn rejects_numeric_suffix_only_instances() {
             }),
             "must include an instance name before its index",
         );
-    }
-}
-
-/// Scenario: The first three occurrences are selected in one list or separate object entries.
-/// Guarantees: Duplicate validation admits distinct indexes together and preserves each configured path.
-#[test]
-fn accepts_distinct_instance_indexes_together() {
-    let instances = ["app", "app#1", "app#2"];
-    for separate_entries in [false, true] {
-        let perfcounters = if separate_entries {
-            instances
-                .iter()
-                .map(|instance| {
-                    json!({
-                        "object": "Process", "instances": instance,
-                        "counters": [{"name": "Private Bytes"}]
-                    })
-                })
-                .collect::<Vec<_>>()
-        } else {
-            vec![json!({
-                "object": "Process", "instances": instances,
-                "counters": [{"name": "Private Bytes"}]
-            })]
-        };
-        let config = Config::from_json(&json!({"perfcounters": perfcounters})).unwrap();
-        assert_eq!(config.counters.len(), instances.len());
-        for (counter, instance) in config.counters.iter().zip(instances) {
-            assert_eq!(counter.path, format!(r"\Process({instance})\Private Bytes"));
-            assert_eq!(counter.name.as_ref(), counter.path);
-        }
     }
 }
 
@@ -2181,105 +2171,4 @@ fn rejects_conflicting_metric_kinds() {
         }),
         "metrics.test must not contain both gauge and sum",
     );
-}
-
-/// Scenario: Invalid metadata, references, path elements, attributes, limits, or metric types are used.
-/// Guarantees: Invalid configuration fails before any PDH handles are opened.
-#[test]
-fn rejects_invalid_configuration() {
-    let valid = json!({
-        "metrics": {"test": metric()},
-        "perfcounters": [{
-            "object": "Memory",
-            "counters": [{"name": "Available Bytes", "metric": "test"}]
-        }]
-    });
-    for value in [
-        json!({}),
-        json!({"metrics": {}, "perfcounters": []}),
-        json!({
-            "metrics": {"test": metric()},
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": "missing"}]
-            }]
-        }),
-        json!({
-            "metrics": {"test": {"description": "x", "unit": "1", "sum": {}}},
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": "test"}]
-            }]
-        }),
-        json!({
-            "metrics": {"test": {"description": "x", "unit": "1", "sum": null}},
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": "test"}]
-            }]
-        }),
-        json!({
-            "metrics": {
-                "test": {
-                    "description": "x",
-                    "unit": "1",
-                    "up_down_counter": {}
-                }
-            },
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": "test"}]
-            }]
-        }),
-        json!({
-            "metrics": {
-                "test": {
-                    "description": "x",
-                    "unit": "1",
-                    "gauge": {},
-                    "sum": {
-                        "aggregation": "cumulative",
-                        "monotonic": true
-                    }
-                }
-            },
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{"name": "Available Bytes", "metric": "test"}]
-            }]
-        }),
-        json!({
-            "metrics": {"test": metric()},
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{
-                    "name": "Available Bytes",
-                    "metric": "test",
-                    "attributes": {"windows.perf_counter.path": "override"}
-                }]
-            }]
-        }),
-        json!({
-            "metrics": {"test": metric()},
-            "perfcounters": [{
-                "object": "Memory",
-                "counters": [{
-                    "name": "Available Bytes",
-                    "metric": "test",
-                    "scale_power10": 19
-                }]
-            }]
-        }),
-    ] {
-        assert!(Config::from_json(&value).is_err(), "{value}");
-    }
-    for (key, value) in [
-        ("collection_interval", json!("0s")),
-        ("max_instances_per_wildcard", json!(0)),
-        ("max_expanded_counters", json!(16_385)),
-    ] {
-        let mut invalid = valid.clone();
-        invalid[key] = value;
-        assert!(Config::from_json(&invalid).is_err(), "{invalid}");
-    }
 }

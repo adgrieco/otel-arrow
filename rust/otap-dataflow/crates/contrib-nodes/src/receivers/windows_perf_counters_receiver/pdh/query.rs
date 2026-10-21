@@ -40,7 +40,6 @@ pub(super) struct Query<A: PdhApi = NativePdh> {
     exact_counter_reservations: usize,
     next_wildcard_admission_order: u64,
     pub(super) last_wildcard_refresh: Instant,
-    wildcard_refresh_pending: bool,
     initial_wildcard_refresh: bool,
     pub(super) last_object_refresh: Instant,
     selector_failures: BTreeSet<usize>,
@@ -59,7 +58,7 @@ impl Query {
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self, Error> {
         Self::open_with_seed(
-            NativePdh::open_controlled(node, Some(shutdown))?,
+            NativePdh::open_controlled(node, shutdown)?,
             configs,
             exact_retry_cap,
             wildcard_refresh_interval,
@@ -113,7 +112,6 @@ impl<A: PdhApi> Query<A> {
             next_wildcard_admission_order: 0,
             last_wildcard_refresh: seed
                 .map_or_else(Instant::now, |seed| seed.last_wildcard_refresh),
-            wildcard_refresh_pending: false,
             initial_wildcard_refresh: seed.is_none(),
             last_object_refresh: seed.map_or_else(Instant::now, |seed| seed.last_object_refresh),
             selector_failures: seed
@@ -127,10 +125,6 @@ impl<A: PdhApi> Query<A> {
         if let Some(seed) = seed {
             query.initialize_seeded_wildcards(seed, &mut metadata)?;
         }
-        query.wildcard_refresh_pending = query.has_wildcard_configs()
-            && seed.is_none_or(|seed| {
-                seed.last_wildcard_refresh.elapsed() >= wildcard_refresh_interval
-            });
         query.pending.merge(metadata);
         Ok(query)
     }
@@ -182,10 +176,7 @@ impl<A: PdhApi> Query<A> {
         let wildcard_targets = self
             .counter_targets()
             .filter_map(|(key, target)| {
-                target
-                    .origin
-                    .is_wildcard()
-                    .then_some((key.clone(), target.for_recreated_query()))
+                target.origin.is_wildcard().then_some((key.clone(), target))
             })
             .collect::<BTreeMap<_, _>>()
             .into_iter()
@@ -263,7 +254,6 @@ impl<A: PdhApi> Query<A> {
                     && instance.is_some(),
                 admission_order: None,
                 removal_counted: false,
-                history: CounterHistory::default(),
             };
             if let Err(error) = self.add_counter(target.clone()) {
                 if error.is_stop() || error.requires_immediate_query_rebuild() {
@@ -276,7 +266,7 @@ impl<A: PdhApi> Query<A> {
                     Some(sample_failure(config_index, &error))
                 };
                 self.pending.failures.extend(failure);
-                if exact_add_failure_disposition(&error) == ExactAddFailureDisposition::Retry {
+                if !error.is_permanent_counter_error() {
                     self.schedule_retry(key, target, Instant::now());
                 }
             }
@@ -325,7 +315,7 @@ impl<A: PdhApi> Query<A> {
                 handle: counter,
                 kind,
                 scale_power10: self.configs[target.config_index].scale_power10,
-                history: target.history,
+                history: CounterHistory::default(),
                 origin: target.origin,
                 instance: target.instance,
                 emit_instance_attribute: target.emit_instance_attribute,
@@ -429,7 +419,7 @@ impl<A: PdhApi> Query<A> {
                     let _ = self.object_refresh_selectors.remove(&config_index);
                     discoveries.push(WildcardDiscovery {
                         config_index,
-                        paths: Ok(paths),
+                        paths,
                     });
                 }
                 Err(error) if error.is_stop() => return Err(error),
@@ -448,13 +438,12 @@ impl<A: PdhApi> Query<A> {
         let reserved = desired.len();
         self.prepare_successful_discoveries(discoveries, &mut desired, reserved, metadata)?;
         self.last_wildcard_refresh = Instant::now();
-        self.wildcard_refresh_pending = false;
         self.initial_wildcard_refresh = false;
         Ok(())
     }
 
     pub(super) fn wildcard_refresh_due(&self) -> bool {
-        self.wildcard_refresh_pending
+        (self.initial_wildcard_refresh && self.has_wildcard_configs())
             || ((self.has_wildcard_configs() || !self.object_refresh_selectors.is_empty())
                 && self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval)
     }
@@ -565,9 +554,7 @@ impl<A: PdhApi> Query<A> {
         let mut prepared = Vec::new();
         for discovery in discoveries {
             self.api.check_running()?;
-            let Ok(paths) = discovery.paths else {
-                continue;
-            };
+            let paths = discovery.paths;
             let config_index = discovery.config_index;
             let mut paths =
                 keyed_expanded_paths(self.configs[config_index].source_mapping_index, paths)
@@ -934,11 +921,7 @@ impl<A: PdhApi> Query<A> {
                         .failures
                         .push(sample_failure(counter.config_index, &error));
                 }
-                let retry_target = wanted.contains(key).then(|| {
-                    let mut target = counter.target();
-                    target.history.restart_pdh_sampling();
-                    target
-                });
+                let retry_target = wanted.contains(key).then(|| counter.target());
                 let _ = self.pending_removals.insert(
                     key.clone(),
                     PendingRemoval::new(
@@ -979,8 +962,9 @@ impl<A: PdhApi> Query<A> {
                 emit_instance_attribute,
             }) = desired.remove(key)
             else {
-                metadata.diagnostics.discovery_failures += 1;
-                continue;
+                return Err(Error::InvalidSample(
+                    "wildcard admission lost a desired counter",
+                ));
             };
             let admission_order = self.next_wildcard_admission_order;
             self.next_wildcard_admission_order =
@@ -993,7 +977,6 @@ impl<A: PdhApi> Query<A> {
                 emit_instance_attribute,
                 admission_order: Some(admission_order),
                 removal_counted: false,
-                history: CounterHistory::default(),
             };
             if let Some(removal) = self.pending_removals.get_mut(key) {
                 removal.retry_target = Some(target);
@@ -1051,25 +1034,6 @@ impl<A: PdhApi> Query<A> {
             .count()
     }
 
-    #[cfg(test)]
-    pub(super) fn reserved_native_entry_count(&self) -> usize {
-        self.exact_counter_reservations + self.reserved_expanded_count()
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_max_native_counters(
-        &mut self,
-        max_native_counters: usize,
-    ) -> Result<(), Error> {
-        if self.exact_counter_reservations > max_native_counters {
-            return Err(Error::InvalidSample(
-                "query native-counter limit is below its exact-counter reservation",
-            ));
-        }
-        self.max_native_counters = max_native_counters;
-        Ok(())
-    }
-
     pub(super) fn prime(&mut self) -> Result<(), Error> {
         let result = self.collect().map(|sample| {
             self.pending.merge(sample.metadata);
@@ -1110,32 +1074,6 @@ impl<A: PdhApi> Query<A> {
                     .count(),
             )
             .saturating_sub(allocated_expanded)
-    }
-
-    #[cfg(test)]
-    fn reserved_expanded_count(&self) -> usize {
-        let live = self
-            .counters
-            .values()
-            .filter(|counter| counter.origin.is_wildcard())
-            .count();
-        let retrying = self
-            .retry_states
-            .iter()
-            .filter(|(key, state)| {
-                state.target.origin.is_wildcard() && !self.counters.contains_key(*key)
-            })
-            .count();
-        live.saturating_add(retrying)
-            .saturating_add(self.pending_wildcard_removal_count())
-    }
-
-    #[cfg(test)]
-    fn pending_wildcard_removal_count(&self) -> usize {
-        self.pending_removals
-            .values()
-            .filter(|removal| removal.counter.origin.is_wildcard())
-            .count()
     }
 
     fn retry_pending_removals(
@@ -1183,8 +1121,11 @@ impl<A: PdhApi> Query<A> {
     }
 
     pub(super) fn collect(&mut self) -> Result<Sample, Error> {
+        self.collect_at(Instant::now())
+    }
+
+    pub(super) fn collect_at(&mut self, now: Instant) -> Result<Sample, Error> {
         self.api.check_running()?;
-        let now = Instant::now();
         self.refresh_all_wildcards_managed()?;
         let mut metadata = std::mem::take(&mut self.pending);
         metadata.diagnostics.any_query_collected = false;
@@ -1231,9 +1172,6 @@ impl<A: PdhApi> Query<A> {
                 return Err(self.restart_sampling_and_restore_collection_error(metadata, error));
             }
         };
-        if timestamp_unix_nano < self.previous_timestamp_unix_nano {
-            self.reset_histories_for_clock_rollback();
-        }
         let _ = cumulative_start_time(
             &mut self.start_time_unix_nano,
             &mut self.previous_timestamp_unix_nano,
@@ -1276,9 +1214,7 @@ impl<A: PdhApi> Query<A> {
                         .failures
                         .push(sample_failure(counter.config_index, &error));
                     if error.is_invalid_counter_handle_read() {
-                        let mut target = counter.target();
-                        target.history.restart_pdh_sampling();
-                        retired.push((key.clone(), target));
+                        retired.push((key.clone(), counter.target()));
                     }
                     continue;
                 }
@@ -1323,22 +1259,6 @@ impl<A: PdhApi> Query<A> {
         }
         Ok(points)
     }
-
-    fn reset_histories_for_clock_rollback(&mut self) {
-        for history in self
-            .retry_states
-            .values_mut()
-            .map(|state| &mut state.target.history)
-            .chain(self.pending_removals.values_mut().filter_map(|removal| {
-                removal
-                    .retry_target
-                    .as_mut()
-                    .map(|target| &mut target.history)
-            }))
-        {
-            *history = CounterHistory::default();
-        }
-    }
 }
 
 fn setup_error_with_cleanup<A: PdhApi>(
@@ -1349,7 +1269,7 @@ fn setup_error_with_cleanup<A: PdhApi>(
 ) -> Error {
     match api.remove(counter, path) {
         Ok(()) => error,
-        Err(cleanup) => Error::with_cleanup_failure(path, Some(error), cleanup),
+        Err(cleanup) => Error::with_cleanup_failure(path, error, cleanup),
     }
 }
 
@@ -1399,13 +1319,6 @@ pub(super) struct QueryRecreationSeed {
     object_refresh_selectors: BTreeSet<usize>,
 }
 
-impl QueryRecreationSeed {
-    #[cfg(test)]
-    pub(super) fn reserved_native_entry_count(&self, exact_counter_reservations: usize) -> usize {
-        exact_counter_reservations.saturating_add(self.wildcard_targets.len())
-    }
-}
-
 struct WildcardReconciliation {
     live: BTreeSet<CounterKey>,
     wanted: BTreeSet<CounterKey>,
@@ -1415,21 +1328,7 @@ struct WildcardReconciliation {
 
 struct WildcardDiscovery {
     config_index: usize,
-    paths: Result<Vec<String>, Error>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ExactAddFailureDisposition {
-    Diagnostic,
-    Retry,
-}
-
-pub(super) fn exact_add_failure_disposition(error: &Error) -> ExactAddFailureDisposition {
-    if error.is_permanent_counter_error() {
-        ExactAddFailureDisposition::Diagnostic
-    } else {
-        ExactAddFailureDisposition::Retry
-    }
+    paths: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -1441,7 +1340,6 @@ struct CounterTarget {
     emit_instance_attribute: bool,
     admission_order: Option<u64>,
     removal_counted: bool,
-    history: CounterHistory,
 }
 
 #[derive(Clone, Copy)]
@@ -1542,11 +1440,6 @@ impl CounterTarget {
             emit_instance_attribute: self.emit_instance_attribute,
         }
     }
-
-    fn for_recreated_query(mut self) -> Self {
-        self.history.restart_pdh_sampling();
-        self
-    }
 }
 
 fn restart_query_pdh_sampling<'a>(histories: impl Iterator<Item = &'a mut CounterHistory>) {
@@ -1605,7 +1498,6 @@ impl<C> CounterHandle<C> {
             emit_instance_attribute: self.emit_instance_attribute,
             admission_order: self.admission_order,
             removal_counted: self.removal_counted,
-            history: self.history,
         }
     }
 
@@ -1713,66 +1605,9 @@ impl<C> CounterHandle<C> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "tests/query_internal.rs"]
+mod tests;
 
-    /// Scenario: The same failed counter is scheduled repeatedly before it recovers.
-    /// Guarantees: One stable identity owns one retry entry and repeated failures advance its bounded backoff.
-    #[test]
-    fn retry_state_is_unique_per_stable_identity() {
-        let key = CounterKey::new(0, r"\Process(worker)\Private Bytes");
-        let target = CounterTarget {
-            config_index: 0,
-            path: Arc::from(r"\Process(worker)\Private Bytes"),
-            origin: CounterOrigin::Wildcard,
-            instance: Some(Arc::new(InstanceIdentity {
-                name: "worker".to_owned(),
-                parent: None,
-                index: 0,
-            })),
-            emit_instance_attribute: true,
-            admission_order: Some(0),
-            removal_counted: false,
-            history: CounterHistory::default(),
-        };
-        let now = Instant::now();
-        let mut states = BTreeMap::new();
-
-        schedule_retry_state(
-            &mut states,
-            key.clone(),
-            target.clone(),
-            now,
-            Duration::from_secs(30),
-        );
-        schedule_retry_state(
-            &mut states,
-            key.clone(),
-            target,
-            now,
-            Duration::from_secs(30),
-        );
-
-        assert_eq!(states.len(), 1);
-        let state = states.get(&key).unwrap();
-        assert_eq!(state.attempts, 2);
-        assert_eq!(state.next_attempt, now + Duration::from_secs(2));
-    }
-
-    /// Scenario: Exact and wildcard counter-add failures use distinct retry clocks.
-    /// Guarantees: Exact targets cap backoff at the collection retry cadence while wildcard targets retain the discovery refresh cap.
-    #[test]
-    fn retry_cap_follows_counter_origin() {
-        let exact_retry_cap = Duration::from_secs(2);
-        let wildcard_retry_cap = Duration::from_secs(60);
-
-        assert_eq!(
-            CounterOrigin::Exact.retry_cap(exact_retry_cap, wildcard_retry_cap),
-            exact_retry_cap
-        );
-        assert_eq!(
-            CounterOrigin::Wildcard.retry_cap(exact_retry_cap, wildcard_retry_cap),
-            wildcard_retry_cap
-        );
-    }
-}
+#[cfg(test)]
+#[path = "tests/query_support.rs"]
+mod test_support;

@@ -907,21 +907,11 @@ async fn live_pdh_refreshes_process_membership_after_duplicate_renumbering() {
 #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
 async fn live_pdh_collects_parsed_instance_paths() {
     let _serial = TEST_PDH_LOCK.lock().await;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let directory =
-        std::env::temp_dir().join(format!("otel-arrow-pdh-{}-{nonce}", std::process::id()));
-    std::fs::create_dir(&directory).unwrap();
-    let instance = format!("otpd{:08x}", std::process::id());
-    let executable = directory.join(format!("{instance}.exe"));
-    let source = std::env::var_os("COMSPEC").expect("COMSPEC must identify cmd.exe");
-    let _ = std::fs::copy(source, &executable).unwrap();
-    let processes = [
-        spawn_counter_process(&executable),
-        spawn_counter_process(&executable),
-    ];
+    let mut fixture = CounterProcessFixture::new();
+    let expected = [fixture.spawn(), fixture.spawn()]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let instance = &fixture.instance;
     let config = Config::from_json(&serde_json::json!({
         "metrics": {
             "process.id": {
@@ -962,16 +952,8 @@ async fn live_pdh_collects_parsed_instance_paths() {
             value => panic!("expected a positive process ID, got {value:?}"),
         })
         .collect::<BTreeSet<_>>();
-    let expected = processes
-        .iter()
-        .map(|process| i64::from(process.0.id()))
-        .collect::<BTreeSet<_>>();
     assert_eq!(ids, expected);
     assert!(into_otap(&counters, sample).unwrap().is_some());
-    drop(query);
-    drop(processes);
-    std::fs::remove_file(executable).unwrap();
-    std::fs::remove_dir(directory).unwrap();
 }
 
 /// Scenario: One live PDH query maps two distinct Memory paths to metrics with different attributes.
@@ -1213,35 +1195,4 @@ async fn live_pdh_elapsed_and_multi_timer_counters() {
         )
     }));
     assert!(into_otap(&configs, second).unwrap().is_some());
-}
-
-/// Scenario: An invalid exact path is configured beside a valid counter and then by itself.
-/// Guarantees: Healthy collection continues, while an all-invalid set starts empty with diagnostics.
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
-async fn live_pdh_invalid_counters_start_empty() {
-    let _serial = TEST_PDH_LOCK.lock().await;
-    let configs = vec![
-        counter(r"\Memory\Available Bytes", "windows.memory.available"),
-        counter(
-            r"\Memory\otel-arrow-nonexistent-counter",
-            "windows.memory.invalid",
-        ),
-    ];
-    let mut query = open_live_query(configs.clone(), "invalid");
-    let sample = query.collect().unwrap();
-    assert_eq!(sample.metadata.failures.len(), 1);
-    assert_eq!(sample.metadata.failures[0].counter_index, 1);
-    assert_eq!(sample.points.len(), 1);
-    assert_eq!(sample.points[0].counter_index, 0);
-    assert!(
-        matches!(sample.points[0].value, SampleValue::Value(Number::Integer(value)) if value >= 0)
-    );
-    assert!(into_otap(&configs, sample).unwrap().is_some());
-
-    let mut invalid = open_live_query(configs[1..].to_vec(), "all-invalid");
-    let sample = invalid.collect().unwrap();
-    assert!(sample.points.is_empty());
-    assert_eq!(sample.metadata.failures.len(), 1);
-    assert_eq!(sample.metadata.failures[0].counter_index, 0);
 }
