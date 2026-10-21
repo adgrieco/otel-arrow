@@ -131,7 +131,7 @@ windows.operations:
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `object` | Yes | None | Windows performance object |
-| `instances` | No | None | One instance, a list, or `"*"` |
+| `instances` | No | None | One instance, a list, or full/partial `*` and `?` patterns |
 | `aggregation_name` | No | `_Total` | Provider aggregation instance |
 | `counters` | Yes | None | Counter mappings for the object |
 
@@ -179,16 +179,38 @@ Validated on English hosts; counter names are configured in English and
 resolved independently of the display language. No non-English receiver run
 is claimed.
 
-Configure performance object and counter names in English. Every worker pins
-and verifies native UI language `0x0409` before its first PDH call. With any
-wildcard configured, a failed or ineffective pin or failed startup object-list
-refresh fails the whole receiver. Exact-only configurations skip refresh and
-warn once if the pin fails, continuing with English adds. Startup refresh
-changes PDH name lookups process-wide, not just for this worker.
+Configure performance object and counter names in English. Exact selectors
+use `PdhAddEnglishCounterW` and keep their configured English path. Each
+wildcard discovery temporarily English-adds the configured template, reads
+its host-language `PdhGetCounterInfoW.szFullPath`, attempts removal, and
+expands that path. Concrete members use `PdhAddCounterW`; their emitted
+paths may be host-language while metric names, metadata and path templates
+remain configured English. There is no host-language-selector fallback.
+The worker never changes thread language; `worker.startup` reports its native
+thread UI language for diagnostics, not as a startup prerequisite.
 
-English templates expand directly, and exact and expanded paths are added
-with `PdhAddEnglishCounterW`. Counter-info paths do not determine identity.
-There is no localized translation or fallback.
+Exact availability failures retry with the existing bounded backoff. Wildcard
+lookup failures retry at `wildcard_refresh_interval` and keep previously
+admitted healthy members collecting. An unresolved selector emits one warning
+per failure episode, with no reminders; healthy retained values do not resolve
+a failed lookup. Expansion with no current instances is not a failure and is
+looked up again at the next discovery.
+
+While an exact selector is unresolved or a wildcard lookup is failing, one
+object-list refresh covers all failing selectors at the start of a discovery.
+It runs only after `max(wildcard_refresh_interval, 10m)` since startup or the
+last attempt, before wildcard lookups, never as a forced startup refresh or
+an extra exact retry. Every attempt emits one informational `objects.refresh`
+event with duration, object count when available, and explicit failure detail.
+Failure does not stop collection. The synchronous call stalls the worker;
+approximately two seconds was observed in native German-context probes, not
+a timeout or completed receiver performance acceptance.
+
+Object-list refresh can change process-shared PDH name state. Changes to that
+state by another component, or language changes while running, are unsupported:
+expanded identities could change and require removal/re-addition. The fixed
+receiver still needs its identified German-context smoke before turn-on;
+native probes are not German receiver acceptance.
 
 Omit `instances`, or use an empty list, for objects without instances. Specify
 one name or a list for exact instances. Partial patterns such as `"worker*"` are
@@ -457,7 +479,12 @@ not by `--validate-and-exit`.
 
 - The source pipeline must allocate one core.
 - Multiple receiver nodes may use independent intervals. Each node owns one
-  worker and one PDH query. Avoid unintentionally configuring duplicate collection.
+  worker and one serving PDH query. Avoid unintentionally duplicating collection.
+- Wildcard resolution uses isolated per-template lookup queries. Each retains
+  at most one temporary handle if removal fails; that handle is never collected
+  or charged to member admission. Cleanup is retried before another lookup for
+  that template, without discarding healthy serving-query results. Worker
+  shutdown closes serving and lookup queries.
 - Use narrow wildcard patterns where possible. The configurable per-path and
   receiver-wide limits bound active handles and emitted cardinality.
 - One scrape can be in flight. Missed ticks are skipped rather than queued.
@@ -481,12 +508,15 @@ and low-cardinality reason. Other runtime events are:
 - `windows_perf_counters_receiver.shutdown.timeout`
 - `windows_perf_counters_receiver.query.close.fail`
 - `windows_perf_counters_receiver.worker.startup`
-- `windows_perf_counters_receiver.worker.language.warn`
+- `windows_perf_counters_receiver.objects.refresh`
 - `windows_perf_counters_receiver.startup.fail`
 - `windows_perf_counters_receiver.ready`
 
 Repeated scrape and counter warnings are suppressed until the affected
-condition recovers. Configuration events are:
+condition recovers. Selector warnings use reason `selector_unresolved` and
+re-arm only after successful selector resolution, not retained member values.
+Object-list refresh results are informational, including failed attempts.
+Configuration events are:
 
 - `windows_perf_counters_receiver.config.instance_override`
 - `windows_perf_counters_receiver.config.metric_definition.unused_path`

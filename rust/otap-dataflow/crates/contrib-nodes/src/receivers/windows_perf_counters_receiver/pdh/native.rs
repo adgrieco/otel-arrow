@@ -4,145 +4,85 @@
 //! Owns native handles, aligned metadata storage, and PDH status/value decoding.
 #![allow(unsafe_code)]
 
-use super::{Error, InstanceIdentity, Number, PdhApi, PdhOperation, RawSample, ValueFormat};
+use super::{
+    CounterLanguage, Error, InstanceIdentity, Number, PdhApi, PdhOperation, RawSample, ValueFormat,
+};
+use std::collections::BTreeMap;
 use std::mem::{size_of, size_of_val};
 use std::ptr::{null, null_mut};
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::Globalization::{GetThreadUILanguage, SetThreadUILanguage};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use windows_sys::Win32::Globalization::GetThreadUILanguage;
 use windows_sys::Win32::System::Performance::{
     PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
     PDH_COUNTER_INFO_W, PDH_COUNTER_PATH_ELEMENTS_W, PDH_CSTATUS_INVALID_DATA,
     PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_NO_INSTANCE, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE,
     PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY, PDH_INVALID_ARGUMENT,
     PDH_INVALID_DATA, PDH_MORE_DATA, PDH_NO_DATA, PDH_RAW_COUNTER, PDH_REFRESHCOUNTERS,
-    PERF_DETAIL_WIZARD, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhEnumObjectsW,
-    PdhExpandWildCardPathW, PdhGetCounterInfoW, PdhGetFormattedCounterValue, PdhGetRawCounterValue,
-    PdhOpenQueryW, PdhParseCounterPathW, PdhRemoveCounter,
+    PERF_DETAIL_WIZARD, PdhAddCounterW, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
+    PdhEnumObjectsW, PdhExpandWildCardPathW, PdhGetCounterInfoW, PdhGetFormattedCounterValue,
+    PdhGetRawCounterValue, PdhOpenQueryW, PdhParseCounterPathW, PdhRemoveCounter,
 };
 
 // These flags are not exposed by windows-sys 0.61.2.
 const PDH_FMT_NOSCALE: u32 = 0x0000_1000;
 const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
-const ENGLISH_UI_LANGUAGE: u16 = 0x0409;
-
-pub(super) fn initialize_worker(
-    node: &str,
-    refresh_objects: bool,
-    shutdown: &AtomicBool,
-) -> Result<(), Error> {
+pub(super) fn initialize_worker(node: &str, shutdown: &AtomicBool) -> Result<(), Error> {
     check_running(Some(shutdown))?;
-    let result = initialize_worker_with(
-        node,
-        refresh_objects,
-        || {
-            // SAFETY: This changes only the calling worker thread's UI language.
-            unsafe {
-                let returned = SetThreadUILanguage(ENGLISH_UI_LANGUAGE);
-                (returned, GetThreadUILanguage())
-            }
-        },
-        |refresh, size, buffer| {
-            check_running(Some(shutdown))?;
-            // SAFETY: Null selects the local live source and machine. The optional
-            // output slice is writable for the supplied UTF-16 element count.
-            Ok(unsafe {
-                PdhEnumObjectsW(
-                    null(),
-                    null(),
-                    buffer.map_or(null_mut(), |buffer| buffer.as_mut_ptr()),
-                    size,
-                    PERF_DETAIL_WIZARD,
-                    refresh.into(),
-                )
-            })
-        },
-    );
-    check_running(Some(shutdown))?;
-    result
-}
-
-fn initialize_worker_with(
-    node: &str,
-    refresh_objects: bool,
-    pin_language: impl FnOnce() -> (u16, u16),
-    mut enumerate_objects: impl FnMut(bool, &mut u32, Option<&mut [u16]>) -> Result<u32, Error>,
-) -> Result<(), Error> {
-    let (language_result, verified_language) = pin_language();
-    let mut refresh_status = None;
-    let mut enumeration_status = None;
-    let pin_error = (language_result != ENGLISH_UI_LANGUAGE
-        || verified_language != ENGLISH_UI_LANGUAGE)
-        .then_some(Error::WorkerLanguagePin {
-            requested: ENGLISH_UI_LANGUAGE,
-            returned: language_result,
-            verified: verified_language,
-        });
-    let result = if let Some(error) = pin_error {
-        if refresh_objects {
-            Err(error)
-        } else {
-            otel_arrow_dfe_telemetry::otel_warn!(
-                "windows_perf_counters_receiver.worker.language.warn",
-                node = node,
-                error = %error
-            );
-            Ok(())
-        }
-    } else if refresh_objects {
-        let mut size = 0;
-        let status = enumerate_objects(true, &mut size, None)?;
-        refresh_status = Some(status);
-        if !matches!(status, 0 | PDH_MORE_DATA) || (status == PDH_MORE_DATA && size == 0) {
-            Err(Error::WorkerObjectRefresh {
-                stage: "refresh sizing",
-                status,
-            })
-        } else if size == 0 {
-            Ok(())
-        } else {
-            let mut buffer = vec![0_u16; refresh_size(size, "refresh size conversion", status)?];
-            size = refresh_size(buffer.len(), "enumeration buffer size", status)?;
-            let mut status = enumerate_objects(false, &mut size, Some(&mut buffer))?;
-            enumeration_status = Some(status);
-            if status == PDH_MORE_DATA {
-                let capacity: u32 = refresh_size(buffer.len(), "enumeration buffer size", status)?;
-                size = size.max(capacity.checked_mul(2).ok_or(Error::WorkerObjectRefresh {
-                    stage: "enumeration buffer growth",
-                    status,
-                })?);
-                buffer.resize(
-                    refresh_size(size, "enumeration size conversion", status)?,
-                    0,
-                );
-                status = enumerate_objects(false, &mut size, Some(&mut buffer))?;
-                enumeration_status = Some(status);
-            }
-            if status == 0 {
-                Ok(())
-            } else {
-                Err(Error::WorkerObjectRefresh {
-                    stage: "enumeration fill",
-                    status,
-                })
-            }
-        }
-    } else {
-        Ok(())
-    };
+    // SAFETY: This reads only the calling worker thread's UI language.
+    let language = unsafe { GetThreadUILanguage() };
     otel_arrow_dfe_telemetry::otel_info!(
         "windows_perf_counters_receiver.worker.startup",
         node = node,
-        requested_language_id = ENGLISH_UI_LANGUAGE as u64,
-        language_result = language_result as u64,
-        verified_language_id = verified_language as u64,
-        wildcards_configured = refresh_objects,
-        object_refresh_status = ?refresh_status,
-        object_enumeration_status = ?enumeration_status
+        thread_ui_language_id = language as u64
     );
-    result
+    Ok(())
+}
+
+fn refresh_objects_with(
+    mut enumerate_objects: impl FnMut(bool, &mut u32, Option<&mut [u16]>) -> Result<u32, Error>,
+) -> Result<usize, Error> {
+    let mut size = 0;
+    let status = enumerate_objects(true, &mut size, None)?;
+    if !matches!(status, 0 | PDH_MORE_DATA) || (status == PDH_MORE_DATA && size == 0) {
+        Err(Error::WorkerObjectRefresh {
+            stage: "refresh sizing",
+            status,
+        })
+    } else if size == 0 {
+        Ok(0)
+    } else {
+        let mut buffer = vec![0_u16; refresh_size(size, "refresh size conversion", status)?];
+        size = refresh_size(buffer.len(), "enumeration buffer size", status)?;
+        let mut status = enumerate_objects(false, &mut size, Some(&mut buffer))?;
+        if status == PDH_MORE_DATA {
+            let capacity: u32 = refresh_size(buffer.len(), "enumeration buffer size", status)?;
+            size = size.max(capacity.checked_mul(2).ok_or(Error::WorkerObjectRefresh {
+                stage: "enumeration buffer growth",
+                status,
+            })?);
+            buffer.resize(
+                refresh_size(size, "enumeration size conversion", status)?,
+                0,
+            );
+            status = enumerate_objects(false, &mut size, Some(&mut buffer))?;
+        }
+        if status == 0 {
+            let filled = refresh_size(size, "enumeration filled size", status)?;
+            let objects = buffer.get(..filled).ok_or(Error::WorkerObjectRefresh {
+                stage: "enumeration filled size",
+                status,
+            })?;
+            Ok(NativePdh::parse_multi_sz(objects)?.len())
+        } else {
+            Err(Error::WorkerObjectRefresh {
+                stage: "enumeration fill",
+                status,
+            })
+        }
+    }
 }
 
 fn refresh_size<T, U>(value: T, stage: &'static str, status: u32) -> Result<U, Error>
@@ -398,6 +338,51 @@ pub(in super::super) struct NativePdh {
     counters: CounterHandles,
     node: String,
     shutdown: Option<Arc<AtomicBool>>,
+    lookup_queries: BTreeMap<String, LookupQuery>,
+}
+
+struct LookupQuery {
+    // A template awaiting removal must never join serving-query collection.
+    api: NativePdh,
+    pending: Option<CounterToken>,
+}
+
+pub(super) fn resolve_template<A: PdhApi>(
+    api: &mut A,
+    pending: &mut Option<A::Counter>,
+    path: &str,
+    full_path: impl FnOnce(&mut A, &A::Counter, &str) -> Result<String, Error>,
+) -> Result<String, Error> {
+    if let Some(counter) = pending.as_ref() {
+        api.remove(counter, path)
+            .map_err(|error| Error::WildcardCleanup {
+                path: path.to_owned(),
+                message: error.to_string(),
+                lookup_failed: false,
+            })?;
+        *pending = None;
+    }
+    api.check_running()?;
+    let counter = api.add(path, CounterLanguage::English)?;
+    let resolved = full_path(api, &counter, path);
+    let cleanup = api.remove(&counter, path);
+    if cleanup.is_err() {
+        *pending = Some(counter);
+    }
+    if resolved.as_ref().is_err_and(Error::is_stop) {
+        return resolved;
+    }
+    match cleanup {
+        Ok(()) => resolved,
+        Err(cleanup) => Err(Error::WildcardCleanup {
+            path: path.to_owned(),
+            message: resolved.as_ref().err().map_or_else(
+                || cleanup.to_string(),
+                |lookup| format!("{lookup}; {cleanup}"),
+            ),
+            lookup_failed: resolved.is_err(),
+        }),
+    }
 }
 
 impl NativePdh {
@@ -423,6 +408,7 @@ impl NativePdh {
             counters: CounterHandles::new(),
             node,
             shutdown,
+            lookup_queries: BTreeMap::new(),
         })
     }
 
@@ -480,6 +466,33 @@ impl NativePdh {
         Ok(Some(String::from_utf16_lossy(&units[..length])))
     }
 
+    fn full_path(&mut self, counter: &CounterToken, path: &str) -> Result<String, Error> {
+        let handle = self.counter_handle(counter, path)?;
+        let (buffer, filled) = fixed_header_buffer_with::<usize>(
+            path,
+            &COUNTER_INFO_BUFFER,
+            BufferFillSize::Reported,
+            |size, buffer| {
+                self.check_running()?;
+                // SAFETY: The counter belongs to this lookup query. The helper
+                // supplies aligned writable storage or null for sizing.
+                Ok(unsafe {
+                    PdhGetCounterInfoW(
+                        handle,
+                        false,
+                        size,
+                        buffer.map_or(null_mut(), |buffer| buffer.as_mut_ptr().cast()),
+                    )
+                })
+            },
+        )?;
+        // SAFETY: A successful fill initialized the validated fixed header.
+        let info = unsafe { &*buffer.as_ptr::<PDH_COUNTER_INFO_W>() };
+        Self::wide_string(info.szFullPath, &buffer, filled)?
+            .filter(|path| !path.is_empty())
+            .ok_or(Error::InvalidSample("counter info returned no full path"))
+    }
+
     fn parse_multi_sz(buffer: &[u16]) -> Result<Vec<String>, Error> {
         let mut values = Vec::new();
         let mut start = 0;
@@ -507,7 +520,7 @@ impl NativePdh {
     ) -> Result<Vec<u16>, Error> {
         let mut size = 0;
         let size_status = expand(&mut size, None)?;
-        if matches!(size_status, 0 | PDH_CSTATUS_NO_INSTANCE) && size == 0 {
+        if size_status == PDH_CSTATUS_NO_INSTANCE || (size_status == 0 && size == 0) {
             return Ok(Vec::new());
         }
         if size_status != PDH_MORE_DATA {
@@ -718,16 +731,26 @@ impl PdhApi for NativePdh {
         check_running(self.shutdown.as_deref())
     }
 
-    fn add(&mut self, path: &str) -> Result<CounterToken, Error> {
+    fn add(&mut self, path: &str, language: CounterLanguage) -> Result<CounterToken, Error> {
         self.check_running()?;
         let generation = self.counters.take_generation(path)?;
         let wide_path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
         let mut handle = null_mut();
         // SAFETY: The adapter owns the live query, path is NUL-terminated,
         // and the output handle is writable.
-        let status =
-            unsafe { PdhAddEnglishCounterW(self.query, wide_path.as_ptr(), 0, &mut handle) };
-        check(PdhOperation::AddEnglishCounter, path, status)?;
+        let (status, operation) = unsafe {
+            match language {
+                CounterLanguage::English => (
+                    PdhAddEnglishCounterW(self.query, wide_path.as_ptr(), 0, &mut handle),
+                    PdhOperation::AddEnglishCounter,
+                ),
+                CounterLanguage::Localized => (
+                    PdhAddCounterW(self.query, wide_path.as_ptr(), 0, &mut handle),
+                    PdhOperation::AddCounter,
+                ),
+            }
+        };
+        check(operation, path, status)?;
         Ok(self.counters.insert(generation, handle))
     }
 
@@ -800,7 +823,47 @@ impl PdhApi for NativePdh {
     }
 
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
-        self.expand_wildcard(path)
+        self.check_running()?;
+        if !self.lookup_queries.contains_key(path) {
+            let api = Self::open_controlled(self.node.clone(), self.shutdown.clone())?;
+            let _ = self
+                .lookup_queries
+                .insert(path.to_owned(), LookupQuery { api, pending: None });
+        }
+        let lookup = self
+            .lookup_queries
+            .get_mut(path)
+            .expect("lookup query was inserted");
+        let localized =
+            resolve_template(&mut lookup.api, &mut lookup.pending, path, Self::full_path)?;
+        self.expand_wildcard(&localized)
+    }
+
+    fn refresh_objects(&mut self) -> Result<usize, Error> {
+        let started = Instant::now();
+        let result = refresh_objects_with(|refresh, size, buffer| {
+            self.check_running()?;
+            // SAFETY: Null selects the live local source and machine. The output
+            // buffer is writable for the supplied UTF-16 element count.
+            Ok(unsafe {
+                PdhEnumObjectsW(
+                    null(),
+                    null(),
+                    buffer.map_or(null_mut(), |buffer| buffer.as_mut_ptr()),
+                    size,
+                    PERF_DETAIL_WIZARD,
+                    refresh.into(),
+                )
+            })
+        });
+        otel_arrow_dfe_telemetry::otel_info!(
+            "windows_perf_counters_receiver.objects.refresh",
+            node = self.node.as_str(),
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+            object_count = ?result.as_ref().ok(),
+            error = ?result.as_ref().err()
+        );
+        result
     }
 
     fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
@@ -835,59 +898,55 @@ impl Drop for NativePdh {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::TEST_PDH_LOCK;
     use super::*;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use windows_sys::Win32::System::Performance::PdhFormatFromRawValue;
 
-    /// Scenario: An exact-only worker pins English UI language without refreshing the process-wide PDH object list.
-    /// Guarantees: Exact counters avoid the wildcard-only refresh side effect while still enforcing the language pin.
-    #[test]
-    fn exact_worker_pins_language_without_object_refresh() {
-        initialize_worker_with(
-            "exact",
-            false,
-            || (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE),
-            |_, _, _| panic!("exact-only worker must not enumerate objects"),
-        )
-        .unwrap();
+    /// Scenario: Native startup and local object-list refresh run in the calling thread's existing UI language.
+    /// Guarantees: Refresh returns an object count without changing language or requiring English as a startup prerequisite.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires live Windows performance counters; run explicitly with `-- --ignored`"]
+    async fn live_object_refresh_preserves_thread_language() {
+        let _serial = TEST_PDH_LOCK.lock().await;
+        // SAFETY: This reads the current test thread's native UI language.
+        let before = unsafe { GetThreadUILanguage() };
+        initialize_worker("object-refresh", &AtomicBool::new(false)).unwrap();
+        let mut api = NativePdh::open("object-refresh".to_owned()).unwrap();
+        assert!(api.refresh_objects().unwrap() > 0);
+        // SAFETY: This reads the same thread after startup and refresh.
+        assert_eq!(unsafe { GetThreadUILanguage() }, before);
     }
 
     /// Scenario: Object-list sizing succeeds or requests a buffer, and the first fill may require growth.
-    /// Guarantees: Pinning precedes one refresh; fill retries once with a larger buffer without another refresh.
+    /// Guarantees: Only sizing refreshes the local list; fill retries without another refresh and returns the object count.
     #[test]
-    fn wildcard_worker_pins_then_refreshes_object_list() {
+    fn object_refresh_sizing_and_fill_follow_native_probe_sequence() {
         for sizing_status in [0, PDH_MORE_DATA] {
             for grow in [false, true] {
-                let pinned = Cell::new(false);
                 let calls = RefCell::new(Vec::new());
-                initialize_worker_with(
-                    "wildcard",
-                    true,
-                    || {
-                        pinned.set(true);
-                        (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE)
-                    },
-                    |refresh, size, buffer| {
-                        assert!(pinned.get());
-                        calls.borrow_mut().push((refresh, buffer.is_some()));
-                        match buffer {
-                            None => {
-                                *size = 8;
-                                Ok(sizing_status)
-                            }
-                            Some(buffer) if grow && calls.borrow().len() == 2 => {
-                                assert_eq!(buffer.len(), 8);
-                                *size = 24;
-                                Ok(PDH_MORE_DATA)
-                            }
-                            Some(buffer) => {
-                                assert_eq!(buffer.len(), if grow { 24 } else { 8 });
-                                Ok(0)
-                            }
+                let count = refresh_objects_with(|refresh, size, buffer| {
+                    calls.borrow_mut().push((refresh, buffer.is_some()));
+                    match buffer {
+                        None => {
+                            *size = 8;
+                            Ok(sizing_status)
                         }
-                    },
-                )
+                        Some(buffer) if grow && calls.borrow().len() == 2 => {
+                            assert_eq!(buffer.len(), 8);
+                            *size = 24;
+                            Ok(PDH_MORE_DATA)
+                        }
+                        Some(buffer) => {
+                            assert_eq!(buffer.len(), if grow { 24 } else { 8 });
+                            buffer[..5].copy_from_slice(&[65, 0, 66, 0, 0]);
+                            *size = 5;
+                            Ok(0)
+                        }
+                    }
+                })
                 .unwrap();
+                assert_eq!(count, 2);
                 let mut expected = vec![(true, false), (false, true)];
                 if grow {
                     expected.push((false, true));
@@ -897,55 +956,11 @@ mod tests {
         }
     }
 
-    /// Scenario: SetThreadUILanguage fails or returns a language other than en-US.
-    /// Guarantees: Worker startup returns a typed language-pin error before any PDH object refresh.
-    #[test]
-    fn worker_rejects_failed_language_pin() {
-        for (returned, verified) in [(0, 0x0409), (0x0407, 0x0409), (0x0409, 0x0407)] {
-            let error = initialize_worker_with(
-                "language-failure",
-                true,
-                || (returned, verified),
-                |_, _, _| panic!("failed pin must stop before object enumeration"),
-            )
-            .unwrap_err();
-            assert!(matches!(
-                error,
-                Error::WorkerLanguagePin {
-                    requested: ENGLISH_UI_LANGUAGE,
-                    returned: actual,
-                    verified: actual_verified,
-                } if actual == returned && actual_verified == verified
-            ));
-        }
-    }
-
-    /// Scenario: An exact-only worker cannot set or verify English UI language.
-    /// Guarantees: Startup continues without object refresh because English adds do not require the pin.
-    #[test]
-    fn exact_worker_continues_after_failed_or_ineffective_pin() {
-        for result in [(0, 0x0407), (0x0409, 0x0407)] {
-            initialize_worker_with(
-                "exact-pin-warning",
-                false,
-                || result,
-                |_, _, _| panic!("exact-only worker must not refresh objects"),
-            )
-            .unwrap();
-        }
-    }
-
-    /// Scenario: The pinned wildcard worker cannot refresh or fill the PDH object list.
-    /// Guarantees: Both native stages fail startup with the typed object-refresh error.
+    /// Scenario: A conditional object-list refresh fails during sizing or buffer fill.
+    /// Guarantees: Both native stages preserve an explicit typed error for the informational refresh result.
     #[test]
     fn worker_rejects_failed_object_refresh() {
-        let sizing = initialize_worker_with(
-            "refresh-failure",
-            true,
-            || (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE),
-            |_, _, _| Ok(5),
-        )
-        .unwrap_err();
+        let sizing = refresh_objects_with(|_, _, _| Ok(5)).unwrap_err();
         assert!(matches!(
             sizing,
             Error::WorkerObjectRefresh {
@@ -954,19 +969,14 @@ mod tests {
             }
         ));
 
-        let fill = initialize_worker_with(
-            "fill-failure",
-            true,
-            || (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE),
-            |_, size, buffer| {
-                if buffer.is_none() {
-                    *size = 8;
-                    Ok(PDH_MORE_DATA)
-                } else {
-                    Ok(6)
-                }
-            },
-        )
+        let fill = refresh_objects_with(|_, size, buffer| {
+            if buffer.is_none() {
+                *size = 8;
+                Ok(PDH_MORE_DATA)
+            } else {
+                Ok(6)
+            }
+        })
         .unwrap_err();
         assert!(matches!(
             fill,
@@ -978,21 +988,16 @@ mod tests {
     }
 
     /// Scenario: Object membership keeps growing beyond the single allowed fill retry.
-    /// Guarantees: Startup returns a typed refresh failure after two fills and never refreshes a second time.
+    /// Guarantees: Refresh returns a typed failure after two fills and never refreshes a second time.
     #[test]
     fn object_refresh_fill_growth_is_bounded() {
         let mut calls = 0;
-        let error = initialize_worker_with(
-            "growth",
-            true,
-            || (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE),
-            |refresh, size, buffer| {
-                calls += 1;
-                assert_eq!(refresh, buffer.is_none());
-                *size = size.saturating_add(8);
-                Ok(PDH_MORE_DATA)
-            },
-        )
+        let error = refresh_objects_with(|refresh, size, buffer| {
+            calls += 1;
+            assert_eq!(refresh, buffer.is_none());
+            *size = size.saturating_add(8);
+            Ok(PDH_MORE_DATA)
+        })
         .unwrap_err();
         assert_eq!(calls, 3);
         assert!(matches!(
@@ -1009,20 +1014,15 @@ mod tests {
     #[test]
     fn native_buffer_calls_propagate_stop_without_retry() {
         let mut calls = 0;
-        let error = initialize_worker_with(
-            "stop",
-            true,
-            || (ENGLISH_UI_LANGUAGE, ENGLISH_UI_LANGUAGE),
-            |_, size, buffer| {
-                calls += 1;
-                if buffer.is_none() {
-                    *size = 8;
-                    Ok(PDH_MORE_DATA)
-                } else {
-                    Err(Error::WorkerStopRequested)
-                }
-            },
-        )
+        let error = refresh_objects_with(|_, size, buffer| {
+            calls += 1;
+            if buffer.is_none() {
+                *size = 8;
+                Ok(PDH_MORE_DATA)
+            } else {
+                Err(Error::WorkerStopRequested)
+            }
+        })
         .unwrap_err();
         assert!(matches!(error, Error::WorkerStopRequested));
         assert_eq!(calls, 2);
@@ -1769,12 +1769,16 @@ mod tests {
     /// Guarantees: Both documented no-instance status and successful zero-size responses become an empty membership set.
     #[test]
     fn wildcard_expansion_accepts_zero_matches() {
-        for status in [0, PDH_CSTATUS_NO_INSTANCE] {
+        for (status, reported) in [
+            (0, 0),
+            (PDH_CSTATUS_NO_INSTANCE, 0),
+            (PDH_CSTATUS_NO_INSTANCE, 37),
+        ] {
             let mut calls = 0;
             let buffer = NativePdh::expanded_path_buffer_with("fixture", |size, buffer| {
                 calls += 1;
                 assert!(buffer.is_none());
-                *size = 0;
+                *size = reported;
                 Ok(status)
             })
             .unwrap();

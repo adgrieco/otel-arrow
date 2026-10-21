@@ -68,14 +68,10 @@ impl Worker {
         max_native_counters: usize,
         node: String,
     ) -> Result<Self, Error> {
-        let has_wildcards = counters
-            .iter()
-            .any(|counter| counter.instance_config.is_wildcard());
         let mut settings = QuerySettings {
             cadence,
             max_instances_per_wildcard,
             node,
-            has_wildcards,
             initialized: false,
         };
         Self::start_controlled(
@@ -426,7 +422,6 @@ struct QuerySettings {
     cadence: QueryCadence,
     max_instances_per_wildcard: usize,
     node: String,
-    has_wildcards: bool,
     initialized: bool,
 }
 
@@ -439,7 +434,7 @@ impl QuerySettings {
         shutdown: Arc<AtomicBool>,
     ) -> Result<Query, Error> {
         initialize_once(&mut self.initialized, || {
-            super::native::initialize_worker(&self.node, self.has_wildcards, &shutdown)
+            super::native::initialize_worker(&self.node, &shutdown)
         })?;
         Query::open_replacement(
             configs,

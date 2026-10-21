@@ -16,7 +16,7 @@ use super::expansion::{
 };
 use super::native::NativePdh;
 use super::timing::{cumulative_start_time, positive_timestamp};
-use super::{PdhApi, ValueFormat};
+use super::{CounterLanguage, PdhApi, ValueFormat};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -42,6 +42,9 @@ pub(super) struct Query<A: PdhApi = NativePdh> {
     pub(super) last_wildcard_refresh: Instant,
     wildcard_refresh_pending: bool,
     initial_wildcard_refresh: bool,
+    pub(super) last_object_refresh: Instant,
+    selector_failures: BTreeSet<usize>,
+    object_refresh_selectors: BTreeSet<usize>,
 }
 
 impl Query {
@@ -112,6 +115,11 @@ impl<A: PdhApi> Query<A> {
                 .map_or_else(Instant::now, |seed| seed.last_wildcard_refresh),
             wildcard_refresh_pending: false,
             initial_wildcard_refresh: seed.is_none(),
+            last_object_refresh: seed.map_or_else(Instant::now, |seed| seed.last_object_refresh),
+            selector_failures: seed
+                .map_or_else(BTreeSet::new, |seed| seed.selector_failures.clone()),
+            object_refresh_selectors: seed
+                .map_or_else(BTreeSet::new, |seed| seed.object_refresh_selectors.clone()),
         };
         query.initialize_exact_counters()?;
         query.ensure_available_or_recoverable(&query.pending)?;
@@ -187,6 +195,9 @@ impl<A: PdhApi> Query<A> {
             previous_timestamp_unix_nano: self.previous_timestamp_unix_nano,
             last_wildcard_refresh: self.last_wildcard_refresh,
             wildcard_targets,
+            last_object_refresh: self.last_object_refresh,
+            selector_failures: self.selector_failures.clone(),
+            object_refresh_selectors: self.object_refresh_selectors.clone(),
         }
     }
 
@@ -259,9 +270,12 @@ impl<A: PdhApi> Query<A> {
                     return Err(error);
                 }
                 self.pending.diagnostics.counter_add_failures += 1;
-                self.pending
-                    .failures
-                    .push(sample_failure(config_index, &error));
+                let failure = if !error.is_permanent_counter_error() {
+                    self.record_selector_failure(config_index, &error)
+                } else {
+                    Some(sample_failure(config_index, &error))
+                };
+                self.pending.failures.extend(failure);
                 if exact_add_failure_disposition(&error) == ExactAddFailureDisposition::Retry {
                     self.schedule_retry(key, target, Instant::now());
                 }
@@ -272,7 +286,12 @@ impl<A: PdhApi> Query<A> {
 
     fn add_counter(&mut self, target: CounterTarget) -> Result<(), Error> {
         self.api.check_running()?;
-        let counter = self.api.add(&target.path)?;
+        let language = if target.origin.is_wildcard() {
+            CounterLanguage::Localized
+        } else {
+            CounterLanguage::English
+        };
+        let counter = self.api.add(&target.path, language)?;
         self.api.check_running()?;
         let kind = match self
             .api
@@ -294,6 +313,10 @@ impl<A: PdhApi> Query<A> {
             self.configs[target.config_index].source_mapping_index,
             &target.path,
         );
+        if !target.origin.is_wildcard() {
+            let _ = self.selector_failures.remove(&target.config_index);
+            let _ = self.object_refresh_selectors.remove(&target.config_index);
+        }
         let _ = self.counters.insert(
             key,
             CounterHandle {
@@ -337,9 +360,13 @@ impl<A: PdhApi> Query<A> {
             Err(error) if error.is_stop() => Err(error),
             Err(error) => {
                 metadata.diagnostics.counter_add_failures += 1;
-                metadata
-                    .failures
-                    .push(sample_failure(target.config_index, &error));
+                let failure = if !target.origin.is_wildcard() && !error.is_permanent_counter_error()
+                {
+                    self.record_selector_failure(target.config_index, &error)
+                } else {
+                    Some(sample_failure(target.config_index, &error))
+                };
+                metadata.failures.extend(failure);
                 if error.requires_immediate_query_rebuild() {
                     return Err(error);
                 }
@@ -373,6 +400,17 @@ impl<A: PdhApi> Query<A> {
 
     fn refresh_wildcards(&mut self, metadata: &mut PendingMetadata) -> Result<(), Error> {
         metadata.diagnostics.discovery_refreshes += 1;
+        let refresh_interval = self.wildcard_refresh_interval.max(Duration::from_secs(600));
+        if !self.object_refresh_selectors.is_empty()
+            && self.last_object_refresh.elapsed() >= refresh_interval
+        {
+            self.last_object_refresh = Instant::now();
+            match self.api.refresh_objects() {
+                Ok(_) => {}
+                Err(error) if error.is_stop() => return Err(error),
+                Err(_) => metadata.diagnostics.discovery_failures += 1,
+            }
+        }
         let wildcard_configs = self
             .configs
             .iter()
@@ -386,10 +424,14 @@ impl<A: PdhApi> Query<A> {
         for config_index in wildcard_configs {
             self.api.check_running()?;
             match self.api.expand(&self.configs[config_index].path) {
-                Ok(paths) => discoveries.push(WildcardDiscovery {
-                    config_index,
-                    paths: Ok(paths),
-                }),
+                Ok(paths) => {
+                    let _ = self.selector_failures.remove(&config_index);
+                    let _ = self.object_refresh_selectors.remove(&config_index);
+                    discoveries.push(WildcardDiscovery {
+                        config_index,
+                        paths: Ok(paths),
+                    });
+                }
                 Err(error) if error.is_stop() => return Err(error),
                 Err(error) => {
                     let reserved = desired.len();
@@ -413,7 +455,7 @@ impl<A: PdhApi> Query<A> {
 
     pub(super) fn wildcard_refresh_due(&self) -> bool {
         self.wildcard_refresh_pending
-            || (self.has_wildcard_configs()
+            || ((self.has_wildcard_configs() || !self.object_refresh_selectors.is_empty())
                 && self.last_wildcard_refresh.elapsed() >= self.wildcard_refresh_interval)
     }
 
@@ -427,18 +469,51 @@ impl<A: PdhApi> Query<A> {
         result
     }
 
+    fn record_selector_failure(
+        &mut self,
+        config_index: usize,
+        error: &Error,
+    ) -> Option<SampleFailure> {
+        if !matches!(
+            error,
+            Error::WildcardCleanup {
+                lookup_failed: false,
+                ..
+            }
+        ) {
+            let _ = self.object_refresh_selectors.insert(config_index);
+        }
+        self.selector_failures
+            .insert(config_index)
+            .then(|| SampleFailure {
+                counter_index: config_index,
+                path: Arc::from(self.configs[config_index].path.as_str()),
+                reason: "selector_unresolved",
+                error: error.to_string(),
+                diagnostic_only: true,
+            })
+    }
+
     fn reserve_failed_discovery(
-        &self,
+        &mut self,
         config_index: usize,
         desired: &mut DesiredCounters,
         expanded_total: usize,
         metadata: &mut PendingMetadata,
         error: &Error,
     ) {
-        metadata.diagnostics.discovery_failures += 1;
-        let mut failure = sample_failure(config_index, error);
-        failure.diagnostic_only = true;
-        metadata.failures.push(failure);
+        if !matches!(
+            error,
+            Error::WildcardCleanup {
+                lookup_failed: false,
+                ..
+            }
+        ) {
+            metadata.diagnostics.discovery_failures += 1;
+        }
+        metadata
+            .failures
+            .extend(self.record_selector_failure(config_index, error));
         let mut retained = self
             .counter_targets()
             .filter(|(_, target)| {
@@ -1318,6 +1393,9 @@ pub(super) struct QueryRecreationSeed {
     previous_timestamp_unix_nano: i64,
     last_wildcard_refresh: Instant,
     wildcard_targets: Vec<(CounterKey, CounterTarget)>,
+    last_object_refresh: Instant,
+    selector_failures: BTreeSet<usize>,
+    object_refresh_selectors: BTreeSet<usize>,
 }
 
 impl QueryRecreationSeed {

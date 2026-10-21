@@ -347,7 +347,9 @@ async fn live_pdh_unavailable_exact_counter_retries_after_startup() {
             .any(|point| point.path.as_ref() == r"\Memory\Available Bytes")
     );
     assert!(sample.metadata.failures.iter().any(|failure| {
-        failure.counter_index == 1 && failure.reason == "PdhAddEnglishCounterW"
+        failure.counter_index == 1
+            && failure.reason == "selector_unresolved"
+            && failure.error.contains("PdhAddEnglishCounterW")
     }));
     assert_eq!(sample.metadata.diagnostics.counter_add_failures, 1);
     assert!(
@@ -460,8 +462,9 @@ async fn live_pdh_preserves_provider_significant_counter_space() {
     assert!(
         sample.metadata.failures.iter().any(|failure| {
             failure.counter_index == 1
-                && failure.reason == "PdhExpandWildCardPathW(size)"
-                && failure.error == "PDH status 0xC0000BB9"
+                && failure.reason == "selector_unresolved"
+                && failure.error.contains("PdhAddEnglishCounterW")
+                && failure.error.contains("0xC0000BB9")
                 && failure.diagnostic_only
         }),
         "{:#?}",
@@ -618,9 +621,9 @@ async fn live_pdh_adapter_rejects_removed_tokens() {
     let _serial = TEST_PDH_LOCK.lock().await;
     let path = r"\Memory\Available Bytes";
     let mut api = NativePdh::open("removed".to_owned()).unwrap();
-    let removed = api.add(path).unwrap();
+    let removed = api.add(path, CounterLanguage::English).unwrap();
     api.remove(&removed, path).unwrap();
-    let live = api.add(path).unwrap();
+    let live = api.add(path, CounterLanguage::English).unwrap();
     for result in [
         api.remove(&removed, path),
         api.counter_type(&removed, path).map(|_| ()),

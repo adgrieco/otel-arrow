@@ -182,6 +182,16 @@ impl FailureLogState {
             let Some(counter) = receiver.config.counters.get(failure.counter_index) else {
                 return Err(failure.counter_index);
             };
+            if failure.reason == "selector_unresolved" {
+                otel_arrow_dfe_telemetry::otel_warn!(
+                    "windows_perf_counters_receiver.counter.fail",
+                    node = receiver.node.as_str(),
+                    path_template = counter.path.as_str(),
+                    reason = failure.reason,
+                    error = failure.error.as_str()
+                );
+                continue;
+            }
             let key = (
                 failure.counter_index,
                 Arc::clone(&failure.path),

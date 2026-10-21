@@ -265,7 +265,7 @@ impl Drop for StartupTestPdh {
 impl PdhApi for StartupTestPdh {
     type Counter = ();
 
-    fn add(&mut self, _path: &str) -> Result<Self::Counter, Error> {
+    fn add(&mut self, _path: &str, _language: CounterLanguage) -> Result<Self::Counter, Error> {
         Ok(())
     }
 
@@ -296,6 +296,10 @@ impl PdhApi for StartupTestPdh {
 
     fn timestamp(&mut self) -> Result<i64, Error> {
         Ok(1)
+    }
+
+    fn refresh_objects(&mut self) -> Result<usize, Error> {
+        Ok(0)
     }
 
     fn expand(&mut self, _path: &str) -> Result<Vec<String>, Error> {
@@ -345,7 +349,7 @@ struct RecoveringRefreshPdh {
 impl PdhApi for RecoveringRefreshPdh {
     type Counter = String;
 
-    fn add(&mut self, path: &str) -> Result<Self::Counter, Error> {
+    fn add(&mut self, path: &str, _language: CounterLanguage) -> Result<Self::Counter, Error> {
         if self.add_calls.fetch_add(1, Ordering::AcqRel) == 0 {
             return Err(Error::CounterSetup {
                 path: path.to_owned(),
@@ -385,6 +389,10 @@ impl PdhApi for RecoveringRefreshPdh {
 
     fn timestamp(&mut self) -> Result<i64, Error> {
         Ok(self.timestamp)
+    }
+
+    fn refresh_objects(&mut self) -> Result<usize, Error> {
+        Ok(0)
     }
 
     fn expand(&mut self, _path: &str) -> Result<Vec<String>, Error> {
@@ -442,7 +450,7 @@ impl PdhApi for PeakPdh {
         Ok(())
     }
 
-    fn add(&mut self, path: &str) -> Result<Self::Counter, Error> {
+    fn add(&mut self, path: &str, _language: CounterLanguage) -> Result<Self::Counter, Error> {
         self.owned += 1;
         let current = self.ownership.current.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.ownership.peak.fetch_max(current, Ordering::AcqRel);
@@ -492,6 +500,10 @@ impl PdhApi for PeakPdh {
 
     fn timestamp(&mut self) -> Result<i64, Error> {
         Ok(100)
+    }
+
+    fn refresh_objects(&mut self) -> Result<usize, Error> {
+        Ok(0)
     }
 
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
@@ -870,16 +882,21 @@ fn repeated_refresh_failures_stay_on_refresh_cadence() {
     states.borrow()[0].borrow_mut().expand_error = true;
     let initial_expand_calls = states.borrow()[0].borrow().calls.expand;
     let mut queries = slot;
-    for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
+    for attempt in 0..QUERY_REBUILD_AFTER_FAILURES {
         let sample = collect_query(&mut queries, Duration::ZERO, 1, &mut open).unwrap();
         assert_eq!(sample.points.len(), 1);
         assert_eq!(sample.points[0].counter_index, 0);
         assert_eq!(sample.metadata.diagnostics.discovery_failures, 2);
         assert_eq!(sample.metadata.diagnostics.query_rebuild_attempts, 0);
-        assert_eq!(sample.metadata.failures.len(), 2);
-        assert!(sample.metadata.failures.iter().all(|failure| {
-            failure.reason == "PdhExpandWildCardPathW" && failure.diagnostic_only
-        }));
+        assert_eq!(
+            sample.metadata.failures.len(),
+            if attempt == 0 { 2 } else { 0 }
+        );
+        assert!(
+            sample.metadata.failures.iter().all(|failure| {
+                failure.reason == "selector_unresolved" && failure.diagnostic_only
+            })
+        );
     }
 
     assert!(queries.query.is_some());

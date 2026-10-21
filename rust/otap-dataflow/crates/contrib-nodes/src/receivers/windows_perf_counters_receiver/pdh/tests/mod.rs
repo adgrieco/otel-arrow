@@ -81,6 +81,7 @@ fn fake_counter(path: &str, formatted: Number) -> FakeCounter {
 struct FakeState {
     counters: Vec<FakeCounter>,
     added: Vec<String>,
+    attempted_adds: Vec<(String, CounterLanguage)>,
     calls: FakeNativeCalls,
     collect_has_data: bool,
     collect_error: bool,
@@ -90,6 +91,8 @@ struct FakeState {
     remove_error: bool,
     remove_errors: BTreeSet<usize>,
     expand_error: bool,
+    expand_operation: PdhOperation,
+    object_refresh_error: bool,
     expand_errors: BTreeSet<String>,
     stop_after_expand: Option<Arc<AtomicBool>>,
     stop_after_add: Option<Arc<AtomicBool>>,
@@ -108,6 +111,8 @@ struct FakeNativeCalls {
     timestamp: usize,
     expand: usize,
     parse: usize,
+    refresh: usize,
+    order: Vec<&'static str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -161,9 +166,10 @@ impl PdhApi for FakePdh {
         }
     }
 
-    fn add(&mut self, path: &str) -> Result<Self::Counter, Error> {
+    fn add(&mut self, path: &str, language: CounterLanguage) -> Result<Self::Counter, Error> {
         let mut state = self.state.borrow_mut();
         state.calls.add += 1;
+        state.attempted_adds.push((path.to_owned(), language));
         let counter = state
             .counters
             .iter()
@@ -283,15 +289,37 @@ impl PdhApi for FakePdh {
         }
     }
 
+    fn refresh_objects(&mut self) -> Result<usize, Error> {
+        let mut state = self.state.borrow_mut();
+        state.calls.refresh += 1;
+        state.calls.order.push("objects.refresh");
+        if state.object_refresh_error {
+            Err(Error::WorkerObjectRefresh {
+                stage: "refresh sizing",
+                status: 5,
+            })
+        } else {
+            Ok(12)
+        }
+    }
+
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
         let mut state = self.state.borrow_mut();
         state.calls.expand += 1;
+        state.calls.order.push("lookup");
         if let Some(stop) = &state.stop_after_expand {
             stop.store(true, Ordering::Release);
         }
         if state.expand_error || state.expand_errors.contains(path) {
+            if state.expand_operation == PdhOperation::RemoveCounter {
+                return Err(Error::WildcardCleanup {
+                    path: path.to_owned(),
+                    message: "temporary handle cleanup is pending".to_owned(),
+                    lookup_failed: false,
+                });
+            }
             return Err(Error::Pdh {
-                operation: PdhOperation::ExpandWildcardPath,
+                operation: state.expand_operation,
                 path: path.to_owned(),
                 status: 1,
             });
@@ -316,7 +344,7 @@ struct RecoveringPrimePdh {
 impl PdhApi for RecoveringPrimePdh {
     type Counter = ();
 
-    fn add(&mut self, _path: &str) -> Result<Self::Counter, Error> {
+    fn add(&mut self, _path: &str, _language: CounterLanguage) -> Result<Self::Counter, Error> {
         Ok(())
     }
 
@@ -361,6 +389,10 @@ impl PdhApi for RecoveringPrimePdh {
         Ok(100 + i64::try_from(self.collect_calls.load(Ordering::Relaxed)).unwrap_or(i64::MAX))
     }
 
+    fn refresh_objects(&mut self) -> Result<usize, Error> {
+        Ok(0)
+    }
+
     fn expand(&mut self, _path: &str) -> Result<Vec<String>, Error> {
         Ok(Vec::new())
     }
@@ -380,7 +412,7 @@ struct RebuildPrimePdh {
 impl PdhApi for RebuildPrimePdh {
     type Counter = ();
 
-    fn add(&mut self, _path: &str) -> Result<Self::Counter, Error> {
+    fn add(&mut self, _path: &str, _language: CounterLanguage) -> Result<Self::Counter, Error> {
         Ok(())
     }
 
@@ -422,6 +454,10 @@ impl PdhApi for RebuildPrimePdh {
 
     fn timestamp(&mut self) -> Result<i64, Error> {
         Ok(100 + i64::try_from(self.collect_calls).unwrap_or(i64::MAX) * 10)
+    }
+
+    fn refresh_objects(&mut self) -> Result<usize, Error> {
+        Ok(0)
     }
 
     fn expand(&mut self, _path: &str) -> Result<Vec<String>, Error> {
@@ -471,6 +507,7 @@ fn fake_state_value(counters: Vec<FakeCounter>) -> FakeState {
     FakeState {
         counters,
         added: Vec::new(),
+        attempted_adds: Vec::new(),
         calls: FakeNativeCalls::default(),
         collect_has_data: true,
         collect_error: false,
@@ -480,6 +517,8 @@ fn fake_state_value(counters: Vec<FakeCounter>) -> FakeState {
         remove_error: false,
         remove_errors: BTreeSet::new(),
         expand_error: false,
+        expand_operation: PdhOperation::ExpandWildcardPath,
+        object_refresh_error: false,
         expand_errors: BTreeSet::new(),
         stop_after_expand: None,
         stop_after_add: None,
@@ -515,25 +554,73 @@ fn fake_query_with_seed(
     (state, query)
 }
 
-/// Scenario: A fake PDH add receives one concrete English wildcard expansion result.
-/// Guarantees: Expanded members use the same English-add adapter route as exact configured paths.
+/// Scenario: A temporary English wildcard lookup succeeds, fails metadata, stops, or fails removal.
+/// Guarantees: Removal is attempted on every post-add path; failed cleanup retains one uncollected handle and cannot acquire another.
 #[test]
-fn fake_pdh_records_english_expanded_add() {
-    let path = r"\Process(worker)\Private Bytes";
-    let state = fake_state(vec![FakeCounter {
-        path: path.to_owned(),
-        native_type: 0x0001_0100,
-        raw: None,
-        multi_count: 1,
-        formatted: Some(Number::Integer(1)),
-        raw_error: false,
-        formatted_error: false,
-    }]);
-    let mut api = FakePdh::new(Rc::clone(&state));
-
-    let _ = api.add(path).unwrap();
-
-    assert_eq!(state.borrow().added, [path.to_owned()]);
+fn temporary_template_cleanup_is_bounded_and_stop_safe() {
+    let path = r"\Process(svchos?)\ID Process";
+    let localized = r"\Prozess(svchos?)\Prozesskennung";
+    for info_fails in [false, true] {
+        for removal_fails in [false, true] {
+            for stopped in [false, true] {
+                let state = fake_state(vec![fake_counter(path, Number::Integer(1))]);
+                state.borrow_mut().remove_error = removal_fails;
+                if stopped {
+                    state.borrow_mut().stop_after_add = Some(Arc::new(AtomicBool::new(false)));
+                }
+                let mut api = FakePdh::new(Rc::clone(&state));
+                let mut pending = None;
+                let result = native::resolve_template(&mut api, &mut pending, path, |api, _, _| {
+                    api.check_running()?;
+                    if info_fails {
+                        Err(Error::Pdh {
+                            operation: PdhOperation::GetCounterInfo,
+                            path: path.to_owned(),
+                            status: 5,
+                        })
+                    } else {
+                        Ok(localized.to_owned())
+                    }
+                });
+                assert_eq!(pending.is_some(), removal_fails);
+                assert_eq!(state.borrow().removed, [0]);
+                assert_eq!(state.borrow().calls.collect, 0);
+                assert_eq!(
+                    state.borrow().attempted_adds,
+                    [(path.to_owned(), CounterLanguage::English)]
+                );
+                if stopped {
+                    assert!(result.is_err_and(|error| error.is_stop()));
+                } else if removal_fails {
+                    assert!(result.is_err_and(|error| matches!(error,
+                        Error::WildcardCleanup { lookup_failed, .. } if lookup_failed == info_fails)));
+                    let retry =
+                        native::resolve_template(&mut api, &mut pending, path, |_, _, _| {
+                            panic!("pending cleanup must finish before another lookup")
+                        })
+                        .unwrap_err();
+                    assert!(!retry.requires_immediate_query_rebuild());
+                    assert!(!retry.is_query_collection_failure());
+                    assert_eq!(state.borrow().calls.add, 1);
+                    assert_eq!(api.active.len(), 1);
+                    state.borrow_mut().remove_error = false;
+                    let resolved =
+                        native::resolve_template(&mut api, &mut pending, path, |_, _, _| {
+                            Ok(localized.to_owned())
+                        })
+                        .unwrap();
+                    assert_eq!(resolved, localized);
+                    assert!(pending.is_none());
+                    assert!(api.active.is_empty());
+                    assert_eq!(state.borrow().calls.add, 2);
+                } else if info_fails {
+                    assert!(result.is_err());
+                } else {
+                    assert_eq!(result.unwrap(), localized);
+                }
+            }
+        }
+    }
 }
 
 /// Scenario: A fake PDH token is used after removal and after a replacement add.
@@ -551,9 +638,9 @@ fn fake_pdh_rejects_removed_tokens() {
         formatted_error: false,
     }]);
     let mut api = FakePdh::new(state);
-    let removed = api.add(path).unwrap();
+    let removed = api.add(path, CounterLanguage::English).unwrap();
     api.remove(&removed, path).unwrap();
-    let replacement = api.add(path).unwrap();
+    let replacement = api.add(path, CounterLanguage::English).unwrap();
 
     assert!(matches!(
         api.counter_type(&removed, path),

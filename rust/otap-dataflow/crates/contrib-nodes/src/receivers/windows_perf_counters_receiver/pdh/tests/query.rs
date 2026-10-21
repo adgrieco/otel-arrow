@@ -28,7 +28,7 @@ struct InvalidHandlePdh(Rc<RefCell<InvalidHandleState>>);
 impl PdhApi for InvalidHandlePdh {
     type Counter = usize;
 
-    fn add(&mut self, path: &str) -> Result<Self::Counter, Error> {
+    fn add(&mut self, path: &str, _language: CounterLanguage) -> Result<Self::Counter, Error> {
         let mut state = self.0.borrow_mut();
         state.add_attempts.push(path.to_owned());
         if state.failed_adds_remaining > 0 {
@@ -131,6 +131,10 @@ impl PdhApi for InvalidHandlePdh {
 
     fn timestamp(&mut self) -> Result<i64, Error> {
         Ok(self.0.borrow().timestamp)
+    }
+
+    fn refresh_objects(&mut self) -> Result<usize, Error> {
+        Ok(0)
     }
 
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {
@@ -1777,6 +1781,300 @@ fn queued_retry_cleanup_failure_requires_query_rebuild() {
     assert_eq!(state.borrow().removed, [0]);
 }
 
+/// Scenario: English exact and wildcard selectors resolve beside German and absent English inputs.
+/// Guarantees: Exact adds stay English, expanded adds use localized identity, projection preserves configured metadata, and unresolved inputs warn once.
+#[test]
+fn smoke_selector_shapes_preserve_language_and_output_sources() {
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric;
+    use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryIntoWithOptions};
+    use otel_arrow_dfe_pdata_codec::OtapPayload;
+    use prost::Message;
+
+    let paths = [
+        r"\Memory\Available Bytes",
+        r"\Processor(_Total)\% Processor Time",
+        r"\Processor(*)\% Processor Time",
+        r"\Process(svchos?)\ID Process",
+        r"\Prozessor(_Total)\Prozessorzeit (%)",
+        r"\AldoTel Smoke Missing\Missing Counter",
+    ];
+    let localized = [
+        r"\Prozessor(0)\Prozessorzeit (%)",
+        r"\Prozess(svchost)\Prozesskennung",
+    ];
+    let mut configs = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let mut config = counter(path, &format!("smoke.{index}"));
+            config.source_mapping_index = index;
+            if matches!(index, 2 | 3) {
+                config.instance_config = InstanceConfig::Wildcard {
+                    excluded_aggregation: None,
+                };
+            }
+            config
+        })
+        .collect::<Vec<_>>();
+    configs[3].attributes = Arc::new(BTreeMap::from([(
+        "instance".to_owned(),
+        "configured".to_owned(),
+    )]));
+    let (state, mut query) = fake_query_with_cadences(
+        configs.clone(),
+        paths[..2]
+            .iter()
+            .chain(localized.iter())
+            .map(|path| fake_counter(path, Number::Integer(42)))
+            .collect(),
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+    for (template, concrete) in paths[2..4].iter().zip(localized) {
+        let _ = state
+            .borrow_mut()
+            .expansions
+            .insert((*template).to_owned(), vec![concrete.to_owned()]);
+    }
+    let sample = query.collect().unwrap();
+    assert_eq!(sample.points.len(), 4);
+    assert_eq!(sample.metadata.failures.len(), 2);
+    assert!(
+        sample
+            .metadata
+            .failures
+            .iter()
+            .all(|failure| failure.reason == "selector_unresolved")
+    );
+    assert_eq!(
+        sample
+            .points
+            .iter()
+            .map(|point| point.path.as_ref())
+            .collect::<Vec<_>>(),
+        [paths[0], paths[1], localized[0], localized[1]]
+    );
+    assert!(
+        state
+            .borrow()
+            .attempted_adds
+            .iter()
+            .all(|(path, language)| {
+                *language
+                    == if localized.contains(&path.as_str()) {
+                        CounterLanguage::Localized
+                    } else {
+                        CounterLanguage::English
+                    }
+            })
+    );
+    let records = into_otap(&configs, sample).unwrap().unwrap();
+    let bytes: OtlpProtoBytes = OtapPayload::from_otap(records)
+        .try_into_with_default()
+        .unwrap();
+    let decoded = ExportMetricsServiceRequest::decode(bytes.as_bytes()).unwrap();
+    for metric in &decoded.resource_metrics[0].scope_metrics[0].metrics {
+        let index = configs
+            .iter()
+            .position(|config| config.name.as_ref() == metric.name)
+            .unwrap();
+        let Some(metric::Data::Gauge(gauge)) = &metric.data else {
+            panic!("expected Gauge")
+        };
+        let attributes = gauge.data_points[0]
+            .attributes
+            .iter()
+            .map(|attribute| {
+                let Some(any_value::Value::StringValue(value)) = attribute
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.value.as_ref())
+                else {
+                    panic!("expected string identity")
+                };
+                (attribute.key.as_str(), value.as_str())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let concrete = if index < 2 {
+            paths[index]
+        } else {
+            localized[index - 2]
+        };
+        assert_eq!(attributes["windows.perf_counter.path"], concrete);
+        assert_eq!(
+            attributes
+                .get("windows.perf_counter.path_template")
+                .copied(),
+            (index >= 2).then_some(paths[index])
+        );
+        if index == 3 {
+            assert_eq!(attributes["instance"], "configured");
+        }
+        assert_eq!(metric.description, configs[index].description.as_ref());
+        assert_eq!(metric.unit, configs[index].unit.as_ref());
+    }
+    let retry = query.collect().unwrap();
+    assert_eq!(retry.points.len(), 4);
+    assert_eq!(retry.metadata.diagnostics.counter_add_failures, 2);
+    assert!(retry.metadata.failures.is_empty());
+    assert_eq!(state.borrow().calls.refresh, 0);
+}
+
+/// Scenario: Exact-only discovery has an unresolved selector and reaches the minimum or configured object-refresh interval.
+/// Guarantees: There is no startup refresh or extra exact retry, each due discovery refreshes once, and failed refresh cannot stop healthy collection.
+#[test]
+fn unresolved_exact_drives_conditional_refresh_at_discovery_only() {
+    for (discovery, refresh_fails) in [(60, false), (900, false), (60, true)] {
+        let interval = Duration::from_secs(discovery);
+        let required = interval.max(Duration::from_secs(600));
+        let healthy = r"\Memory\Available Bytes";
+        let missing = r"\AldoTel Smoke Missing\Missing Counter";
+        let (state, mut query) = fake_query_with_cadences(
+            vec![counter(healthy, "healthy"), counter(missing, "missing")],
+            vec![fake_counter(healthy, Number::Integer(42))],
+            Duration::ZERO,
+            interval,
+        );
+        state.borrow_mut().object_refresh_error = refresh_fails;
+        let _ = query.collect().unwrap();
+        assert_eq!(state.borrow().calls.refresh, 0);
+        query.last_wildcard_refresh = Instant::now() - interval;
+        query.last_object_refresh = Instant::now() - (required - Duration::from_secs(1));
+        let _ = query.collect().unwrap();
+        assert_eq!(state.borrow().calls.refresh, 0);
+        query.last_wildcard_refresh = Instant::now() - interval;
+        query.last_object_refresh = Instant::now() - required;
+        let attempts = state.borrow().calls.add;
+        let refreshed = query.collect().unwrap();
+        assert_eq!(refreshed.points.len(), 1);
+        assert!(refreshed.metadata.failures.is_empty());
+        assert_eq!(
+            refreshed.metadata.diagnostics.discovery_failures,
+            u64::from(refresh_fails)
+        );
+        assert_eq!(state.borrow().calls.refresh, 1);
+        assert_eq!(state.borrow().calls.add, attempts + 1);
+        query.last_wildcard_refresh = Instant::now() - interval;
+        let _ = query.collect().unwrap();
+        assert_eq!(state.borrow().calls.refresh, 1);
+        state
+            .borrow_mut()
+            .counters
+            .push(fake_counter(missing, Number::Integer(7)));
+        let _ = query.collect().unwrap();
+        query.last_wildcard_refresh = Instant::now() - interval;
+        query.last_object_refresh = Instant::now() - required;
+        assert_eq!(query.collect().unwrap().points.len(), 2);
+        assert_eq!(state.borrow().calls.refresh, 1);
+    }
+}
+
+/// Scenario: A resolved wildcard later fails lookup, retains healthy members, rebuilds, resolves empty, and fails again.
+/// Guarantees: Retained values and changed native reasons cannot re-arm warnings; refresh precedes lookup, and only successful resolution ends the episode.
+#[test]
+fn retained_wildcard_failure_episode_survives_values_and_seeded_rebuild() {
+    let template = r"\Process(svchos?)\ID Process";
+    let concrete = r"\Prozess(svchost)\Prozesskennung";
+    let mut config = counter(template, "process");
+    config.instance_config = InstanceConfig::Wildcard {
+        excluded_aggregation: None,
+    };
+    let (state, mut query) = fake_query_with_cadences(
+        vec![config.clone()],
+        vec![fake_counter(concrete, Number::Integer(42))],
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+    let _ = state
+        .borrow_mut()
+        .expansions
+        .insert(template.to_owned(), vec![concrete.to_owned()]);
+    assert_eq!(query.collect().unwrap().points.len(), 1);
+    query.last_object_refresh = Instant::now() - Duration::from_secs(600);
+    let _ = query.collect().unwrap();
+    assert_eq!(state.borrow().calls.refresh, 0);
+    state.borrow_mut().expand_error = true;
+    let failed = query.collect().unwrap();
+    assert_eq!(failed.points.len(), 1);
+    assert_eq!(failed.metadata.failures.len(), 1);
+    state.borrow_mut().calls.order.clear();
+    state.borrow_mut().expand_operation = PdhOperation::GetCounterInfo;
+    let repeated = query.collect().unwrap();
+    assert_eq!(repeated.points.len(), 1);
+    assert!(repeated.metadata.failures.is_empty());
+    assert_eq!(state.borrow().calls.order, ["objects.refresh", "lookup"]);
+    let seed = query.recreation_seed();
+    let mut rebuilt = Query::open_with_seed(
+        FakePdh::new(Rc::clone(&state)),
+        vec![config],
+        Duration::ZERO,
+        Duration::ZERO,
+        256,
+        4096,
+        Some(&seed),
+    )
+    .unwrap();
+    assert!(rebuilt.collect().unwrap().metadata.failures.is_empty());
+    assert_eq!(state.borrow().calls.refresh, 1);
+    state.borrow_mut().expand_error = false;
+    state.borrow_mut().expansions.clear();
+    assert!(rebuilt.collect().unwrap().points.is_empty());
+    state.borrow_mut().expand_error = true;
+    assert_eq!(rebuilt.collect().unwrap().metadata.failures.len(), 1);
+}
+
+/// Scenario: Temporary-template cleanup fails with healthy retained members, with or without an earlier lookup failure.
+/// Guarantees: Cleanup preserves collection and its warning episode, does not count as discovery failure, and cannot erase an earlier refresh prerequisite.
+#[test]
+fn template_cleanup_failure_does_not_escalate_or_corrupt_refresh_accounting() {
+    for earlier_lookup_failure in [false, true] {
+        let template = r"\Process(*)\ID Process";
+        let concrete = r"\Prozess(svchost)\Prozesskennung";
+        let mut config = counter(template, "process");
+        config.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
+        let (state, mut query) = fake_query_with_cadences(
+            vec![config],
+            vec![fake_counter(concrete, Number::Integer(42))],
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        let _ = state
+            .borrow_mut()
+            .expansions
+            .insert(template.to_owned(), vec![concrete.to_owned()]);
+        assert_eq!(query.collect().unwrap().points.len(), 1);
+        state.borrow_mut().expand_error = true;
+        if earlier_lookup_failure {
+            state.borrow_mut().expand_operation = PdhOperation::GetCounterInfo;
+            let failed = query.collect().unwrap();
+            assert_eq!(failed.metadata.diagnostics.discovery_failures, 1);
+            assert_eq!(failed.metadata.failures.len(), 1);
+        }
+        state.borrow_mut().expand_operation = PdhOperation::RemoveCounter;
+        let cleanup = query.collect().unwrap();
+        assert_eq!(cleanup.points.len(), 1);
+        assert_eq!(cleanup.metadata.diagnostics.discovery_failures, 0);
+        assert_eq!(
+            cleanup.metadata.failures.len(),
+            usize::from(!earlier_lookup_failure)
+        );
+        query.last_object_refresh = Instant::now() - Duration::from_secs(600);
+        let repeated = query.collect().unwrap();
+        assert!(repeated.metadata.diagnostics.any_query_collected);
+        assert_eq!(repeated.points.len(), 1);
+        assert!(repeated.metadata.failures.is_empty());
+        assert_eq!(repeated.metadata.diagnostics.discovery_failures, 0);
+        assert_eq!(
+            state.borrow().calls.refresh,
+            usize::from(earlier_lookup_failure)
+        );
+    }
+}
+
 /// Scenario: An exact counter remains transiently unavailable for one queued retry and then becomes valid.
 /// Guarantees: The transient failure remains queued through existing backoff state and successful re-add counts one recovery.
 #[test]
@@ -1793,7 +2091,8 @@ fn queued_transient_retry_still_recovers() {
     assert_eq!(retrying.metadata.diagnostics.retry_attempts, 1);
     assert_eq!(retrying.metadata.diagnostics.retry_recoveries, 0);
     assert_eq!(retrying.metadata.diagnostics.counter_add_failures, 2);
-    assert_eq!(retrying.metadata.failures.len(), 2);
+    assert_eq!(retrying.metadata.failures.len(), 1);
+    assert_eq!(retrying.metadata.failures[0].reason, "selector_unresolved");
 
     {
         let mut state = state.borrow_mut();

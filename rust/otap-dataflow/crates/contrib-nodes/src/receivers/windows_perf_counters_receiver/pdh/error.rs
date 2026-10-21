@@ -9,6 +9,7 @@ use windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) enum PdhOperation {
     AddEnglishCounter,
+    AddCounter,
     CollectQueryData,
     #[cfg(test)]
     CounterDataStatus,
@@ -30,6 +31,7 @@ impl PdhOperation {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::AddEnglishCounter => "PdhAddEnglishCounterW",
+            Self::AddCounter => "PdhAddCounterW",
             Self::CollectQueryData => "PdhCollectQueryData",
             #[cfg(test)]
             Self::CounterDataStatus => "counter CStatus",
@@ -91,13 +93,11 @@ pub(in super::super) enum Error {
     Scale { path: String, source: ScaleError },
     #[error("failed to start PDH worker thread: {0}")]
     WorkerStart(String),
-    #[error(
-        "PDH worker failed to pin UI language to 0x{requested:04X}; SetThreadUILanguage returned 0x{returned:04X}, GetThreadUILanguage verified 0x{verified:04X}"
-    )]
-    WorkerLanguagePin {
-        requested: u16,
-        returned: u16,
-        verified: u16,
+    #[error("wildcard lookup cleanup for {path} failed: {message}")]
+    WildcardCleanup {
+        path: String,
+        message: String,
+        lookup_failed: bool,
     },
     #[error("PDH worker object-list {stage} failed with status 0x{status:08X}")]
     WorkerObjectRefresh { stage: &'static str, status: u32 },
@@ -196,7 +196,7 @@ impl Error {
             Self::Calculation { .. } => "calculation",
             Self::Scale { .. } => "scale",
             Self::WorkerStart(_) => "worker_start",
-            Self::WorkerLanguagePin { .. } => "worker_language_pin",
+            Self::WildcardCleanup { .. } => "wildcard_lookup_cleanup",
             Self::WorkerObjectRefresh { .. } => "worker_object_refresh",
             Self::WorkerStopRequested => "worker_stop_requested",
             Self::WorkerBusy => "worker_busy",
@@ -229,6 +229,7 @@ impl Error {
             Self::Pdh { path, .. }
             | Self::CounterData { path, .. }
             | Self::CounterSetup { path, .. }
+            | Self::WildcardCleanup { path, .. }
             | Self::InvalidCounterToken { path }
             | Self::Calculation { path, .. }
             | Self::Scale { path, .. } => Some(path),

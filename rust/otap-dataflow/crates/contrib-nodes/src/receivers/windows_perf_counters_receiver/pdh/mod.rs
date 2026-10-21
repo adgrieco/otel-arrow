@@ -29,6 +29,12 @@ pub(super) enum ValueFormat {
     Double,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CounterLanguage {
+    English,
+    Localized,
+}
+
 /// Checked native fields used to validate receiver-side sampling state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RawSample {
@@ -45,7 +51,7 @@ pub(super) trait PdhApi {
         Ok(())
     }
 
-    fn add(&mut self, path: &str) -> Result<Self::Counter, Error>;
+    fn add(&mut self, path: &str, language: CounterLanguage) -> Result<Self::Counter, Error>;
     fn remove(&mut self, counter: &Self::Counter, path: &str) -> Result<(), Error>;
     fn counter_type(&mut self, counter: &Self::Counter, path: &str) -> Result<u32, Error>;
     /// Returns whether collection has data; an expected omission returns false.
@@ -60,9 +66,11 @@ pub(super) trait PdhApi {
         format: ValueFormat,
     ) -> Result<Option<Number>, Error>;
     fn timestamp(&mut self) -> Result<i64, Error>;
-    /// Returns concrete English paths for one configured wildcard template.
+    /// Resolves an English template and returns concrete host-language paths.
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error>;
-    /// Parses the instance identity from one concrete English path.
+    /// Refreshes the local object list and returns its object count.
+    fn refresh_objects(&mut self) -> Result<usize, Error>;
+    /// Parses the instance identity from one concrete path.
     fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error>;
 }
 
