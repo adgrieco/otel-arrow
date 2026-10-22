@@ -158,7 +158,7 @@ async fn healthy_collection_and_recovery_only_have_distinct_accounting() {
         .unwrap();
 
     let recovery_only = Sample {
-        timestamp_unix_nano: 110,
+        timestamp_unix_nano: 0,
         members: Vec::new(),
         points: Vec::new(),
         metadata: PendingMetadata {
@@ -196,6 +196,140 @@ async fn healthy_collection_and_recovery_only_have_distinct_accounting() {
     assert_eq!(metrics.health.counter_add_failures.get(), 1);
     assert_eq!(metrics.health.query_pending.get(), 1);
     assert_eq!(metrics.health.counter_read_failures.get(), 0);
+}
+
+/// Scenario: Startup recovery, no-query backoff and failed replacement produce timestamp-free maintenance before a rebuilt query publishes.
+/// Guarantees: The runtime consumes worker-shaped maintenance without publication or collection failures and continues through successful recovery.
+#[tokio::test(start_paused = true)]
+async fn timestamp_free_query_maintenance_recovers_through_runtime() {
+    let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+    let mut samples = std::collections::VecDeque::new();
+    for (reason, rebuild_attempts) in [
+        ("PdhOpenQueryW", 0),
+        ("query_recovery_pending", 0),
+        ("PdhOpenQueryW", 1),
+    ] {
+        samples.push_back(Sample {
+            timestamp_unix_nano: 0,
+            members: Vec::new(),
+            points: Vec::new(),
+            metadata: PendingMetadata {
+                diagnostics: SampleDiagnostics {
+                    query_pending: true,
+                    query_rebuild_attempts: rebuild_attempts,
+                    ..Default::default()
+                },
+                failures: vec![SampleFailure {
+                    counter_index: 0,
+                    path: Arc::from(r"\Memory\Available Bytes"),
+                    reason,
+                    error: "query unavailable".to_owned(),
+                    diagnostic_only: true,
+                }],
+                ..Default::default()
+            },
+        });
+    }
+    samples.push_back(Sample {
+        timestamp_unix_nano: 100,
+        members: Vec::new(),
+        points: Vec::new(),
+        metadata: PendingMetadata {
+            diagnostics: SampleDiagnostics {
+                query_rebuild_attempts: 1,
+                query_rebuild_recoveries: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    });
+    samples.push_back(Sample {
+        timestamp_unix_nano: 110,
+        members: Vec::new(),
+        points: vec![sample_point(0, 110, Number::Integer(42))],
+        metadata: collected_metadata(),
+    });
+    let calls = std::cell::Cell::new(0);
+    let sends = std::cell::Cell::new(0);
+    let result = receiver.collect_and_send_with(
+        || {
+            calls.set(calls.get() + 1);
+            std::future::ready(Ok(samples.pop_front().expect("unexpected extra scrape")))
+        },
+        |_| {
+            sends.set(sends.get() + 1);
+            std::future::pending::<Result<(), Error>>()
+        },
+    );
+    tokio::pin!(result);
+    tokio::select! {
+        _ = &mut result => panic!("receiver terminated during query maintenance"),
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+    }
+    assert_eq!(calls.get(), 5);
+    assert_eq!(sends.get(), 1);
+    let metrics = receiver.metrics.borrow();
+    assert_eq!(metrics.scrape_attempts(Outcome::Failure), 4);
+    assert_eq!(metrics.scrape_attempts(Outcome::Success), 1);
+    assert_eq!(metrics.health.scrape_failures.get(), 0);
+    assert_eq!(metrics.health.scrapes.get(), 1);
+    assert_eq!(metrics.health.query_pending.get(), 0);
+    assert_eq!(metrics.health.query_rebuild_attempts.get(), 2);
+    assert_eq!(metrics.health.query_rebuild_recoveries.get(), 1);
+}
+
+/// Scenario: A zero-time sample contains collected data, observations, or an invalid retained member index.
+/// Guarantees: Maintenance handling cannot bypass strict collected-sample timestamp or structural invariant checks.
+#[tokio::test]
+async fn maintenance_handling_preserves_projection_invariants() {
+    for (collected, point, member) in [
+        (true, false, false),
+        (true, true, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
+        let sample = Sample {
+            timestamp_unix_nano: 0,
+            members: if member {
+                vec![super::super::model::SampleMember {
+                    counter_index: 1,
+                    path: Arc::from(r"\Memory\Available Bytes"),
+                    instance: None,
+                    emit_instance_attribute: false,
+                }]
+            } else {
+                Vec::new()
+            },
+            points: if point {
+                vec![sample_point(0, 10, Number::Integer(42))]
+            } else {
+                Vec::new()
+            },
+            metadata: PendingMetadata {
+                diagnostics: SampleDiagnostics {
+                    any_query_collected: collected,
+                    query_pending: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        let error = receiver
+            .process_collected_sample(
+                sample,
+                Duration::ZERO,
+                false,
+                &mut FailureLogState::default(),
+                |_| async { panic!("invalid sample must not publish") },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CollectionLoopError::Projection(_)));
+        let metrics = receiver.metrics.borrow();
+        assert_eq!(metrics.scrape_attempts(Outcome::Failure), 1);
+        assert_eq!(metrics.health.scrape_failures.get(), 0);
+    }
 }
 
 /// Scenario: A timeout warning is followed by a distinct native collection failure before any successful scrape.

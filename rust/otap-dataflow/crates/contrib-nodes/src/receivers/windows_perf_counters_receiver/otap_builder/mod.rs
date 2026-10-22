@@ -247,6 +247,23 @@ fn prepare_point<'a>(
     })
 }
 
+pub(super) fn validate_member_indexes(
+    counters: &[CounterConfig],
+    sample: &Sample,
+) -> Result<(), ProjectionInvariantError> {
+    for member in &sample.members {
+        if member.counter_index >= counters.len() {
+            return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
+                format!(
+                    "sample membership references missing configured counter {}",
+                    member.counter_index
+                ),
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn project(
     counters: &[CounterConfig],
     sample: &Sample,
@@ -259,17 +276,10 @@ fn project(
             ),
         )));
     }
+    validate_member_indexes(counters, sample)?;
     let mut builder = ProjectionBuilder::new();
     let mut membership = BTreeSet::new();
     for member in &sample.members {
-        if member.counter_index >= counters.len() {
-            return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
-                format!(
-                    "sample membership references missing configured counter {}",
-                    member.counter_index
-                ),
-            )));
-        }
         let _ = membership.insert((member.counter_index, Arc::clone(&member.path)));
     }
     let mut ready = Vec::new();
