@@ -861,8 +861,8 @@ fn projects_calculated_double_gauge() {
     );
 }
 
-/// Scenario: A sample references a configured-counter index that does not exist.
-/// Guarantees: Internal contract corruption cannot masquerade as recoverable point loss.
+/// Scenario: A value or omission references a missing counter, with or without admitted membership.
+/// Guarantees: Every observation validates its configured index before omission or membership can hide corruption.
 #[test]
 fn rejects_missing_counter_index_as_invariant() {
     let counters = [counter(
@@ -870,25 +870,170 @@ fn rejects_missing_counter_index_as_invariant() {
         "windows.memory.available",
         "By",
     )];
-    let error = project_sample(
-        &counters,
-        &Sample {
-            timestamp_unix_nano: 1,
-            members: Vec::new(),
-            points: vec![point(
-                1,
-                r"\Memory\Available Bytes",
-                SampleValue::Value(Number::Integer(42)),
-            )],
-            metadata: Default::default(),
-        },
-    )
-    .unwrap_err();
+    for index in [1, usize::MAX] {
+        for value in [
+            SampleValue::NoObservation,
+            SampleValue::Value(Number::Integer(42)),
+        ] {
+            for members in [
+                Vec::new(),
+                vec![SampleMember {
+                    counter_index: 0,
+                    path: Arc::from(r"\Memory\Available Bytes"),
+                    instance: None,
+                    emit_instance_attribute: false,
+                }],
+            ] {
+                let error = project_sample(
+                    &counters,
+                    &Sample {
+                        timestamp_unix_nano: 1,
+                        members,
+                        points: vec![point(index, r"\Memory\Available Bytes", value)],
+                        metadata: Default::default(),
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "Invalid argument error: sample references missing configured counter {index}"
+                    )
+                );
+            }
+        }
+    }
+}
 
-    assert_eq!(
-        error.to_string(),
-        "Invalid argument error: sample references missing configured counter 1"
-    );
+/// Scenario: An empty, omitted, or valued sample carries a non-positive envelope timestamp.
+/// Guarantees: Projection rejects the whole sample and retains the invalid timestamp in its diagnostic.
+#[test]
+fn rejects_nonpositive_sample_timestamps() {
+    let path = r"\Memory\Available Bytes";
+    let counters = [counter(path, "available", "By")];
+    for timestamp in [i64::MIN, -1, 0] {
+        for points in [
+            vec![],
+            vec![point(0, path, SampleValue::NoObservation)],
+            vec![point(0, path, SampleValue::Value(Number::Integer(42)))],
+        ] {
+            let error = project_sample(
+                &counters,
+                &Sample {
+                    timestamp_unix_nano: timestamp,
+                    members: Vec::new(),
+                    points,
+                    metadata: Default::default(),
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("Invalid argument error: sample has non-positive timestamp {timestamp}")
+            );
+        }
+    }
+}
+
+/// Scenario: A later concrete Gauge observation has a non-positive timestamp.
+/// Guarantees: Emit-ready points validate their own time with path context, while omissions need no output timestamp.
+#[test]
+fn rejects_nonpositive_observation_timestamps() {
+    let counters = [counter(r"\Process(*)\Private Bytes", "private", "By")];
+    let path = r"\Process(worker)\Private Bytes";
+    for timestamp in [i64::MIN, -1, 0] {
+        let mut sample = Sample {
+            timestamp_unix_nano: 30,
+            members: Vec::new(),
+            points: vec![
+                point_at(
+                    0,
+                    r"\Process(healthy)\Private Bytes",
+                    10,
+                    SampleValue::Value(Number::Integer(1)),
+                ),
+                point_at(0, path, timestamp, SampleValue::Value(Number::Integer(2))),
+            ],
+            metadata: Default::default(),
+        };
+        let error = project_sample(&counters, &sample).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Invalid argument error: counter {path} has non-positive timestamp {timestamp}"
+            )
+        );
+        sample.points[1].value = SampleValue::NoObservation;
+        assert!(project_sample(&counters, &sample).unwrap().is_some());
+    }
+}
+
+/// Scenario: A concrete observation after a healthy peer contains NaN or either infinity.
+/// Guarantees: The batch fails explicitly with the concrete path and value rather than publishing a non-finite double.
+#[test]
+fn rejects_nonfinite_values_as_invariants() {
+    let counters = [counter(r"\Process(*)\Private Bytes", "private", "By")];
+    let path = r"\Process(worker)\Private Bytes";
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let error = project_sample(
+            &counters,
+            &Sample {
+                timestamp_unix_nano: 30,
+                members: Vec::new(),
+                points: vec![
+                    point_at(
+                        0,
+                        r"\Process(healthy)\Private Bytes",
+                        10,
+                        SampleValue::Value(Number::Integer(1)),
+                    ),
+                    point_at(0, path, 20, SampleValue::Value(Number::Double(value))),
+                ],
+                metadata: Default::default(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("Invalid argument error: counter {path} has non-finite double value {value}")
+        );
+    }
+}
+
+/// Scenario: One mapping/path pair occurs twice with values or omissions and equal or different times.
+/// Guarantees: Omission and observation time do not make duplicate concrete identities distinct.
+#[test]
+fn rejects_duplicate_concrete_observations() {
+    let path = r"\Process(worker)\Private Bytes";
+    let counters = [counter(r"\Process(*)\Private Bytes", "private", "By")];
+    for first in [
+        SampleValue::Value(Number::Integer(7)),
+        SampleValue::NoObservation,
+    ] {
+        for second in [
+            SampleValue::Value(Number::Integer(8)),
+            SampleValue::NoObservation,
+        ] {
+            for timestamp in [1, 2] {
+                let error = project_sample(
+                    &counters,
+                    &Sample {
+                        timestamp_unix_nano: 2,
+                        members: Vec::new(),
+                        points: vec![point(0, path, first), point_at(0, path, timestamp, second)],
+                        metadata: Default::default(),
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "Invalid argument error: sample repeats counter {path} (metric private) at index 0"
+                    )
+                );
+            }
+        }
+    }
 }
 
 /// Scenario: A point references a concrete source absent from the worker's admitted membership snapshot.

@@ -706,8 +706,14 @@ impl ObjectNormalizer<'_> {
         let counter_name =
             validate_native_component(&format!("{counter_field}.name"), &mapping.name)?;
         if !(MIN_SCALE_POWER10..=MAX_SCALE_POWER10).contains(&mapping.scale_power10) {
+            let expanded = self
+                .instances
+                .expand(self.aggregation_name)
+                .next()
+                .expect("normalized instances always produce at least one selector");
+            let path = counter_path(self.object_name, expanded.instance, counter_name);
             return Err(invalid(format!(
-                "{counter_field}.scale_power10 must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}"
+                "counter path {path:?} scale_power10 must be between {MIN_SCALE_POWER10} and {MAX_SCALE_POWER10}"
             )));
         }
         let metric_name = normalize_metric_reference(&counter_field, &mapping.metric)?;

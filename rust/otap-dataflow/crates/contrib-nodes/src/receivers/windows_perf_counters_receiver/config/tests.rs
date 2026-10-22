@@ -1106,8 +1106,33 @@ fn bounds_configured_scale_power() {
                 scale
             );
         } else {
-            assert_config_error(value, "scale_power10 must be between -18 and 18");
+            assert_config_error(
+                value,
+                &format!(
+                    "counter path {:?} scale_power10 must be between -18 and 18",
+                    r"\Memory\Available Bytes"
+                ),
+            );
         }
+    }
+}
+
+/// Scenario: An invalid scale belongs to a fixed-instance list or a wildcard selector.
+/// Guarantees: The main-compatible diagnostic identifies the first generated native path without changing its spelling.
+#[test]
+fn invalid_scale_identifies_the_first_configured_path() {
+    for (instances, path) in [
+        (json!(["worker ", "other"]), r"\Process(worker )\ID Process"),
+        (json!(["*"]), r"\Process(*)\ID Process"),
+        (json!(["svchos?"]), r"\Process(svchos?)\ID Process"),
+    ] {
+        assert_config_error(
+            json!({"perfcounters": [{
+                "object": "Process", "instances": instances,
+                "counters": [{"name": "ID Process", "scale_power10": 19}]
+            }]}),
+            &format!("counter path {path:?} scale_power10 must be between -18 and 18"),
+        );
     }
 }
 
@@ -1891,7 +1916,11 @@ fn rejects_duplicate_paths_across_output_mappings() {
         }]
     }))
     .unwrap_err();
-    assert!(error.to_string().contains("duplicate counter path"));
+    assert!(
+        error
+            .to_string()
+            .contains(r"duplicate counter path: \Memory\Available Bytes")
+    );
 
     assert_config_error(
         json!({

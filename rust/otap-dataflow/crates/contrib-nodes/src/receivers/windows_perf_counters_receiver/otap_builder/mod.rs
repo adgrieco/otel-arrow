@@ -197,16 +197,28 @@ fn append_attributes(
 }
 
 fn prepare_point<'a>(
-    counters: &'a [CounterConfig],
+    counter: &'a CounterConfig,
     point: &'a SamplePoint,
     value: Number,
 ) -> Result<PreparedPoint<'a>, ProjectionInvariantError> {
-    let counter = counters.get(point.counter_index).ok_or_else(|| {
-        ProjectionInvariantError(ArrowError::InvalidArgumentError(format!(
-            "sample references missing configured counter {}",
-            point.counter_index
-        )))
-    })?;
+    if point.timestamp_unix_nano <= 0 {
+        return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
+            format!(
+                "counter {} has non-positive timestamp {}",
+                point.path, point.timestamp_unix_nano
+            ),
+        )));
+    }
+    if let Number::Double(number) = value
+        && !number.is_finite()
+    {
+        return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
+            format!(
+                "counter {} has non-finite double value {number}",
+                point.path
+            ),
+        )));
+    }
     let start_time_unix_nano = match counter.metric_kind {
         MetricKind::Gauge => None,
         MetricKind::Sum => {
@@ -239,6 +251,14 @@ fn project(
     counters: &[CounterConfig],
     sample: &Sample,
 ) -> Result<Option<OtapArrowRecords>, ProjectionInvariantError> {
+    if sample.timestamp_unix_nano <= 0 {
+        return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
+            format!(
+                "sample has non-positive timestamp {}",
+                sample.timestamp_unix_nano
+            ),
+        )));
+    }
     let mut builder = ProjectionBuilder::new();
     let mut membership = BTreeSet::new();
     for member in &sample.members {
@@ -253,7 +273,22 @@ fn project(
         let _ = membership.insert((member.counter_index, Arc::clone(&member.path)));
     }
     let mut ready = Vec::new();
+    let mut seen_counters = BTreeSet::new();
     for point in &sample.points {
+        let counter = counters.get(point.counter_index).ok_or_else(|| {
+            ProjectionInvariantError(ArrowError::InvalidArgumentError(format!(
+                "sample references missing configured counter {}",
+                point.counter_index
+            )))
+        })?;
+        if !seen_counters.insert((point.counter_index, point.path.as_ref())) {
+            return Err(ProjectionInvariantError(ArrowError::InvalidArgumentError(
+                format!(
+                    "sample repeats counter {} (metric {}) at index {}",
+                    point.path, counter.name, point.counter_index
+                ),
+            )));
+        }
         if !membership.is_empty()
             && !membership.contains(&(point.counter_index, Arc::clone(&point.path)))
         {
@@ -265,11 +300,11 @@ fn project(
             )));
         }
         if let SampleValue::Value(value) = point.value {
-            ready.push((point, value));
+            ready.push((counter, point, value));
         }
     }
-    for (point_count, (point, value)) in ready.into_iter().enumerate() {
-        let prepared = prepare_point(counters, point, value)?;
+    for (point_count, (counter, point, value)) in ready.into_iter().enumerate() {
+        let prepared = prepare_point(counter, point, value)?;
         let point_id = u32::try_from(point_count).map_err(|_| {
             ProjectionInvariantError(ArrowError::InvalidArgumentError(
                 "too many counter values".to_owned(),
@@ -287,7 +322,8 @@ fn project(
 }
 
 /// Project concrete observations using their own timestamps and required Sum starts.
-/// Missing/invalid starts and malformed membership are receiver invariant errors.
+/// Invalid times, values, counter references, duplicate observations, starts,
+/// and malformed membership are receiver invariant errors.
 pub(super) fn project_sample(
     counters: &[CounterConfig],
     sample: &Sample,
