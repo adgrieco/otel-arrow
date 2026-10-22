@@ -73,12 +73,13 @@ fn permanently_rejected_exact_startup_is_fatal() {
 #[tokio::test(flavor = "current_thread")]
 async fn recoverable_startup_errors_become_pending_and_rebuild() {
     for cleanup_failed in [false, true] {
+        let configs = vec![counter(r"\Memory\Available Bytes", "memory")];
         let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let factory_opens = Arc::clone(&opens);
         let dropped = Arc::new(AtomicBool::new(false));
         let factory_dropped = Arc::clone(&dropped);
         let mut worker = Worker::start_with(
-            vec![counter(r"\Memory\Available Bytes", "memory")],
+            configs.clone(),
             Duration::from_millis(20),
             4096,
             move |configs, limit, _seed| {
@@ -99,7 +100,7 @@ async fn recoverable_startup_errors_become_pending_and_rebuild() {
                     });
                 }
                 Query::open_with_seed(
-                    StartupTestPdh {
+                    StartupTestPdh::<false> {
                         dropped: Arc::clone(&factory_dropped),
                     },
                     configs,
@@ -118,6 +119,8 @@ async fn recoverable_startup_errors_become_pending_and_rebuild() {
         assert!(pending.metadata.diagnostics.query_pending);
         assert!(!pending.metadata.diagnostics.any_query_collected);
         assert!(pending.points.is_empty());
+        assert!(pending.timestamp_unix_nano > 0);
+        assert!(project_sample(&configs, &pending).unwrap().is_none());
         assert_eq!(opens.load(Ordering::Acquire), 1);
         assert!(pending.metadata.failures.iter().any(|failure| {
             failure.reason
@@ -131,6 +134,8 @@ async fn recoverable_startup_errors_become_pending_and_rebuild() {
         tokio::time::sleep(Duration::from_millis(30)).await;
         let failed_rebuild = worker.collect().await.unwrap();
         assert!(failed_rebuild.points.is_empty());
+        assert!(failed_rebuild.timestamp_unix_nano > 0);
+        assert!(project_sample(&configs, &failed_rebuild).unwrap().is_none());
         assert!(!failed_rebuild.metadata.diagnostics.any_query_collected);
         assert!(failed_rebuild.metadata.diagnostics.query_pending);
         assert_eq!(
@@ -156,6 +161,7 @@ async fn recoverable_startup_errors_become_pending_and_rebuild() {
         assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_attempts, 1);
         assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
         assert!(rebuilt.points.is_empty());
+        assert!(project_sample(&configs, &rebuilt).unwrap().is_none());
         let ready = worker.collect().await.unwrap();
         assert!(ready.metadata.diagnostics.any_query_collected);
         assert_eq!(ready.points.len(), 1);
@@ -278,17 +284,17 @@ fn dynamic_slot_refreshes_membership_with_bounded_admission() {
     assert_eq!(state.borrow().removed.len(), 1);
 }
 
-struct StartupTestPdh {
+struct StartupTestPdh<const TIMESTAMP_FAILS: bool> {
     dropped: Arc<AtomicBool>,
 }
 
-impl Drop for StartupTestPdh {
+impl<const TIMESTAMP_FAILS: bool> Drop for StartupTestPdh<TIMESTAMP_FAILS> {
     fn drop(&mut self) {
         self.dropped.store(true, Ordering::Release);
     }
 }
 
-impl PdhApi for StartupTestPdh {
+impl<const TIMESTAMP_FAILS: bool> PdhApi for StartupTestPdh<TIMESTAMP_FAILS> {
     type Counter = ();
 
     fn add(&mut self, _path: &str, _language: CounterLanguage) -> Result<Self::Counter, Error> {
@@ -321,7 +327,19 @@ impl PdhApi for StartupTestPdh {
     }
 
     fn timestamp(&mut self) -> Result<i64, Error> {
-        Ok(1)
+        if TIMESTAMP_FAILS {
+            Self::current_timestamp()
+        } else {
+            Ok(1)
+        }
+    }
+
+    fn current_timestamp() -> Result<i64, Error> {
+        if TIMESTAMP_FAILS {
+            Err(Error::Timestamp("test timestamp failure"))
+        } else {
+            NativePdh::current_timestamp()
+        }
     }
 
     fn refresh_objects(&mut self) -> Result<usize, Error> {
@@ -337,6 +355,50 @@ impl PdhApi for StartupTestPdh {
             path: path.to_owned(),
         })
     }
+}
+
+/// Scenario: Reading the clock fails during initial query setup or a scheduled no-query maintenance attempt.
+/// Guarantees: Initial timestamp failure is fatal, while scheduled failure remains a counted collection error rather than an invalid maintenance sample.
+#[test]
+fn timestamp_failure_is_fatal_at_startup_and_counted_during_maintenance() {
+    let configs = vec![counter(r"\Memory\Available Bytes", "memory")];
+    let mut initial_open = |configs, limit, seed: Option<&QueryRecreationSeed>| {
+        Query::open_with_seed(
+            StartupTestPdh::<true> {
+                dropped: Arc::new(AtomicBool::new(false)),
+            },
+            configs,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            256,
+            limit,
+            seed,
+        )
+    };
+    assert!(matches!(
+        QuerySlot::open_initial(configs.clone(), 4_096, &mut initial_open),
+        Err(Error::Timestamp("test timestamp failure"))
+    ));
+
+    let mut failed_open = |_configs, _limit, _seed: Option<&QueryRecreationSeed>| {
+        Err::<Query<StartupTestPdh<true>>, _>(Error::Pdh {
+            operation: PdhOperation::OpenQuery,
+            path: "<query>".to_owned(),
+            status: 1,
+        })
+    };
+    let mut slot = QuerySlot::open_initial(configs, 4_096, &mut failed_open).unwrap();
+    let error = collect_query(
+        &mut slot,
+        Duration::ZERO,
+        4_096,
+        &mut failed_open,
+        Instant::now(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Timestamp("test timestamp failure")));
+    assert!(error.is_collection_failure());
+    assert!(slot.query.is_none());
 }
 
 /// Scenario: A worker query factory is invoked repeatedly for initial and replacement queries.
@@ -761,11 +823,10 @@ fn initial_wildcard_reserves_later_exact_native_entry() {
 
     assert_eq!(observed_limits.borrow().as_slice(), [3]);
     assert_eq!(queries.active_expanded_count(), 2);
-    assert_eq!(queries.reserved_native_entry_count(), 3);
 }
 
 /// Scenario: A wildcard query reaches the rebuild threshold while its admitted member has not disappeared.
-/// Guarantees: The down slot reserves the seeded wildcard member so healthy peers cannot consume its recovery capacity.
+/// Guarantees: Replacement receives the retained seed and restores the admitted member within the same one-entry native budget.
 #[test]
 fn down_query_reserves_seeded_wildcard_membership() {
     let path = r"\Process(*)\Private Bytes";
@@ -779,6 +840,8 @@ fn down_query_reserves_seeded_wildcard_membership() {
     let mut open = move |configs: Vec<CounterConfig>,
                          max_native_counters: usize,
                          seed: Option<&QueryRecreationSeed>| {
+        assert_eq!(seed.is_some(), !factory_states.borrow().is_empty());
+        assert_eq!(max_native_counters, 1);
         let state = Rc::new(RefCell::new(FakeState {
             expansions: [(path.to_owned(), vec![concrete.to_owned()])]
                 .into_iter()
@@ -795,12 +858,17 @@ fn down_query_reserves_seeded_wildcard_membership() {
             seed,
         )
         .unwrap();
+        if seed.is_some() {
+            assert_eq!(query.admitted_members().len(), 1);
+            assert_eq!(query.admitted_members()[0].path.as_ref(), concrete);
+            assert_eq!(state.borrow().calls.expand, 0);
+            assert_eq!(state.borrow().added, [concrete.to_owned()]);
+        }
         factory_states.borrow_mut().push(state);
         Ok(query)
     };
     let plan = vec![config];
     let mut slot = QuerySlot::open_initial(plan, 1, &mut open).unwrap();
-    assert_eq!(slot.reserved_native_entry_count(), 1);
     states.borrow()[0].borrow_mut().collect_error = true;
 
     for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
@@ -809,7 +877,11 @@ fn down_query_reserves_seeded_wildcard_membership() {
     }
 
     assert!(slot.query.is_none());
-    assert_eq!(slot.reserved_native_entry_count(), 1);
+    let rebuilt = collect_query(&mut slot, Duration::ZERO, 1, &mut open, Instant::now()).unwrap();
+    assert_eq!(rebuilt.members.len(), 1);
+    assert_eq!(rebuilt.members[0].path.as_ref(), concrete);
+    assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
+    assert_eq!(states.borrow().len(), 2);
 }
 
 /// Scenario: A down wildcard query's rebuild attempt fails with an error that normally schedules an immediate rebuild.
@@ -851,7 +923,6 @@ fn failed_rebuild_preserves_down_query_state() {
         assert!(result.is_err_and(|error| error.is_query_collection_failure()));
     }
     assert!(slot.query.is_none());
-    assert_eq!(slot.reserved_native_entry_count(), 1);
 
     let observed_seeds = RefCell::new(Vec::new());
     let mut fail_rebuild = |_: Vec<CounterConfig>, _: usize, seed: Option<&QueryRecreationSeed>| {
@@ -882,7 +953,6 @@ fn failed_rebuild_preserves_down_query_state() {
     assert!(matches!(pending, Error::QueryRecoveryPending { .. }));
     assert_eq!(observed_seeds.borrow().as_slice(), [true, true]);
     assert!(slot.query.is_none());
-    assert_eq!(slot.reserved_native_entry_count(), 1);
 }
 
 /// Scenario: Two wildcard expansions repeatedly fail while an exact counter remains healthy.
@@ -961,7 +1031,6 @@ fn repeated_refresh_failures_stay_on_refresh_cadence() {
     }
 
     assert!(queries.query.is_some());
-    assert_eq!(queries.reserved_native_entry_count(), 1);
     assert_eq!(
         states.borrow()[0].borrow().calls.expand,
         initial_expand_calls + 2 * QUERY_REBUILD_AFTER_FAILURES as usize
@@ -1095,7 +1164,6 @@ fn exact_reservation_reduces_same_query_expansion_capacity() {
 
     query.prime().unwrap();
     assert_eq!(query.active_expanded_count(), 1);
-    assert_eq!(query.reserved_native_entry_count(), 2);
     assert_eq!(state.borrow().added.len(), 2);
 }
 
@@ -1104,7 +1172,7 @@ fn exact_reservation_reduces_same_query_expansion_capacity() {
 #[test]
 fn query_rejects_limit_below_exact_reservation() {
     let result = Query::open_with_seed(
-        StartupTestPdh {
+        StartupTestPdh::<false> {
             dropped: Arc::new(AtomicBool::new(false)),
         },
         vec![
@@ -1297,7 +1365,7 @@ async fn startup_longer_than_thirty_seconds_eventually_succeeds() {
             let _ = entered_tx.send(());
             let _ = release_rx.recv();
             Query::open_with_seed(
-                StartupTestPdh {
+                StartupTestPdh::<false> {
                     dropped: Arc::clone(&factory_dropped),
                 },
                 configs,
@@ -1435,7 +1503,7 @@ async fn cancelling_startup_stops_between_initialization_units() {
                 let _ = release_rx.recv();
             }
             Query::open_with_seed(
-                StartupTestPdh {
+                StartupTestPdh::<false> {
                     dropped: Arc::clone(&factory_dropped),
                 },
                 configs,
@@ -1611,7 +1679,6 @@ fn failed_pending_cleanup_remains_bounded_without_query_escalation() {
         let pending =
             collect_query(&mut slot, Duration::from_secs(60), limit, &mut open, now).unwrap();
         assert_eq!(pending.metadata.diagnostics.discovery_failures, 0);
-        assert_eq!(slot.reserved_native_entry_count(), 1);
         assert_eq!(
             state
                 .borrow()
@@ -1649,7 +1716,6 @@ fn failed_pending_cleanup_remains_bounded_without_query_escalation() {
                 .count(),
             2
         );
-        assert_eq!(slot.reserved_native_entry_count(), 1);
         let backoff = collect_query(
             &mut slot,
             Duration::from_secs(60),
@@ -1860,7 +1926,7 @@ async fn shutdown_during_recovery_closes_all_handles() {
 /// Guarantees: Permanent startup corruption remains explicit instead of entering an endless recovery loop.
 #[tokio::test(flavor = "current_thread")]
 async fn startup_rejects_nonrecoverable_query_errors() {
-    let result = Worker::start_with::<StartupTestPdh, _>(
+    let result = Worker::start_with::<StartupTestPdh<false>, _>(
         vec![counter(
             r"\Memory\Available Bytes",
             "windows.memory.available",
@@ -1886,16 +1952,16 @@ async fn startup_rejects_nonrecoverable_query_errors() {
 async fn startup_prime_query_failure_starts_and_recovers() {
     let path = r"\Processor(_Total)\% Processor Time";
     let counters = vec![counter(path, "system.cpu.time")];
-    let collect_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let factory_calls = Arc::clone(&collect_calls);
     let mut worker = Worker::start_with(
         counters,
         Duration::from_secs(30),
         4_096,
         move |counters, max_expanded_counters, _seed| {
             Query::open_with_seed(
-                RecoveringPrimePdh {
-                    collect_calls: Arc::clone(&factory_calls),
+                CalculatedPdh {
+                    fail_collect: Arc::new(AtomicBool::new(false)),
+                    collect_calls: 0,
+                    fail_first_collect: true,
                 },
                 counters,
                 Duration::from_secs(30),
@@ -1921,7 +1987,7 @@ async fn startup_prime_query_failure_starts_and_recovers() {
     let recovered = worker.collect().await.unwrap();
     assert!(matches!(
         recovered.points[0].value,
-        SampleValue::Value(Number::Double(1.0))
+        SampleValue::Value(Number::Double(2.0))
     ));
     assert!(
         worker
@@ -1931,11 +1997,12 @@ async fn startup_prime_query_failure_starts_and_recovers() {
     );
 }
 
-/// Scenario: An initially healthy deferred-recovery query goes down and successfully rebuilds during the next requested scrape.
-/// Guarantees: Rebuild and priming maintenance produce an empty sample marked as no query collection, so runtime accounting treats the attempt as failed.
+/// Scenario: An initially healthy query goes down, fails a replacement open, and subsequently rebuilds.
+/// Guarantees: No-query maintenance retains the seed timestamp and valid membership, projects no batch, and never claims a successful collection.
 #[test]
-fn rebuild_only_sample_reports_no_query_collected() {
+fn rebuild_maintenance_preserves_timestamp_membership_and_projection() {
     let path = r"\Unavailable\Value";
+    let configs = vec![counter(path, "windows.unavailable")];
     let open_calls = Rc::new(Cell::new(0_usize));
     let factory_open_calls = Rc::clone(&open_calls);
     let states = Rc::new(RefCell::new(Vec::new()));
@@ -1944,6 +2011,13 @@ fn rebuild_only_sample_reports_no_query_collected() {
                          max_native_counters: usize,
                          seed: Option<&QueryRecreationSeed>| {
         factory_open_calls.set(factory_open_calls.get() + 1);
+        if factory_open_calls.get() == 2 {
+            return Err(Error::Pdh {
+                operation: PdhOperation::OpenQuery,
+                path: "<query>".to_owned(),
+                status: 1,
+            });
+        }
         let (state, query) = fake_query_with_seed(
             configs,
             vec![fake_counter(path, Number::Integer(42))],
@@ -1956,7 +2030,7 @@ fn rebuild_only_sample_reports_no_query_collected() {
         Ok(query)
     };
     let mut queries = open_initial_query(
-        vec![counter(path, "windows.unavailable")],
+        configs.clone(),
         Duration::ZERO,
         4_096,
         &mut open,
@@ -1964,6 +2038,16 @@ fn rebuild_only_sample_reports_no_query_collected() {
     )
     .unwrap()
     .unwrap();
+    states.borrow()[0].borrow_mut().timestamp = 110;
+    let healthy = collect_query(
+        &mut queries,
+        Duration::ZERO,
+        4_096,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap();
+    assert_eq!(healthy.timestamp_unix_nano, 110);
     states.borrow()[0].borrow_mut().collect_error = true;
     for _ in 0..QUERY_REBUILD_AFTER_FAILURES {
         assert!(
@@ -1978,6 +2062,24 @@ fn rebuild_only_sample_reports_no_query_collected() {
         );
     }
 
+    let pending = collect_query(
+        &mut queries,
+        Duration::ZERO,
+        4_096,
+        &mut open,
+        Instant::now(),
+    )
+    .unwrap();
+    assert!(queries.query.is_none());
+    assert_eq!(pending.timestamp_unix_nano, 110);
+    assert!(pending.points.is_empty());
+    assert_eq!(pending.members.len(), 1);
+    assert_eq!(pending.members[0].counter_index, 0);
+    assert_eq!(pending.members[0].path.as_ref(), path);
+    assert!(!pending.metadata.diagnostics.any_query_collected);
+    assert!(pending.metadata.diagnostics.query_pending);
+    assert!(project_sample(&configs, &pending).unwrap().is_none());
+
     let rebuilt = collect_query(
         &mut queries,
         Duration::ZERO,
@@ -1988,10 +2090,11 @@ fn rebuild_only_sample_reports_no_query_collected() {
     .unwrap();
 
     assert!(rebuilt.points.is_empty());
+    assert!(project_sample(&configs, &rebuilt).unwrap().is_none());
     assert!(!rebuilt.metadata.diagnostics.any_query_collected);
     assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_attempts, 1);
     assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
-    assert_eq!(open_calls.get(), 2);
+    assert_eq!(open_calls.get(), 3);
 }
 
 /// Scenario: A calculated query configured for planned recreation reaches the failure threshold and is rebuilt during a scrape.
@@ -2009,13 +2112,14 @@ fn rebuilt_query_defers_values_until_the_next_scrape() {
         let open_index = factory_open_calls.get();
         factory_open_calls.set(open_index + 1);
         Query::open_with_seed(
-            RebuildPrimePdh {
+            CalculatedPdh {
                 fail_collect: if open_index == 0 {
                     Arc::clone(&factory_first_query_failure)
                 } else {
                     Arc::new(AtomicBool::new(false))
                 },
                 collect_calls: 0,
+                fail_first_collect: false,
             },
             configs,
             Duration::from_secs(30),
@@ -2330,23 +2434,19 @@ fn query_recovery_cap_is_independent_of_membership_refresh() {
     let factory_fail_collect = Arc::clone(&fail_collect);
     let open_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let factory_open_calls = Arc::clone(&open_calls);
-    let observed_refreshes = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let factory_refreshes = Arc::clone(&observed_refreshes);
-    let cadence = QueryCadence::new(Duration::from_secs(2), Duration::from_secs(60));
+    let retry_cap = Duration::from_secs(2);
+    let wildcard_refresh = Duration::from_secs(60);
     let mut open = move |configs, max_native_counters, seed: Option<&QueryRecreationSeed>| {
         let _ = factory_open_calls.fetch_add(1, Ordering::AcqRel);
-        factory_refreshes
-            .lock()
-            .unwrap()
-            .push(cadence.wildcard_refresh());
         Query::open_with_seed(
-            RebuildPrimePdh {
+            CalculatedPdh {
                 fail_collect: Arc::clone(&factory_fail_collect),
                 collect_calls: 0,
+                fail_first_collect: false,
             },
             configs,
-            cadence.retry_cap(),
-            cadence.wildcard_refresh(),
+            retry_cap,
+            wildcard_refresh,
             256,
             max_native_counters,
             seed,
@@ -2364,7 +2464,7 @@ fn query_recovery_cap_is_independent_of_membership_refresh() {
         assert!(matches!(
             collect_query(
                 &mut slot,
-                cadence.retry_cap(),
+                retry_cap,
                 4_096,
                 &mut open,
                 now + Duration::from_secs(offset)
@@ -2378,7 +2478,7 @@ fn query_recovery_cap_is_independent_of_membership_refresh() {
     fail_collect.store(false, Ordering::Release);
     let rebuilt = collect_query(
         &mut slot,
-        cadence.retry_cap(),
+        retry_cap,
         4_096,
         &mut open,
         now + Duration::from_secs(5),
@@ -2388,56 +2488,6 @@ fn query_recovery_cap_is_independent_of_membership_refresh() {
     assert!(rebuilt.points.is_empty());
     assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
     assert_eq!(open_calls.load(Ordering::Acquire), 2);
-    assert_eq!(
-        observed_refreshes.lock().unwrap().as_slice(),
-        [Duration::from_secs(60), Duration::from_secs(60)]
-    );
-}
-
-/// Scenario: Query collection fails transiently and then remains unavailable.
-/// Guarantees: Valid query history survives the first two retries and a rebuild is requested at the bounded threshold.
-#[test]
-fn query_rebuild_waits_for_bounded_retries() {
-    assert!(!should_rebuild_query(1));
-    assert!(!should_rebuild_query(2));
-    assert!(should_rebuild_query(3));
-    assert!(should_rebuild_query(u32::MAX));
-}
-
-/// Scenario: A simulated PDH call remains blocked past the shutdown deadline.
-/// Guarantees: Shutdown returns at the deadline, cleanup occurs later on the worker,
-/// and worker-owned resources remain alive until that cleanup completes.
-#[tokio::test(flavor = "current_thread")]
-async fn blocked_worker_releases_resources_after_timeout() {
-    let (mut worker, ownership, started, release) = blocked_collect_worker().await;
-    {
-        let collection = worker.collect();
-        tokio::pin!(collection);
-        tokio::select! {
-            result = &mut collection => panic!("collection resolved before release: {result:?}"),
-            result = started => result.expect("worker should enter native collection"),
-        }
-    }
-
-    let start = Instant::now();
-    assert!(
-        !worker
-            .shutdown(start + Duration::from_millis(25))
-            .await
-            .unwrap()
-    );
-    assert!(start.elapsed() < Duration::from_secs(1));
-    assert_eq!(ownership.current.load(Ordering::Acquire), 1);
-    assert_eq!(ownership.closed_queries.load(Ordering::Acquire), 0);
-    release.send(()).unwrap();
-    assert!(
-        worker
-            .shutdown(Instant::now() + Duration::from_secs(2))
-            .await
-            .unwrap()
-    );
-    assert_eq!(ownership.current.load(Ordering::Acquire), 0);
-    assert_eq!(ownership.closed_queries.load(Ordering::Acquire), 1);
 }
 
 async fn blocked_collect_worker() -> (

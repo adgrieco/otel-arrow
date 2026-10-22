@@ -11,8 +11,6 @@ pub(in super::super) enum PdhOperation {
     AddEnglishCounter,
     AddCounter,
     CollectQueryData,
-    #[cfg(test)]
-    CounterDataStatus,
     ExpandWildcardPath,
     ExpandWildcardPathSize,
     FormattedCounterDataStatus,
@@ -33,8 +31,6 @@ impl PdhOperation {
             Self::AddEnglishCounter => "PdhAddEnglishCounterW",
             Self::AddCounter => "PdhAddCounterW",
             Self::CollectQueryData => "PdhCollectQueryData",
-            #[cfg(test)]
-            Self::CounterDataStatus => "counter CStatus",
             Self::ExpandWildcardPath => "PdhExpandWildCardPathW",
             Self::ExpandWildcardPathSize => "PdhExpandWildCardPathW(size)",
             Self::FormattedCounterDataStatus => "formatted counter CStatus",

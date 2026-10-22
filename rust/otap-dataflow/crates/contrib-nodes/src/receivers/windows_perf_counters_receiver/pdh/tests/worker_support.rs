@@ -7,14 +7,6 @@ impl QueryCadence {
     pub(in super::super) fn uniform(cadence: Duration) -> Self {
         Self::new(cadence, cadence)
     }
-
-    pub(in super::super) fn retry_cap(self) -> Duration {
-        self.retry_cap
-    }
-
-    pub(in super::super) fn wildcard_refresh(self) -> Duration {
-        self.wildcard_refresh
-    }
 }
 
 impl Worker {
@@ -66,21 +58,5 @@ impl<A: PdhApi> QuerySlot<A> {
             &AtomicBool::new(false),
         )?
         .ok_or(Error::WorkerStopRequested)
-    }
-
-    pub(in super::super) fn reserved_native_entry_count(&self) -> usize {
-        let exact = self
-            .configs
-            .iter()
-            .filter(|config| !config.instance_config.is_wildcard())
-            .count();
-        self.query.as_ref().map_or_else(
-            || {
-                self.rebuild_seed
-                    .as_ref()
-                    .map_or(exact, |seed| seed.reserved_native_entry_count(exact))
-            },
-            Query::reserved_native_entry_count,
-        )
     }
 }

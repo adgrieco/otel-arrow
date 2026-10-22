@@ -6,7 +6,7 @@ use super::error::Error;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(test)]
-pub(super) use test_support::{is_aggregation_instance, limit_expanded_paths, parse_instance};
+pub(super) use test_support::parse_instance;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct CounterKey {

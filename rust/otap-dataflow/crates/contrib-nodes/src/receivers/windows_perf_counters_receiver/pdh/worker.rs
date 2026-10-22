@@ -9,6 +9,7 @@ use super::PdhApi;
 use super::diagnostics::SampleLogState;
 use super::error::Error;
 use super::query::{Query, QueryRecreationSeed, retry_delay};
+use super::timing::positive_timestamp;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -30,10 +31,6 @@ impl QueryCadence {
             wildcard_refresh,
         }
     }
-}
-
-pub(super) fn should_rebuild_query(consecutive_failures: u32) -> bool {
-    consecutive_failures >= QUERY_REBUILD_AFTER_FAILURES
 }
 
 /// Capacity-one command client for the thread that owns the persistent query.
@@ -610,7 +607,7 @@ impl<A: PdhApi> QuerySlot<A> {
         self.rebuild_seed = None;
         primed?;
         self.pending.diagnostics.query_rebuild_recoveries += 1;
-        let mut sample = Sample::empty(self.recovery_timestamp_unix_nano());
+        let mut sample = Sample::empty(self.recovery_timestamp_unix_nano()?);
         self.move_pending_metadata_to(&mut sample.metadata);
         sample.metadata.diagnostics.any_query_collected = false;
         Ok(sample)
@@ -633,7 +630,7 @@ impl<A: PdhApi> QuerySlot<A> {
         {
             self.query_failure_attempts = self.query_failure_attempts.saturating_add(1);
             self.next_query_retry = now + retry_delay(self.query_failure_attempts, retry_cap);
-            if should_rebuild_query(self.query_failure_attempts) {
+            if self.query_failure_attempts >= QUERY_REBUILD_AFTER_FAILURES {
                 self.schedule_rebuild(self.next_query_retry);
             }
         } else if result.is_ok() {
@@ -657,10 +654,20 @@ impl<A: PdhApi> QuerySlot<A> {
         self.next_rebuild = next_rebuild;
     }
 
-    fn recovery_timestamp_unix_nano(&self) -> i64 {
-        self.query
+    fn recovery_timestamp_unix_nano(&self) -> Result<i64, Error> {
+        let timestamp = self
+            .query
             .as_ref()
-            .map_or(0, |query| query.previous_timestamp_unix_nano)
+            .map(|query| query.previous_timestamp_unix_nano)
+            .or_else(|| {
+                self.rebuild_seed
+                    .as_ref()
+                    .map(|seed| seed.previous_timestamp_unix_nano)
+            });
+        positive_timestamp(match timestamp {
+            Some(timestamp) => timestamp,
+            None => A::current_timestamp()?,
+        })
     }
 
     fn move_pending_metadata_to(&mut self, target: &mut PendingMetadata) {
@@ -701,7 +708,7 @@ where
                 return Err(error);
             }
             slot.record_query_failure(&error);
-            let mut sample = Sample::empty(slot.recovery_timestamp_unix_nano());
+            let mut sample = Sample::empty(slot.recovery_timestamp_unix_nano()?);
             slot.move_pending_metadata_to(&mut sample.metadata);
             sample.metadata.diagnostics.any_query_collected = false;
             sample

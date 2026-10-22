@@ -66,7 +66,17 @@ pub(super) trait PdhApi {
         path: &str,
         format: ValueFormat,
     ) -> Result<Option<Number>, Error>;
-    fn timestamp(&mut self) -> Result<i64, Error>;
+    fn timestamp(&mut self) -> Result<i64, Error> {
+        Self::current_timestamp()
+    }
+    /// Reads the same wall clock even when no query could be opened.
+    fn current_timestamp() -> Result<i64, Error> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| Error::Timestamp("system clock precedes Unix epoch"))?
+            .as_nanos();
+        i64::try_from(timestamp).map_err(|_| Error::Timestamp("timestamp exceeds i64 nanoseconds"))
+    }
     /// Resolves an English template and returns concrete host-language paths.
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error>;
     /// Refreshes the local object list and returns its object count.

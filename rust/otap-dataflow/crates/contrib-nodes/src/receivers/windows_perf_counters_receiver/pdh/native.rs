@@ -13,7 +13,7 @@ use std::ptr::{null, null_mut};
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use windows_sys::Win32::Globalization::GetThreadUILanguage;
 use windows_sys::Win32::System::Performance::{
     PDH_CALC_NEGATIVE_DENOMINATOR, PDH_CALC_NEGATIVE_TIMEBASE, PDH_CALC_NEGATIVE_VALUE,
@@ -761,14 +761,6 @@ impl PdhApi for NativePdh {
             // supplies initialized, writable storage for the format it decodes.
             unsafe { PdhGetFormattedCounterValue(handle, flags, null_mut(), value) }
         })
-    }
-
-    fn timestamp(&mut self) -> Result<i64, Error> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| Error::Timestamp("system clock precedes Unix epoch"))?
-            .as_nanos();
-        i64::try_from(timestamp).map_err(|_| Error::Timestamp("timestamp exceeds i64 nanoseconds"))
     }
 
     fn expand(&mut self, path: &str) -> Result<Vec<String>, Error> {

@@ -158,7 +158,7 @@ async fn healthy_collection_and_recovery_only_have_distinct_accounting() {
         .unwrap();
 
     let recovery_only = Sample {
-        timestamp_unix_nano: 0,
+        timestamp_unix_nano: 110,
         members: Vec::new(),
         points: Vec::new(),
         metadata: PendingMetadata {
@@ -198,19 +198,19 @@ async fn healthy_collection_and_recovery_only_have_distinct_accounting() {
     assert_eq!(metrics.health.counter_read_failures.get(), 0);
 }
 
-/// Scenario: Startup recovery, no-query backoff and failed replacement produce timestamp-free maintenance before a rebuilt query publishes.
-/// Guarantees: The runtime consumes worker-shaped maintenance without publication or collection failures and continues through successful recovery.
+/// Scenario: Startup recovery, no-query backoff and failed replacement produce timestamped maintenance before a rebuilt query publishes.
+/// Guarantees: The runtime projects producer-stamped maintenance without publication or collection failures and continues through successful recovery.
 #[tokio::test(start_paused = true)]
-async fn timestamp_free_query_maintenance_recovers_through_runtime() {
+async fn timestamped_query_maintenance_recovers_through_runtime() {
     let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
     let mut samples = std::collections::VecDeque::new();
-    for (reason, rebuild_attempts) in [
-        ("PdhOpenQueryW", 0),
-        ("query_recovery_pending", 0),
-        ("PdhOpenQueryW", 1),
+    for (timestamp, reason, rebuild_attempts) in [
+        (70, "PdhOpenQueryW", 0),
+        (80, "query_recovery_pending", 0),
+        (90, "PdhOpenQueryW", 1),
     ] {
         samples.push_back(Sample {
-            timestamp_unix_nano: 0,
+            timestamp_unix_nano: timestamp,
             members: Vec::new(),
             points: Vec::new(),
             metadata: PendingMetadata {
@@ -278,19 +278,20 @@ async fn timestamp_free_query_maintenance_recovers_through_runtime() {
     assert_eq!(metrics.health.query_rebuild_recoveries.get(), 1);
 }
 
-/// Scenario: A zero-time sample contains collected data, observations, or an invalid retained member index.
-/// Guarantees: Maintenance handling cannot bypass strict collected-sample timestamp or structural invariant checks.
+/// Scenario: Collected and maintenance samples have a zero timestamp, or stamped maintenance has an invalid retained member index.
+/// Guarantees: Every sample must satisfy strict timestamp and membership invariants, including empty no-query maintenance.
 #[tokio::test]
 async fn maintenance_handling_preserves_projection_invariants() {
-    for (collected, point, member) in [
-        (true, false, false),
-        (true, true, false),
-        (false, true, false),
-        (false, false, true),
+    for (timestamp, collected, point, member) in [
+        (0, true, false, false),
+        (0, true, true, false),
+        (0, false, true, false),
+        (0, false, false, false),
+        (100, false, false, true),
     ] {
         let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
         let sample = Sample {
-            timestamp_unix_nano: 0,
+            timestamp_unix_nano: timestamp,
             members: if member {
                 vec![super::super::model::SampleMember {
                     counter_index: 1,

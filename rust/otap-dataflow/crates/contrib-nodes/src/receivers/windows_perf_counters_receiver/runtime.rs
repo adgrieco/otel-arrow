@@ -6,7 +6,7 @@
 use super::config::Config;
 use super::metrics::WindowsPerfCountersReceiverMetrics;
 use super::model::{Sample, SampleFailure};
-use super::otap_builder::{ProjectionInvariantError, project_sample, validate_member_indexes};
+use super::otap_builder::{ProjectionInvariantError, project_sample};
 use super::pdh;
 use async_trait::async_trait;
 use linkme::distributed_slice;
@@ -278,16 +278,7 @@ impl WindowsPerfCountersReceiver {
         F: FnOnce(OtapPdata) -> Fut,
         Fut: Future<Output = Result<(), Error>>,
     {
-        // No-query maintenance uses zero as an absent observation timestamp.
-        let projection = if sample.timestamp_unix_nano == 0
-            && !sample.metadata.diagnostics.any_query_collected
-            && sample.points.is_empty()
-        {
-            validate_member_indexes(&self.config.counters, &sample).map(|()| None)
-        } else {
-            project_sample(&self.config.counters, &sample)
-        };
-        let projection = match projection {
+        let projection = match project_sample(&self.config.counters, &sample) {
             Ok(projection) => projection,
             Err(err) => {
                 self.metrics.borrow_mut().record_scrape(Outcome::Failure);

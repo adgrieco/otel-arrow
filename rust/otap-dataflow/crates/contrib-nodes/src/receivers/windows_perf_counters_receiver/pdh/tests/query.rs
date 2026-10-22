@@ -7,12 +7,8 @@ use super::*;
 /// Guarantees: Decoded OTAP retains grouped metadata, concrete identity, static precedence, collection times and query-owned Sum start.
 #[test]
 fn query_producer_to_decoded_otap_preserves_observations() {
-    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value;
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{metric, number_data_point};
-    use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryIntoWithOptions};
-    use otel_arrow_dfe_pdata_codec::OtapPayload;
-    use prost::Message;
 
     let config = Config::from_json(&serde_json::json!({
         "metrics": {
@@ -90,10 +86,7 @@ fn query_producer_to_decoded_otap_preserves_observations() {
     sample.members.extend(later.members);
     sample.points.extend(later.points);
     let records = into_otap(&config.counters, sample).unwrap().unwrap();
-    let bytes: OtlpProtoBytes = OtapPayload::from_otap(records)
-        .try_into_with_default()
-        .unwrap();
-    let decoded = ExportMetricsServiceRequest::decode(bytes.as_bytes()).unwrap();
+    let decoded = decode(records);
     let resource = &decoded.resource_metrics[0];
     assert!(
         resource
@@ -534,29 +527,29 @@ fn failed_wildcard_retirement_preserves_rebuild_seed() {
             state.timestamp = 110;
         }
         let retry_cap = Duration::from_secs(60);
-        let failed_cleanup =
-            collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now()).unwrap();
+        let failed_at = Instant::now();
+        let failed_cleanup = collect_query(&mut slot, retry_cap, 2, &mut open, failed_at).unwrap();
         assert_eq!(failed_cleanup.points.len(), 1);
         assert_eq!(failed_cleanup.points[0].path.as_ref(), healthy);
         assert!(slot.query.is_some());
         state.borrow_mut().collect_status = Some(PDH_INVALID_HANDLE);
         assert!(
-            collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now())
+            collect_query(&mut slot, retry_cap, 2, &mut open, failed_at)
                 .unwrap_err()
                 .is_invalid_query()
         );
         state.borrow_mut().collect_status = None;
         assert!(slot.query.is_none());
-        assert_eq!(slot.reserved_native_entry_count(), 2);
-        let backoff = collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now()).unwrap();
+        let backoff = collect_query(&mut slot, retry_cap, 2, &mut open, failed_at).unwrap();
         assert!(!backoff.metadata.diagnostics.any_query_collected);
         assert!(backoff.points.is_empty());
+        assert_eq!(backoff.members.len(), 2);
         assert!(!backoff.metadata.failures.is_empty());
         assert_eq!(opens.get(), 1);
         state.borrow_mut().cleanup_fails = false;
-        std::thread::sleep(Duration::from_millis(1100));
+        let mut rebuild_at = failed_at + Duration::from_secs(1);
         if fail_replacement_open {
-            let failed = collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now()).unwrap();
+            let failed = collect_query(&mut slot, retry_cap, 2, &mut open, rebuild_at).unwrap();
             assert!(!failed.metadata.diagnostics.any_query_collected);
             assert!(failed.points.is_empty());
             assert!(
@@ -564,14 +557,14 @@ fn failed_wildcard_retirement_preserves_rebuild_seed() {
                     failure.reason == "PdhOpenQueryW" && failure.diagnostic_only
                 })
             );
-            std::thread::sleep(Duration::from_millis(1100));
+            rebuild_at += Duration::from_secs(1);
         }
-        let rebuilt = collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now()).unwrap();
+        let rebuilt = collect_query(&mut slot, retry_cap, 2, &mut open, rebuild_at).unwrap();
         assert!(!rebuilt.metadata.diagnostics.any_query_collected);
         assert!(rebuilt.points.is_empty());
         assert_eq!(rebuilt.metadata.diagnostics.query_rebuild_recoveries, 1);
         state.borrow_mut().timestamp = 120;
-        let ready = collect_query(&mut slot, retry_cap, 2, &mut open, Instant::now()).unwrap();
+        let ready = collect_query(&mut slot, retry_cap, 2, &mut open, rebuild_at).unwrap();
         assert_eq!(ready.points.len(), 2);
         assert_eq!(ready.points[0].path.as_ref(), path);
         assert_eq!(ready.points[0].start_time_unix_nano, Some(100));
@@ -587,6 +580,63 @@ fn failed_wildcard_retirement_preserves_rebuild_seed() {
             ]
         );
         assert_eq!(state.borrow().max_active, 2);
+    }
+}
+
+/// Scenario: A wildcard lookup succeeds or fails before temporary-handle cleanup also fails.
+/// Guarantees: Healthy members survive and warnings remain once per episode; only a genuine lookup failure counts discovery failure and enables object refresh.
+#[test]
+fn lookup_failure_with_pending_cleanup_preserves_discovery_classification() {
+    let template = r"\Process(*)\Private Bytes";
+    let member = r"\Process(worker)\Private Bytes";
+    let healthy = r"\Memory\Available Bytes";
+    for lookup_failed in [false, true] {
+        let mut wildcard = counter(template, "private");
+        wildcard.instance_config = InstanceConfig::Wildcard {
+            excluded_aggregation: None,
+        };
+        let (state, mut query) = fake_query(
+            vec![wildcard, counter(healthy, "memory")],
+            vec![
+                fake_counter(member, Number::Integer(1)),
+                fake_counter(healthy, Number::Integer(2)),
+            ],
+        );
+        let _ = state
+            .borrow_mut()
+            .expansions
+            .insert(template.to_owned(), vec![member.to_owned()]);
+        query.refresh_all_wildcards_managed().unwrap();
+        {
+            let mut state = state.borrow_mut();
+            state.expand_error = true;
+            state.expand_operation = PdhOperation::RemoveCounter;
+            state.lookup_failure_on_cleanup = lookup_failed;
+        }
+        query.last_object_refresh = Instant::now() - Duration::from_secs(601);
+        for attempt in 0..2 {
+            query.last_wildcard_refresh = Instant::now() - Duration::from_secs(31);
+            let sample = query.collect().unwrap();
+            assert_eq!(sample.points.len(), 2);
+            assert_eq!(
+                sample.metadata.diagnostics.discovery_failures,
+                u64::from(lookup_failed)
+            );
+            assert_eq!(
+                sample
+                    .metadata
+                    .failures
+                    .iter()
+                    .filter(|failure| failure.reason == "selector_unresolved")
+                    .count(),
+                usize::from(attempt == 0)
+            );
+            assert_eq!(
+                state.borrow().calls.refresh,
+                usize::from(lookup_failed && attempt == 1)
+            );
+        }
+        assert!(state.borrow().removed.is_empty());
     }
 }
 
@@ -990,7 +1040,6 @@ fn invalid_handle_cleanup_failure_preserves_healthy_collection() {
     assert!(sample.metadata.diagnostics.any_query_collected);
     assert_eq!(sample.metadata.diagnostics.discovery_failures, 0);
     assert_eq!(sample.metadata.failures.len(), 2);
-    assert_eq!(query.reserved_native_entry_count(), 2);
     let state = state.borrow();
     assert_eq!(state.cleanup_attempts, [handle]);
     assert_eq!(state.active, BTreeSet::from([handle, 1]));
@@ -1069,13 +1118,11 @@ fn wildcard_add_stop_is_not_a_counter_failure_or_retry() {
     config.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
     };
-    let (state, mut query) = fake_query_with_seed(
+    let (state, mut query) = fake_query_with_cadences(
         vec![config],
         vec![fake_counter(expanded, Number::Integer(1))],
         Duration::ZERO,
         Duration::ZERO,
-        4096,
-        None,
     );
     {
         let mut state = state.borrow_mut();
@@ -1133,7 +1180,6 @@ fn wanted_pending_removal_retains_seed_and_cleanup_outcome() {
             state.remove_error = true;
         }
         query.refresh_all_wildcards_managed().unwrap();
-        assert_eq!(query.reserved_native_entry_count(), 2);
         assert_eq!(query.admitted_members().len(), 1);
         assert_eq!(query.admitted_members()[0].path.as_ref(), wanted);
         assert_eq!(query.pending.diagnostics.discovery_failures, 0);
@@ -1157,7 +1203,6 @@ fn wanted_pending_removal_retains_seed_and_cleanup_outcome() {
         query.refresh_all_wildcards_managed().unwrap();
         state.borrow_mut().expand_error = false;
         assert_eq!(query.active_counter_count(), 0);
-        assert_eq!(query.reserved_native_entry_count(), 2);
         assert_eq!(query.admitted_members().len(), 1);
         assert!(query.pending.overflows.is_empty());
         assert_eq!(state.borrow().added.len(), 2);
@@ -1167,7 +1212,6 @@ fn wanted_pending_removal_retains_seed_and_cleanup_outcome() {
             assert_eq!(recovered.points.len(), 1);
             assert_eq!(recovered.points[0].path.as_ref(), wanted);
             assert_eq!(recovered.points[0].value, SampleValue::Warming);
-            assert_eq!(query.reserved_native_entry_count(), 1);
             assert_eq!(
                 recovered.metadata.diagnostics.discovery_failures,
                 u64::from(discovery_fails)
@@ -1180,7 +1224,6 @@ fn wanted_pending_removal_retains_seed_and_cleanup_outcome() {
             assert!(failed.metadata.failures.iter().any(|failure| {
                 failure.reason == "PdhRemoveCounter" && failure.path.as_ref() == wanted
             }));
-            assert_eq!(query.reserved_native_entry_count(), 1);
             assert_eq!(
                 failed.metadata.diagnostics.discovery_failures,
                 u64::from(discovery_fails)
@@ -1233,7 +1276,6 @@ fn departed_pending_replacement_cannot_restore_stale_handle() {
             .insert(template.to_owned(), Vec::new());
         query.refresh_all_wildcards_managed().unwrap();
         assert!(query.admitted_members().is_empty());
-        assert_eq!(query.recreation_seed().reserved_native_entry_count(0), 0);
         assert_eq!(query.pending.diagnostics.instances_removed, 2);
         let _ = state
             .borrow_mut()
@@ -1241,12 +1283,7 @@ fn departed_pending_replacement_cannot_restore_stale_handle() {
             .insert(template.to_owned(), vec![wanted.to_owned()]);
         query.refresh_all_wildcards_managed().unwrap();
         assert_eq!(query.active_counter_count(), 0);
-        assert_eq!(query.reserved_native_entry_count(), 2);
         assert_eq!(query.admitted_members().len(), usize::from(limit == 3));
-        assert_eq!(
-            query.recreation_seed().reserved_native_entry_count(0),
-            usize::from(limit == 3)
-        );
         state.borrow_mut().remove_error = false;
         assert_eq!(
             query.collect().unwrap().points.len(),
@@ -1342,7 +1379,6 @@ fn pending_replacement_handoff_preserves_owner_and_pattern_quota() {
     };
     assert_eq!(members(&query), expected);
     assert_eq!(query.active_counter_count(), 2);
-    assert_eq!(query.reserved_native_entry_count(), 3);
     let seed = query.recreation_seed();
     let restored = Query::open_with_seed(
         FakePdh::new(fake_state(counters())),
@@ -1358,7 +1394,6 @@ fn pending_replacement_handoff_preserves_owner_and_pattern_quota() {
     let _ = state.borrow_mut().expand_errors.insert(second.to_owned());
     query.refresh_all_wildcards_managed().unwrap();
     assert_eq!(members(&query), expected);
-    assert_eq!(query.reserved_native_entry_count(), 3);
     assert!(query.pending.overflows.is_empty());
     state.borrow_mut().remove_errors.clear();
     let cleaned = query.collect().unwrap();
@@ -1370,7 +1405,6 @@ fn pending_replacement_handoff_preserves_owner_and_pattern_quota() {
         .unwrap();
     assert_eq!(replacement.counter_index, 0);
     assert_eq!(replacement.value, SampleValue::Warming);
-    assert_eq!(query.reserved_native_entry_count(), 3);
 }
 
 /// Scenario: A departed member's first removal fails and more collections arrive before the cleanup retry deadline.
@@ -1406,7 +1440,6 @@ fn pending_removal_waits_for_cleanup_backoff() {
     let first = query.collect().unwrap();
     let second = query.collect().unwrap();
     assert_eq!(state.borrow().removed, [0]);
-    assert_eq!(query.reserved_native_entry_count(), 1);
     assert_eq!(first.metadata.diagnostics.discovery_failures, 0);
     assert_eq!(first.metadata.failures.len(), 1);
     assert_eq!(second.metadata.diagnostics.discovery_failures, 0);
@@ -1938,90 +1971,51 @@ fn setup_cleanup_failure_requires_query_rebuild() {
     assert_eq!(state.borrow().removed, vec![0]);
 }
 
-/// Scenario: An exact counter first fails transiently, then exposes an unsupported native type on its queued retry.
+/// Scenario: An exact Gauge or Sum first fails transiently, then its retry exposes an unsupported native or base type.
 /// Guarantees: The permanent rejection is reported once, terminates the queued retry, and is not counted as recovery.
 #[test]
 fn queued_retry_stops_after_unsupported_type() {
     let path = r"\Object\Unsupported";
-    let (state, mut query) = fake_query_with_cadences(
-        vec![counter(path, "windows.unsupported")],
-        Vec::new(),
-        Duration::ZERO,
-        Duration::ZERO,
-    );
-    state.borrow_mut().counters.push(FakeCounter {
-        path: path.to_owned(),
-        native_type: 0x4003_0401,
-        raw: None,
-        multi_count: 1,
-        formatted: None,
-        raw_error: false,
-        formatted_error: false,
-    });
+    for (config, native_type) in [
+        (counter(path, "windows.unsupported"), 0x4003_0401),
+        (
+            cumulative_sum(path, "object.operations", "{operation}"),
+            0x4003_0402,
+        ),
+    ] {
+        let (state, mut query) =
+            fake_query_with_cadences(vec![config], Vec::new(), Duration::ZERO, Duration::ZERO);
+        state.borrow_mut().counters.push(FakeCounter {
+            path: path.to_owned(),
+            native_type,
+            raw: None,
+            multi_count: 1,
+            formatted: None,
+            raw_error: false,
+            formatted_error: false,
+        });
 
-    assert!(matches!(
-        query.collect(),
-        Err(Error::NoUsableCounters { .. })
-    ));
-    let rejected = std::mem::take(&mut query.pending);
-    assert_eq!(rejected.diagnostics.retry_attempts, 1);
-    assert_eq!(rejected.diagnostics.retry_recoveries, 0);
-    assert_eq!(rejected.diagnostics.counter_add_failures, 2);
-    assert_eq!(rejected.failures.len(), 2);
-    assert_eq!(rejected.failures[1].reason, "unsupported_type");
-    assert_eq!(state.borrow().removed, [0]);
+        assert!(matches!(
+            query.collect(),
+            Err(Error::NoUsableCounters { .. })
+        ));
+        let rejected = std::mem::take(&mut query.pending);
+        assert_eq!(rejected.diagnostics.retry_attempts, 1);
+        assert_eq!(rejected.diagnostics.retry_recoveries, 0);
+        assert_eq!(rejected.diagnostics.counter_add_failures, 2);
+        assert_eq!(rejected.failures.len(), 2);
+        assert_eq!(rejected.failures[1].reason, "unsupported_type");
+        assert_eq!(state.borrow().removed, [0]);
 
-    state.borrow_mut().timestamp = 110;
-    assert!(matches!(
-        query.collect(),
-        Err(Error::NoUsableCounters { .. })
-    ));
-    assert_eq!(query.pending.diagnostics.retry_attempts, 0);
-    assert!(query.pending.failures.is_empty());
-    assert_eq!(state.borrow().removed, [0]);
-}
-
-/// Scenario: An exact Sum first fails transiently, then its retry finds an unsupported native base type.
-/// Guarantees: Permanent native rejection cleans up its handle and terminates the queued retry.
-#[test]
-fn queued_retry_stops_after_unsupported_base_type() {
-    let path = r"\Object\Operations";
-    let (state, mut query) = fake_query_with_cadences(
-        vec![cumulative_sum(path, "object.operations", "{operation}")],
-        Vec::new(),
-        Duration::ZERO,
-        Duration::ZERO,
-    );
-    state.borrow_mut().counters.push(FakeCounter {
-        path: path.to_owned(),
-        native_type: 0x4003_0402,
-        raw: None,
-        multi_count: 1,
-        formatted: Some(Number::Integer(42)),
-        raw_error: false,
-        formatted_error: false,
-    });
-
-    assert!(matches!(
-        query.collect(),
-        Err(Error::NoUsableCounters { .. })
-    ));
-    let rejected = std::mem::take(&mut query.pending);
-    assert_eq!(rejected.diagnostics.retry_attempts, 1);
-    assert_eq!(rejected.diagnostics.retry_recoveries, 0);
-    assert_eq!(rejected.diagnostics.counter_add_failures, 2);
-    assert_eq!(rejected.failures.len(), 2);
-    assert_eq!(rejected.failures[1].reason, "unsupported_type");
-    assert_eq!(state.borrow().removed, [0]);
-
-    state.borrow_mut().timestamp = 110;
-    assert!(matches!(
-        query.collect(),
-        Err(Error::NoUsableCounters { .. })
-    ));
-    assert_eq!(query.pending.diagnostics.retry_attempts, 0);
-    assert!(query.pending.failures.is_empty());
-    assert_eq!(state.borrow().removed, [0]);
+        state.borrow_mut().timestamp = 110;
+        assert!(matches!(
+            query.collect(),
+            Err(Error::NoUsableCounters { .. })
+        ));
+        assert_eq!(query.pending.diagnostics.retry_attempts, 0);
+        assert!(query.pending.failures.is_empty());
+        assert_eq!(state.borrow().removed, [0]);
+    }
 }
 
 /// Scenario: An exact Sum retry finds an unsupported native type whose cleanup also fails.
@@ -2136,12 +2130,8 @@ fn mixed_language_exact_and_wildcard_group_preserves_calculated_readiness() {
 /// Guarantees: Exact adds stay English, expanded adds use localized identity, projection preserves configured metadata, and unresolved inputs warn once.
 #[test]
 fn smoke_selector_shapes_preserve_language_and_output_sources() {
-    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
     use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value;
     use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::metric;
-    use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryIntoWithOptions};
-    use otel_arrow_dfe_pdata_codec::OtapPayload;
-    use prost::Message;
 
     let paths = [
         r"\Memory\Available Bytes",
@@ -2222,10 +2212,7 @@ fn smoke_selector_shapes_preserve_language_and_output_sources() {
             })
     );
     let records = into_otap(&configs, sample).unwrap().unwrap();
-    let bytes: OtlpProtoBytes = OtapPayload::from_otap(records)
-        .try_into_with_default()
-        .unwrap();
-    let decoded = ExportMetricsServiceRequest::decode(bytes.as_bytes()).unwrap();
+    let decoded = decode(records);
     for metric in &decoded.resource_metrics[0].scope_metrics[0].metrics {
         let index = configs
             .iter()
@@ -2555,7 +2542,6 @@ fn wildcard_remove_failure_stays_owned_until_local_retry() {
     let pending = query.collect().unwrap();
     assert!(pending.points.is_empty());
     assert_eq!(query.active_expanded_count(), 0);
-    assert_eq!(query.reserved_native_entry_count(), 1);
     assert_eq!(pending.metadata.failures.len(), 1);
     assert_eq!(pending.metadata.failures[0].reason, "PdhRemoveCounter");
     assert_eq!(state.borrow().removed, [0]);
@@ -2568,7 +2554,6 @@ fn wildcard_remove_failure_stays_owned_until_local_retry() {
     let cleaned = query.collect().unwrap();
     assert!(cleaned.points.is_empty());
     assert_eq!(query.active_expanded_count(), 0);
-    assert_eq!(query.reserved_native_entry_count(), 0);
     assert_eq!(state.borrow().removed, [0, 0]);
 }
 
@@ -2740,7 +2725,6 @@ fn rediscovered_pending_removal_restores_existing_handle() {
     assert!(removed.points.is_empty());
     assert_eq!(removed.metadata.diagnostics.instances_removed, 1);
     assert_eq!(query.active_expanded_count(), 0);
-    assert_eq!(query.reserved_native_entry_count(), 1);
 
     {
         let mut state = state.borrow_mut();
@@ -2755,7 +2739,6 @@ fn rediscovered_pending_removal_restores_existing_handle() {
     assert_eq!(restored.points.len(), 1);
     assert_eq!(restored.points[0].path.as_ref(), expanded);
     assert_eq!(query.active_expanded_count(), 1);
-    assert_eq!(query.reserved_native_entry_count(), 1);
 
     {
         let mut state = state.borrow_mut();
@@ -2766,7 +2749,6 @@ fn rediscovered_pending_removal_restores_existing_handle() {
     let removed_again = query.collect().unwrap();
     assert!(removed_again.points.is_empty());
     assert_eq!(removed_again.metadata.diagnostics.instances_removed, 0);
-    assert_eq!(query.reserved_native_entry_count(), 1);
     let state = state.borrow();
     assert_eq!(state.added.len(), 1);
     assert_eq!(state.added[0], expanded);
@@ -2902,7 +2884,6 @@ fn pending_wildcard_removal_consumes_one_budget_entry() {
     }
     query.refresh_all_wildcards_managed().unwrap();
     assert_eq!(query.active_expanded_count(), 1);
-    assert_eq!(query.reserved_native_entry_count(), 2);
     assert_eq!(query.admitted_members().len(), 1);
     assert_eq!(query.admitted_members()[0].path.as_ref(), second_expanded);
     assert!(query.pending.overflows.is_empty());
@@ -2957,8 +2938,8 @@ fn non_ascii_case_collisions_share_one_budgeted_key() {
     let other = r"\Object(worker)\Value".to_owned();
     assert_eq!(CounterKey::new(0, &upper), CounterKey::new(0, &lower));
 
-    let mut paths = keyed_expanded_paths(0, vec![lower.clone(), other.clone(), upper.clone()]);
-    let allocation = limit_expanded_paths(&mut paths, 2, 2);
+    let paths = keyed_expanded_paths(0, vec![lower.clone(), other.clone(), upper.clone()]);
+    let allocation = expansion_allocation(paths.len(), 2, 2);
 
     assert_eq!(
         allocation,
@@ -3090,16 +3071,13 @@ fn global_refresh_preserves_failed_removal_reservation() {
             .iter()
             .any(|failure| failure.reason == "PdhRemoveCounter")
     );
-    assert_eq!(query.reserved_native_entry_count(), 1);
     assert_eq!(state.borrow().added, [later_old.to_owned()]);
     assert_eq!(failed.metadata.diagnostics.instances_omitted_over_limit, 2);
     state.borrow_mut().remove_error = false;
     let _ = query.collect().unwrap();
-    assert_eq!(query.reserved_native_entry_count(), 0);
     query.refresh_all_wildcards_managed().unwrap();
     let admitted = query.collect().unwrap();
     assert_eq!(admitted.points[0].path.as_ref(), first_new);
-    assert_eq!(query.reserved_native_entry_count(), 1);
     assert_eq!(
         state.borrow().added,
         [later_old.to_owned(), first_new.to_owned()]
@@ -3115,14 +3093,8 @@ fn empty_startup_expansion_is_diagnosed_once() {
     config.instance_config = InstanceConfig::Wildcard {
         excluded_aggregation: None,
     };
-    let (state, mut query) = fake_query_with_seed(
-        vec![config],
-        Vec::new(),
-        Duration::ZERO,
-        Duration::ZERO,
-        4096,
-        None,
-    );
+    let (state, mut query) =
+        fake_query_with_cadences(vec![config], Vec::new(), Duration::ZERO, Duration::ZERO);
     let startup = query.collect().unwrap();
     assert_eq!(
         startup
@@ -3165,16 +3137,11 @@ fn empty_startup_expansion_is_diagnosed_once() {
     assert_eq!(admitted.points[0].path.as_ref(), expanded);
 }
 
-/// Scenario: Discovery returns more sorted paths than either configured expansion bound allows.
-/// Guarantees: The retained prefix is deterministic and every omitted instance is counted explicitly.
+/// Scenario: Discovered membership exceeds the per-pattern bound or remaining total capacity.
+/// Guarantees: Production allocation counts retained entries and omissions against the correct independent limits.
 #[test]
-fn expansion_limits_are_deterministic_and_report_omissions() {
-    let mut paths = vec!["charlie".to_owned(), "alpha".to_owned(), "bravo".to_owned()];
-    paths.sort();
-
-    let omitted = limit_expanded_paths(&mut paths, 2, 10);
-
-    assert_eq!(paths, ["alpha", "bravo"]);
+fn expansion_allocation_reports_each_limit() {
+    let omitted = expansion_allocation(3, 2, 10);
     assert_eq!(
         omitted,
         ExpansionAllocation {
@@ -3184,8 +3151,7 @@ fn expansion_limits_are_deterministic_and_report_omissions() {
         }
     );
 
-    let omitted = limit_expanded_paths(&mut paths, 2, 1);
-    assert_eq!(paths, ["alpha"]);
+    let omitted = expansion_allocation(2, 2, 1);
     assert_eq!(
         omitted,
         ExpansionAllocation {
@@ -3473,26 +3439,27 @@ fn refresh_group_changes_preserve_stable_histories() {
 /// Guarantees: Aggregate matching is case-sensitive and does not confuse other provider instances.
 #[test]
 fn identifies_provider_aggregation_instances() {
-    assert!(is_aggregation_instance(
-        r"\Process(_Total)\Private Bytes",
-        "_Total"
-    ));
-    assert!(!is_aggregation_instance(
-        r"\Custom(_GLOBAL_)\Counter",
-        "_Global_"
-    ));
-    assert!(!is_aggregation_instance(
-        r"\Process(worker)\Private Bytes",
-        "_Total"
-    ));
-    assert!(!is_aggregation_instance(
-        r"\Thread(_Total/_Total)\% Processor Time",
-        "_Total"
-    ));
-    assert!(!is_aggregation_instance(
-        r"\Process(_Total#1)\Private Bytes",
-        "_Total"
-    ));
+    let peer = r"\Process(healthy)\Private Bytes".to_owned();
+    for (path, aggregate, removed) in [
+        (r"\Process(_Total)\Private Bytes", "_Total", true),
+        (r"\Custom(_GLOBAL_)\Counter", "_Global_", false),
+        (r"\Process(worker)\Private Bytes", "_Total", false),
+        (r"\Thread(_Total/_Total)\% Processor Time", "_Total", false),
+        (r"\Process(_Total#1)\Private Bytes", "_Total", false),
+    ] {
+        let mut paths = vec![path.to_owned(), peer.clone()];
+        assert!(
+            !cleanup_aggregation_instances(&mut paths, Some(aggregate), parse_instance).unwrap()
+        );
+        assert_eq!(
+            paths,
+            if removed {
+                vec![peer.clone()]
+            } else {
+                vec![path.to_owned(), peer.clone()]
+            }
+        );
+    }
 }
 
 /// Scenario: A wildcard aggregate sorts before concrete instances under a one-instance limit.
@@ -3504,7 +3471,7 @@ fn filters_aggregation_before_expansion_limits() {
         r"\Process(worker)\Private Bytes".to_owned(),
     ];
     assert!(!cleanup_aggregation_instances(&mut paths, Some("_Total"), parse_instance).unwrap());
-    let allocation = limit_expanded_paths(&mut paths, 1, 1);
+    let allocation = expansion_allocation(paths.len(), 1, 1);
     assert_eq!(
         allocation,
         ExpansionAllocation {

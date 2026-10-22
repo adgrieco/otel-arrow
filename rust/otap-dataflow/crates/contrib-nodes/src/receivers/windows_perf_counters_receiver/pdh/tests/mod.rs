@@ -10,6 +10,7 @@ use super::super::{
     TEST_PDH_LOCK,
     config::Config,
     otap_builder::{into_otap, project_sample},
+    test_utils::decode,
 };
 use super::expansion::*;
 use super::native::NativePdh;
@@ -94,6 +95,7 @@ struct FakeState {
     remove_errors: BTreeSet<usize>,
     expand_error: bool,
     expand_operation: PdhOperation,
+    lookup_failure_on_cleanup: bool,
     object_refresh_error: bool,
     expand_errors: BTreeSet<String>,
     stop_after_expand: Option<Arc<AtomicBool>>,
@@ -266,7 +268,7 @@ impl PdhApi for FakePdh {
         let counter = &state.counters[index];
         if counter.formatted_error {
             return Err(Error::CounterData {
-                operation: PdhOperation::CounterDataStatus,
+                operation: PdhOperation::FormattedCounterDataStatus,
                 path: path.to_owned(),
                 status: 1,
             });
@@ -321,7 +323,7 @@ impl PdhApi for FakePdh {
                 return Err(Error::WildcardCleanup {
                     path: path.to_owned(),
                     message: "temporary handle cleanup is pending".to_owned(),
-                    lookup_failed: false,
+                    lookup_failed: state.lookup_failure_on_cleanup,
                 });
             }
             return Err(Error::Pdh {
@@ -343,79 +345,13 @@ impl PdhApi for FakePdh {
     }
 }
 
-struct RecoveringPrimePdh {
-    collect_calls: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl PdhApi for RecoveringPrimePdh {
-    type Counter = ();
-
-    fn add(&mut self, _path: &str, _language: CounterLanguage) -> Result<Self::Counter, Error> {
-        Ok(())
-    }
-
-    fn remove(&mut self, _counter: &Self::Counter, _path: &str) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn counter_type(&mut self, _counter: &Self::Counter, _path: &str) -> Result<u32, Error> {
-        Ok(0x2041_0500)
-    }
-
-    fn collect(&mut self) -> Result<bool, Error> {
-        if self.collect_calls.fetch_add(1, Ordering::Relaxed) == 0 {
-            Err(Error::Pdh {
-                operation: PdhOperation::CollectQueryData,
-                path: "<query>".to_owned(),
-                status: 1,
-            })
-        } else {
-            Ok(true)
-        }
-    }
-
-    fn raw(&mut self, _counter: &Self::Counter, _path: &str) -> Result<Option<RawSample>, Error> {
-        Ok(Some(RawSample {
-            second_value: i64::try_from(self.collect_calls.load(Ordering::Relaxed))
-                .unwrap_or(i64::MAX),
-            multi_count: 1,
-        }))
-    }
-
-    fn formatted(
-        &mut self,
-        _counter: &Self::Counter,
-        _path: &str,
-        _format: ValueFormat,
-    ) -> Result<Option<Number>, Error> {
-        Ok(Some(Number::Double(1.0)))
-    }
-
-    fn timestamp(&mut self) -> Result<i64, Error> {
-        Ok(100 + i64::try_from(self.collect_calls.load(Ordering::Relaxed)).unwrap_or(i64::MAX))
-    }
-
-    fn refresh_objects(&mut self) -> Result<usize, Error> {
-        Ok(0)
-    }
-
-    fn expand(&mut self, _path: &str) -> Result<Vec<String>, Error> {
-        Ok(Vec::new())
-    }
-
-    fn parse_instance(&mut self, path: &str) -> Result<InstanceIdentity, Error> {
-        Err(Error::InvalidCounterToken {
-            path: path.to_owned(),
-        })
-    }
-}
-
-struct RebuildPrimePdh {
+struct CalculatedPdh {
     fail_collect: Arc<AtomicBool>,
     collect_calls: usize,
+    fail_first_collect: bool,
 }
 
-impl PdhApi for RebuildPrimePdh {
+impl PdhApi for CalculatedPdh {
     type Counter = ();
 
     fn add(&mut self, _path: &str, _language: CounterLanguage) -> Result<Self::Counter, Error> {
@@ -431,7 +367,8 @@ impl PdhApi for RebuildPrimePdh {
     }
 
     fn collect(&mut self) -> Result<bool, Error> {
-        if self.fail_collect.load(Ordering::Relaxed) {
+        if std::mem::take(&mut self.fail_first_collect) || self.fail_collect.load(Ordering::Relaxed)
+        {
             return Err(Error::Pdh {
                 operation: PdhOperation::CollectQueryData,
                 path: "<query>".to_owned(),
@@ -495,18 +432,14 @@ fn fake_query_with_cadences(
     exact_retry_cap: Duration,
     wildcard_refresh_interval: Duration,
 ) -> (Rc<RefCell<FakeState>>, Query<FakePdh>) {
-    let state = fake_state(counters);
-    let query = Query::open_with_seed(
-        FakePdh::new(Rc::clone(&state)),
+    fake_query_with_seed(
         configs,
+        counters,
         exact_retry_cap,
         wildcard_refresh_interval,
-        256,
         4_096,
         None,
     )
-    .unwrap();
-    (state, query)
 }
 
 fn fake_state_value(counters: Vec<FakeCounter>) -> FakeState {
@@ -525,6 +458,7 @@ fn fake_state_value(counters: Vec<FakeCounter>) -> FakeState {
         remove_errors: BTreeSet::new(),
         expand_error: false,
         expand_operation: PdhOperation::ExpandWildcardPath,
+        lookup_failure_on_cleanup: false,
         object_refresh_error: false,
         expand_errors: BTreeSet::new(),
         stop_after_expand: None,
@@ -600,7 +534,10 @@ fn temporary_template_cleanup_is_bounded_and_stop_safe() {
                     assert!(result.is_err_and(|error| error.is_stop()));
                 } else if removal_fails {
                     assert!(result.is_err_and(|error| matches!(error,
-                        Error::WildcardCleanup { lookup_failed, .. } if lookup_failed == info_fails)));
+                        Error::WildcardCleanup { message, lookup_failed, .. }
+                            if lookup_failed == info_fails
+                                && message.contains("PdhRemoveCounter")
+                                && (!info_fails || message.contains("PdhGetCounterInfoW")))));
                     let retry =
                         native::resolve_template(&mut api, &mut pending, path, |_, _, _| {
                             panic!("pending cleanup must finish before another lookup")
@@ -628,32 +565,6 @@ fn temporary_template_cleanup_is_bounded_and_stop_safe() {
             }
         }
     }
-}
-
-/// Scenario: A fake PDH token is used after removal and after a replacement add.
-/// Guarantees: Removed generations stay invalid while the replacement token remains usable.
-#[test]
-fn fake_pdh_rejects_removed_tokens() {
-    let path = r"\Memory\Available Bytes";
-    let state = fake_state(vec![FakeCounter {
-        path: path.to_owned(),
-        native_type: 0x0001_0100,
-        raw: None,
-        multi_count: 1,
-        formatted: Some(Number::Integer(1)),
-        raw_error: false,
-        formatted_error: false,
-    }]);
-    let mut api = FakePdh::new(state);
-    let removed = api.add(path, CounterLanguage::English).unwrap();
-    api.remove(&removed, path).unwrap();
-    let replacement = api.add(path, CounterLanguage::English).unwrap();
-
-    assert!(matches!(
-        api.counter_type(&removed, path),
-        Err(Error::InvalidCounterToken { .. })
-    ));
-    assert_eq!(api.counter_type(&replacement, path).unwrap(), 0x0001_0100);
 }
 
 mod live;

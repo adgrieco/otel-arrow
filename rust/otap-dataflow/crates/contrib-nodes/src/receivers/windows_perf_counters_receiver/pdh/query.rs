@@ -1311,7 +1311,7 @@ type DesiredCounters = BTreeMap<CounterKey, DesiredCounter>;
 
 pub(super) struct QueryRecreationSeed {
     start_time_unix_nano: i64,
-    previous_timestamp_unix_nano: i64,
+    pub(super) previous_timestamp_unix_nano: i64,
     last_wildcard_refresh: Instant,
     wildcard_targets: Vec<(CounterKey, CounterTarget)>,
     last_object_refresh: Instant,
