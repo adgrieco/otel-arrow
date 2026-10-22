@@ -654,9 +654,12 @@ impl Drop for CounterProcess {
 }
 
 fn spawn_counter_process(executable: &Path) -> CounterProcess {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut child = CounterProcess(
         ProcessCommand::new(executable)
             .args(["/d", "/q", "/c", "echo ready & set /p wait="])
+            .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

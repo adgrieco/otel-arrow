@@ -16,6 +16,7 @@ use super::native::NativePdh;
 use super::query::*;
 use super::worker::*;
 use super::*;
+use super::{QueryCadence, Worker};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader};
@@ -27,7 +28,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-fn counter(path: &str, name: &str) -> CounterConfig {
+pub(super) fn counter(path: &str, name: &str) -> CounterConfig {
     CounterConfig {
         path: path.to_owned(),
         name: Arc::from(name),
@@ -88,6 +89,7 @@ struct FakeState {
     collect_status: Option<u32>,
     timestamp: i64,
     timestamp_error: bool,
+    formatted_timestamp: Option<i64>,
     remove_error: bool,
     remove_errors: BTreeSet<usize>,
     expand_error: bool,
@@ -276,7 +278,11 @@ impl PdhApi for FakePdh {
                     | (ValueFormat::Double, Number::Double(_))
             ));
         }
-        Ok(counter.formatted)
+        let formatted = counter.formatted;
+        if let Some(timestamp) = state.formatted_timestamp {
+            state.timestamp = timestamp;
+        }
+        Ok(formatted)
     }
 
     fn timestamp(&mut self) -> Result<i64, Error> {
@@ -514,6 +520,7 @@ fn fake_state_value(counters: Vec<FakeCounter>) -> FakeState {
         collect_status: None,
         timestamp: 100,
         timestamp_error: false,
+        formatted_timestamp: None,
         remove_error: false,
         remove_errors: BTreeSet::new(),
         expand_error: false,

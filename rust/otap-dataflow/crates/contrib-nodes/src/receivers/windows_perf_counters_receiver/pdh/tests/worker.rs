@@ -3,6 +3,31 @@
 
 use super::*;
 
+/// Scenario: An owned worker join temporarily has no completion receiver.
+/// Guarantees: Shutdown returns WorkerStopped without panicking or losing join ownership, and cleanup can still complete.
+#[tokio::test(flavor = "current_thread")]
+async fn missing_shutdown_completion_preserves_join_ownership() {
+    let (mut worker, ownership, _started, _release) = blocked_collect_worker().await;
+    assert_eq!(worker.startup.active_expanded, 0);
+    let completion = worker.completion.take();
+    assert!(matches!(
+        worker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .await,
+        Err(Error::WorkerStopped)
+    ));
+    assert!(worker.join.is_some());
+    worker.completion = completion;
+    assert!(
+        worker
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap()
+    );
+    assert_eq!(ownership.current.load(Ordering::Acquire), 0);
+    assert_eq!(ownership.closed_queries.load(Ordering::Acquire), 1);
+}
+
 /// Scenario: Every exact mapping is permanently unsupported rather than temporarily unavailable.
 /// Guarantees: Startup fails contextually, releases rejected handles, and does not advertise pending readiness without recovery work.
 #[test]
@@ -2427,6 +2452,7 @@ async fn blocked_collect_worker() -> (
         vec![counter(r"\Memory\Available Bytes", "available")],
         Duration::from_secs(30),
         4_096,
+        "test".to_owned(),
         move |configs, limit, seed, shutdown| {
             Query::open_with_seed(
                 PeakPdh {

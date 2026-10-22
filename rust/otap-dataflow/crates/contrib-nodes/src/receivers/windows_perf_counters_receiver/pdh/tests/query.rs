@@ -3,6 +3,192 @@
 
 use super::*;
 
+/// Scenario: Real query sampling produces two localized members, an exact Sum, and a later independent observation.
+/// Guarantees: Decoded OTAP retains grouped metadata, concrete identity, static precedence, collection times and query-owned Sum start.
+#[test]
+fn query_producer_to_decoded_otap_preserves_observations() {
+    use otel_arrow_dfe_pdata::proto::opentelemetry::collector::metrics::v1::ExportMetricsServiceRequest;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::common::v1::any_value;
+    use otel_arrow_dfe_pdata::proto::opentelemetry::metrics::v1::{metric, number_data_point};
+    use otel_arrow_dfe_pdata::{OtlpProtoBytes, TryIntoWithOptions};
+    use otel_arrow_dfe_pdata_codec::OtapPayload;
+    use prost::Message;
+
+    let config = Config::from_json(&serde_json::json!({
+        "metrics": {
+            "process.id": {"description": "Process identity", "unit": "1", "gauge": {}},
+            "memory": {"description": "Available memory", "unit": "By",
+                "sum": {"aggregation": "cumulative", "monotonic": false}}
+        },
+        "perfcounters": [
+            {"object": "Process", "instances": "worker*",
+                "counters": [{"name": "ID Process", "metric": "process.id",
+                    "attributes": {" state ": " running ", "instance": "configured"}}]},
+            {"object": "Memory", "counters": [{"name": "Available Bytes", "metric": "memory"},
+                {"name": "missing"}]}
+        ]
+    }))
+    .unwrap();
+    let template = config.counters[0].path.clone();
+    let paths = [
+        r"\Prozess(worker)\Prozesskennung",
+        r"\Prozess(worker#1)\Prozesskennung",
+    ];
+    let exact = r"\Memory\Available Bytes";
+    let (state, mut query) = fake_query(
+        config.counters.clone(),
+        vec![
+            fake_counter(paths[0], Number::Integer(40)),
+            fake_counter(paths[1], Number::Integer(41)),
+            fake_counter(exact, Number::Integer(42)),
+        ],
+    );
+    {
+        let mut state = state.borrow_mut();
+        let _ = state
+            .expansions
+            .insert(template.clone(), paths.map(str::to_owned).to_vec());
+        state.timestamp = 110;
+        state.formatted_timestamp = Some(900);
+    }
+    let mut sample = query.collect().unwrap();
+    assert_eq!(sample.timestamp_unix_nano, 110);
+    assert_eq!(sample.points.len(), 3);
+    assert_eq!(sample.metadata.failures.len(), 1);
+    assert_eq!(
+        sample.metadata.failures[0].path.as_ref(),
+        r"\Memory\missing"
+    );
+    assert_eq!(state.borrow().timestamp, 900);
+    assert!(
+        sample
+            .points
+            .iter()
+            .all(|point| point.timestamp_unix_nano == 110)
+    );
+    let exact_point = sample
+        .points
+        .iter()
+        .find(|point| point.counter_index == 1)
+        .unwrap();
+    assert_eq!(exact_point.path.as_ref(), exact);
+    assert_eq!(exact_point.start_time_unix_nano, Some(100));
+    let later_path = r"\Prozess(worker-later)\Prozesskennung";
+    let (later_state, mut later_query) = fake_query(
+        config.counters[..1].to_vec(),
+        vec![fake_counter(later_path, Number::Integer(99))],
+    );
+    {
+        let mut state = later_state.borrow_mut();
+        let _ = state
+            .expansions
+            .insert(template.clone(), vec![later_path.to_owned()]);
+        state.timestamp = 220;
+    }
+    let later = later_query.collect().unwrap();
+    sample.timestamp_unix_nano = later.timestamp_unix_nano;
+    sample.members.extend(later.members);
+    sample.points.extend(later.points);
+    let records = into_otap(&config.counters, sample).unwrap().unwrap();
+    let bytes: OtlpProtoBytes = OtapPayload::from_otap(records)
+        .try_into_with_default()
+        .unwrap();
+    let decoded = ExportMetricsServiceRequest::decode(bytes.as_bytes()).unwrap();
+    let resource = &decoded.resource_metrics[0];
+    assert!(
+        resource
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes
+            .iter()
+            .any(|attribute| attribute.key == "os.type"
+                && attribute.value.as_ref().unwrap().value
+                    == Some(any_value::Value::StringValue("windows".to_owned())))
+    );
+    let scope = &resource.scope_metrics[0];
+    assert_eq!(
+        scope.scope.as_ref().unwrap().name,
+        "otel-arrow-dfe-contrib-nodes/windows_perf_counters"
+    );
+    assert_eq!(scope.metrics.len(), 2);
+    let process = scope
+        .metrics
+        .iter()
+        .find(|metric| metric.name == "process.id")
+        .unwrap();
+    assert_eq!(process.description, "Process identity");
+    assert_eq!(process.unit, "1");
+    let metric::Data::Gauge(gauge) = process.data.as_ref().unwrap() else {
+        panic!("expected Gauge")
+    };
+    assert_eq!(gauge.data_points.len(), 3);
+    for (path, name, index, time, value) in [
+        (paths[0], "worker", "0", 110, 40),
+        (paths[1], "worker", "1", 110, 41),
+        (later_path, "worker-later", "0", 220, 99),
+    ] {
+        let point = gauge
+            .data_points
+            .iter()
+            .find(|point| {
+                point.attributes.iter().any(|attribute| {
+                    attribute.key == "windows.perf_counter.path"
+                        && attribute.value.as_ref().unwrap().value
+                            == Some(any_value::Value::StringValue(path.to_owned()))
+                })
+            })
+            .unwrap();
+        let attributes = point
+            .attributes
+            .iter()
+            .map(|attribute| {
+                let Some(any_value::Value::StringValue(value)) = attribute
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.value.as_ref())
+                else {
+                    panic!("expected string")
+                };
+                (attribute.key.as_str(), value.as_str())
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            attributes,
+            BTreeMap::from([
+                (" state ", " running "),
+                ("instance", "configured"),
+                ("windows.perf_counter.path", path),
+                ("windows.perf_counter.path_template", template.as_str()),
+                ("windows.perf_counter.instance", name),
+                ("windows.perf_counter.instance_index", index),
+            ])
+        );
+        assert_eq!(point.time_unix_nano, time);
+        assert_eq!(point.start_time_unix_nano, 0);
+        assert_eq!(point.value, Some(number_data_point::Value::AsInt(value)));
+    }
+    let memory = scope
+        .metrics
+        .iter()
+        .find(|metric| metric.name == "memory")
+        .unwrap();
+    let metric::Data::Sum(sum) = memory.data.as_ref().unwrap() else {
+        panic!("expected Sum")
+    };
+    assert_eq!(memory.description, "Available memory");
+    assert_eq!(memory.unit, "By");
+    assert_eq!(sum.aggregation_temporality, 2);
+    assert!(!sum.is_monotonic);
+    assert_eq!(sum.data_points.len(), 1);
+    assert_eq!(sum.data_points[0].start_time_unix_nano, 100);
+    assert_eq!(sum.data_points[0].time_unix_nano, 110);
+    assert_eq!(
+        sum.data_points[0].value,
+        Some(number_data_point::Value::AsInt(42))
+    );
+}
+
 /// Scenario: An unsupported native type is reported for a configured counter.
 /// Guarantees: The contextual sample failure retains the actual path rather than the worker placeholder.
 #[test]
@@ -17,6 +203,88 @@ fn unsupported_type_failure_retains_counter_path() {
     assert_eq!(failure.reason, "unsupported_type");
 }
 use windows_sys::Win32::System::Performance::PDH_INVALID_HANDLE;
+
+/// Scenario: Exact and wildcard failures retry, resolve, and a wildcard fails again with healthy retained members.
+/// Guarantees: The worker's diagnostic consumer emits one warning per episode and no recovery events on steady collection.
+#[test]
+fn collection_diagnostics_log_selector_episodes_without_reminders() {
+    use tracing_subscriber::layer::SubscriberExt;
+    // The test subscriber shares captured event names; production log state stays worker-local.
+    #[derive(Clone, Default)]
+    struct Events(Arc<std::sync::Mutex<Vec<&'static str>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.lock().unwrap().push(event.metadata().name());
+        }
+    }
+    let output = Events::default();
+    let subscriber = tracing_subscriber::registry().with(output.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        let healthy = r"\Memory\Available Bytes";
+        let missing = r"\Memory\Late Counter";
+        let template = r"\Process(worker*)\ID Process";
+        let member = r"\Prozess(worker)\Prozesskennung";
+        let wildcard = CounterConfig {
+            instance_config: InstanceConfig::Wildcard {
+                excluded_aggregation: None,
+            },
+            ..counter(template, "process")
+        };
+        let configs = vec![
+            counter(healthy, "healthy"),
+            counter(missing, "late"),
+            wildcard,
+        ];
+        let (state, mut query) = fake_query_with_cadences(
+            configs.clone(),
+            vec![fake_counter(healthy, Number::Integer(42))],
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        state.borrow_mut().expand_error = true;
+        let mut logs = diagnostics::SampleLogState::new("diagnostics-test".to_owned(), configs);
+        for _ in 0..3 {
+            logs.log(&query.collect().unwrap()).unwrap();
+        }
+        {
+            let mut state = state.borrow_mut();
+            state.expand_error = false;
+            state
+                .counters
+                .push(fake_counter(missing, Number::Integer(7)));
+            state
+                .counters
+                .push(fake_counter(member, Number::Integer(99)));
+            let _ = state
+                .expansions
+                .insert(template.to_owned(), vec![member.to_owned()]);
+        }
+        logs.log(&query.collect().unwrap()).unwrap();
+        let before_steady = output.0.lock().unwrap().len();
+        logs.log(&query.collect().unwrap()).unwrap();
+        assert_eq!(output.0.lock().unwrap().len(), before_steady);
+        state.borrow_mut().expand_error = true;
+        for _ in 0..3 {
+            let sample = query.collect().unwrap();
+            assert_eq!(sample.points.len(), 3);
+            logs.log(&sample).unwrap();
+        }
+    });
+    let captured = output.0.lock().unwrap();
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|name| **name == "windows_perf_counters_receiver.counter.fail")
+            .count(),
+        3
+    );
+    assert!(captured.contains(&"windows_perf_counters_receiver.instances.change"));
+    assert!(captured.contains(&"windows_perf_counters_receiver.recovery.change"));
+}
 
 struct InvalidHandleState {
     next_handle: usize,

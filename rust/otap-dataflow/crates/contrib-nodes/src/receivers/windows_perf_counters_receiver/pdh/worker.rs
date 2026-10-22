@@ -6,6 +6,7 @@
 use super::super::config::CounterConfig;
 use super::super::model::{PendingMetadata, Sample, SampleFailure, SampleMember};
 use super::PdhApi;
+use super::diagnostics::SampleLogState;
 use super::error::Error;
 use super::query::{Query, QueryRecreationSeed, retry_delay};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,13 +57,14 @@ impl Worker {
         let mut settings = QuerySettings {
             cadence,
             max_instances_per_wildcard,
-            node,
+            node: node.clone(),
             initialized: false,
         };
         Self::start_controlled(
             counters,
             cadence.retry_cap,
             max_native_counters,
+            node,
             move |counters, query_limit, seed, shutdown| {
                 settings.open(counters, query_limit, seed, shutdown)
             },
@@ -74,6 +76,7 @@ impl Worker {
         counters: Vec<CounterConfig>,
         query_retry_cap: Duration,
         max_native_counters: usize,
+        node: String,
         mut open: F,
     ) -> Result<Self, Error>
     where
@@ -94,6 +97,7 @@ impl Worker {
         let worker_accepted = Arc::clone(&accepted);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown_requested);
+        let logs = SampleLogState::new(node, counters.clone());
         let join = std::thread::Builder::new()
             .name("windows-perf-counters-pdh".to_owned())
             .spawn(move || {
@@ -111,6 +115,7 @@ impl Worker {
                     completion_tx,
                     worker_accepted,
                     worker_shutdown,
+                    logs,
                 );
             })
             .map_err(|err| Error::WorkerStart(err.to_string()))?;
@@ -171,10 +176,10 @@ impl Worker {
         let Some(join) = self.join.take() else {
             return Ok(true);
         };
-        let completion = self
-            .completion
-            .as_mut()
-            .expect("an owned join has a completion signal");
+        let Some(completion) = self.completion.as_mut() else {
+            self.join = Some(join);
+            return Err(Error::WorkerStopped);
+        };
         match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), completion).await {
             Ok(_) => {
                 self.completion = None;
@@ -264,6 +269,7 @@ fn run_worker_thread<A, F>(
     completion_tx: oneshot::Sender<()>,
     accepted: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
+    mut logs: SampleLogState,
 ) where
     A: PdhApi,
     F: FnMut(Vec<CounterConfig>, usize, Option<&QueryRecreationSeed>) -> Result<Query<A>, Error>,
@@ -300,7 +306,11 @@ fn run_worker_thread<A, F>(
                     max_native_counters,
                     open,
                     Instant::now(),
-                );
+                )
+                .and_then(|sample| {
+                    logs.log(&sample)?;
+                    Ok(sample)
+                });
                 drop(accepted);
                 let _ = response.send(result);
             }

@@ -6,7 +6,7 @@ use crate::receivers::windows_perf_counters_receiver::config::{
     CounterConfig, InstanceConfig, MetricKind,
 };
 use crate::receivers::windows_perf_counters_receiver::model::{
-    Number, PendingMetadata, SampleDiagnostics, SampleMember, SamplePoint, SampleValue,
+    Number, PendingMetadata, SampleDiagnostics, SamplePoint, SampleValue,
 };
 use arrow::array::TimestampNanosecondArray;
 use otel_arrow_dfe_config::node::NodeUserConfig;
@@ -198,118 +198,6 @@ async fn healthy_collection_and_recovery_only_have_distinct_accounting() {
     assert_eq!(metrics.health.counter_read_failures.get(), 0);
 }
 
-/// Scenario: Unique wildcard members fail and disappear repeatedly under a one-member admission limit.
-/// Guarantees: Warning suppression retains current/retrying identities, drops departed identities, and re-arms when a removed identity returns.
-#[test]
-fn wildcard_warning_state_is_bounded_by_current_membership() {
-    let mut config = test_counter(BTreeMap::new());
-    config.path = r"\Process(*)\Private Bytes".to_owned();
-    config.instance_config = InstanceConfig::Wildcard {
-        excluded_aggregation: None,
-    };
-    let receiver = test_receiver(vec![config]);
-    let mut state = FailureLogState::default();
-    for index in 0..100 {
-        let path: Arc<str> = Arc::from(format!(r"\Process(worker{index})\Private Bytes"));
-        let mut failed = Sample::empty(100);
-        failed.members.push(SampleMember {
-            counter_index: 0,
-            path: Arc::clone(&path),
-            instance: None,
-            emit_instance_attribute: false,
-        });
-        failed.metadata.failures.push(SampleFailure {
-            counter_index: 0,
-            path,
-            reason: "counter CStatus",
-            error: "invalid data".to_owned(),
-            diagnostic_only: false,
-        });
-        state.log_counter_failures(&receiver, &failed).unwrap();
-        assert_eq!(state.active_counter_failures.len(), 1);
-        failed.metadata.failures.clear();
-        state.log_counter_failures(&receiver, &failed).unwrap();
-        assert_eq!(state.active_counter_failures.len(), 1);
-        state
-            .log_counter_failures(&receiver, &Sample::empty(110))
-            .unwrap();
-        assert!(state.active_counter_failures.is_empty());
-    }
-    let path: Arc<str> = Arc::from(r"\Process(worker0)\Private Bytes");
-    let mut removed = Sample::empty(120);
-    removed.metadata.failures.push(SampleFailure {
-        counter_index: 0,
-        path: Arc::clone(&path),
-        reason: "PdhRemoveCounter",
-        error: "cleanup pending".to_owned(),
-        diagnostic_only: true,
-    });
-    state.log_counter_failures(&receiver, &removed).unwrap();
-    state.log_counter_failures(&receiver, &removed).unwrap();
-    assert_eq!(state.active_counter_failures.len(), 1);
-    state
-        .log_counter_failures(&receiver, &Sample::empty(130))
-        .unwrap();
-    assert!(state.active_counter_failures.is_empty());
-    removed.metadata.failures[0].reason = "counter CStatus";
-    state.log_counter_failures(&receiver, &removed).unwrap();
-    assert_eq!(state.active_counter_failures.len(), 1);
-}
-
-/// Scenario: A concrete counter fails, is absent and omitted on later scrapes, then produces a valid value before failing again.
-/// Guarantees: Warning suppression persists until real value recovery and re-arms only after that recovery.
-#[test]
-fn counter_failure_suppression_requires_valid_recovery() {
-    let receiver = test_receiver(vec![test_counter(BTreeMap::new())]);
-    let path = Arc::<str>::from(r"\Memory\Available Bytes");
-    let failure = SampleFailure {
-        counter_index: 0,
-        path: Arc::clone(&path),
-        reason: "counter CStatus",
-        error: "PDH_INVALID_DATA".to_owned(),
-        diagnostic_only: false,
-    };
-    let mut state = FailureLogState::default();
-    let mut failed = Sample::empty(10);
-    failed.metadata.failures.push(failure.clone());
-    state.log_counter_failures(&receiver, &failed).unwrap();
-    assert_eq!(state.active_counter_failures.len(), 1);
-
-    state
-        .log_counter_failures(&receiver, &Sample::empty(20))
-        .unwrap();
-    assert_eq!(state.active_counter_failures.len(), 1);
-
-    let omitted = Sample {
-        timestamp_unix_nano: 30,
-        members: Vec::new(),
-        points: vec![SamplePoint {
-            counter_index: 0,
-            path: Arc::clone(&path),
-            instance: None,
-            emit_instance_attribute: false,
-            timestamp_unix_nano: 30,
-            start_time_unix_nano: None,
-            value: SampleValue::NoObservation,
-        }],
-        metadata: collected_metadata(),
-    };
-    state.log_counter_failures(&receiver, &omitted).unwrap();
-    assert_eq!(state.active_counter_failures.len(), 1);
-
-    let recovered = Sample {
-        timestamp_unix_nano: 40,
-        members: Vec::new(),
-        points: vec![sample_point(0, 40, Number::Integer(42))],
-        metadata: collected_metadata(),
-    };
-    state.log_counter_failures(&receiver, &recovered).unwrap();
-    assert!(state.active_counter_failures.is_empty());
-
-    state.log_counter_failures(&receiver, &failed).unwrap();
-    assert_eq!(state.active_counter_failures.len(), 1);
-}
-
 /// Scenario: A timeout warning is followed by a distinct native collection failure before any successful scrape.
 /// Guarantees: Timeout suppression cannot hide the first real failure warning in the same unsuccessful episode.
 #[test]
@@ -345,58 +233,6 @@ fn timeout_warning_rearms_only_after_on_time_completion() {
     state.record_completion(true);
     assert!(!state.scrape_timeout_active);
     assert!(state.scrape_failure_active);
-}
-
-/// Scenario: Steady samples surround each counter-retry and query-rebuild transition.
-/// Guarantees: Only recovery activity emits a contextual recovery.change event, including a rebuild recovery without an attempt in the same sample.
-#[test]
-fn recovery_events_are_silent_without_activity() {
-    use tracing_subscriber::layer::SubscriberExt;
-
-    // Tracing subscribers require thread-safe storage; capture stays scoped to this test.
-    struct Events(Arc<std::sync::Mutex<Vec<&'static str>>>);
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            self.0.lock().unwrap().push(event.metadata().name());
-        }
-    }
-    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::registry().with(Events(Arc::clone(&events)));
-    let receiver = test_receiver(Vec::new());
-    tracing::subscriber::with_default(subscriber, || {
-        let mut sample = Sample::empty(100);
-        receiver.log_sample_events(&sample);
-        for diagnostics in [
-            SampleDiagnostics {
-                retry_attempts: 1,
-                ..Default::default()
-            },
-            SampleDiagnostics {
-                retry_recoveries: 1,
-                ..Default::default()
-            },
-            SampleDiagnostics {
-                query_rebuild_attempts: 1,
-                ..Default::default()
-            },
-            SampleDiagnostics {
-                query_rebuild_recoveries: 1,
-                ..Default::default()
-            },
-        ] {
-            sample.metadata.diagnostics = diagnostics;
-            receiver.log_sample_events(&sample);
-        }
-        receiver.log_sample_events(&Sample::empty(101));
-    });
-    assert_eq!(
-        *events.lock().unwrap(),
-        ["windows_perf_counters_receiver.recovery.change"; 4]
-    );
 }
 
 /// Scenario: The initial PDH pass remains pending before it eventually succeeds.

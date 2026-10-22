@@ -5,7 +5,7 @@
 
 use super::config::Config;
 use super::metrics::WindowsPerfCountersReceiverMetrics;
-use super::model::{Sample, SampleFailure, SampleValue};
+use super::model::{Sample, SampleFailure};
 use super::otap_builder::{ProjectionInvariantError, project_sample};
 use super::pdh;
 use async_trait::async_trait;
@@ -23,7 +23,6 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
 
@@ -101,7 +100,6 @@ fn receiver_error(
 struct FailureLogState {
     scrape_failure_active: bool,
     scrape_timeout_active: bool,
-    active_counter_failures: BTreeSet<(usize, Arc<str>, &'static str)>,
 }
 
 impl FailureLogState {
@@ -136,80 +134,6 @@ impl FailureLogState {
             self.scrape_timeout_active = true;
         }
     }
-
-    fn log_counter_failures(
-        &mut self,
-        receiver: &WindowsPerfCountersReceiver,
-        sample: &Sample,
-    ) -> Result<(), usize> {
-        let retained = sample
-            .members
-            .iter()
-            .map(|member| (member.counter_index, member.path.as_ref()))
-            .chain(
-                sample
-                    .metadata
-                    .failures
-                    .iter()
-                    .filter(|failure| failure.reason == "PdhRemoveCounter")
-                    .map(|failure| (failure.counter_index, failure.path.as_ref())),
-            )
-            .collect::<BTreeSet<_>>();
-        self.active_counter_failures
-            .retain(|(counter_index, path, _)| {
-                retained.contains(&(*counter_index, path.as_ref()))
-                    || receiver
-                        .config
-                        .counters
-                        .get(*counter_index)
-                        .is_some_and(|counter| path.as_ref() == counter.path.as_str())
-            });
-        for point in &sample.points {
-            if !matches!(point.value, SampleValue::Value(_)) {
-                continue;
-            }
-            let Some(counter) = receiver.config.counters.get(point.counter_index) else {
-                return Err(point.counter_index);
-            };
-            self.active_counter_failures
-                .retain(|(counter_index, path, _)| {
-                    *counter_index != point.counter_index
-                        || (path.as_ref() != point.path.as_ref()
-                            && path.as_ref() != counter.path.as_str())
-                });
-        }
-        for failure in &sample.metadata.failures {
-            let Some(counter) = receiver.config.counters.get(failure.counter_index) else {
-                return Err(failure.counter_index);
-            };
-            if failure.reason == "selector_unresolved" {
-                otel_arrow_dfe_telemetry::otel_warn!(
-                    "windows_perf_counters_receiver.counter.fail",
-                    node = receiver.node.as_str(),
-                    path_template = counter.path.as_str(),
-                    reason = failure.reason,
-                    error = failure.error.as_str()
-                );
-                continue;
-            }
-            let key = (
-                failure.counter_index,
-                Arc::clone(&failure.path),
-                failure.reason,
-            );
-            if !self.active_counter_failures.contains(&key) {
-                otel_arrow_dfe_telemetry::otel_warn!(
-                    "windows_perf_counters_receiver.counter.fail",
-                    node = receiver.node.as_str(),
-                    path_template = counter.path.as_str(),
-                    reason = failure.reason,
-                    error = failure.error.as_str()
-                );
-            }
-            let _ = self.active_counter_failures.insert(key);
-        }
-        Ok(())
-    }
 }
 
 struct ControlExit {
@@ -227,7 +151,6 @@ struct WindowsPerfCountersReceiver {
 enum CollectionLoopError {
     Native(pdh::Error),
     Projection(ProjectionInvariantError),
-    MissingCounter(usize),
     Send(Error),
 }
 
@@ -343,52 +266,6 @@ impl WindowsPerfCountersReceiver {
         self.record_sample_diagnostics(sample);
     }
 
-    fn log_sample_events(&self, sample: &Sample) {
-        for overflow in &sample.metadata.overflows {
-            let path_template = &self.config.counters[overflow.counter_index].path;
-            otel_arrow_dfe_telemetry::otel_warn!(
-                "windows_perf_counters_receiver.instance_limit.exceeded",
-                node = self.node.as_str(),
-                path_template = path_template,
-                reason = overflow.reason,
-                discovered = overflow.discovered as u64,
-                retained = overflow.retained as u64,
-                omitted = overflow.omitted as u64,
-                per_wildcard_omitted = overflow.per_wildcard_omitted as u64,
-                total_omitted = overflow.total_omitted as u64,
-                examples = ?overflow.examples
-            );
-        }
-
-        if sample.metadata.diagnostics.instances_added > 0
-            || sample.metadata.diagnostics.instances_removed > 0
-        {
-            otel_arrow_dfe_telemetry::otel_info!(
-                "windows_perf_counters_receiver.instances.change",
-                node = self.node.as_str(),
-                added = sample.metadata.diagnostics.instances_added,
-                removed = sample.metadata.diagnostics.instances_removed,
-                active = sample.metadata.diagnostics.active_expanded_counters as u64,
-                timestamp_unix_nano = sample.timestamp_unix_nano
-            );
-        }
-        let diagnostics = &sample.metadata.diagnostics;
-        if diagnostics.retry_attempts > 0
-            || diagnostics.retry_recoveries > 0
-            || diagnostics.query_rebuild_attempts > 0
-            || diagnostics.query_rebuild_recoveries > 0
-        {
-            otel_arrow_dfe_telemetry::otel_info!(
-                "windows_perf_counters_receiver.recovery.change",
-                node = self.node.as_str(),
-                retry_attempts = diagnostics.retry_attempts,
-                retry_recoveries = diagnostics.retry_recoveries,
-                query_rebuild_attempts = diagnostics.query_rebuild_attempts,
-                query_rebuild_recoveries = diagnostics.query_rebuild_recoveries
-            );
-        }
-    }
-
     async fn process_collected_sample<F, Fut>(
         &self,
         sample: Sample,
@@ -415,10 +292,6 @@ impl WindowsPerfCountersReceiver {
         } else {
             self.record_recovery_only_sample(collection_duration, &sample);
         }
-        self.log_sample_events(&sample);
-        failure_logs
-            .log_counter_failures(self, &sample)
-            .map_err(CollectionLoopError::MissingCounter)?;
         let Some(records) = projection else {
             return Ok(());
         };
@@ -551,11 +424,6 @@ impl WindowsPerfCountersReceiver {
             CollectionLoopError::Projection(error) => {
                 receiver_error(effect_handler, error.to_string(), "")
             }
-            CollectionLoopError::MissingCounter(counter_index) => receiver_error(
-                effect_handler,
-                format!("sample failure references missing configured counter {counter_index}"),
-                "",
-            ),
             CollectionLoopError::Send(error) => error,
         })
     }
